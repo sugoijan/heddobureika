@@ -1,6 +1,8 @@
-use gloo::events::EventListener;
+use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
+use js_sys::Date;
 use std::collections::VecDeque;
 use std::fmt::Write;
+use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -14,9 +16,10 @@ const MAX_TAB_DEPTH_RATIO: f64 = 0.32;
 const MAX_LINE_BEND_RATIO: f64 = 0.2;
 const SNAP_DISTANCE_RATIO: f64 = 0.18;
 const SOLVE_TOLERANCE_RATIO: f64 = 0.08;
+const RUBBER_BAND_RATIO: f64 = 0.35;
 const WORKSPACE_SCALE_MIN: f64 = 1.0;
 const WORKSPACE_SCALE_MAX: f64 = 2.5;
-const WORKSPACE_SCALE_DEFAULT: f64 = 1.414;
+const WORKSPACE_SCALE_DEFAULT: f64 = 1.6;
 const FRAME_SNAP_MIN: f64 = 0.4;
 const FRAME_SNAP_MAX: f64 = 3.0;
 const FRAME_SNAP_DEFAULT: f64 = 1.0;
@@ -105,6 +108,12 @@ struct DragState {
     start_y: f64,
     members: Vec<usize>,
     start_positions: Vec<(f64, f64)>,
+}
+
+#[derive(Default)]
+struct DragHandlers {
+    on_move: Option<Rc<dyn Fn(&MouseEvent)>>,
+    on_release: Option<Rc<dyn Fn(&MouseEvent)>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -401,6 +410,47 @@ fn rand_unit(seed: u64, salt: u64) -> f64 {
 
 fn rand_range(seed: u64, salt: u64, min: f64, max: f64) -> f64 {
     min + (max - min) * rand_unit(seed, salt)
+}
+
+fn rubber_band_distance(delta: f64, limit: f64) -> f64 {
+    if limit <= 0.0 {
+        return 0.0;
+    }
+    let abs = delta.abs();
+    let sign = delta.signum();
+    sign * (limit * abs / (limit + abs))
+}
+
+fn rubber_band_clamp(value: f64, min: f64, max: f64, limit: f64) -> f64 {
+    if value < min {
+        min + rubber_band_distance(value - min, limit)
+    } else if value > max {
+        max + rubber_band_distance(value - max, limit)
+    } else {
+        value
+    }
+}
+
+fn time_nonce(previous: u64) -> u64 {
+    let now = Date::now() as u64;
+    splitmix64(now ^ previous.wrapping_add(0x9e3779b97f4a7c15))
+}
+
+fn build_full_connections(cols: usize, rows: usize) -> Vec<[bool; 4]> {
+    let total = cols * rows;
+    let mut connections = vec![[false; 4]; total];
+    for row in 0..rows {
+        for col in 0..cols {
+            let id = row * cols + col;
+            if col + 1 < cols {
+                set_connection(&mut connections, id, DIR_RIGHT, true, cols, rows);
+            }
+            if row + 1 < rows {
+                set_connection(&mut connections, id, DIR_DOWN, true, cols, rows);
+            }
+        }
+    }
+    connections
 }
 
 fn scramble_seed(base: u64, nonce: u64, cols: usize, rows: usize) -> u64 {
@@ -997,6 +1047,7 @@ fn app() -> Html {
     let positions = use_state(Vec::<(f64, f64)>::new);
     let active_id = use_state(|| None::<usize>);
     let drag_state = use_mut_ref(|| None::<DragState>);
+    let drag_handlers = use_mut_ref(DragHandlers::default);
     let svg_ref = use_node_ref();
     let workspace_scale = use_state(|| WORKSPACE_SCALE_DEFAULT);
     let workspace_scale_value = *workspace_scale;
@@ -1023,6 +1074,16 @@ fn app() -> Html {
     };
 
     let image_size_value = *image_size;
+    let seed_label = if image_size_value.is_some() {
+        let cols = grid.cols as usize;
+        let rows = grid.rows as usize;
+        format!(
+            "{:#x}",
+            scramble_seed(PUZZLE_SEED, scramble_nonce_value, cols, rows)
+        )
+    } else {
+        "--".to_string()
+    };
     {
         let positions = positions.clone();
         let active_id = active_id.clone();
@@ -1046,7 +1107,8 @@ fn app() -> Html {
                     let view_min_y = (height as f64 - view_height) * 0.5;
                     let margin =
                         piece_width.max(piece_height) * (MAX_TAB_DEPTH_RATIO + MAX_LINE_BEND_RATIO);
-                    let seed = scramble_seed(PUZZLE_SEED, 0, cols, rows);
+                    let nonce = time_nonce(*scramble_nonce);
+                    let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
                     let (next_positions, order) = scramble_layout(
                         seed,
                         cols,
@@ -1065,7 +1127,7 @@ fn app() -> Html {
                     z_order.set(order);
                     connections.set(vec![[false; 4]; cols * rows]);
                     solved.set(false);
-                    scramble_nonce.set(0);
+                    scramble_nonce.set(nonce);
                 }
                 || ()
             },
@@ -1105,19 +1167,88 @@ fn app() -> Html {
     {
         let show_controls = show_controls.clone();
         use_effect_with(
+            show_controls_value,
+            move |show_controls_value| {
+                let current = *show_controls_value;
+                let window = web_sys::window().expect("window available");
+                let options = EventListenerOptions {
+                    phase: EventListenerPhase::Capture,
+                    passive: false,
+                };
+                let listener = EventListener::new_with_options(
+                    &window,
+                    "keydown",
+                    options,
+                    move |event: &Event| {
+                        if let Some(event) = event.dyn_ref::<KeyboardEvent>() {
+                            if event.repeat() {
+                                return;
+                            }
+                            let key = event.key();
+                            let code = event.code();
+                            let toggle = matches!(key.as_str(), "?" | "d" | "D")
+                                || matches!(code.as_str(), "KeyD" | "Slash");
+                            if toggle {
+                                let next = !current;
+                                gloo::console::log!(
+                                    "controls",
+                                    format!("{} -> {}", current, next),
+                                    key,
+                                    code
+                                );
+                                show_controls.set(next);
+                                event.prevent_default();
+                            }
+                        }
+                    },
+                );
+                || drop(listener)
+            },
+        );
+    }
+
+    {
+        let drag_handlers = drag_handlers.clone();
+        use_effect_with(
             (),
             move |_| {
                 let window = web_sys::window().expect("window available");
-                let listener = EventListener::new(&window, "keydown", move |event: &Event| {
-                    if let Some(event) = event.dyn_ref::<KeyboardEvent>() {
-                        let key = event.key();
-                        if key == "?" || key == "d" || key == "D" {
-                            show_controls.set(!*show_controls);
-                            event.prevent_default();
+                let move_handlers = drag_handlers.clone();
+                let move_listener = EventListener::new_with_options(
+                    &window,
+                    "mousemove",
+                    EventListenerOptions {
+                        phase: EventListenerPhase::Capture,
+                        passive: false,
+                    },
+                    move |event: &Event| {
+                        if let Some(event) = event.dyn_ref::<MouseEvent>() {
+                            if let Some(handler) = move_handlers.borrow().on_move.as_ref() {
+                                handler(event);
+                            }
                         }
-                    }
-                });
-                || drop(listener)
+                    },
+                );
+                let up_handlers = drag_handlers.clone();
+                let up_listener = EventListener::new_with_options(
+                    &window,
+                    "mouseup",
+                    EventListenerOptions {
+                        phase: EventListenerPhase::Capture,
+                        passive: false,
+                    },
+                    move |event: &Event| {
+                        if let Some(event) = event.dyn_ref::<MouseEvent>() {
+                            if let Some(handler) = up_handlers.borrow().on_release.as_ref() {
+                                handler(event);
+                            }
+                        }
+                    },
+                );
+                || {
+                    drop(move_listener);
+                    drop(up_listener);
+                }
             },
         );
     }
@@ -1142,7 +1273,9 @@ fn app() -> Html {
         );
     }
 
-    let (content, on_scramble, scramble_disabled) = if let Some((width, height)) = *image_size {
+    let (content, on_scramble, on_solve, scramble_disabled) = if let Some((width, height)) =
+        *image_size
+    {
         let width_f = width as f64;
         let height_f = height as f64;
         let view_width = width_f * workspace_scale_value;
@@ -1177,6 +1310,25 @@ fn app() -> Html {
             horizontal: &horizontal_waves,
             vertical: &vertical_waves,
         };
+        let max_bend = horizontal_waves
+            .iter()
+            .chain(vertical_waves.iter())
+            .fold(0.0_f64, |acc, wave| acc.max(wave.amplitude.abs()));
+        let mask_pad = max_depth + max_bend;
+        let mask_x = fmt_f64(-mask_pad);
+        let mask_y = fmt_f64(-mask_pad);
+        let mask_width = fmt_f64(piece_width + mask_pad * 2.0);
+        let mask_height = fmt_f64(piece_height + mask_pad * 2.0);
+        let center_min_x = view_min_x + piece_width * 0.5;
+        let center_min_y = view_min_y + piece_height * 0.5;
+        let mut center_max_x = view_min_x + view_width - piece_width * 0.5;
+        let mut center_max_y = view_min_y + view_height - piece_height * 0.5;
+        if center_max_x < center_min_x {
+            center_max_x = center_min_x;
+        }
+        if center_max_y < center_min_y {
+            center_max_y = center_min_y;
+        }
         let piece_shapes: Vec<(Piece, String)> = pieces
             .iter()
             .map(|piece| {
@@ -1189,23 +1341,49 @@ fn app() -> Html {
         let positions_value = (*positions).clone();
         let active_id_value = *active_id;
         let z_order_value = (*z_order).clone();
-        let on_mouse_move = {
+        let drag_move = {
             let positions = positions.clone();
             let drag_state = drag_state.clone();
             let svg_ref = svg_ref.clone();
-            Callback::from(move |event: MouseEvent| {
+            move |event: &MouseEvent| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     if let Some((x, y)) = event_to_svg_coords(
-                        &event,
+                        event,
                         &svg_ref,
                         view_min_x,
                         view_min_y,
                         view_width,
                         view_height,
                     ) {
-                        let dx = x - drag.start_x;
-                        let dy = y - drag.start_y;
+                        let mut dx = x - drag.start_x;
+                        let mut dy = y - drag.start_y;
+                        if !drag.start_positions.is_empty() {
+                            let mut min_start_x = f64::INFINITY;
+                            let mut max_start_x = f64::NEG_INFINITY;
+                            let mut min_start_y = f64::INFINITY;
+                            let mut max_start_y = f64::NEG_INFINITY;
+                            for start in &drag.start_positions {
+                                let center_x = start.0 + piece_width * 0.5;
+                                let center_y = start.1 + piece_height * 0.5;
+                                min_start_x = min_start_x.min(center_x);
+                                max_start_x = max_start_x.max(center_x);
+                                min_start_y = min_start_y.min(center_y);
+                                max_start_y = max_start_y.max(center_y);
+                            }
+                            let min_dx = center_min_x - min_start_x;
+                            let max_dx = center_max_x - max_start_x;
+                            let min_dy = center_min_y - min_start_y;
+                            let max_dy = center_max_y - max_start_y;
+                            let rubber_limit =
+                                piece_width.min(piece_height) * RUBBER_BAND_RATIO;
+                            if min_dx <= max_dx {
+                                dx = rubber_band_clamp(dx, min_dx, max_dx, rubber_limit);
+                            }
+                            if min_dy <= max_dy {
+                                dy = rubber_band_clamp(dy, min_dy, max_dy, rubber_limit);
+                            }
+                        }
                         let mut next = (*positions).clone();
                         for (index, member) in drag.members.iter().enumerate() {
                             if let Some(pos) = next.get_mut(*member) {
@@ -1217,15 +1395,15 @@ fn app() -> Html {
                     }
                     event.prevent_default();
                 }
-            })
+            }
         };
-        let on_mouse_release = {
+        let drag_release = {
             let positions = positions.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let connections = connections.clone();
             let solved = solved.clone();
-            Callback::from(move |event: MouseEvent| {
+            move |event: &MouseEvent| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     let mut next = (*positions).clone();
@@ -1285,19 +1463,41 @@ fn app() -> Html {
                     }
 
                     if let Some((_dist, dx, dy, member, dir)) = best {
+                        let mut min_x = f64::INFINITY;
+                        let mut max_x = f64::NEG_INFINITY;
+                        let mut min_y = f64::INFINITY;
+                        let mut max_y = f64::NEG_INFINITY;
                         for id in &drag.members {
-                            if let Some(pos) = next.get_mut(*id) {
-                                *pos = (pos.0 + dx, pos.1 + dy);
+                            if let Some(pos) = next.get(*id) {
+                                let center_x = pos.0 + piece_width * 0.5;
+                                let center_y = pos.1 + piece_height * 0.5;
+                                min_x = min_x.min(center_x);
+                                max_x = max_x.max(center_x);
+                                min_y = min_y.min(center_y);
+                                max_y = max_y.max(center_y);
                             }
                         }
-                        set_connection(
-                            &mut next_connections,
-                            member,
-                            dir,
-                            true,
-                            cols,
-                            rows,
-                        );
+                        let can_snap = min_x.is_finite()
+                            && min_y.is_finite()
+                            && min_x + dx >= center_min_x
+                            && max_x + dx <= center_max_x
+                            && min_y + dy >= center_min_y
+                            && max_y + dy <= center_max_y;
+                        if can_snap {
+                            for id in &drag.members {
+                                if let Some(pos) = next.get_mut(*id) {
+                                    *pos = (pos.0 + dx, pos.1 + dy);
+                                }
+                            }
+                            set_connection(
+                                &mut next_connections,
+                                member,
+                                dir,
+                                true,
+                                cols,
+                                rows,
+                            );
+                        }
                     }
 
                     for member in &drag.members {
@@ -1417,6 +1617,49 @@ fn app() -> Html {
                         }
                     }
 
+                    let clamp_ids: &[usize] = if group_after.is_empty() {
+                        &drag.members
+                    } else {
+                        &group_after
+                    };
+                    if !clamp_ids.is_empty() {
+                        let mut min_cx = f64::INFINITY;
+                        let mut max_cx = f64::NEG_INFINITY;
+                        let mut min_cy = f64::INFINITY;
+                        let mut max_cy = f64::NEG_INFINITY;
+                        for id in clamp_ids {
+                            if let Some(pos) = next.get(*id) {
+                                let center_x = pos.0 + piece_width * 0.5;
+                                let center_y = pos.1 + piece_height * 0.5;
+                                min_cx = min_cx.min(center_x);
+                                max_cx = max_cx.max(center_x);
+                                min_cy = min_cy.min(center_y);
+                                max_cy = max_cy.max(center_y);
+                            }
+                        }
+                        if min_cx.is_finite() && min_cy.is_finite() {
+                            let mut shift_x = 0.0;
+                            let mut shift_y = 0.0;
+                            if min_cx < center_min_x {
+                                shift_x = center_min_x - min_cx;
+                            } else if max_cx > center_max_x {
+                                shift_x = center_max_x - max_cx;
+                            }
+                            if min_cy < center_min_y {
+                                shift_y = center_min_y - min_cy;
+                            } else if max_cy > center_max_y {
+                                shift_y = center_max_y - max_cy;
+                            }
+                            if shift_x != 0.0 || shift_y != 0.0 {
+                                for id in clamp_ids {
+                                    if let Some(pos) = next.get_mut(*id) {
+                                        *pos = (pos.0 + shift_x, pos.1 + shift_y);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let solved_now = is_solved(&next, cols, rows, piece_width, piece_height);
                     positions.set(next);
                     connections.set(next_connections);
@@ -1425,18 +1668,15 @@ fn app() -> Html {
                     *drag_state.borrow_mut() = None;
                     event.prevent_default();
                 }
-            })
+            }
         };
-
-        let max_bend = horizontal_waves
-            .iter()
-            .chain(vertical_waves.iter())
-            .fold(0.0_f64, |acc, wave| acc.max(wave.amplitude.abs()));
-        let mask_pad = max_depth + max_bend;
-        let mask_x = fmt_f64(-mask_pad);
-        let mask_y = fmt_f64(-mask_pad);
-        let mask_width = fmt_f64(piece_width + mask_pad * 2.0);
-        let mask_height = fmt_f64(piece_height + mask_pad * 2.0);
+        let drag_move = Rc::new(drag_move);
+        let drag_release = Rc::new(drag_release);
+        {
+            let mut handlers = drag_handlers.borrow_mut();
+            handlers.on_move = Some(drag_move.clone());
+            handlers.on_release = Some(drag_release.clone());
+        }
 
         let on_scramble = {
             let positions = positions.clone();
@@ -1453,7 +1693,7 @@ fn app() -> Html {
                 if total == 0 {
                     return;
                 }
-                let next_nonce = scramble_nonce_value.wrapping_add(1);
+                let next_nonce = time_nonce(*scramble_nonce);
                 scramble_nonce.set(next_nonce);
                 let seed = scramble_seed(PUZZLE_SEED, next_nonce, cols, rows);
                 let (next_positions, order) = scramble_layout(
@@ -1474,6 +1714,38 @@ fn app() -> Html {
                 active_id.set(None);
                 *drag_state.borrow_mut() = None;
                 solved.set(false);
+            })
+        };
+        let on_solve = {
+            let positions = positions.clone();
+            let connections = connections.clone();
+            let z_order = z_order.clone();
+            let active_id = active_id.clone();
+            let drag_state = drag_state.clone();
+            let solved = solved.clone();
+            Callback::from(move |_: MouseEvent| {
+                let cols = grid.cols as usize;
+                let rows = grid.rows as usize;
+                let total = cols * rows;
+                if total == 0 {
+                    return;
+                }
+                let mut next_positions = Vec::with_capacity(total);
+                for row in 0..rows {
+                    for col in 0..cols {
+                        next_positions.push((
+                            col as f64 * piece_width,
+                            row as f64 * piece_height,
+                        ));
+                    }
+                }
+                let order: Vec<usize> = (0..total).collect();
+                positions.set(next_positions);
+                connections.set(build_full_connections(cols, rows));
+                z_order.set(order);
+                active_id.set(None);
+                *drag_state.borrow_mut() = None;
+                solved.set(true);
             })
         };
 
@@ -1664,9 +1936,6 @@ fn app() -> Html {
                     height={fmt_f64(view_height)}
                     preserveAspectRatio="xMidYMid meet"
                     ref={svg_ref}
-                    onmousemove={on_mouse_move}
-                    onmouseup={on_mouse_release.clone()}
-                    onmouseleave={on_mouse_release}
                 >
                     <defs>
                         {mask_defs}
@@ -1676,11 +1945,13 @@ fn app() -> Html {
                 </svg>
             },
             on_scramble,
+            on_solve,
             false,
         )
     } else {
         (
             html! { <p>{ "Loading puzzle image..." }</p> },
+            Callback::from(|_: MouseEvent| {}),
             Callback::from(|_: MouseEvent| {}),
             true,
         )
@@ -1701,6 +1972,12 @@ fn app() -> Html {
             <aside class="controls">
                 <h2>{ "Puzzle Controls" }</h2>
                 <p class={status_class}>{ status_label }</p>
+                <div class="control">
+                    <label>
+                        { "Seed" }
+                        <span class="control-value">{ seed_label }</span>
+                    </label>
+                </div>
                 <div class="control">
                     <label for="grid-select">
                         { "Grid" }
@@ -1752,6 +2029,16 @@ fn app() -> Html {
                         disabled={scramble_disabled}
                     >
                         { "Scramble" }
+                    </button>
+                </div>
+                <div class="control">
+                    <button
+                        class="control-button"
+                        type="button"
+                        onclick={on_solve}
+                        disabled={scramble_disabled}
+                    >
+                        { "Solve" }
                     </button>
                 </div>
                 <div class="control">

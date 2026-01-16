@@ -520,6 +520,7 @@ name = "heddobureika"
 version = "0.1.0"
 dependencies = [
  "gloo 0.10.0",
+ "js-sys",
  "wasm-bindgen",
  "web-sys",
  "yew",

@@ -8,4 +8,13 @@ license = "CC-BY-NC-SA-4.0"
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = "0.2"
 gloo = "0.10"
+js-sys = "0.3"
 web-sys = { version = "0.3", features = ["DomRect", "Element", "Event", "HtmlImageElement", "HtmlInputElement", "HtmlSelectElement", "InputEvent", "KeyboardEvent", "Window"] }
+
+[profile.release]
+opt-level = "z"
+# use "thin" if build time becomes painful
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
