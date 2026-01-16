@@ -1,5 +1,6 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use js_sys::Date;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt::Write;
 use std::rc::Rc;
@@ -52,6 +53,8 @@ const SKEW_RANGE_MAX: f64 = 0.2;
 const VARIATION_MIN: f64 = 0.0;
 const VARIATION_MAX: f64 = 1.0;
 const LINE_BEND_MIN: f64 = 0.0;
+const STORAGE_KEY: &str = "heddobureika.board.v1";
+const STORAGE_VERSION: u32 = 1;
 const DIR_UP: usize = 0;
 const DIR_RIGHT: usize = 1;
 const DIR_DOWN: usize = 2;
@@ -124,6 +127,21 @@ struct DragHandlers {
     on_release: Option<Rc<dyn Fn(&MouseEvent)>>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedBoard {
+    version: u32,
+    cols: u32,
+    rows: u32,
+    image_width: u32,
+    image_height: u32,
+    positions: Vec<(f64, f64)>,
+    rotations: Vec<f64>,
+    flips: Vec<bool>,
+    connections: Vec<[bool; 4]>,
+    z_order: Vec<usize>,
+    scramble_nonce: u64,
+}
+
 #[derive(Clone, PartialEq)]
 struct ShapeSettings {
     tab_width: f64,
@@ -189,6 +207,59 @@ const GRID_PRESETS: [GridPreset; 5] = [
 ];
 
 const DEFAULT_GRID_INDEX: usize = 0;
+
+fn grid_preset_index(cols: u32, rows: u32) -> Option<usize> {
+    GRID_PRESETS
+        .iter()
+        .position(|preset| preset.cols == cols && preset.rows == rows)
+}
+
+fn validate_saved_board(state: &SavedBoard, total: usize) -> bool {
+    if state.positions.len() != total
+        || state.rotations.len() != total
+        || state.flips.len() != total
+        || state.connections.len() != total
+        || state.z_order.len() != total
+    {
+        return false;
+    }
+    if state.positions.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return false;
+    }
+    if state.rotations.iter().any(|rot| !rot.is_finite()) {
+        return false;
+    }
+    let mut seen = vec![false; total];
+    for id in &state.z_order {
+        if *id >= total || seen[*id] {
+            return false;
+        }
+        seen[*id] = true;
+    }
+    true
+}
+
+fn load_saved_board() -> Option<SavedBoard> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(STORAGE_KEY).ok()??;
+    let state: SavedBoard = serde_json::from_str(&raw).ok()?;
+    if state.version != STORAGE_VERSION {
+        return None;
+    }
+    Some(state)
+}
+
+fn save_board_state(state: &SavedBoard) {
+    let Ok(raw) = serde_json::to_string(state) else {
+        return;
+    };
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.set_item(STORAGE_KEY, &raw);
+}
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
@@ -1135,6 +1206,8 @@ fn app() -> Html {
     let active_id = use_state(|| None::<usize>);
     let drag_state = use_mut_ref(|| None::<DragState>);
     let drag_handlers = use_mut_ref(DragHandlers::default);
+    let restore_state = use_mut_ref(|| None::<SavedBoard>);
+    let restore_attempted = use_mut_ref(|| false);
     let svg_ref = use_node_ref();
     let workspace_scale = use_state(|| WORKSPACE_SCALE_DEFAULT);
     let workspace_scale_value = *workspace_scale;
@@ -1185,50 +1258,105 @@ fn app() -> Html {
         let flips = flips.clone();
         let solved = solved.clone();
         let scramble_nonce = scramble_nonce.clone();
+        let grid_index = grid_index.clone();
+        let restore_state = restore_state.clone();
+        let restore_attempted = restore_attempted.clone();
         use_effect_with(
             (grid_index_value, image_size_value),
             move |(grid_index_value, image_size_value)| {
                 if let Some((width, height)) = *image_size_value {
-                    let grid = GRID_PRESETS[*grid_index_value];
-                    let cols = grid.cols as usize;
-                    let rows = grid.rows as usize;
-                    let piece_width = width as f64 / grid.cols as f64;
-                    let piece_height = height as f64 / grid.rows as f64;
-                    let view_width = width as f64 * workspace_scale_value;
-                    let view_height = height as f64 * workspace_scale_value;
-                    let view_min_x = (width as f64 - view_width) * 0.5;
-                    let view_min_y = (height as f64 - view_height) * 0.5;
-                    let margin =
-                        piece_width.max(piece_height) * (MAX_TAB_DEPTH_RATIO + MAX_LINE_BEND_RATIO);
-                    let nonce = time_nonce(*scramble_nonce);
-                    let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
-                    let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
-                    let flip_seed = splitmix64(seed ^ 0xF11F_5EED);
-                    let (next_positions, order) = scramble_layout(
-                        seed,
-                        cols,
-                        rows,
-                        piece_width,
-                        piece_height,
-                        view_min_x,
-                        view_min_y,
-                        view_width,
-                        view_height,
-                        margin,
-                    );
-                    positions.set(next_positions);
-                    active_id.set(None);
-                    *drag_state.borrow_mut() = None;
-                    z_order.set(order);
-                    connections.set(vec![[false; 4]; cols * rows]);
-                    rotations.set(scramble_rotations(
-                        rotation_seed,
-                        cols * rows,
-                        rotation_enabled_value,
-                    ));
-                    flips.set(scramble_flips(flip_seed, cols * rows, FLIP_CHANCE));
-                    solved.set(false);
-                    scramble_nonce.set(nonce);
+                    let mut skip_scramble = false;
+                    let saved_state = {
+                        let mut attempted = restore_attempted.borrow_mut();
+                        if !*attempted {
+                            *attempted = true;
+                            *restore_state.borrow_mut() = load_saved_board();
+                        }
+                        restore_state.borrow_mut().take()
+                    };
+                    if let Some(state) = saved_state {
+                        if state.image_width == width && state.image_height == height {
+                            if let Some(saved_index) =
+                                grid_preset_index(state.cols, state.rows)
+                            {
+                                if saved_index != *grid_index_value {
+                                    *restore_state.borrow_mut() = Some(state);
+                                    grid_index.set(saved_index);
+                                    skip_scramble = true;
+                                } else {
+                                    let cols = state.cols as usize;
+                                    let rows = state.rows as usize;
+                                    let total = cols * rows;
+                                    if validate_saved_board(&state, total) {
+                                        let piece_width = width as f64 / state.cols as f64;
+                                        let piece_height = height as f64 / state.rows as f64;
+                                        positions.set(state.positions.clone());
+                                        rotations.set(state.rotations.clone());
+                                        flips.set(state.flips.clone());
+                                        connections.set(state.connections.clone());
+                                        z_order.set(state.z_order.clone());
+                                        scramble_nonce.set(state.scramble_nonce);
+                                        active_id.set(None);
+                                        *drag_state.borrow_mut() = None;
+                                        let solved_now = is_solved(
+                                            &state.positions,
+                                            &state.rotations,
+                                            &state.flips,
+                                            cols,
+                                            rows,
+                                            piece_width,
+                                            piece_height,
+                                            rotation_enabled_value,
+                                        );
+                                        solved.set(solved_now);
+                                        skip_scramble = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !skip_scramble {
+                        let grid = GRID_PRESETS[*grid_index_value];
+                        let cols = grid.cols as usize;
+                        let rows = grid.rows as usize;
+                        let piece_width = width as f64 / grid.cols as f64;
+                        let piece_height = height as f64 / grid.rows as f64;
+                        let view_width = width as f64 * workspace_scale_value;
+                        let view_height = height as f64 * workspace_scale_value;
+                        let view_min_x = (width as f64 - view_width) * 0.5;
+                        let view_min_y = (height as f64 - view_height) * 0.5;
+                        let margin = piece_width.max(piece_height)
+                            * (MAX_TAB_DEPTH_RATIO + MAX_LINE_BEND_RATIO);
+                        let nonce = time_nonce(*scramble_nonce);
+                        let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
+                        let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
+                        let flip_seed = splitmix64(seed ^ 0xF11F_5EED);
+                        let (next_positions, order) = scramble_layout(
+                            seed,
+                            cols,
+                            rows,
+                            piece_width,
+                            piece_height,
+                            view_min_x,
+                            view_min_y,
+                            view_width,
+                            view_height,
+                            margin,
+                        );
+                        positions.set(next_positions);
+                        active_id.set(None);
+                        *drag_state.borrow_mut() = None;
+                        z_order.set(order);
+                        connections.set(vec![[false; 4]; cols * rows]);
+                        rotations.set(scramble_rotations(
+                            rotation_seed,
+                            cols * rows,
+                            rotation_enabled_value,
+                        ));
+                        flips.set(scramble_flips(flip_seed, cols * rows, FLIP_CHANCE));
+                        solved.set(false);
+                        scramble_nonce.set(nonce);
+                    }
                 }
                 || ()
             },
@@ -1306,6 +1434,72 @@ fn app() -> Html {
             }
         })
     };
+
+    {
+        let positions = positions.clone();
+        let rotations = rotations.clone();
+        let flips = flips.clone();
+        let connections = connections.clone();
+        let z_order = z_order.clone();
+        let image_size = image_size.clone();
+        let grid_index = grid_index.clone();
+        let scramble_nonce = scramble_nonce.clone();
+        let active_id = active_id.clone();
+        use_effect_with(
+            (
+                (*positions).clone(),
+                (*rotations).clone(),
+                (*flips).clone(),
+                (*connections).clone(),
+                (*z_order).clone(),
+                *grid_index,
+                *scramble_nonce,
+                *image_size,
+                *active_id,
+            ),
+            move |(
+                positions_value,
+                rotations_value,
+                flips_value,
+                connections_value,
+                z_order_value,
+                grid_index_value,
+                scramble_nonce_value,
+                image_size_value,
+                active_id_value,
+            )| {
+                if active_id_value.is_none() {
+                    if let Some((width, height)) = *image_size_value {
+                        let grid = GRID_PRESETS[*grid_index_value];
+                        let total = (grid.cols * grid.rows) as usize;
+                        if positions_value.len() == total
+                            && rotations_value.len() == total
+                            && flips_value.len() == total
+                            && connections_value.len() == total
+                            && z_order_value.len() == total
+                            && z_order_value.iter().all(|id| *id < total)
+                        {
+                            let state = SavedBoard {
+                                version: STORAGE_VERSION,
+                                cols: grid.cols,
+                                rows: grid.rows,
+                                image_width: width,
+                                image_height: height,
+                                positions: positions_value.clone(),
+                                rotations: rotations_value.clone(),
+                                flips: flips_value.clone(),
+                                connections: connections_value.clone(),
+                                z_order: z_order_value.clone(),
+                                scramble_nonce: *scramble_nonce_value,
+                            };
+                            save_board_state(&state);
+                        }
+                    }
+                }
+                || ()
+            },
+        );
+    }
 
     {
         let show_controls = show_controls.clone();
