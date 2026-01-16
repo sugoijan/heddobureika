@@ -63,6 +63,11 @@ body {
   transition: opacity 120ms ease;
 }
 
+.piece-back {
+  display: none;
+  pointer-events: none;
+}
+
 .piece-outline-light {
   stroke: rgba(255, 255, 255, 0.8);
   stroke-width: 1.6;
@@ -84,6 +89,14 @@ body {
 
 .piece:hover .piece-outline-dark {
   stroke: rgba(0, 0, 0, 0.8);
+}
+
+.piece.flipped .piece-image {
+  display: none;
+}
+
+.piece.flipped .piece-back {
+  display: block;
 }
 
 .controls {

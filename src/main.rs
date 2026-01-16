@@ -21,6 +21,7 @@ const ROTATION_SNAP_TOLERANCE_DEG: f64 = 3.0;
 const ROTATION_SOLVE_TOLERANCE_DEG: f64 = 1.5;
 const CLICK_MOVE_RATIO: f64 = 0.08;
 const CLICK_MAX_DURATION_MS: f64 = 240.0;
+const FLIP_CHANCE: f64 = 0.3;
 const RUBBER_BAND_RATIO: f64 = 0.35;
 const WORKSPACE_SCALE_MIN: f64 = 1.0;
 const WORKSPACE_SCALE_MAX: f64 = 2.5;
@@ -112,6 +113,7 @@ struct DragState {
     start_x: f64,
     start_y: f64,
     start_time: f64,
+    primary_id: usize,
     members: Vec<usize>,
     start_positions: Vec<(f64, f64)>,
 }
@@ -371,6 +373,7 @@ fn collect_group(connections: &[[bool; 4]], start: usize, cols: usize, rows: usi
 fn is_solved(
     positions: &[(f64, f64)],
     rotations: &[f64],
+    flips: &[bool],
     cols: usize,
     rows: usize,
     piece_width: f64,
@@ -379,6 +382,12 @@ fn is_solved(
 ) -> bool {
     let total = cols * rows;
     if positions.len() != total {
+        return false;
+    }
+    if flips.len() != total {
+        return false;
+    }
+    if flips.iter().any(|flip| *flip) {
         return false;
     }
     if rotation_enabled {
@@ -564,6 +573,16 @@ fn scramble_rotations(seed: u64, total: usize, enabled: bool) -> Vec<f64> {
         rotations.push(rand_range(seed, salt, 0.0, 360.0));
     }
     rotations
+}
+
+fn scramble_flips(seed: u64, total: usize, chance: f64) -> Vec<bool> {
+    let threshold = chance.clamp(0.0, 1.0);
+    let mut flips = Vec::with_capacity(total);
+    for id in 0..total {
+        let salt = 0xF11F_5EED_u64 + id as u64;
+        flips.push(rand_unit(seed, salt) < threshold);
+    }
+    flips
 }
 
 fn edge_seed(base: u64, orientation: u64, row: u32, col: u32) -> u64 {
@@ -1122,6 +1141,7 @@ fn app() -> Html {
     let z_order = use_state(Vec::<usize>::new);
     let connections = use_state(Vec::<[bool; 4]>::new);
     let rotations = use_state(Vec::<f64>::new);
+    let flips = use_state(Vec::<bool>::new);
     let rotation_enabled = use_state(|| true);
     let rotation_enabled_value = *rotation_enabled;
     let scramble_nonce = use_state(|| 0u64);
@@ -1162,6 +1182,7 @@ fn app() -> Html {
         let z_order = z_order.clone();
         let connections = connections.clone();
         let rotations = rotations.clone();
+        let flips = flips.clone();
         let solved = solved.clone();
         let scramble_nonce = scramble_nonce.clone();
         use_effect_with(
@@ -1182,6 +1203,7 @@ fn app() -> Html {
                     let nonce = time_nonce(*scramble_nonce);
                     let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
                     let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
+                    let flip_seed = splitmix64(seed ^ 0xF11F_5EED);
                     let (next_positions, order) = scramble_layout(
                         seed,
                         cols,
@@ -1204,6 +1226,7 @@ fn app() -> Html {
                         cols * rows,
                         rotation_enabled_value,
                     ));
+                    flips.set(scramble_flips(flip_seed, cols * rows, FLIP_CHANCE));
                     solved.set(false);
                     scramble_nonce.set(nonce);
                 }
@@ -1244,6 +1267,7 @@ fn app() -> Html {
     let on_rotation_toggle = {
         let rotation_enabled = rotation_enabled.clone();
         let rotations = rotations.clone();
+        let flips = flips.clone();
         let positions = positions.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
@@ -1267,9 +1291,11 @@ fn app() -> Html {
                 let piece_width = width as f64 / grid.cols as f64;
                 let piece_height = height as f64 / grid.rows as f64;
                 let positions_snapshot = (*positions).clone();
+                let flips_snapshot = (*flips).clone();
                 let solved_now = is_solved(
                     &positions_snapshot,
                     &rotations_snapshot,
+                    &flips_snapshot,
                     cols,
                     rows,
                     piece_width,
@@ -1390,7 +1416,7 @@ fn app() -> Html {
         );
     }
 
-    let (content, on_scramble, on_solve, on_solve_rotation, scramble_disabled) =
+    let (content, on_scramble, on_solve, on_solve_rotation, on_unflip, scramble_disabled) =
         if let Some((width, height)) = *image_size {
         let width_f = width as f64;
         let height_f = height as f64;
@@ -1456,6 +1482,7 @@ fn app() -> Html {
 
         let positions_value = (*positions).clone();
         let rotations_value = (*rotations).clone();
+        let flips_value = (*flips).clone();
         let active_id_value = *active_id;
         let z_order_value = (*z_order).clone();
         let drag_move = {
@@ -1517,6 +1544,7 @@ fn app() -> Html {
         let drag_release = {
             let positions = positions.clone();
             let rotations = rotations.clone();
+            let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let connections = connections.clone();
@@ -1527,77 +1555,130 @@ fn app() -> Html {
                 if let Some(drag) = drag {
                     let mut next = (*positions).clone();
                     let mut next_rotations = (*rotations).clone();
+                    let mut next_flips = (*flips).clone();
                     let mut next_connections = (*connections).clone();
                     let cols = grid.cols as usize;
                     let rows = grid.rows as usize;
                     let snap_distance = piece_width.min(piece_height) * SNAP_DISTANCE_RATIO;
                     let click_tolerance =
                         piece_width.min(piece_height) * CLICK_MOVE_RATIO;
-                    if rotation_enabled_value {
-                        if let Some((x, y)) = event_to_svg_coords(
-                            event,
-                            &svg_ref,
-                            view_min_x,
-                            view_min_y,
-                            view_width,
-                            view_height,
-                        ) {
-                            let dx = x - drag.start_x;
-                            let dy = y - drag.start_y;
-                            let dist = (dx * dx + dy * dy).sqrt();
-                            let elapsed = Date::now() - drag.start_time;
-                            if dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS {
-                                if !drag.members.is_empty() {
-                                    let pivot_x = drag.start_x;
-                                    let pivot_y = drag.start_y;
-                                    let current_positions = next.clone();
-                                    let current_angle = drag
-                                        .members
-                                        .first()
-                                        .and_then(|id| next_rotations.get(*id))
-                                        .copied()
-                                        .unwrap_or(0.0);
-                                    let target_angle = next_snap_rotation(current_angle);
-                                    let delta = angle_delta(target_angle, current_angle);
-                                    for member in &drag.members {
-                                        if let Some(pos) = current_positions.get(*member) {
-                                            let center_x = pos.0 + piece_width * 0.5;
-                                            let center_y = pos.1 + piece_height * 0.5;
-                                            let (rx, ry) = rotate_point(
-                                                center_x,
-                                                center_y,
-                                                pivot_x,
-                                                pivot_y,
-                                                delta,
+                    if let Some((x, y)) = event_to_svg_coords(
+                        event,
+                        &svg_ref,
+                        view_min_x,
+                        view_min_y,
+                        view_width,
+                        view_height,
+                    ) {
+                        let dx = x - drag.start_x;
+                        let dy = y - drag.start_y;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let elapsed = Date::now() - drag.start_time;
+                        if dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS {
+                            let click_id = drag.primary_id;
+                            let ctrl_flip = event.ctrl_key();
+                            let was_flipped = next_flips.get(click_id).copied().unwrap_or(false);
+                            if ctrl_flip {
+                                if let Some(flip) = next_flips.get_mut(click_id) {
+                                    *flip = !*flip;
+                                }
+                                clear_piece_connections(&mut next_connections, click_id, cols, rows);
+                                let solved_now = is_solved(
+                                    &next,
+                                    &next_rotations,
+                                    &next_flips,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    rotation_enabled_value,
+                                );
+                                positions.set(next);
+                                connections.set(next_connections);
+                                rotations.set(next_rotations);
+                                flips.set(next_flips);
+                                solved.set(solved_now);
+                                active_id.set(None);
+                                *drag_state.borrow_mut() = None;
+                                event.prevent_default();
+                                return;
+                            }
+                            if was_flipped {
+                                if let Some(flip) = next_flips.get_mut(click_id) {
+                                    *flip = false;
+                                }
+                                clear_piece_connections(&mut next_connections, click_id, cols, rows);
+                                let solved_now = is_solved(
+                                    &next,
+                                    &next_rotations,
+                                    &next_flips,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    rotation_enabled_value,
+                                );
+                                positions.set(next);
+                                connections.set(next_connections);
+                                rotations.set(next_rotations);
+                                flips.set(next_flips);
+                                solved.set(solved_now);
+                                active_id.set(None);
+                                *drag_state.borrow_mut() = None;
+                                event.prevent_default();
+                                return;
+                            }
+                            if rotation_enabled_value && !drag.members.is_empty() {
+                                let pivot_x = drag.start_x;
+                                let pivot_y = drag.start_y;
+                                let current_positions = next.clone();
+                                let current_angle = drag
+                                    .members
+                                    .first()
+                                    .and_then(|id| next_rotations.get(*id))
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                let target_angle = next_snap_rotation(current_angle);
+                                let delta = angle_delta(target_angle, current_angle);
+                                for member in &drag.members {
+                                    if let Some(pos) = current_positions.get(*member) {
+                                        let center_x = pos.0 + piece_width * 0.5;
+                                        let center_y = pos.1 + piece_height * 0.5;
+                                        let (rx, ry) = rotate_point(
+                                            center_x,
+                                            center_y,
+                                            pivot_x,
+                                            pivot_y,
+                                            delta,
+                                        );
+                                        if let Some(pos) = next.get_mut(*member) {
+                                            *pos = (
+                                                rx - piece_width * 0.5,
+                                                ry - piece_height * 0.5,
                                             );
-                                            if let Some(pos) = next.get_mut(*member) {
-                                                *pos = (
-                                                    rx - piece_width * 0.5,
-                                                    ry - piece_height * 0.5,
-                                                );
-                                            }
-                                            if let Some(rot) = next_rotations.get_mut(*member) {
-                                                *rot = normalize_angle(*rot + delta);
-                                            }
+                                        }
+                                        if let Some(rot) = next_rotations.get_mut(*member) {
+                                            *rot = normalize_angle(*rot + delta);
                                         }
                                     }
-                                    let solved_now = is_solved(
-                                        &next,
-                                        &next_rotations,
-                                        cols,
-                                            rows,
-                                            piece_width,
-                                            piece_height,
-                                            rotation_enabled_value,
-                                        );
-                                        positions.set(next);
-                                        rotations.set(next_rotations);
-                                        solved.set(solved_now);
-                                        active_id.set(None);
-                                        *drag_state.borrow_mut() = None;
-                                        event.prevent_default();
-                                        return;
                                 }
+                                let solved_now = is_solved(
+                                    &next,
+                                    &next_rotations,
+                                    &next_flips,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    rotation_enabled_value,
+                                );
+                                positions.set(next);
+                                rotations.set(next_rotations);
+                                solved.set(solved_now);
+                                active_id.set(None);
+                                *drag_state.borrow_mut() = None;
+                                event.prevent_default();
+                                return;
                             }
                         }
                     }
@@ -1613,6 +1694,9 @@ fn app() -> Html {
                         if *member >= next.len() {
                             continue;
                         }
+                        if next_flips.get(*member).copied().unwrap_or(false) {
+                            continue;
+                        }
                         let current = next[*member];
                         let center_a = (
                             current.0 + piece_width * 0.5,
@@ -1622,6 +1706,9 @@ fn app() -> Html {
                         for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
                             if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
                                 if in_group[neighbor] {
+                                    continue;
+                                }
+                                if next_flips.get(neighbor).copied().unwrap_or(false) {
                                     continue;
                                 }
                                 let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
@@ -1697,6 +1784,9 @@ fn app() -> Html {
                         if *member >= next.len() {
                             continue;
                         }
+                        if next_flips.get(*member).copied().unwrap_or(false) {
+                            continue;
+                        }
                         let current = next[*member];
                         let center_a = (
                             current.0 + piece_width * 0.5,
@@ -1706,6 +1796,9 @@ fn app() -> Html {
                         for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
                             if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
                                 if in_group[neighbor] {
+                                    continue;
+                                }
+                                if next_flips.get(neighbor).copied().unwrap_or(false) {
                                     continue;
                                 }
                                 let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
@@ -1872,6 +1965,7 @@ fn app() -> Html {
                     let solved_now = is_solved(
                         &next,
                         &next_rotations,
+                        &next_flips,
                         cols,
                         rows,
                         piece_width,
@@ -1880,6 +1974,7 @@ fn app() -> Html {
                     );
                     positions.set(next);
                     connections.set(next_connections);
+                    flips.set(next_flips);
                     solved.set(solved_now);
                     active_id.set(None);
                     *drag_state.borrow_mut() = None;
@@ -1900,6 +1995,7 @@ fn app() -> Html {
             let connections = connections.clone();
             let z_order = z_order.clone();
             let rotations = rotations.clone();
+            let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let scramble_nonce = scramble_nonce.clone();
@@ -1915,6 +2011,7 @@ fn app() -> Html {
                 scramble_nonce.set(next_nonce);
                 let seed = scramble_seed(PUZZLE_SEED, next_nonce, cols, rows);
                 let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
+                let flip_seed = splitmix64(seed ^ 0xF11F_5EED);
                 let (next_positions, order) = scramble_layout(
                     seed,
                     cols,
@@ -1935,6 +2032,7 @@ fn app() -> Html {
                     total,
                     rotation_enabled_value,
                 ));
+                flips.set(scramble_flips(flip_seed, total, FLIP_CHANCE));
                 active_id.set(None);
                 *drag_state.borrow_mut() = None;
                 solved.set(false);
@@ -1945,6 +2043,7 @@ fn app() -> Html {
             let connections = connections.clone();
             let z_order = z_order.clone();
             let rotations = rotations.clone();
+            let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let solved = solved.clone();
@@ -1969,6 +2068,7 @@ fn app() -> Html {
                 connections.set(build_full_connections(cols, rows));
                 z_order.set(order);
                 rotations.set(vec![0.0; total]);
+                flips.set(vec![false; total]);
                 active_id.set(None);
                 *drag_state.borrow_mut() = None;
                 solved.set(true);
@@ -1977,6 +2077,7 @@ fn app() -> Html {
         let on_solve_rotation = {
             let positions = positions.clone();
             let rotations = rotations.clone();
+            let flips = flips.clone();
             let solved = solved.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
@@ -1986,11 +2087,13 @@ fn app() -> Html {
                     return;
                 }
                 let positions_snapshot = (*positions).clone();
+                let flips_snapshot = (*flips).clone();
                 let zeroed = vec![0.0; total];
                 rotations.set(zeroed.clone());
                 let solved_now = is_solved(
                     &positions_snapshot,
                     &zeroed,
+                    &flips_snapshot,
                     cols,
                     rows,
                     piece_width,
@@ -1999,6 +2102,50 @@ fn app() -> Html {
                 );
                 solved.set(solved_now);
             })
+        };
+        let on_unflip = {
+            let positions = positions.clone();
+            let rotations = rotations.clone();
+            let flips = flips.clone();
+            let solved = solved.clone();
+            Callback::from(move |_: MouseEvent| {
+                let cols = grid.cols as usize;
+                let rows = grid.rows as usize;
+                let total = cols * rows;
+                if total == 0 {
+                    return;
+                }
+                let positions_snapshot = (*positions).clone();
+                let rotations_snapshot = (*rotations).clone();
+                let cleared = vec![false; total];
+                flips.set(cleared.clone());
+                let solved_now = is_solved(
+                    &positions_snapshot,
+                    &rotations_snapshot,
+                    &cleared,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    rotation_enabled_value,
+                );
+                solved.set(solved_now);
+            })
+        };
+
+        let back_pattern = html! {
+            <pattern
+                id="piece-back-pattern"
+                patternUnits="userSpaceOnUse"
+                width="28"
+                height="28"
+            >
+                <rect width="28" height="28" fill="#3a2418" />
+                <circle cx="7" cy="7" r="3.2" fill="#8f5b32" />
+                <circle cx="21" cy="21" r="3.2" fill="#8f5b32" />
+                <circle cx="21" cy="7" r="2.2" fill="#734423" />
+                <circle cx="7" cy="21" r="2.2" fill="#734423" />
+            </pattern>
         };
 
         let mask_defs: Html = piece_shapes
@@ -2036,19 +2183,44 @@ fn app() -> Html {
             let current =
                 positions_value.get(piece.id).copied().unwrap_or((piece_x, piece_y));
             let rotation = rotations_value.get(piece.id).copied().unwrap_or(0.0);
+            let flipped = flips_value.get(piece.id).copied().unwrap_or(false);
+            let center_x = piece_width * 0.5;
+            let center_y = piece_height * 0.5;
+            let flip_transform = if flipped {
+                format!(
+                    " translate({} {}) scale(-1 1) translate(-{} -{})",
+                    fmt_f64(center_x),
+                    fmt_f64(center_y),
+                    fmt_f64(center_x),
+                    fmt_f64(center_y)
+                )
+            } else {
+                String::new()
+            };
             let transform = format!(
-                "translate({} {}) rotate({} {} {})",
+                "translate({} {}) rotate({} {} {}){}",
                 fmt_f64(current.0),
                 fmt_f64(current.1),
                 fmt_f64(rotation),
-                fmt_f64(piece_width * 0.5),
-                fmt_f64(piece_height * 0.5)
+                fmt_f64(center_x),
+                fmt_f64(center_y),
+                flip_transform
             );
             let mask_ref = format!("url(#piece-mask-{})", piece.id);
             let img_x = fmt_f64(-piece_x);
             let img_y = fmt_f64(-piece_y);
             let is_dragging = active_id_value == Some(piece.id);
-            let class = if is_dragging { "piece dragging" } else { "piece" };
+            let class = if is_dragging {
+                if flipped {
+                    "piece dragging flipped"
+                } else {
+                    "piece dragging"
+                }
+            } else if flipped {
+                "piece flipped"
+            } else {
+                "piece"
+            };
             let on_piece_down = {
                 let positions = positions.clone();
                 let drag_state = drag_state.clone();
@@ -2118,6 +2290,7 @@ fn app() -> Html {
                             start_x: x,
                             start_y: y,
                             start_time: Date::now(),
+                            primary_id: piece_id,
                             members,
                             start_positions,
                         });
@@ -2133,6 +2306,15 @@ fn app() -> Html {
                     transform={transform}
                     onmousedown={on_piece_down}
                 >
+                    <rect
+                        class="piece-back"
+                        x={img_x.clone()}
+                        y={img_y.clone()}
+                        width={width.to_string()}
+                        height={height.to_string()}
+                        fill="url(#piece-back-pattern)"
+                        mask={mask_ref.clone()}
+                    />
                     <image
                         class="piece-image"
                         href={IMAGE_SRC}
@@ -2165,6 +2347,9 @@ fn app() -> Html {
         } else {
             nodes.into_iter().collect()
         };
+        let on_context_menu = Callback::from(|event: MouseEvent| {
+            event.prevent_default();
+        });
         let bounds = html! {
             <>
                 <rect
@@ -2193,8 +2378,10 @@ fn app() -> Html {
                     height={fmt_f64(view_height)}
                     preserveAspectRatio="xMidYMid meet"
                     ref={svg_ref}
+                    oncontextmenu={on_context_menu}
                 >
                     <defs>
+                        {back_pattern}
                         {mask_defs}
                     </defs>
                     {bounds}
@@ -2204,11 +2391,13 @@ fn app() -> Html {
             on_scramble,
             on_solve,
             on_solve_rotation,
+            on_unflip,
             false,
         )
     } else {
         (
             html! { <p>{ "Loading puzzle image..." }</p> },
+            Callback::from(|_: MouseEvent| {}),
             Callback::from(|_: MouseEvent| {}),
             Callback::from(|_: MouseEvent| {}),
             Callback::from(|_: MouseEvent| {}),
@@ -2322,6 +2511,16 @@ fn app() -> Html {
                         disabled={scramble_disabled}
                     >
                         { "Solve rotation" }
+                    </button>
+                </div>
+                <div class="control">
+                    <button
+                        class="control-button"
+                        type="button"
+                        onclick={on_unflip}
+                        disabled={scramble_disabled}
+                    >
+                        { "Unflip all" }
                     </button>
                 </div>
                 <div class="control">
