@@ -16,6 +16,11 @@ const MAX_TAB_DEPTH_RATIO: f64 = 0.32;
 const MAX_LINE_BEND_RATIO: f64 = 0.2;
 const SNAP_DISTANCE_RATIO: f64 = 0.18;
 const SOLVE_TOLERANCE_RATIO: f64 = 0.08;
+const ROTATION_STEP_DEG: f64 = 90.0;
+const ROTATION_SNAP_TOLERANCE_DEG: f64 = 3.0;
+const ROTATION_SOLVE_TOLERANCE_DEG: f64 = 1.5;
+const CLICK_MOVE_RATIO: f64 = 0.08;
+const CLICK_MAX_DURATION_MS: f64 = 240.0;
 const RUBBER_BAND_RATIO: f64 = 0.35;
 const WORKSPACE_SCALE_MIN: f64 = 1.0;
 const WORKSPACE_SCALE_MAX: f64 = 2.5;
@@ -106,6 +111,7 @@ struct WarpField<'a> {
 struct DragState {
     start_x: f64,
     start_y: f64,
+    start_time: f64,
     members: Vec<usize>,
     start_positions: Vec<(f64, f64)>,
 }
@@ -364,14 +370,26 @@ fn collect_group(connections: &[[bool; 4]], start: usize, cols: usize, rows: usi
 
 fn is_solved(
     positions: &[(f64, f64)],
+    rotations: &[f64],
     cols: usize,
     rows: usize,
     piece_width: f64,
     piece_height: f64,
+    rotation_enabled: bool,
 ) -> bool {
     let total = cols * rows;
     if positions.len() != total {
         return false;
+    }
+    if rotation_enabled {
+        if rotations.len() != total {
+            return false;
+        }
+        for rotation in rotations {
+            if angle_delta(0.0, *rotation).abs() > ROTATION_SOLVE_TOLERANCE_DEG {
+                return false;
+            }
+        }
     }
     let tolerance = piece_width.min(piece_height) * SOLVE_TOLERANCE_RATIO;
     let tolerance_sq = tolerance * tolerance;
@@ -429,6 +447,44 @@ fn rubber_band_clamp(value: f64, min: f64, max: f64, limit: f64) -> f64 {
     } else {
         value
     }
+}
+
+fn normalize_angle(mut angle: f64) -> f64 {
+    angle = angle % 360.0;
+    if angle < 0.0 {
+        angle += 360.0;
+    }
+    angle
+}
+
+fn angle_delta(target: f64, current: f64) -> f64 {
+    let mut diff = normalize_angle(target - current);
+    if diff > 180.0 {
+        diff -= 360.0;
+    }
+    diff
+}
+
+fn angle_matches(a: f64, b: f64) -> bool {
+    angle_delta(a, b).abs() <= ROTATION_SNAP_TOLERANCE_DEG
+}
+
+fn next_snap_rotation(angle: f64) -> f64 {
+    let next = (angle / ROTATION_STEP_DEG).floor() + 1.0;
+    normalize_angle(next * ROTATION_STEP_DEG)
+}
+
+fn rotate_vec(x: f64, y: f64, angle_deg: f64) -> (f64, f64) {
+    let radians = angle_deg.to_radians();
+    let cos = radians.cos();
+    let sin = radians.sin();
+    (x * cos - y * sin, x * sin + y * cos)
+}
+
+fn rotate_point(x: f64, y: f64, origin_x: f64, origin_y: f64, angle_deg: f64) -> (f64, f64) {
+    let (dx, dy) = (x - origin_x, y - origin_y);
+    let (rx, ry) = rotate_vec(dx, dy, angle_deg);
+    (origin_x + rx, origin_y + ry)
 }
 
 fn time_nonce(previous: u64) -> u64 {
@@ -496,6 +552,18 @@ fn scramble_layout(
         order.swap(i, j);
     }
     (positions, order)
+}
+
+fn scramble_rotations(seed: u64, total: usize, enabled: bool) -> Vec<f64> {
+    if !enabled {
+        return vec![0.0; total];
+    }
+    let mut rotations = Vec::with_capacity(total);
+    for id in 0..total {
+        let salt = 0xC001_u64 + id as u64;
+        rotations.push(rand_range(seed, salt, 0.0, 360.0));
+    }
+    rotations
 }
 
 fn edge_seed(base: u64, orientation: u64, row: u32, col: u32) -> u64 {
@@ -1053,6 +1121,9 @@ fn app() -> Html {
     let workspace_scale_value = *workspace_scale;
     let z_order = use_state(Vec::<usize>::new);
     let connections = use_state(Vec::<[bool; 4]>::new);
+    let rotations = use_state(Vec::<f64>::new);
+    let rotation_enabled = use_state(|| true);
+    let rotation_enabled_value = *rotation_enabled;
     let scramble_nonce = use_state(|| 0u64);
     let scramble_nonce_value = *scramble_nonce;
     let frame_snap_ratio = use_state(|| FRAME_SNAP_DEFAULT);
@@ -1090,6 +1161,7 @@ fn app() -> Html {
         let drag_state = drag_state.clone();
         let z_order = z_order.clone();
         let connections = connections.clone();
+        let rotations = rotations.clone();
         let solved = solved.clone();
         let scramble_nonce = scramble_nonce.clone();
         use_effect_with(
@@ -1109,6 +1181,7 @@ fn app() -> Html {
                         piece_width.max(piece_height) * (MAX_TAB_DEPTH_RATIO + MAX_LINE_BEND_RATIO);
                     let nonce = time_nonce(*scramble_nonce);
                     let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
+                    let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
                     let (next_positions, order) = scramble_layout(
                         seed,
                         cols,
@@ -1126,6 +1199,11 @@ fn app() -> Html {
                     *drag_state.borrow_mut() = None;
                     z_order.set(order);
                     connections.set(vec![[false; 4]; cols * rows]);
+                    rotations.set(scramble_rotations(
+                        rotation_seed,
+                        cols * rows,
+                        rotation_enabled_value,
+                    ));
                     solved.set(false);
                     scramble_nonce.set(nonce);
                 }
@@ -1160,6 +1238,45 @@ fn app() -> Html {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f64>() {
                 frame_snap_ratio.set(value.clamp(FRAME_SNAP_MIN, FRAME_SNAP_MAX));
+            }
+        })
+    };
+    let on_rotation_toggle = {
+        let rotation_enabled = rotation_enabled.clone();
+        let rotations = rotations.clone();
+        let positions = positions.clone();
+        let image_size = image_size.clone();
+        let grid_index = grid_index.clone();
+        let solved = solved.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let enabled = input.checked();
+            rotation_enabled.set(enabled);
+            let total = positions.len();
+            let rotations_snapshot = if enabled {
+                (*rotations).clone()
+            } else {
+                let zeroed = vec![0.0; total];
+                rotations.set(zeroed.clone());
+                zeroed
+            };
+            if let Some((width, height)) = *image_size {
+                let grid = GRID_PRESETS[*grid_index];
+                let cols = grid.cols as usize;
+                let rows = grid.rows as usize;
+                let piece_width = width as f64 / grid.cols as f64;
+                let piece_height = height as f64 / grid.rows as f64;
+                let positions_snapshot = (*positions).clone();
+                let solved_now = is_solved(
+                    &positions_snapshot,
+                    &rotations_snapshot,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    enabled,
+                );
+                solved.set(solved_now);
             }
         })
     };
@@ -1273,9 +1390,8 @@ fn app() -> Html {
         );
     }
 
-    let (content, on_scramble, on_solve, scramble_disabled) = if let Some((width, height)) =
-        *image_size
-    {
+    let (content, on_scramble, on_solve, on_solve_rotation, scramble_disabled) =
+        if let Some((width, height)) = *image_size {
         let width_f = width as f64;
         let height_f = height as f64;
         let view_width = width_f * workspace_scale_value;
@@ -1339,6 +1455,7 @@ fn app() -> Html {
             .collect();
 
         let positions_value = (*positions).clone();
+        let rotations_value = (*rotations).clone();
         let active_id_value = *active_id;
         let z_order_value = (*z_order).clone();
         let drag_move = {
@@ -1399,18 +1516,91 @@ fn app() -> Html {
         };
         let drag_release = {
             let positions = positions.clone();
+            let rotations = rotations.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let connections = connections.clone();
             let solved = solved.clone();
+            let svg_ref = svg_ref.clone();
             move |event: &MouseEvent| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     let mut next = (*positions).clone();
+                    let mut next_rotations = (*rotations).clone();
                     let mut next_connections = (*connections).clone();
                     let cols = grid.cols as usize;
                     let rows = grid.rows as usize;
                     let snap_distance = piece_width.min(piece_height) * SNAP_DISTANCE_RATIO;
+                    let click_tolerance =
+                        piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+                    if rotation_enabled_value {
+                        if let Some((x, y)) = event_to_svg_coords(
+                            event,
+                            &svg_ref,
+                            view_min_x,
+                            view_min_y,
+                            view_width,
+                            view_height,
+                        ) {
+                            let dx = x - drag.start_x;
+                            let dy = y - drag.start_y;
+                            let dist = (dx * dx + dy * dy).sqrt();
+                            let elapsed = Date::now() - drag.start_time;
+                            if dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS {
+                                if !drag.members.is_empty() {
+                                    let pivot_x = drag.start_x;
+                                    let pivot_y = drag.start_y;
+                                    let current_positions = next.clone();
+                                    let current_angle = drag
+                                        .members
+                                        .first()
+                                        .and_then(|id| next_rotations.get(*id))
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let target_angle = next_snap_rotation(current_angle);
+                                    let delta = angle_delta(target_angle, current_angle);
+                                    for member in &drag.members {
+                                        if let Some(pos) = current_positions.get(*member) {
+                                            let center_x = pos.0 + piece_width * 0.5;
+                                            let center_y = pos.1 + piece_height * 0.5;
+                                            let (rx, ry) = rotate_point(
+                                                center_x,
+                                                center_y,
+                                                pivot_x,
+                                                pivot_y,
+                                                delta,
+                                            );
+                                            if let Some(pos) = next.get_mut(*member) {
+                                                *pos = (
+                                                    rx - piece_width * 0.5,
+                                                    ry - piece_height * 0.5,
+                                                );
+                                            }
+                                            if let Some(rot) = next_rotations.get_mut(*member) {
+                                                *rot = normalize_angle(*rot + delta);
+                                            }
+                                        }
+                                    }
+                                    let solved_now = is_solved(
+                                        &next,
+                                        &next_rotations,
+                                        cols,
+                                            rows,
+                                            piece_width,
+                                            piece_height,
+                                            rotation_enabled_value,
+                                        );
+                                        positions.set(next);
+                                        rotations.set(next_rotations);
+                                        solved.set(solved_now);
+                                        active_id.set(None);
+                                        *drag_state.borrow_mut() = None;
+                                        event.prevent_default();
+                                        return;
+                                }
+                            }
+                        }
+                    }
                     let mut in_group = vec![false; cols * rows];
                     for member in &drag.members {
                         if *member < in_group.len() {
@@ -1424,33 +1614,36 @@ fn app() -> Html {
                             continue;
                         }
                         let current = next[*member];
+                        let center_a = (
+                            current.0 + piece_width * 0.5,
+                            current.1 + piece_height * 0.5,
+                        );
+                        let rot_a = next_rotations.get(*member).copied().unwrap_or(0.0);
                         for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
                             if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
                                 if in_group[neighbor] {
                                     continue;
                                 }
-                                let neighbor_pos = next[neighbor];
-                                let (tx, ty) = match dir {
-                                    DIR_LEFT => (
-                                        neighbor_pos.0 + piece_width,
-                                        neighbor_pos.1,
-                                    ),
-                                    DIR_RIGHT => (
-                                        neighbor_pos.0 - piece_width,
-                                        neighbor_pos.1,
-                                    ),
-                                    DIR_UP => (
-                                        neighbor_pos.0,
-                                        neighbor_pos.1 + piece_height,
-                                    ),
-                                    DIR_DOWN => (
-                                        neighbor_pos.0,
-                                        neighbor_pos.1 - piece_height,
-                                    ),
-                                    _ => (current.0, current.1),
+                                let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
+                                if !angle_matches(rot_a, rot_b) {
+                                    continue;
+                                }
+                                let base = match dir {
+                                    DIR_LEFT => (-piece_width, 0.0),
+                                    DIR_RIGHT => (piece_width, 0.0),
+                                    DIR_UP => (0.0, -piece_height),
+                                    DIR_DOWN => (0.0, piece_height),
+                                    _ => (0.0, 0.0),
                                 };
-                                let dx = tx - current.0;
-                                let dy = ty - current.1;
+                                let (vx, vy) = rotate_vec(base.0, base.1, rot_a);
+                                let neighbor_pos = next[neighbor];
+                                let center_b = (
+                                    neighbor_pos.0 + piece_width * 0.5,
+                                    neighbor_pos.1 + piece_height * 0.5,
+                                );
+                                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
+                                let dx = actual.0 - vx;
+                                let dy = actual.1 - vy;
                                 let dist = (dx * dx + dy * dy).sqrt();
                                 if dist <= snap_distance {
                                     match best {
@@ -1505,33 +1698,36 @@ fn app() -> Html {
                             continue;
                         }
                         let current = next[*member];
+                        let center_a = (
+                            current.0 + piece_width * 0.5,
+                            current.1 + piece_height * 0.5,
+                        );
+                        let rot_a = next_rotations.get(*member).copied().unwrap_or(0.0);
                         for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
                             if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
                                 if in_group[neighbor] {
                                     continue;
                                 }
-                                let neighbor_pos = next[neighbor];
-                                let (tx, ty) = match dir {
-                                    DIR_LEFT => (
-                                        neighbor_pos.0 + piece_width,
-                                        neighbor_pos.1,
-                                    ),
-                                    DIR_RIGHT => (
-                                        neighbor_pos.0 - piece_width,
-                                        neighbor_pos.1,
-                                    ),
-                                    DIR_UP => (
-                                        neighbor_pos.0,
-                                        neighbor_pos.1 + piece_height,
-                                    ),
-                                    DIR_DOWN => (
-                                        neighbor_pos.0,
-                                        neighbor_pos.1 - piece_height,
-                                    ),
-                                    _ => (current.0, current.1),
+                                let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
+                                if !angle_matches(rot_a, rot_b) {
+                                    continue;
+                                }
+                                let base = match dir {
+                                    DIR_LEFT => (-piece_width, 0.0),
+                                    DIR_RIGHT => (piece_width, 0.0),
+                                    DIR_UP => (0.0, -piece_height),
+                                    DIR_DOWN => (0.0, piece_height),
+                                    _ => (0.0, 0.0),
                                 };
-                                let dx = tx - current.0;
-                                let dy = ty - current.1;
+                                let (vx, vy) = rotate_vec(base.0, base.1, rot_a);
+                                let neighbor_pos = next[neighbor];
+                                let center_b = (
+                                    neighbor_pos.0 + piece_width * 0.5,
+                                    neighbor_pos.1 + piece_height * 0.5,
+                                );
+                                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
+                                let dx = actual.0 - vx;
+                                let dy = actual.1 - vy;
                                 let dist = (dx * dx + dy * dy).sqrt();
                                 if dist <= snap_distance {
                                     set_connection(
@@ -1601,7 +1797,20 @@ fn app() -> Html {
                                     }
                                 }
                             }
-                            if has_borders {
+                            let mut rotation_ok = true;
+                            if rotation_enabled_value {
+                                for id in &group_after {
+                                    if let Some(rot) = next_rotations.get(*id) {
+                                        if angle_delta(0.0, *rot).abs()
+                                            > ROTATION_SNAP_TOLERANCE_DEG
+                                        {
+                                            rotation_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if has_borders && rotation_ok {
                                 let dx = -min_x;
                                 let dy = -min_y;
                                 let dist = (dx * dx + dy * dy).sqrt();
@@ -1660,7 +1869,15 @@ fn app() -> Html {
                         }
                     }
 
-                    let solved_now = is_solved(&next, cols, rows, piece_width, piece_height);
+                    let solved_now = is_solved(
+                        &next,
+                        &next_rotations,
+                        cols,
+                        rows,
+                        piece_width,
+                        piece_height,
+                        rotation_enabled_value,
+                    );
                     positions.set(next);
                     connections.set(next_connections);
                     solved.set(solved_now);
@@ -1682,6 +1899,7 @@ fn app() -> Html {
             let positions = positions.clone();
             let connections = connections.clone();
             let z_order = z_order.clone();
+            let rotations = rotations.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let scramble_nonce = scramble_nonce.clone();
@@ -1696,6 +1914,7 @@ fn app() -> Html {
                 let next_nonce = time_nonce(*scramble_nonce);
                 scramble_nonce.set(next_nonce);
                 let seed = scramble_seed(PUZZLE_SEED, next_nonce, cols, rows);
+                let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
                 let (next_positions, order) = scramble_layout(
                     seed,
                     cols,
@@ -1711,6 +1930,11 @@ fn app() -> Html {
                 positions.set(next_positions);
                 connections.set(vec![[false; 4]; total]);
                 z_order.set(order);
+                rotations.set(scramble_rotations(
+                    rotation_seed,
+                    total,
+                    rotation_enabled_value,
+                ));
                 active_id.set(None);
                 *drag_state.borrow_mut() = None;
                 solved.set(false);
@@ -1720,6 +1944,7 @@ fn app() -> Html {
             let positions = positions.clone();
             let connections = connections.clone();
             let z_order = z_order.clone();
+            let rotations = rotations.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let solved = solved.clone();
@@ -1743,9 +1968,36 @@ fn app() -> Html {
                 positions.set(next_positions);
                 connections.set(build_full_connections(cols, rows));
                 z_order.set(order);
+                rotations.set(vec![0.0; total]);
                 active_id.set(None);
                 *drag_state.borrow_mut() = None;
                 solved.set(true);
+            })
+        };
+        let on_solve_rotation = {
+            let positions = positions.clone();
+            let rotations = rotations.clone();
+            let solved = solved.clone();
+            Callback::from(move |_: MouseEvent| {
+                let cols = grid.cols as usize;
+                let rows = grid.rows as usize;
+                let total = cols * rows;
+                if total == 0 {
+                    return;
+                }
+                let positions_snapshot = (*positions).clone();
+                let zeroed = vec![0.0; total];
+                rotations.set(zeroed.clone());
+                let solved_now = is_solved(
+                    &positions_snapshot,
+                    &zeroed,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    rotation_enabled_value,
+                );
+                solved.set(solved_now);
             })
         };
 
@@ -1783,10 +2035,14 @@ fn app() -> Html {
             let piece_y = piece.row as f64 * piece_height;
             let current =
                 positions_value.get(piece.id).copied().unwrap_or((piece_x, piece_y));
+            let rotation = rotations_value.get(piece.id).copied().unwrap_or(0.0);
             let transform = format!(
-                "translate({} {})",
+                "translate({} {}) rotate({} {} {})",
                 fmt_f64(current.0),
-                fmt_f64(current.1)
+                fmt_f64(current.1),
+                fmt_f64(rotation),
+                fmt_f64(piece_width * 0.5),
+                fmt_f64(piece_height * 0.5)
             );
             let mask_ref = format!("url(#piece-mask-{})", piece.id);
             let img_x = fmt_f64(-piece_x);
@@ -1861,6 +2117,7 @@ fn app() -> Html {
                         *drag_state.borrow_mut() = Some(DragState {
                             start_x: x,
                             start_y: y,
+                            start_time: Date::now(),
                             members,
                             start_positions,
                         });
@@ -1946,11 +2203,13 @@ fn app() -> Html {
             },
             on_scramble,
             on_solve,
+            on_solve_rotation,
             false,
         )
     } else {
         (
             html! { <p>{ "Loading puzzle image..." }</p> },
+            Callback::from(|_: MouseEvent| {}),
             Callback::from(|_: MouseEvent| {}),
             Callback::from(|_: MouseEvent| {}),
             true,
@@ -2022,6 +2281,20 @@ fn app() -> Html {
                     />
                 </div>
                 <div class="control">
+                    <label for="rotation-enabled">
+                        { "Rotation" }
+                        <span class="control-value">
+                            { if rotation_enabled_value { "On" } else { "Off" } }
+                        </span>
+                    </label>
+                    <input
+                        id="rotation-enabled"
+                        type="checkbox"
+                        checked={rotation_enabled_value}
+                        onchange={on_rotation_toggle}
+                    />
+                </div>
+                <div class="control">
                     <button
                         class="control-button"
                         type="button"
@@ -2039,6 +2312,16 @@ fn app() -> Html {
                         disabled={scramble_disabled}
                     >
                         { "Solve" }
+                    </button>
+                </div>
+                <div class="control">
+                    <button
+                        class="control-button"
+                        type="button"
+                        onclick={on_solve_rotation}
+                        disabled={scramble_disabled}
+                    >
+                        { "Solve rotation" }
                     </button>
                 </div>
                 <div class="control">
