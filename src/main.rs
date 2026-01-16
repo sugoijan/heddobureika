@@ -8,6 +8,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{
     Element, Event, HtmlImageElement, HtmlInputElement, HtmlSelectElement, InputEvent, KeyboardEvent,
+    Touch, TouchEvent,
 };
 use yew::prelude::*;
 
@@ -26,7 +27,7 @@ const FLIP_CHANCE: f64 = 0.3;
 const RUBBER_BAND_RATIO: f64 = 0.35;
 const WORKSPACE_SCALE_MIN: f64 = 1.0;
 const WORKSPACE_SCALE_MAX: f64 = 2.5;
-const WORKSPACE_SCALE_DEFAULT: f64 = 1.6;
+const WORKSPACE_SCALE_DEFAULT: f64 = 1.7;
 const FRAME_SNAP_MIN: f64 = 0.4;
 const FRAME_SNAP_MAX: f64 = 3.0;
 const FRAME_SNAP_DEFAULT: f64 = 1.0;
@@ -117,14 +118,22 @@ struct DragState {
     start_y: f64,
     start_time: f64,
     primary_id: usize,
+    touch_id: Option<i32>,
+    rotate_mode: bool,
+    pivot_x: f64,
+    pivot_y: f64,
+    start_angle: f64,
     members: Vec<usize>,
     start_positions: Vec<(f64, f64)>,
+    start_rotations: Vec<f64>,
 }
 
 #[derive(Default)]
 struct DragHandlers {
     on_move: Option<Rc<dyn Fn(&MouseEvent)>>,
     on_release: Option<Rc<dyn Fn(&MouseEvent)>>,
+    on_touch_move: Option<Rc<dyn Fn(&TouchEvent)>>,
+    on_touch_release: Option<Rc<dyn Fn(&TouchEvent)>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -341,6 +350,47 @@ fn event_to_svg_coords(
     }
     let x = view_min_x + (event.client_x() as f64 - rect.left()) * view_width / rect.width();
     let y = view_min_y + (event.client_y() as f64 - rect.top()) * view_height / rect.height();
+    Some((x, y))
+}
+
+fn touch_from_event(event: &TouchEvent, touch_id: Option<i32>, use_changed: bool) -> Option<Touch> {
+    let list = if use_changed {
+        event.changed_touches()
+    } else {
+        event.touches()
+    };
+    if let Some(id) = touch_id {
+        for idx in 0..list.length() {
+            if let Some(touch) = list.item(idx) {
+                if touch.identifier() == id {
+                    return Some(touch);
+                }
+            }
+        }
+        None
+    } else {
+        list.item(0)
+    }
+}
+
+fn touch_event_to_svg_coords(
+    event: &TouchEvent,
+    svg_ref: &NodeRef,
+    view_min_x: f64,
+    view_min_y: f64,
+    view_width: f64,
+    view_height: f64,
+    touch_id: Option<i32>,
+    use_changed: bool,
+) -> Option<(f64, f64)> {
+    let svg = svg_ref.cast::<Element>()?;
+    let rect = svg.get_bounding_client_rect();
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let touch = touch_from_event(event, touch_id, use_changed)?;
+    let x = view_min_x + (touch.client_x() as f64 - rect.left()) * view_width / rect.width();
+    let y = view_min_y + (touch.client_y() as f64 - rect.top()) * view_height / rect.height();
     Some((x, y))
 }
 
@@ -1566,6 +1616,23 @@ fn app() -> Html {
                         }
                     },
                 );
+                let touch_move_handlers = drag_handlers.clone();
+                let touch_move_listener = EventListener::new_with_options(
+                    &window,
+                    "touchmove",
+                    EventListenerOptions {
+                        phase: EventListenerPhase::Capture,
+                        passive: false,
+                    },
+                    move |event: &Event| {
+                        if let Some(event) = event.dyn_ref::<TouchEvent>() {
+                            if let Some(handler) = touch_move_handlers.borrow().on_touch_move.as_ref()
+                            {
+                                handler(event);
+                            }
+                        }
+                    },
+                );
                 let up_handlers = drag_handlers.clone();
                 let up_listener = EventListener::new_with_options(
                     &window,
@@ -1582,9 +1649,48 @@ fn app() -> Html {
                         }
                     },
                 );
+                let touch_end_handlers = drag_handlers.clone();
+                let touch_end_listener = EventListener::new_with_options(
+                    &window,
+                    "touchend",
+                    EventListenerOptions {
+                        phase: EventListenerPhase::Capture,
+                        passive: false,
+                    },
+                    move |event: &Event| {
+                        if let Some(event) = event.dyn_ref::<TouchEvent>() {
+                            if let Some(handler) =
+                                touch_end_handlers.borrow().on_touch_release.as_ref()
+                            {
+                                handler(event);
+                            }
+                        }
+                    },
+                );
+                let touch_cancel_handlers = drag_handlers.clone();
+                let touch_cancel_listener = EventListener::new_with_options(
+                    &window,
+                    "touchcancel",
+                    EventListenerOptions {
+                        phase: EventListenerPhase::Capture,
+                        passive: false,
+                    },
+                    move |event: &Event| {
+                        if let Some(event) = event.dyn_ref::<TouchEvent>() {
+                            if let Some(handler) =
+                                touch_cancel_handlers.borrow().on_touch_release.as_ref()
+                            {
+                                handler(event);
+                            }
+                        }
+                    },
+                );
                 || {
                     drop(move_listener);
+                    drop(touch_move_listener);
                     drop(up_listener);
+                    drop(touch_end_listener);
+                    drop(touch_cancel_listener);
                 }
             },
         );
@@ -1679,21 +1785,50 @@ fn app() -> Html {
         let flips_value = (*flips).clone();
         let active_id_value = *active_id;
         let z_order_value = (*z_order).clone();
-        let drag_move = {
+        let drag_move_common: Rc<dyn Fn(f64, f64) -> bool> = {
             let positions = positions.clone();
+            let rotations = rotations.clone();
+            let flips = flips.clone();
             let drag_state = drag_state.clone();
-            let svg_ref = svg_ref.clone();
-            move |event: &MouseEvent| {
+            Rc::new(move |x: f64, y: f64| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
-                    if let Some((x, y)) = event_to_svg_coords(
-                        event,
-                        &svg_ref,
-                        view_min_x,
-                        view_min_y,
-                        view_width,
-                        view_height,
-                    ) {
+                    if drag.rotate_mode && rotation_enabled_value {
+                        let current_angle = (y - drag.pivot_y).atan2(x - drag.pivot_x);
+                        let delta_deg = (current_angle - drag.start_angle).to_degrees();
+                        let mut next = (*positions).clone();
+                        let mut next_rotations = (*rotations).clone();
+                        let flips_snapshot = &*flips;
+                        for (index, member) in drag.members.iter().enumerate() {
+                            if let Some(start) = drag.start_positions.get(index) {
+                                let center_x = start.0 + piece_width * 0.5;
+                                let center_y = start.1 + piece_height * 0.5;
+                                let (rx, ry) = rotate_point(
+                                    center_x,
+                                    center_y,
+                                    drag.pivot_x,
+                                    drag.pivot_y,
+                                    delta_deg,
+                                );
+                                if let Some(pos) = next.get_mut(*member) {
+                                    *pos = (
+                                        rx - piece_width * 0.5,
+                                        ry - piece_height * 0.5,
+                                    );
+                                }
+                                if let Some(rot) = next_rotations.get_mut(*member) {
+                                    let start_rot =
+                                        drag.start_rotations.get(index).copied().unwrap_or(0.0);
+                                    let flipped = flips_snapshot.get(*member).copied().unwrap_or(false);
+                                    let signed_delta = if flipped { -delta_deg } else { delta_deg };
+                                    *rot = normalize_angle(start_rot + signed_delta);
+                                }
+                            }
+                        }
+                        positions.set(next);
+                        rotations.set(next_rotations);
+                        true
+                    } else {
                         let mut dx = x - drag.start_x;
                         let mut dy = y - drag.start_y;
                         if !drag.start_positions.is_empty() {
@@ -1713,8 +1848,7 @@ fn app() -> Html {
                             let max_dx = center_max_x - max_start_x;
                             let min_dy = center_min_y - min_start_y;
                             let max_dy = center_max_y - max_start_y;
-                            let rubber_limit =
-                                piece_width.min(piece_height) * RUBBER_BAND_RATIO;
+                            let rubber_limit = piece_width.min(piece_height) * RUBBER_BAND_RATIO;
                             if min_dx <= max_dx {
                                 dx = rubber_band_clamp(dx, min_dx, max_dx, rubber_limit);
                             }
@@ -1730,12 +1864,57 @@ fn app() -> Html {
                             }
                         }
                         positions.set(next);
+                        true
                     }
-                    event.prevent_default();
+                } else {
+                    false
+                }
+            })
+        };
+        let drag_move = {
+            let svg_ref = svg_ref.clone();
+            let drag_move_common = drag_move_common.clone();
+            move |event: &MouseEvent| {
+                if let Some((x, y)) = event_to_svg_coords(
+                    event,
+                    &svg_ref,
+                    view_min_x,
+                    view_min_y,
+                    view_width,
+                    view_height,
+                ) {
+                    if drag_move_common(x, y) {
+                        event.prevent_default();
+                    }
                 }
             }
         };
-        let drag_release = {
+        let drag_move_touch = {
+            let svg_ref = svg_ref.clone();
+            let drag_state = drag_state.clone();
+            let drag_move_common = drag_move_common.clone();
+            move |event: &TouchEvent| {
+                let touch_id = drag_state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|drag| drag.touch_id);
+                if let Some((x, y)) = touch_event_to_svg_coords(
+                    event,
+                    &svg_ref,
+                    view_min_x,
+                    view_min_y,
+                    view_width,
+                    view_height,
+                    touch_id,
+                    false,
+                ) {
+                    if drag_move_common(x, y) {
+                        event.prevent_default();
+                    }
+                }
+            }
+        };
+        let drag_release_common: Rc<dyn Fn(Option<(f64, f64)>) -> bool> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
@@ -1743,10 +1922,10 @@ fn app() -> Html {
             let drag_state = drag_state.clone();
             let connections = connections.clone();
             let solved = solved.clone();
-            let svg_ref = svg_ref.clone();
-            move |event: &MouseEvent| {
+            Rc::new(move |coords: Option<(f64, f64)>| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
+                    let ctrl_flip = drag.rotate_mode;
                     let mut next = (*positions).clone();
                     let mut next_rotations = (*rotations).clone();
                     let mut next_flips = (*flips).clone();
@@ -1754,23 +1933,14 @@ fn app() -> Html {
                     let cols = grid.cols as usize;
                     let rows = grid.rows as usize;
                     let snap_distance = piece_width.min(piece_height) * SNAP_DISTANCE_RATIO;
-                    let click_tolerance =
-                        piece_width.min(piece_height) * CLICK_MOVE_RATIO;
-                    if let Some((x, y)) = event_to_svg_coords(
-                        event,
-                        &svg_ref,
-                        view_min_x,
-                        view_min_y,
-                        view_width,
-                        view_height,
-                    ) {
+                    let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+                    if let Some((x, y)) = coords {
                         let dx = x - drag.start_x;
                         let dy = y - drag.start_y;
                         let dist = (dx * dx + dy * dy).sqrt();
                         let elapsed = Date::now() - drag.start_time;
                         if dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS {
                             let click_id = drag.primary_id;
-                            let ctrl_flip = event.ctrl_key();
                             let was_flipped = next_flips.get(click_id).copied().unwrap_or(false);
                             if ctrl_flip {
                                 if let Some(flip) = next_flips.get_mut(click_id) {
@@ -1794,8 +1964,7 @@ fn app() -> Html {
                                 solved.set(solved_now);
                                 active_id.set(None);
                                 *drag_state.borrow_mut() = None;
-                                event.prevent_default();
-                                return;
+                                return true;
                             }
                             if was_flipped {
                                 if let Some(flip) = next_flips.get_mut(click_id) {
@@ -1819,8 +1988,7 @@ fn app() -> Html {
                                 solved.set(solved_now);
                                 active_id.set(None);
                                 *drag_state.borrow_mut() = None;
-                                event.prevent_default();
-                                return;
+                                return true;
                             }
                             if rotation_enabled_value && !drag.members.is_empty() {
                                 let pivot_x = drag.start_x;
@@ -1871,8 +2039,7 @@ fn app() -> Html {
                                 solved.set(solved_now);
                                 active_id.set(None);
                                 *drag_state.borrow_mut() = None;
-                                event.prevent_default();
-                                return;
+                                return true;
                             }
                         }
                     }
@@ -2172,16 +2339,62 @@ fn app() -> Html {
                     solved.set(solved_now);
                     active_id.set(None);
                     *drag_state.borrow_mut() = None;
+                    return true;
+                }
+                false
+            })
+        };
+        let drag_release = {
+            let svg_ref = svg_ref.clone();
+            let drag_release_common = drag_release_common.clone();
+            move |event: &MouseEvent| {
+                let coords = event_to_svg_coords(
+                    event,
+                    &svg_ref,
+                    view_min_x,
+                    view_min_y,
+                    view_width,
+                    view_height,
+                );
+                if drag_release_common(coords) {
+                    event.prevent_default();
+                }
+            }
+        };
+        let drag_release_touch = {
+            let svg_ref = svg_ref.clone();
+            let drag_state = drag_state.clone();
+            let drag_release_common = drag_release_common.clone();
+            move |event: &TouchEvent| {
+                let touch_id = drag_state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|drag| drag.touch_id);
+                let coords = touch_event_to_svg_coords(
+                    event,
+                    &svg_ref,
+                    view_min_x,
+                    view_min_y,
+                    view_width,
+                    view_height,
+                    touch_id,
+                    true,
+                );
+                if drag_release_common(coords) {
                     event.prevent_default();
                 }
             }
         };
         let drag_move = Rc::new(drag_move);
+        let drag_move_touch = Rc::new(drag_move_touch);
         let drag_release = Rc::new(drag_release);
+        let drag_release_touch = Rc::new(drag_release_touch);
         {
             let mut handlers = drag_handlers.borrow_mut();
             handlers.on_move = Some(drag_move.clone());
             handlers.on_release = Some(drag_release.clone());
+            handlers.on_touch_move = Some(drag_move_touch.clone());
+            handlers.on_touch_release = Some(drag_release_touch.clone());
         }
 
         let on_scramble = {
@@ -2392,13 +2605,13 @@ fn app() -> Html {
                 String::new()
             };
             let transform = format!(
-                "translate({} {}) rotate({} {} {}){}",
+                "translate({} {}){} rotate({} {} {})",
                 fmt_f64(current.0),
                 fmt_f64(current.1),
+                flip_transform,
                 fmt_f64(rotation),
                 fmt_f64(center_x),
-                fmt_f64(center_y),
-                flip_transform
+                fmt_f64(center_y)
             );
             let mask_ref = format!("url(#piece-mask-{})", piece.id);
             let img_x = fmt_f64(-piece_x);
@@ -2415,17 +2628,87 @@ fn app() -> Html {
             } else {
                 "piece"
             };
-            let on_piece_down = {
+            let start_drag: Rc<dyn Fn(f64, f64, bool, bool, Option<i32>)> = {
                 let positions = positions.clone();
+                let rotations = rotations.clone();
                 let drag_state = drag_state.clone();
                 let active_id = active_id.clone();
-                let svg_ref = svg_ref.clone();
                 let z_order = z_order.clone();
                 let connections = connections.clone();
                 let piece_id = piece.id;
                 let current_pos = current;
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
+                Rc::new(move |x, y, shift_key, rotate_mode, touch_id| {
+                    let positions_snapshot = (*positions).clone();
+                    let mut connections_snapshot = (*connections).clone();
+                    let mut members = if shift_key {
+                        clear_piece_connections(&mut connections_snapshot, piece_id, cols, rows);
+                        connections.set(connections_snapshot);
+                        vec![piece_id]
+                    } else {
+                        collect_group(&connections_snapshot, piece_id, cols, rows)
+                    };
+                    if members.is_empty() {
+                        members.push(piece_id);
+                    }
+                    let pos = positions_snapshot
+                        .get(piece_id)
+                        .copied()
+                        .unwrap_or(current_pos);
+                    let pivot_x = pos.0 + piece_width * 0.5;
+                    let pivot_y = pos.1 + piece_height * 0.5;
+                    let start_angle = (y - pivot_y).atan2(x - pivot_x);
+                    let mut order = (*z_order).clone();
+                    let mut in_group = vec![false; cols * rows];
+                    for id in &members {
+                        if *id < in_group.len() {
+                            in_group[*id] = true;
+                        }
+                    }
+                    let mut group_order = Vec::new();
+                    for id in &order {
+                        if *id < in_group.len() && in_group[*id] {
+                            group_order.push(*id);
+                        }
+                    }
+                    order.retain(|id| !in_group.get(*id).copied().unwrap_or(false));
+                    order.extend(group_order);
+                    z_order.set(order);
+                    let mut start_positions = Vec::with_capacity(members.len());
+                    for id in &members {
+                        if let Some(start) = positions_snapshot.get(*id) {
+                            start_positions.push(*start);
+                        } else {
+                            start_positions.push(pos);
+                        }
+                    }
+                    let rotations_snapshot = (*rotations).clone();
+                    let mut start_rotations = Vec::with_capacity(members.len());
+                    for id in &members {
+                        let rot = rotations_snapshot.get(*id).copied().unwrap_or(0.0);
+                        start_rotations.push(rot);
+                    }
+                    *drag_state.borrow_mut() = Some(DragState {
+                        start_x: x,
+                        start_y: y,
+                        start_time: Date::now(),
+                        primary_id: piece_id,
+                        touch_id,
+                        rotate_mode,
+                        pivot_x,
+                        pivot_y,
+                        start_angle,
+                        members,
+                        start_positions,
+                        start_rotations,
+                    });
+                    active_id.set(Some(piece_id));
+                })
+            };
+            let on_piece_down = {
+                let svg_ref = svg_ref.clone();
+                let start_drag = start_drag.clone();
                 Callback::from(move |event: MouseEvent| {
                     if let Some((x, y)) = event_to_svg_coords(
                         &event,
@@ -2435,60 +2718,29 @@ fn app() -> Html {
                         view_width,
                         view_height,
                     ) {
-                        let positions_snapshot = (*positions).clone();
-                        let mut connections_snapshot = (*connections).clone();
-                        let mut members = if event.shift_key() {
-                            clear_piece_connections(
-                                &mut connections_snapshot,
-                                piece_id,
-                                cols,
-                                rows,
-                            );
-                            connections.set(connections_snapshot);
-                            vec![piece_id]
-                        } else {
-                            collect_group(&connections_snapshot, piece_id, cols, rows)
-                        };
-                        if members.is_empty() {
-                            members.push(piece_id);
+                        start_drag(x, y, event.shift_key(), event.ctrl_key(), None);
+                    }
+                    event.prevent_default();
+                })
+            };
+            let on_piece_touch = {
+                let svg_ref = svg_ref.clone();
+                let start_drag = start_drag.clone();
+                Callback::from(move |event: TouchEvent| {
+                    if let Some(touch) = touch_from_event(&event, None, true) {
+                        let touch_id = Some(touch.identifier());
+                        if let Some((x, y)) = touch_event_to_svg_coords(
+                            &event,
+                            &svg_ref,
+                            view_min_x,
+                            view_min_y,
+                            view_width,
+                            view_height,
+                            touch_id,
+                            true,
+                        ) {
+                            start_drag(x, y, false, false, touch_id);
                         }
-                        let pos = positions_snapshot
-                            .get(piece_id)
-                            .copied()
-                            .unwrap_or(current_pos);
-                        let mut order = (*z_order).clone();
-                        let mut in_group = vec![false; cols * rows];
-                        for id in &members {
-                            if *id < in_group.len() {
-                                in_group[*id] = true;
-                            }
-                        }
-                        let mut group_order = Vec::new();
-                        for id in &order {
-                            if *id < in_group.len() && in_group[*id] {
-                                group_order.push(*id);
-                            }
-                        }
-                        order.retain(|id| !in_group.get(*id).copied().unwrap_or(false));
-                        order.extend(group_order);
-                        z_order.set(order);
-                        let mut start_positions = Vec::with_capacity(members.len());
-                        for id in &members {
-                            if let Some(start) = positions_snapshot.get(*id) {
-                                start_positions.push(*start);
-                            } else {
-                                start_positions.push(pos);
-                            }
-                        }
-                        *drag_state.borrow_mut() = Some(DragState {
-                            start_x: x,
-                            start_y: y,
-                            start_time: Date::now(),
-                            primary_id: piece_id,
-                            members,
-                            start_positions,
-                        });
-                        active_id.set(Some(piece_id));
                     }
                     event.prevent_default();
                 })
@@ -2499,6 +2751,7 @@ fn app() -> Html {
                     class={class}
                     transform={transform}
                     onmousedown={on_piece_down}
+                    ontouchstart={on_piece_touch}
                 >
                     <rect
                         class="piece-back"
@@ -2608,6 +2861,11 @@ fn app() -> Html {
         >
             { "source" }
         </a>
+    };
+    let preview_box = html! {
+        <aside class="preview-box">
+            <img src={IMAGE_SRC} alt="Puzzle preview" />
+        </aside>
     };
     let controls_panel = if show_controls_value {
         html! {
@@ -2862,6 +3120,7 @@ fn app() -> Html {
             {content}
             {solved_banner}
             {controls_hint}
+            {preview_box}
             {controls_panel}
         </main>
     }
