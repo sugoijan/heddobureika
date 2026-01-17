@@ -37,10 +37,20 @@ body {
 
 .piece {
   cursor: grab;
+  transition: transform 140ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.puzzle-image.no-anim .piece {
+  transition: none;
 }
 
 .piece.dragging {
   cursor: grabbing;
+  transition: none;
+}
+
+.piece.animating {
+  transition: none;
 }
 
 .piece-hitbox {
@@ -48,10 +58,34 @@ body {
   pointer-events: all;
 }
 
+.puzzle-image.debug .piece-hitbox {
+  stroke: rgba(40, 120, 200, 0.45);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.piece-debug-center {
+  fill: rgba(255, 87, 51, 0.9);
+  stroke: rgba(255, 255, 255, 0.8);
+  stroke-width: 0.8;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.piece-debug-label {
+  font-size: 18px;
+  fill: rgba(0, 0, 0, 0.75);
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.9);
+  stroke-width: 2px;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
 .piece-outline {
   fill: none;
   vector-effect: non-scaling-stroke;
-  shape-rendering: crispEdges;
   pointer-events: none;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -134,8 +168,6 @@ body {
 
 .preview-box {
   position: fixed;
-  bottom: 16px;
-  left: 16px;
   z-index: 9;
   width: 170px;
   max-width: 28vw;
@@ -150,9 +182,121 @@ body {
   transition: transform 160ms ease, box-shadow 160ms ease;
 }
 
+.preview-box.corner-bl {
+  bottom: 16px;
+  left: 16px;
+  transform-origin: bottom left;
+}
+
+.preview-box.corner-br {
+  bottom: 16px;
+  right: 16px;
+  transform-origin: bottom right;
+}
+
+.preview-box.corner-tl {
+  top: 16px;
+  left: 16px;
+  transform-origin: top left;
+}
+
+.preview-box.corner-tr {
+  top: 16px;
+  right: 16px;
+  transform-origin: top right;
+}
+
 .preview-box:hover {
   transform: scale(2.00);
   box-shadow: 0 16px 32px rgba(0, 0, 0, 0.22);
+}
+
+.preview-arrow {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  background: rgba(255, 255, 255, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 6px 12px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  --arrow-tx: -50%;
+  --arrow-ty: -50%;
+  transform: translate(var(--arrow-tx), var(--arrow-ty)) scale(0.9);
+  transition: transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease;
+  pointer-events: none;
+}
+
+.preview-box:hover .preview-arrow {
+  opacity: 0.85;
+  transform: translate(var(--arrow-tx), var(--arrow-ty)) scale(1);
+  pointer-events: auto;
+}
+
+.preview-arrow:hover {
+  opacity: 1;
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.22);
+  transform: translate(var(--arrow-tx), var(--arrow-ty)) scale(1.08);
+}
+
+.preview-arrow:focus-visible {
+  outline: 2px solid rgba(30, 120, 210, 0.7);
+  outline-offset: 2px;
+}
+
+.preview-arrow-icon {
+  width: 12px;
+  height: 12px;
+  stroke: rgba(30, 30, 30, 0.85);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+}
+
+.preview-arrow-right {
+  right: -8px;
+  top: 50%;
+  --arrow-tx: 50%;
+  --arrow-ty: -50%;
+}
+
+.preview-arrow-left {
+  left: -8px;
+  top: 50%;
+  --arrow-tx: -50%;
+  --arrow-ty: -50%;
+}
+
+.preview-arrow-up {
+  top: -8px;
+  left: 50%;
+  --arrow-tx: -50%;
+  --arrow-ty: -50%;
+}
+
+.preview-arrow-down {
+  bottom: -8px;
+  left: 50%;
+  --arrow-tx: -50%;
+  --arrow-ty: 50%;
+}
+
+.preview-arrow-left .preview-arrow-icon {
+  transform: rotate(180deg);
+}
+
+.preview-arrow-up .preview-arrow-icon {
+  transform: rotate(-90deg);
+}
+
+.preview-arrow-down .preview-arrow-icon {
+  transform: rotate(90deg);
 }
 
 .preview-box img {

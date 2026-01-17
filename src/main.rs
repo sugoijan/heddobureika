@@ -1,4 +1,5 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
+use gloo::timers::callback::Interval;
 use js_sys::Date;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -17,12 +18,17 @@ const PUZZLE_SEED: u64 = 0x5EED_5EED_25_20;
 const MAX_TAB_DEPTH_RATIO: f64 = 0.32;
 const MAX_LINE_BEND_RATIO: f64 = 0.2;
 const SNAP_DISTANCE_RATIO: f64 = 0.18;
+const CONNECT_DISTANCE_RATIO: f64 = 0.06;
 const SOLVE_TOLERANCE_RATIO: f64 = 0.08;
 const ROTATION_STEP_DEG: f64 = 90.0;
 const ROTATION_SNAP_TOLERANCE_DEG: f64 = 3.0;
 const ROTATION_SOLVE_TOLERANCE_DEG: f64 = 1.5;
+const ROTATION_NOISE_MIN: f64 = 0.0;
+const ROTATION_NOISE_MAX: f64 = 6.0;
+const ROTATION_NOISE_DEFAULT: f64 = 0.6;
 const CLICK_MOVE_RATIO: f64 = 0.08;
 const CLICK_MAX_DURATION_MS: f64 = 240.0;
+const SNAP_ANIMATION_MS: f64 = 160.0;
 const FLIP_CHANCE: f64 = 0.3;
 const RUBBER_BAND_RATIO: f64 = 0.35;
 const WORKSPACE_SCALE_MIN: f64 = 1.0;
@@ -126,6 +132,48 @@ struct DragState {
     members: Vec<usize>,
     start_positions: Vec<(f64, f64)>,
     start_rotations: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+enum AnimationKind {
+    Pivot {
+        pivot_x: f64,
+        pivot_y: f64,
+        delta: f64,
+    },
+    Anchor {
+        anchor_id: usize,
+        start_center: (f64, f64),
+        target_center: (f64, f64),
+        start_rot: f64,
+        target_rot: f64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct RotationAnimation {
+    start_time: f64,
+    duration: f64,
+    members: Vec<usize>,
+    start_positions: Vec<(f64, f64)>,
+    start_rotations: Vec<f64>,
+    kind: AnimationKind,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedRotation {
+    members: Vec<usize>,
+    pivot_x: f64,
+    pivot_y: f64,
+    noise: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PreviewCorner {
+    BottomLeft,
+    BottomRight,
+    TopLeft,
+    TopRight,
 }
 
 #[derive(Default)]
@@ -491,10 +539,19 @@ fn collect_group(connections: &[[bool; 4]], start: usize, cols: usize, rows: usi
     group
 }
 
+fn is_fully_connected(connections: &[[bool; 4]], cols: usize, rows: usize) -> bool {
+    let total = cols * rows;
+    if total == 0 || connections.len() != total {
+        return false;
+    }
+    collect_group(connections, 0, cols, rows).len() == total
+}
+
 fn is_solved(
     positions: &[(f64, f64)],
     rotations: &[f64],
     flips: &[bool],
+    connections: &[[bool; 4]],
     cols: usize,
     rows: usize,
     piece_width: f64,
@@ -510,6 +567,9 @@ fn is_solved(
     }
     if flips.iter().any(|flip| *flip) {
         return false;
+    }
+    if is_fully_connected(connections, cols, rows) {
+        return true;
     }
     if rotation_enabled {
         if rotations.len() != total {
@@ -604,6 +664,20 @@ fn next_snap_rotation(angle: f64) -> f64 {
     normalize_angle(next * ROTATION_STEP_DEG)
 }
 
+fn click_rotation_delta(current_angle: f64, noise: f64, noise_range: f64) -> f64 {
+    let mut target = next_snap_rotation(current_angle + noise);
+    target = normalize_angle(target + noise);
+    let min_step = if noise_range > 0.0 {
+        noise_range.max(ROTATION_SNAP_TOLERANCE_DEG)
+    } else {
+        0.0
+    };
+    if min_step > 0.0 && angle_delta(target, current_angle).abs() <= min_step {
+        target = normalize_angle(target + ROTATION_STEP_DEG);
+    }
+    angle_delta(target, current_angle)
+}
+
 fn rotate_vec(x: f64, y: f64, angle_deg: f64) -> (f64, f64) {
     let radians = angle_deg.to_radians();
     let cos = radians.cos();
@@ -615,6 +689,61 @@ fn rotate_point(x: f64, y: f64, origin_x: f64, origin_y: f64, angle_deg: f64) ->
     let (dx, dy) = (x - origin_x, y - origin_y);
     let (rx, ry) = rotate_vec(dx, dy, angle_deg);
     (origin_x + rx, origin_y + ry)
+}
+
+fn aligned_center_from_anchor(
+    anchor_row: i32,
+    anchor_col: i32,
+    anchor_center: (f64, f64),
+    member_id: usize,
+    cols: usize,
+    piece_width: f64,
+    piece_height: f64,
+    rotation: f64,
+) -> (f64, f64) {
+    let row = (member_id / cols) as i32;
+    let col = (member_id % cols) as i32;
+    let dx = (col - anchor_col) as f64 * piece_width;
+    let dy = (row - anchor_row) as f64 * piece_height;
+    let (rx, ry) = rotate_vec(dx, dy, rotation);
+    (anchor_center.0 + rx, anchor_center.1 + ry)
+}
+
+fn align_group_to_anchor(
+    positions: &mut Vec<(f64, f64)>,
+    rotations: &mut Vec<f64>,
+    members: &[usize],
+    anchor_id: usize,
+    anchor_center: (f64, f64),
+    target_rot: f64,
+    cols: usize,
+    piece_width: f64,
+    piece_height: f64,
+) {
+    if members.is_empty() || cols == 0 {
+        return;
+    }
+    let target_rot = normalize_angle(target_rot);
+    let anchor_row = (anchor_id / cols) as i32;
+    let anchor_col = (anchor_id % cols) as i32;
+    for id in members {
+        let center = aligned_center_from_anchor(
+            anchor_row,
+            anchor_col,
+            anchor_center,
+            *id,
+            cols,
+            piece_width,
+            piece_height,
+            target_rot,
+        );
+        if let Some(pos) = positions.get_mut(*id) {
+            *pos = (center.0 - piece_width * 0.5, center.1 - piece_height * 0.5);
+        }
+        if let Some(rot) = rotations.get_mut(*id) {
+            *rot = target_rot;
+        }
+    }
 }
 
 fn time_nonce(previous: u64) -> u64 {
@@ -1254,7 +1383,13 @@ fn app() -> Html {
     });
     let positions = use_state(Vec::<(f64, f64)>::new);
     let active_id = use_state(|| None::<usize>);
+    let dragging_members = use_state(Vec::<usize>::new);
+    let animating_members = use_state(Vec::<usize>::new);
     let drag_state = use_mut_ref(|| None::<DragState>);
+    let rotation_anim = use_mut_ref(|| None::<RotationAnimation>);
+    let rotation_anim_handle = use_mut_ref(|| None::<Interval>);
+    let rotation_queue = use_mut_ref(|| VecDeque::<QueuedRotation>::new());
+    let preview_corner = use_state(|| PreviewCorner::BottomLeft);
     let drag_handlers = use_mut_ref(DragHandlers::default);
     let restore_state = use_mut_ref(|| None::<SavedBoard>);
     let restore_attempted = use_mut_ref(|| false);
@@ -1267,6 +1402,10 @@ fn app() -> Html {
     let flips = use_state(Vec::<bool>::new);
     let rotation_enabled = use_state(|| true);
     let rotation_enabled_value = *rotation_enabled;
+    let animations_enabled = use_state(|| false);
+    let animations_enabled_value = *animations_enabled;
+    let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
+    let rotation_noise_value = *rotation_noise;
     let scramble_nonce = use_state(|| 0u64);
     let scramble_nonce_value = *scramble_nonce;
     let frame_snap_ratio = use_state(|| FRAME_SNAP_DEFAULT);
@@ -1275,6 +1414,10 @@ fn app() -> Html {
     let solved_value = *solved;
     let show_controls = use_state(|| false);
     let show_controls_value = *show_controls;
+    let show_debug = use_state(|| false);
+    let show_debug_value = *show_debug;
+    let dragging_members_value = (*dragging_members).clone();
+    let animating_members_value = (*animating_members).clone();
     let status_label = if solved_value { "Solved" } else { "In progress" };
     let status_class = if solved_value {
         "status status-solved"
@@ -1302,6 +1445,11 @@ fn app() -> Html {
         let positions = positions.clone();
         let active_id = active_id.clone();
         let drag_state = drag_state.clone();
+        let dragging_members = dragging_members.clone();
+        let animating_members = animating_members.clone();
+        let rotation_anim = rotation_anim.clone();
+        let rotation_anim_handle = rotation_anim_handle.clone();
+        let rotation_queue = rotation_queue.clone();
         let z_order = z_order.clone();
         let connections = connections.clone();
         let rotations = rotations.clone();
@@ -1347,11 +1495,17 @@ fn app() -> Html {
                                         z_order.set(state.z_order.clone());
                                         scramble_nonce.set(state.scramble_nonce);
                                         active_id.set(None);
+                                        dragging_members.set(Vec::new());
+                                        animating_members.set(Vec::new());
+                                        *rotation_anim.borrow_mut() = None;
+                                        rotation_anim_handle.borrow_mut().take();
+                                        rotation_queue.borrow_mut().clear();
                                         *drag_state.borrow_mut() = None;
                                         let solved_now = is_solved(
                                             &state.positions,
                                             &state.rotations,
                                             &state.flips,
+                                            &state.connections,
                                             cols,
                                             rows,
                                             piece_width,
@@ -1395,6 +1549,11 @@ fn app() -> Html {
                         );
                         positions.set(next_positions);
                         active_id.set(None);
+                        dragging_members.set(Vec::new());
+                        animating_members.set(Vec::new());
+                        *rotation_anim.borrow_mut() = None;
+                        rotation_anim_handle.borrow_mut().take();
+                        rotation_queue.borrow_mut().clear();
                         *drag_state.borrow_mut() = None;
                         z_order.set(order);
                         connections.set(vec![[false; 4]; cols * rows]);
@@ -1447,6 +1606,7 @@ fn app() -> Html {
         let rotations = rotations.clone();
         let flips = flips.clone();
         let positions = positions.clone();
+        let connections = connections.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
         let solved = solved.clone();
@@ -1470,10 +1630,12 @@ fn app() -> Html {
                 let piece_height = height as f64 / grid.rows as f64;
                 let positions_snapshot = (*positions).clone();
                 let flips_snapshot = (*flips).clone();
+                let connections_snapshot = (*connections).clone();
                 let solved_now = is_solved(
                     &positions_snapshot,
                     &rotations_snapshot,
                     &flips_snapshot,
+                    &connections_snapshot,
                     cols,
                     rows,
                     piece_width,
@@ -1482,6 +1644,40 @@ fn app() -> Html {
                 );
                 solved.set(solved_now);
             }
+        })
+    };
+    let on_rotation_noise = {
+        let rotation_noise = rotation_noise.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f64>() {
+                rotation_noise.set(value.clamp(ROTATION_NOISE_MIN, ROTATION_NOISE_MAX));
+            }
+        })
+    };
+    let on_animations_toggle = {
+        let animations_enabled = animations_enabled.clone();
+        let animating_members = animating_members.clone();
+        let rotation_anim = rotation_anim.clone();
+        let rotation_anim_handle = rotation_anim_handle.clone();
+        let rotation_queue = rotation_queue.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let enabled = input.checked();
+            animations_enabled.set(enabled);
+            if !enabled {
+                animating_members.set(Vec::new());
+                *rotation_anim.borrow_mut() = None;
+                rotation_anim_handle.borrow_mut().take();
+                rotation_queue.borrow_mut().clear();
+            }
+        })
+    };
+    let on_debug_toggle = {
+        let show_debug = show_debug.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            show_debug.set(input.checked());
         })
     };
 
@@ -1495,6 +1691,7 @@ fn app() -> Html {
         let grid_index = grid_index.clone();
         let scramble_nonce = scramble_nonce.clone();
         let active_id = active_id.clone();
+        let animating_members = animating_members.clone();
         use_effect_with(
             (
                 (*positions).clone(),
@@ -1506,6 +1703,7 @@ fn app() -> Html {
                 *scramble_nonce,
                 *image_size,
                 *active_id,
+                (*animating_members).clone(),
             ),
             move |(
                 positions_value,
@@ -1517,8 +1715,9 @@ fn app() -> Html {
                 scramble_nonce_value,
                 image_size_value,
                 active_id_value,
+                animating_members_value,
             )| {
-                if active_id_value.is_none() {
+                if active_id_value.is_none() && animating_members_value.is_empty() {
                     if let Some((width, height)) = *image_size_value {
                         let grid = GRID_PRESETS[*grid_index_value];
                         let total = (grid.cols * grid.rows) as usize;
@@ -1783,7 +1982,18 @@ fn app() -> Html {
         let positions_value = (*positions).clone();
         let rotations_value = (*rotations).clone();
         let flips_value = (*flips).clone();
-        let active_id_value = *active_id;
+        let mut dragging_mask = vec![false; (grid.cols * grid.rows) as usize];
+        for id in &dragging_members_value {
+            if *id < dragging_mask.len() {
+                dragging_mask[*id] = true;
+            }
+        }
+        let mut animating_mask = vec![false; (grid.cols * grid.rows) as usize];
+        for id in &animating_members_value {
+            if *id < animating_mask.len() {
+                animating_mask[*id] = true;
+            }
+        }
         let z_order_value = (*z_order).clone();
         let drag_move_common: Rc<dyn Fn(f64, f64) -> bool> = {
             let positions = positions.clone();
@@ -1921,6 +2131,11 @@ fn app() -> Html {
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let connections = connections.clone();
+            let dragging_members = dragging_members.clone();
+            let animating_members = animating_members.clone();
+            let rotation_anim = rotation_anim.clone();
+            let rotation_anim_handle = rotation_anim_handle.clone();
+            let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
             Rc::new(move |coords: Option<(f64, f64)>| {
                 let drag = drag_state.borrow().clone();
@@ -1930,10 +2145,316 @@ fn app() -> Html {
                     let mut next_rotations = (*rotations).clone();
                     let mut next_flips = (*flips).clone();
                     let mut next_connections = (*connections).clone();
+                    let start_positions_all = next.clone();
+                    let start_rotations_all = next_rotations.clone();
                     let cols = grid.cols as usize;
                     let rows = grid.rows as usize;
                     let snap_distance = piece_width.min(piece_height) * SNAP_DISTANCE_RATIO;
+                    let connect_distance =
+                        piece_width.min(piece_height) * CONNECT_DISTANCE_RATIO;
                     let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+                    let start_group_animation = {
+                        let positions = positions.clone();
+                        let rotations = rotations.clone();
+                        let flips = flips.clone();
+                        let connections = connections.clone();
+                        let solved = solved.clone();
+                        let rotation_anim = rotation_anim.clone();
+                        let rotation_anim_handle = rotation_anim_handle.clone();
+                        let animating_members = animating_members.clone();
+                        let rotation_queue = rotation_queue.clone();
+                        let rotation_enabled_value = rotation_enabled_value;
+                        let rotation_noise_value = rotation_noise_value;
+                        let animations_enabled_value = animations_enabled_value;
+                        let cols = cols;
+                        let rows = rows;
+                        let piece_width = piece_width;
+                        let piece_height = piece_height;
+                        move |anim: RotationAnimation| {
+                            if !animations_enabled_value {
+                                rotation_queue.borrow_mut().clear();
+                                let mut next_positions = (*positions).clone();
+                                let mut next_rotations = (*rotations).clone();
+                                match &anim.kind {
+                                    AnimationKind::Pivot {
+                                        pivot_x,
+                                        pivot_y,
+                                        delta,
+                                    } => {
+                                        for (index, member) in anim.members.iter().enumerate() {
+                                            if let Some(start) =
+                                                anim.start_positions.get(index)
+                                            {
+                                                let center_x = start.0 + piece_width * 0.5;
+                                                let center_y = start.1 + piece_height * 0.5;
+                                                let (rx, ry) = rotate_point(
+                                                    center_x,
+                                                    center_y,
+                                                    *pivot_x,
+                                                    *pivot_y,
+                                                    *delta,
+                                                );
+                                                if let Some(pos) =
+                                                    next_positions.get_mut(*member)
+                                                {
+                                                    *pos = (
+                                                        rx - piece_width * 0.5,
+                                                        ry - piece_height * 0.5,
+                                                    );
+                                                }
+                                                if let Some(rot) =
+                                                    next_rotations.get_mut(*member)
+                                                {
+                                                    let base = anim
+                                                        .start_rotations
+                                                        .get(index)
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    *rot = normalize_angle(base + *delta);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    AnimationKind::Anchor {
+                                        anchor_id,
+                                        target_center,
+                                        target_rot,
+                                        ..
+                                    } => {
+                                        let anchor_row = (*anchor_id / cols) as i32;
+                                        let anchor_col = (*anchor_id % cols) as i32;
+                                        let rot = normalize_angle(*target_rot);
+                                        for member in &anim.members {
+                                            let aligned = aligned_center_from_anchor(
+                                                anchor_row,
+                                                anchor_col,
+                                                *target_center,
+                                                *member,
+                                                cols,
+                                                piece_width,
+                                                piece_height,
+                                                rot,
+                                            );
+                                            if let Some(pos) = next_positions.get_mut(*member) {
+                                                *pos = (
+                                                    aligned.0 - piece_width * 0.5,
+                                                    aligned.1 - piece_height * 0.5,
+                                                );
+                                            }
+                                            if let Some(rot_ref) =
+                                                next_rotations.get_mut(*member)
+                                            {
+                                                *rot_ref = rot;
+                                            }
+                                        }
+                                    }
+                                }
+                                positions.set(next_positions.clone());
+                                rotations.set(next_rotations.clone());
+                                animating_members.set(Vec::new());
+                                *rotation_anim.borrow_mut() = None;
+                                rotation_anim_handle.borrow_mut().take();
+                                let flips_snapshot = (*flips).clone();
+                                let connections_snapshot = (*connections).clone();
+                                let solved_now = is_solved(
+                                    &next_positions,
+                                    &next_rotations,
+                                    &flips_snapshot,
+                                    &connections_snapshot,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    rotation_enabled_value,
+                                );
+                                solved.set(solved_now);
+                                return;
+                            }
+                            let members = anim.members.clone();
+                            *rotation_anim.borrow_mut() = Some(anim);
+                            animating_members.set(members);
+                            rotation_anim_handle.borrow_mut().take();
+                            let positions = positions.clone();
+                            let rotations = rotations.clone();
+                            let flips = flips.clone();
+                            let connections = connections.clone();
+                            let solved = solved.clone();
+                            let rotation_anim = rotation_anim.clone();
+                            let rotation_anim_handle = rotation_anim_handle.clone();
+                            let animating_members = animating_members.clone();
+                            let rotation_anim_handle_for_tick = rotation_anim_handle.clone();
+                            let rotation_queue = rotation_queue.clone();
+                            let interval = Interval::new(16, move || {
+                                let now = Date::now();
+                                let anim = match rotation_anim.borrow().clone() {
+                                    Some(value) => value,
+                                    None => {
+                                        rotation_anim_handle_for_tick.borrow_mut().take();
+                                        animating_members.set(Vec::new());
+                                        return;
+                                    }
+                                };
+                                let mut t = (now - anim.start_time) / anim.duration;
+                                if t < 0.0 {
+                                    t = 0.0;
+                                } else if t > 1.0 {
+                                    t = 1.0;
+                                }
+                                let eased = t * t * (3.0 - 2.0 * t);
+                                let mut next_positions = (*positions).clone();
+                                let mut next_rotations = (*rotations).clone();
+                                match &anim.kind {
+                                    AnimationKind::Pivot {
+                                        pivot_x,
+                                        pivot_y,
+                                        delta,
+                                    } => {
+                                        let current_delta = *delta * eased;
+                                        for (index, member) in anim.members.iter().enumerate() {
+                                            if let Some(start) = anim.start_positions.get(index) {
+                                                let center_x = start.0 + piece_width * 0.5;
+                                                let center_y = start.1 + piece_height * 0.5;
+                                                let (rx, ry) = rotate_point(
+                                                    center_x,
+                                                    center_y,
+                                                    *pivot_x,
+                                                    *pivot_y,
+                                                    current_delta,
+                                                );
+                                                if let Some(pos) =
+                                                    next_positions.get_mut(*member)
+                                                {
+                                                    *pos = (
+                                                        rx - piece_width * 0.5,
+                                                        ry - piece_height * 0.5,
+                                                    );
+                                                }
+                                                if let Some(rot) =
+                                                    next_rotations.get_mut(*member)
+                                                {
+                                                    let base = anim
+                                                        .start_rotations
+                                                        .get(index)
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    *rot = normalize_angle(base + current_delta);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    AnimationKind::Anchor {
+                                        anchor_id,
+                                        start_center,
+                                        target_center,
+                                        start_rot,
+                                        target_rot,
+                                    } => {
+                                        let anchor_row = (*anchor_id / cols) as i32;
+                                        let anchor_col = (*anchor_id % cols) as i32;
+                                        let center = (
+                                            start_center.0
+                                                + (target_center.0 - start_center.0) * eased,
+                                            start_center.1
+                                                + (target_center.1 - start_center.1) * eased,
+                                        );
+                                        let delta = angle_delta(*target_rot, *start_rot);
+                                        let rot = normalize_angle(*start_rot + delta * eased);
+                                        for member in &anim.members {
+                                            let aligned = aligned_center_from_anchor(
+                                                anchor_row,
+                                                anchor_col,
+                                                center,
+                                                *member,
+                                                cols,
+                                                piece_width,
+                                                piece_height,
+                                                rot,
+                                            );
+                                            if let Some(pos) = next_positions.get_mut(*member) {
+                                                *pos = (
+                                                    aligned.0 - piece_width * 0.5,
+                                                    aligned.1 - piece_height * 0.5,
+                                                );
+                                            }
+                                            if let Some(rot_ref) =
+                                                next_rotations.get_mut(*member)
+                                            {
+                                                *rot_ref = rot;
+                                            }
+                                        }
+                                    }
+                                }
+                                positions.set(next_positions.clone());
+                                rotations.set(next_rotations.clone());
+                                if t >= 1.0 {
+                                    let queued = rotation_queue.borrow_mut().pop_front();
+                                    if let Some(next_step) = queued {
+                                        let members = next_step.members.clone();
+                                        let mut start_positions =
+                                            Vec::with_capacity(members.len());
+                                        let mut start_rotations =
+                                            Vec::with_capacity(members.len());
+                                        for member in &members {
+                                            if let Some(pos) =
+                                                next_positions.get(*member)
+                                            {
+                                                start_positions.push(*pos);
+                                            } else {
+                                                start_positions.push((0.0, 0.0));
+                                            }
+                                            let rot = next_rotations
+                                                .get(*member)
+                                                .copied()
+                                                .unwrap_or(0.0);
+                                            start_rotations.push(rot);
+                                        }
+                                        let current_angle = members
+                                            .first()
+                                            .and_then(|id| next_rotations.get(*id))
+                                            .copied()
+                                            .unwrap_or(0.0);
+                                        let delta = click_rotation_delta(
+                                            current_angle,
+                                            next_step.noise,
+                                            rotation_noise_value,
+                                        );
+                                        *rotation_anim.borrow_mut() = Some(RotationAnimation {
+                                            start_time: Date::now(),
+                                            duration: SNAP_ANIMATION_MS,
+                                            members: members.clone(),
+                                            start_positions,
+                                            start_rotations,
+                                            kind: AnimationKind::Pivot {
+                                                pivot_x: next_step.pivot_x,
+                                                pivot_y: next_step.pivot_y,
+                                                delta,
+                                            },
+                                        });
+                                        animating_members.set(members);
+                                        return;
+                                    }
+                                    *rotation_anim.borrow_mut() = None;
+                                    animating_members.set(Vec::new());
+                                    let flips_snapshot = (*flips).clone();
+                                    let connections_snapshot = (*connections).clone();
+                                    let solved_now = is_solved(
+                                        &next_positions,
+                                        &next_rotations,
+                                        &flips_snapshot,
+                                        &connections_snapshot,
+                                        cols,
+                                        rows,
+                                        piece_width,
+                                        piece_height,
+                                        rotation_enabled_value,
+                                    );
+                                    solved.set(solved_now);
+                                    rotation_anim_handle_for_tick.borrow_mut().take();
+                                }
+                            });
+                            *rotation_anim_handle.borrow_mut() = Some(interval);
+                        }
+                    };
                     if let Some((x, y)) = coords {
                         let dx = x - drag.start_x;
                         let dy = y - drag.start_y;
@@ -1951,6 +2472,7 @@ fn app() -> Html {
                                     &next,
                                     &next_rotations,
                                     &next_flips,
+                                    &next_connections,
                                     cols,
                                     rows,
                                     piece_width,
@@ -1963,6 +2485,7 @@ fn app() -> Html {
                                 flips.set(next_flips);
                                 solved.set(solved_now);
                                 active_id.set(None);
+                                dragging_members.set(Vec::new());
                                 *drag_state.borrow_mut() = None;
                                 return true;
                             }
@@ -1975,6 +2498,7 @@ fn app() -> Html {
                                     &next,
                                     &next_rotations,
                                     &next_flips,
+                                    &next_connections,
                                     cols,
                                     rows,
                                     piece_width,
@@ -1987,56 +2511,79 @@ fn app() -> Html {
                                 flips.set(next_flips);
                                 solved.set(solved_now);
                                 active_id.set(None);
+                                dragging_members.set(Vec::new());
                                 *drag_state.borrow_mut() = None;
                                 return true;
                             }
                             if rotation_enabled_value && !drag.members.is_empty() {
                                 let pivot_x = drag.start_x;
                                 let pivot_y = drag.start_y;
-                                let current_positions = next.clone();
+                                let mut noise = 0.0;
+                                if rotation_noise_value > 0.0 {
+                                    let noise_seed = splitmix64(
+                                        (drag.start_time as u64)
+                                            ^ (drag.primary_id as u64)
+                                                .wrapping_mul(0x9e3779b97f4a7c15),
+                                    );
+                                    noise = rand_range(
+                                        noise_seed,
+                                        drag.members.len() as u64,
+                                        -rotation_noise_value,
+                                        rotation_noise_value,
+                                    );
+                                }
+                                let members = drag.members.clone();
+                                if animations_enabled_value {
+                                    if let Some(active_anim) = rotation_anim.borrow().clone() {
+                                        if active_anim.members.contains(&click_id) {
+                                            rotation_queue
+                                                .borrow_mut()
+                                                .push_back(QueuedRotation {
+                                                    members: active_anim.members,
+                                                    pivot_x,
+                                                    pivot_y,
+                                                    noise,
+                                                });
+                                            dragging_members.set(Vec::new());
+                                            active_id.set(None);
+                                            *drag_state.borrow_mut() = None;
+                                            return true;
+                                        }
+                                    }
+                                }
                                 let current_angle = drag
                                     .members
                                     .first()
                                     .and_then(|id| next_rotations.get(*id))
                                     .copied()
                                     .unwrap_or(0.0);
-                                let target_angle = next_snap_rotation(current_angle);
-                                let delta = angle_delta(target_angle, current_angle);
-                                for member in &drag.members {
-                                    if let Some(pos) = current_positions.get(*member) {
-                                        let center_x = pos.0 + piece_width * 0.5;
-                                        let center_y = pos.1 + piece_height * 0.5;
-                                        let (rx, ry) = rotate_point(
-                                            center_x,
-                                            center_y,
-                                            pivot_x,
-                                            pivot_y,
-                                            delta,
-                                        );
-                                        if let Some(pos) = next.get_mut(*member) {
-                                            *pos = (
-                                                rx - piece_width * 0.5,
-                                                ry - piece_height * 0.5,
-                                            );
-                                        }
-                                        if let Some(rot) = next_rotations.get_mut(*member) {
-                                            *rot = normalize_angle(*rot + delta);
-                                        }
+                                let delta =
+                                    click_rotation_delta(current_angle, noise, rotation_noise_value);
+                                let mut start_positions = Vec::with_capacity(members.len());
+                                let mut start_rotations = Vec::with_capacity(members.len());
+                                for member in &members {
+                                    if let Some(pos) = next.get(*member) {
+                                        start_positions.push(*pos);
+                                    } else {
+                                        start_positions.push((0.0, 0.0));
                                     }
+                                    let rot = next_rotations.get(*member).copied().unwrap_or(0.0);
+                                    start_rotations.push(rot);
                                 }
-                                let solved_now = is_solved(
-                                    &next,
-                                    &next_rotations,
-                                    &next_flips,
-                                    cols,
-                                    rows,
-                                    piece_width,
-                                    piece_height,
-                                    rotation_enabled_value,
-                                );
-                                positions.set(next);
-                                rotations.set(next_rotations);
-                                solved.set(solved_now);
+                                rotation_queue.borrow_mut().clear();
+                                start_group_animation(RotationAnimation {
+                                    start_time: Date::now(),
+                                    duration: SNAP_ANIMATION_MS,
+                                    members: members.clone(),
+                                    start_positions,
+                                    start_rotations,
+                                    kind: AnimationKind::Pivot {
+                                        pivot_x,
+                                        pivot_y,
+                                        delta,
+                                    },
+                                });
+                                dragging_members.set(Vec::new());
                                 active_id.set(None);
                                 *drag_state.borrow_mut() = None;
                                 return true;
@@ -2050,7 +2597,17 @@ fn app() -> Html {
                         }
                     }
 
-                    let mut best: Option<(f64, f64, f64, usize, usize)> = None;
+                    #[derive(Clone, Copy)]
+                    struct SnapCandidate {
+                        member: usize,
+                        dir: usize,
+                        center_b: (f64, f64),
+                        rot_b: f64,
+                        base: (f64, f64),
+                        dist: f64,
+                    }
+
+                    let mut candidates = Vec::new();
                     for member in &drag.members {
                         if *member >= next.len() {
                             continue;
@@ -2073,7 +2630,7 @@ fn app() -> Html {
                                     continue;
                                 }
                                 let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
-                                if !angle_matches(rot_a, rot_b) {
+                                if !rotation_enabled_value && !angle_matches(rot_a, rot_b) {
                                     continue;
                                 }
                                 let base = match dir {
@@ -2083,7 +2640,8 @@ fn app() -> Html {
                                     DIR_DOWN => (0.0, piece_height),
                                     _ => (0.0, 0.0),
                                 };
-                                let (vx, vy) = rotate_vec(base.0, base.1, rot_a);
+                                let expected_rot = if rotation_enabled_value { rot_b } else { rot_a };
+                                let (vx, vy) = rotate_vec(base.0, base.1, expected_rot);
                                 let neighbor_pos = next[neighbor];
                                 let center_b = (
                                     neighbor_pos.0 + piece_width * 0.5,
@@ -2094,106 +2652,176 @@ fn app() -> Html {
                                 let dy = actual.1 - vy;
                                 let dist = (dx * dx + dy * dy).sqrt();
                                 if dist <= snap_distance {
-                                    match best {
-                                        Some((best_dist, _, _, _, _)) if dist >= best_dist => {}
-                                        _ => best = Some((dist, dx, dy, *member, dir)),
-                                    }
+                                    candidates.push(SnapCandidate {
+                                        member: *member,
+                                        dir,
+                                        center_b,
+                                        rot_b,
+                                        base,
+                                        dist,
+                                    });
                                 }
                             }
                         }
                     }
 
-                    if let Some((_dist, dx, dy, member, dir)) = best {
-                        let mut min_x = f64::INFINITY;
-                        let mut max_x = f64::NEG_INFINITY;
-                        let mut min_y = f64::INFINITY;
-                        let mut max_y = f64::NEG_INFINITY;
-                        for id in &drag.members {
-                            if let Some(pos) = next.get(*id) {
-                                let center_x = pos.0 + piece_width * 0.5;
-                                let center_y = pos.1 + piece_height * 0.5;
-                                min_x = min_x.min(center_x);
-                                max_x = max_x.max(center_x);
-                                min_y = min_y.min(center_y);
-                                max_y = max_y.max(center_y);
-                            }
-                        }
-                        let can_snap = min_x.is_finite()
-                            && min_y.is_finite()
-                            && min_x + dx >= center_min_x
-                            && max_x + dx <= center_max_x
-                            && min_y + dy >= center_min_y
-                            && max_y + dy <= center_max_y;
-                        if can_snap {
-                            for id in &drag.members {
-                                if let Some(pos) = next.get_mut(*id) {
-                                    *pos = (pos.0 + dx, pos.1 + dy);
-                                }
-                            }
-                            set_connection(
-                                &mut next_connections,
-                                member,
-                                dir,
-                                true,
-                                cols,
-                                rows,
+                    let mut snap_anchor: Option<(usize, (f64, f64), f64)> = None;
+                    if !candidates.is_empty() {
+                        let mut best_index = None;
+                        let mut best_count = 0usize;
+                        let mut best_error = f64::INFINITY;
+                        let mut best_dist = f64::INFINITY;
+                        let mut best_anchor_id = 0usize;
+                        let mut best_anchor_center = (0.0, 0.0);
+                        let mut best_target_rot = 0.0;
+
+                        for (idx, candidate) in candidates.iter().enumerate() {
+                            let target_rot = if rotation_enabled_value {
+                                normalize_angle(candidate.rot_b)
+                            } else {
+                                0.0
+                            };
+                            let anchor_id = candidate.member;
+                            let anchor_row = (anchor_id / cols) as i32;
+                            let anchor_col = (anchor_id % cols) as i32;
+                            let expected =
+                                rotate_vec(candidate.base.0, candidate.base.1, target_rot);
+                            let anchor_center = (
+                                candidate.center_b.0 - expected.0,
+                                candidate.center_b.1 - expected.1,
                             );
-                        }
-                    }
 
-                    for member in &drag.members {
-                        if *member >= next.len() {
-                            continue;
-                        }
-                        if next_flips.get(*member).copied().unwrap_or(false) {
-                            continue;
-                        }
-                        let current = next[*member];
-                        let center_a = (
-                            current.0 + piece_width * 0.5,
-                            current.1 + piece_height * 0.5,
-                        );
-                        let rot_a = next_rotations.get(*member).copied().unwrap_or(0.0);
-                        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-                            if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
-                                if in_group[neighbor] {
+                            let mut min_cx = f64::INFINITY;
+                            let mut max_cx = f64::NEG_INFINITY;
+                            let mut min_cy = f64::INFINITY;
+                            let mut max_cy = f64::NEG_INFINITY;
+                            for id in &drag.members {
+                                    let transformed = aligned_center_from_anchor(
+                                        anchor_row,
+                                        anchor_col,
+                                        anchor_center,
+                                        *id,
+                                        cols,
+                                        piece_width,
+                                        piece_height,
+                                        target_rot,
+                                    );
+                                    min_cx = min_cx.min(transformed.0);
+                                    max_cx = max_cx.max(transformed.0);
+                                    min_cy = min_cy.min(transformed.1);
+                                    max_cy = max_cy.max(transformed.1);
+                            }
+                            let can_snap = min_cx.is_finite()
+                                && min_cy.is_finite()
+                                && min_cx >= center_min_x
+                                && max_cx <= center_max_x
+                                && min_cy >= center_min_y
+                                && max_cy <= center_max_y;
+                            if !can_snap {
+                                continue;
+                            }
+
+                            let mut count = 0usize;
+                            let mut error_sum = 0.0;
+                            for other in &candidates {
+                                if rotation_enabled_value
+                                    && !angle_matches(target_rot, other.rot_b)
+                                {
                                     continue;
                                 }
-                                if next_flips.get(neighbor).copied().unwrap_or(false) {
-                                    continue;
-                                }
-                                let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
-                                if !angle_matches(rot_a, rot_b) {
-                                    continue;
-                                }
-                                let base = match dir {
-                                    DIR_LEFT => (-piece_width, 0.0),
-                                    DIR_RIGHT => (piece_width, 0.0),
-                                    DIR_UP => (0.0, -piece_height),
-                                    DIR_DOWN => (0.0, piece_height),
-                                    _ => (0.0, 0.0),
-                                };
-                                let (vx, vy) = rotate_vec(base.0, base.1, rot_a);
-                                let neighbor_pos = next[neighbor];
-                                let center_b = (
-                                    neighbor_pos.0 + piece_width * 0.5,
-                                    neighbor_pos.1 + piece_height * 0.5,
+                                let new_center = aligned_center_from_anchor(
+                                    anchor_row,
+                                    anchor_col,
+                                    anchor_center,
+                                    other.member,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
+                                    target_rot,
                                 );
-                                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
-                                let dx = actual.0 - vx;
-                                let dy = actual.1 - vy;
+                                let expected =
+                                    rotate_vec(other.base.0, other.base.1, target_rot);
+                                let actual = (
+                                    other.center_b.0 - new_center.0,
+                                    other.center_b.1 - new_center.1,
+                                );
+                                let dx = actual.0 - expected.0;
+                                let dy = actual.1 - expected.1;
                                 let dist = (dx * dx + dy * dy).sqrt();
-                                if dist <= snap_distance {
+                                if dist <= connect_distance {
+                                    count += 1;
+                                    error_sum += dist;
+                                }
+                            }
+
+                            if count > best_count
+                                || (count == best_count
+                                    && (error_sum < best_error
+                                        || (error_sum == best_error
+                                            && candidate.dist < best_dist)))
+                            {
+                                best_index = Some(idx);
+                                best_count = count;
+                                best_error = error_sum;
+                                best_dist = candidate.dist;
+                                best_anchor_id = anchor_id;
+                                best_anchor_center = anchor_center;
+                                best_target_rot = target_rot;
+                            }
+                        }
+
+                        if let Some(_best_idx) = best_index {
+                            align_group_to_anchor(
+                                &mut next,
+                                &mut next_rotations,
+                                &drag.members,
+                                best_anchor_id,
+                                best_anchor_center,
+                                best_target_rot,
+                                cols,
+                                piece_width,
+                                piece_height,
+                            );
+
+                            for candidate in &candidates {
+                                if rotation_enabled_value
+                                    && !angle_matches(best_target_rot, candidate.rot_b)
+                                {
+                                    continue;
+                                }
+                                let new_center = aligned_center_from_anchor(
+                                    (best_anchor_id / cols) as i32,
+                                    (best_anchor_id % cols) as i32,
+                                    best_anchor_center,
+                                    candidate.member,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
+                                    best_target_rot,
+                                );
+                                let expected =
+                                    rotate_vec(candidate.base.0, candidate.base.1, best_target_rot);
+                                let actual = (
+                                    candidate.center_b.0 - new_center.0,
+                                    candidate.center_b.1 - new_center.1,
+                                );
+                                let dx = actual.0 - expected.0;
+                                let dy = actual.1 - expected.1;
+                                let dist = (dx * dx + dy * dy).sqrt();
+                                if dist <= connect_distance {
                                     set_connection(
                                         &mut next_connections,
-                                        *member,
-                                        dir,
+                                        candidate.member,
+                                        candidate.dir,
                                         true,
                                         cols,
                                         rows,
                                     );
                                 }
                             }
+
+                            snap_anchor =
+                                Some((best_anchor_id, best_anchor_center, best_target_rot));
                         }
                     }
 
@@ -2202,32 +2830,292 @@ fn app() -> Html {
                         .first()
                         .map(|id| collect_group(&next_connections, *id, cols, rows))
                         .unwrap_or_default();
+                    if rotation_enabled_value {
+                        if let Some((anchor_id, anchor_center, target_rot)) = snap_anchor {
+                            if !group_after.is_empty() {
+                                align_group_to_anchor(
+                                    &mut next,
+                                    &mut next_rotations,
+                                    &group_after,
+                                    anchor_id,
+                                    anchor_center,
+                                    target_rot,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
+                                );
+                            }
+                        }
+                    }
                     if !group_after.is_empty() {
-                        let mut min_x = f64::INFINITY;
-                        let mut min_y = f64::INFINITY;
-                        let mut max_x = f64::NEG_INFINITY;
-                        let mut max_y = f64::NEG_INFINITY;
-                        for id in &group_after {
-                            if let Some(pos) = next.get(*id) {
-                                min_x = min_x.min(pos.0);
-                                min_y = min_y.min(pos.1);
-                                max_x = max_x.max(pos.0 + piece_width);
-                                max_y = max_y.max(pos.1 + piece_height);
+                        let frame_width = cols as f64 * piece_width;
+                        let frame_height = rows as f64 * piece_height;
+                        let corner_snap_distance = snap_distance * frame_snap_ratio_value;
+                        let mut corner_snapped = false;
+                        if rotation_enabled_value
+                            && group_after.len() < cols * rows
+                            && corner_snap_distance > 0.0
+                        {
+                            let mut best_corner = None;
+                            let target_center_for = |corner: usize, rotation: f64| {
+                                let rotation = normalize_angle(rotation);
+                                let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
+                                let (offset_x, offset_y) = if swap {
+                                    (piece_height * 0.5, piece_width * 0.5)
+                                } else {
+                                    (piece_width * 0.5, piece_height * 0.5)
+                                };
+                                match corner {
+                                    0 => (offset_x, offset_y),
+                                    1 => (frame_width - offset_x, offset_y),
+                                    2 => (frame_width - offset_x, frame_height - offset_y),
+                                    3 => (offset_x, frame_height - offset_y),
+                                    _ => (offset_x, offset_y),
+                                }
+                            };
+                            for id in &group_after {
+                                if *id >= next.len() {
+                                    continue;
+                                }
+                                if next_flips.get(*id).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                let row = *id / cols;
+                                let col = *id % cols;
+                                let piece_corner = if row == 0 && col == 0 {
+                                    Some(0usize)
+                                } else if row == 0 && col + 1 == cols {
+                                    Some(1usize)
+                                } else if row + 1 == rows && col + 1 == cols {
+                                    Some(2usize)
+                                } else if row + 1 == rows && col == 0 {
+                                    Some(3usize)
+                                } else {
+                                    None
+                                };
+                                let piece_corner = match piece_corner {
+                                    Some(value) => value,
+                                    None => continue,
+                                };
+                                let current = next[*id];
+                                let current_center = (
+                                    current.0 + piece_width * 0.5,
+                                    current.1 + piece_height * 0.5,
+                                );
+                                for target_corner in 0..4usize {
+                                    let steps = (target_corner + 4 - piece_corner) % 4;
+                                    let target_rot =
+                                        normalize_angle(steps as f64 * ROTATION_STEP_DEG);
+                                    let target_center = target_center_for(target_corner, target_rot);
+                                    let dx = current_center.0 - target_center.0;
+                                    let dy = current_center.1 - target_center.1;
+                                    let dist = (dx * dx + dy * dy).sqrt();
+                                    if dist > corner_snap_distance {
+                                        continue;
+                                    }
+                                    let anchor_row = (*id / cols) as i32;
+                                    let anchor_col = (*id % cols) as i32;
+                                    let mut min_cx = f64::INFINITY;
+                                    let mut max_cx = f64::NEG_INFINITY;
+                                    let mut min_cy = f64::INFINITY;
+                                    let mut max_cy = f64::NEG_INFINITY;
+                                    for member in &group_after {
+                                        let center = aligned_center_from_anchor(
+                                            anchor_row,
+                                            anchor_col,
+                                            target_center,
+                                            *member,
+                                            cols,
+                                            piece_width,
+                                            piece_height,
+                                            target_rot,
+                                        );
+                                        min_cx = min_cx.min(center.0);
+                                        max_cx = max_cx.max(center.0);
+                                        min_cy = min_cy.min(center.1);
+                                        max_cy = max_cy.max(center.1);
+                                    }
+                                    let can_snap = min_cx.is_finite()
+                                        && min_cy.is_finite()
+                                        && min_cx >= center_min_x
+                                        && max_cx <= center_max_x
+                                        && min_cy >= center_min_y
+                                        && max_cy <= center_max_y;
+                                    if !can_snap {
+                                        continue;
+                                    }
+                                    let should_replace = match best_corner {
+                                        None => true,
+                                        Some((_best_id, _best_center, _best_rot, best_dist)) => {
+                                            dist < best_dist
+                                        }
+                                    };
+                                    if should_replace {
+                                        best_corner =
+                                            Some((*id, target_center, target_rot, dist));
+                                    }
+                                }
+                            }
+                            if let Some((anchor_id, anchor_center, target_rot, _)) = best_corner {
+                                align_group_to_anchor(
+                                    &mut next,
+                                    &mut next_rotations,
+                                    &group_after,
+                                    anchor_id,
+                                    anchor_center,
+                                    target_rot,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
+                                );
+                                corner_snapped = true;
+                            }
+                        }
+                        if rotation_enabled_value
+                            && !corner_snapped
+                            && group_after.len() < cols * rows
+                            && corner_snap_distance > 0.0
+                        {
+                            let mut best_edge = None;
+                            for id in &group_after {
+                                if *id >= next.len() {
+                                    continue;
+                                }
+                                if next_flips.get(*id).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                let row = *id / cols;
+                                let col = *id % cols;
+                                let is_corner = (row == 0 || row + 1 == rows)
+                                    && (col == 0 || col + 1 == cols);
+                                if is_corner {
+                                    continue;
+                                }
+                                let edge_side = if row == 0 {
+                                    Some(DIR_UP)
+                                } else if row + 1 == rows {
+                                    Some(DIR_DOWN)
+                                } else if col == 0 {
+                                    Some(DIR_LEFT)
+                                } else if col + 1 == cols {
+                                    Some(DIR_RIGHT)
+                                } else {
+                                    None
+                                };
+                                let edge_side = match edge_side {
+                                    Some(value) => value,
+                                    None => continue,
+                                };
+                                let current = next[*id];
+                                let current_center = (
+                                    current.0 + piece_width * 0.5,
+                                    current.1 + piece_height * 0.5,
+                                );
+                                for target_edge in 0..4usize {
+                                    let steps = (target_edge + 4 - edge_side) % 4;
+                                    let target_rot =
+                                        normalize_angle(steps as f64 * ROTATION_STEP_DEG);
+                                    let swap =
+                                        ((target_rot / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
+                                    let (rot_w, rot_h) = if swap {
+                                        (piece_height, piece_width)
+                                    } else {
+                                        (piece_width, piece_height)
+                                    };
+                                    let target_center = match target_edge {
+                                        DIR_UP => (current_center.0, rot_h * 0.5),
+                                        DIR_RIGHT => (frame_width - rot_w * 0.5, current_center.1),
+                                        DIR_DOWN => (
+                                            current_center.0,
+                                            frame_height - rot_h * 0.5,
+                                        ),
+                                        DIR_LEFT => (rot_w * 0.5, current_center.1),
+                                        _ => (current_center.0, current_center.1),
+                                    };
+                                    let dist = if target_edge == DIR_UP || target_edge == DIR_DOWN {
+                                        (current_center.1 - target_center.1).abs()
+                                    } else {
+                                        (current_center.0 - target_center.0).abs()
+                                    };
+                                    if dist > corner_snap_distance {
+                                        continue;
+                                    }
+                                    let anchor_row = (*id / cols) as i32;
+                                    let anchor_col = (*id % cols) as i32;
+                                    let mut min_cx = f64::INFINITY;
+                                    let mut max_cx = f64::NEG_INFINITY;
+                                    let mut min_cy = f64::INFINITY;
+                                    let mut max_cy = f64::NEG_INFINITY;
+                                    for member in &group_after {
+                                        let center = aligned_center_from_anchor(
+                                            anchor_row,
+                                            anchor_col,
+                                            target_center,
+                                            *member,
+                                            cols,
+                                            piece_width,
+                                            piece_height,
+                                            target_rot,
+                                        );
+                                        min_cx = min_cx.min(center.0);
+                                        max_cx = max_cx.max(center.0);
+                                        min_cy = min_cy.min(center.1);
+                                        max_cy = max_cy.max(center.1);
+                                    }
+                                    let can_snap = min_cx.is_finite()
+                                        && min_cy.is_finite()
+                                        && min_cx >= center_min_x
+                                        && max_cx <= center_max_x
+                                        && min_cy >= center_min_y
+                                        && max_cy <= center_max_y;
+                                    if !can_snap {
+                                        continue;
+                                    }
+                                    let should_replace = match best_edge {
+                                        None => true,
+                                        Some((_best_id, _best_center, _best_rot, best_dist)) => {
+                                            dist < best_dist
+                                        }
+                                    };
+                                    if should_replace {
+                                        best_edge =
+                                            Some((*id, target_center, target_rot, dist));
+                                    }
+                                }
+                            }
+                            if let Some((anchor_id, anchor_center, target_rot, _)) = best_edge {
+                                align_group_to_anchor(
+                                    &mut next,
+                                    &mut next_rotations,
+                                    &group_after,
+                                    anchor_id,
+                                    anchor_center,
+                                    target_rot,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
+                                );
                             }
                         }
 
                         if group_after.len() == cols * rows {
-                            let center_x = (min_x + max_x) * 0.5;
-                            let center_y = (min_y + max_y) * 0.5;
                             let stage_center_x = view_min_x + view_width * 0.5;
                             let stage_center_y = view_min_y + view_height * 0.5;
-                            let dx = stage_center_x - center_x;
-                            let dy = stage_center_y - center_y;
-                            for id in &group_after {
-                                if let Some(pos) = next.get_mut(*id) {
-                                    *pos = (pos.0 + dx, pos.1 + dy);
-                                }
-                            }
+                            let target_center = (
+                                stage_center_x - frame_width * 0.5 + piece_width * 0.5,
+                                stage_center_y - frame_height * 0.5 + piece_height * 0.5,
+                            );
+                            align_group_to_anchor(
+                                &mut next,
+                                &mut next_rotations,
+                                &group_after,
+                                0,
+                                target_center,
+                                0.0,
+                                cols,
+                                piece_width,
+                                piece_height,
+                            );
                         } else {
                             let mut in_group = vec![false; cols * rows];
                             for id in &group_after {
@@ -2251,29 +3139,30 @@ fn app() -> Html {
                                     }
                                 }
                             }
-                            let mut rotation_ok = true;
-                            if rotation_enabled_value {
-                                for id in &group_after {
-                                    if let Some(rot) = next_rotations.get(*id) {
-                                        if angle_delta(0.0, *rot).abs()
-                                            > ROTATION_SNAP_TOLERANCE_DEG
-                                        {
-                                            rotation_ok = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if has_borders && rotation_ok {
-                                let dx = -min_x;
-                                let dy = -min_y;
-                                let dist = (dx * dx + dy * dy).sqrt();
+                            if has_borders {
                                 let frame_snap_distance = snap_distance * frame_snap_ratio_value;
-                                if dist <= frame_snap_distance {
-                                    for id in &group_after {
-                                        if let Some(pos) = next.get_mut(*id) {
-                                            *pos = (pos.0 + dx, pos.1 + dy);
-                                        }
+                                let anchor_id = 0usize;
+                                if let Some(anchor_pos) = next.get(anchor_id) {
+                                    let current_center = (
+                                        anchor_pos.0 + piece_width * 0.5,
+                                        anchor_pos.1 + piece_height * 0.5,
+                                    );
+                                    let target_center = (piece_width * 0.5, piece_height * 0.5);
+                                    let dx = current_center.0 - target_center.0;
+                                    let dy = current_center.1 - target_center.1;
+                                    let dist = (dx * dx + dy * dy).sqrt();
+                                    if dist <= frame_snap_distance {
+                                        align_group_to_anchor(
+                                            &mut next,
+                                            &mut next_rotations,
+                                            &group_after,
+                                            anchor_id,
+                                            target_center,
+                                            0.0,
+                                            cols,
+                                            piece_width,
+                                            piece_height,
+                                        );
                                     }
                                 }
                             }
@@ -2323,10 +3212,82 @@ fn app() -> Html {
                         }
                     }
 
+                    let mut pending_animation = None;
+                    if rotation_enabled_value && !group_after.is_empty() {
+                        let anchor_id = if group_after.contains(&drag.primary_id) {
+                            drag.primary_id
+                        } else {
+                            group_after[0]
+                        };
+                        if anchor_id < next.len() {
+                            let start_rot = start_rotations_all
+                                .get(anchor_id)
+                                .copied()
+                                .unwrap_or(0.0);
+                            let target_rot = next_rotations
+                                .get(anchor_id)
+                                .copied()
+                                .unwrap_or(start_rot);
+                            if angle_delta(target_rot, start_rot).abs() > 0.01 {
+                                let start_pos = start_positions_all
+                                    .get(anchor_id)
+                                    .copied()
+                                    .unwrap_or(next[anchor_id]);
+                                let target_pos = next[anchor_id];
+                                let start_center = (
+                                    start_pos.0 + piece_width * 0.5,
+                                    start_pos.1 + piece_height * 0.5,
+                                );
+                                let target_center = (
+                                    target_pos.0 + piece_width * 0.5,
+                                    target_pos.1 + piece_height * 0.5,
+                                );
+                                let mut member_positions = Vec::with_capacity(group_after.len());
+                                let mut member_rotations = Vec::with_capacity(group_after.len());
+                                for member in &group_after {
+                                    if let Some(pos) = start_positions_all.get(*member) {
+                                        member_positions.push(*pos);
+                                    } else {
+                                        member_positions.push((0.0, 0.0));
+                                    }
+                                    let rot = start_rotations_all
+                                        .get(*member)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    member_rotations.push(rot);
+                                }
+                                pending_animation = Some(RotationAnimation {
+                                    start_time: Date::now(),
+                                    duration: SNAP_ANIMATION_MS,
+                                    members: group_after.clone(),
+                                    start_positions: member_positions,
+                                    start_rotations: member_rotations,
+                                    kind: AnimationKind::Anchor {
+                                        anchor_id,
+                                        start_center,
+                                        target_center,
+                                        start_rot,
+                                        target_rot,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    if let Some(anim) = pending_animation {
+                        connections.set(next_connections);
+                        flips.set(next_flips);
+                        start_group_animation(anim);
+                        active_id.set(None);
+                        dragging_members.set(Vec::new());
+                        *drag_state.borrow_mut() = None;
+                        return true;
+                    }
+
                     let solved_now = is_solved(
                         &next,
                         &next_rotations,
                         &next_flips,
+                        &next_connections,
                         cols,
                         rows,
                         piece_width,
@@ -2335,9 +3296,11 @@ fn app() -> Html {
                     );
                     positions.set(next);
                     connections.set(next_connections);
+                    rotations.set(next_rotations);
                     flips.set(next_flips);
                     solved.set(solved_now);
                     active_id.set(None);
+                    dragging_members.set(Vec::new());
                     *drag_state.borrow_mut() = None;
                     return true;
                 }
@@ -2405,6 +3368,11 @@ fn app() -> Html {
             let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
+            let dragging_members = dragging_members.clone();
+            let animating_members = animating_members.clone();
+            let rotation_anim = rotation_anim.clone();
+            let rotation_anim_handle = rotation_anim_handle.clone();
+            let rotation_queue = rotation_queue.clone();
             let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             Callback::from(move |_: MouseEvent| {
@@ -2441,6 +3409,11 @@ fn app() -> Html {
                 ));
                 flips.set(scramble_flips(flip_seed, total, FLIP_CHANCE));
                 active_id.set(None);
+                dragging_members.set(Vec::new());
+                animating_members.set(Vec::new());
+                *rotation_anim.borrow_mut() = None;
+                rotation_anim_handle.borrow_mut().take();
+                rotation_queue.borrow_mut().clear();
                 *drag_state.borrow_mut() = None;
                 solved.set(false);
             })
@@ -2453,6 +3426,11 @@ fn app() -> Html {
             let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
+            let dragging_members = dragging_members.clone();
+            let animating_members = animating_members.clone();
+            let rotation_anim = rotation_anim.clone();
+            let rotation_anim_handle = rotation_anim_handle.clone();
+            let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
@@ -2477,6 +3455,11 @@ fn app() -> Html {
                 rotations.set(vec![0.0; total]);
                 flips.set(vec![false; total]);
                 active_id.set(None);
+                dragging_members.set(Vec::new());
+                animating_members.set(Vec::new());
+                *rotation_anim.borrow_mut() = None;
+                rotation_anim_handle.borrow_mut().take();
+                rotation_queue.borrow_mut().clear();
                 *drag_state.borrow_mut() = None;
                 solved.set(true);
             })
@@ -2485,6 +3468,12 @@ fn app() -> Html {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
+            let connections = connections.clone();
+            let dragging_members = dragging_members.clone();
+            let animating_members = animating_members.clone();
+            let rotation_anim = rotation_anim.clone();
+            let rotation_anim_handle = rotation_anim_handle.clone();
+            let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
@@ -2495,12 +3484,14 @@ fn app() -> Html {
                 }
                 let positions_snapshot = (*positions).clone();
                 let flips_snapshot = (*flips).clone();
+                let connections_snapshot = (*connections).clone();
                 let zeroed = vec![0.0; total];
                 rotations.set(zeroed.clone());
                 let solved_now = is_solved(
                     &positions_snapshot,
                     &zeroed,
                     &flips_snapshot,
+                    &connections_snapshot,
                     cols,
                     rows,
                     piece_width,
@@ -2508,12 +3499,23 @@ fn app() -> Html {
                     rotation_enabled_value,
                 );
                 solved.set(solved_now);
+                dragging_members.set(Vec::new());
+                animating_members.set(Vec::new());
+                *rotation_anim.borrow_mut() = None;
+                rotation_anim_handle.borrow_mut().take();
+                rotation_queue.borrow_mut().clear();
             })
         };
         let on_unflip = {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
+            let connections = connections.clone();
+            let dragging_members = dragging_members.clone();
+            let animating_members = animating_members.clone();
+            let rotation_anim = rotation_anim.clone();
+            let rotation_anim_handle = rotation_anim_handle.clone();
+            let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
@@ -2524,12 +3526,14 @@ fn app() -> Html {
                 }
                 let positions_snapshot = (*positions).clone();
                 let rotations_snapshot = (*rotations).clone();
+                let connections_snapshot = (*connections).clone();
                 let cleared = vec![false; total];
                 flips.set(cleared.clone());
                 let solved_now = is_solved(
                     &positions_snapshot,
                     &rotations_snapshot,
                     &cleared,
+                    &connections_snapshot,
                     cols,
                     rows,
                     piece_width,
@@ -2537,9 +3541,17 @@ fn app() -> Html {
                     rotation_enabled_value,
                 );
                 solved.set(solved_now);
+                dragging_members.set(Vec::new());
+                animating_members.set(Vec::new());
+                *rotation_anim.borrow_mut() = None;
+                rotation_anim_handle.borrow_mut().take();
+                rotation_queue.borrow_mut().clear();
             })
         };
 
+        let color_pattern_bg = "#8f5b32";
+        let color_pattern_fg1 = "#734423";
+        let color_pattern_fg2 = "#3a2418";
         let back_pattern = html! {
             <pattern
                 id="piece-back-pattern"
@@ -2547,11 +3559,11 @@ fn app() -> Html {
                 width="28"
                 height="28"
             >
-                <rect width="28" height="28" fill="#3a2418" />
-                <circle cx="7" cy="7" r="3.2" fill="#8f5b32" />
-                <circle cx="21" cy="21" r="3.2" fill="#8f5b32" />
-                <circle cx="21" cy="7" r="2.2" fill="#734423" />
-                <circle cx="7" cy="21" r="2.2" fill="#734423" />
+                <rect width="28" height="28" fill={color_pattern_bg} />
+                <circle cx="7" cy="7" r="2.8" fill={color_pattern_fg1} />
+                <circle cx="21" cy="21" r="2.8" fill={color_pattern_fg1} />
+                <circle cx="21" cy="7" r="1.8" fill={color_pattern_fg2} />
+                <circle cx="7" cy="21" r="1.8" fill={color_pattern_fg2} />
             </pattern>
         };
 
@@ -2616,12 +3628,19 @@ fn app() -> Html {
             let mask_ref = format!("url(#piece-mask-{})", piece.id);
             let img_x = fmt_f64(-piece_x);
             let img_y = fmt_f64(-piece_y);
-            let is_dragging = active_id_value == Some(piece.id);
+            let is_dragging = dragging_mask.get(piece.id).copied().unwrap_or(false);
+            let is_animating = animating_mask.get(piece.id).copied().unwrap_or(false);
             let class = if is_dragging {
                 if flipped {
                     "piece dragging flipped"
                 } else {
                     "piece dragging"
+                }
+            } else if is_animating {
+                if flipped {
+                    "piece animating flipped"
+                } else {
+                    "piece animating"
                 }
             } else if flipped {
                 "piece flipped"
@@ -2633,6 +3652,11 @@ fn app() -> Html {
                 let rotations = rotations.clone();
                 let drag_state = drag_state.clone();
                 let active_id = active_id.clone();
+                let dragging_members = dragging_members.clone();
+                let animating_members = animating_members.clone();
+                let rotation_anim = rotation_anim.clone();
+                let rotation_anim_handle = rotation_anim_handle.clone();
+                let rotation_queue = rotation_queue.clone();
                 let z_order = z_order.clone();
                 let connections = connections.clone();
                 let piece_id = piece.id;
@@ -2652,6 +3676,11 @@ fn app() -> Html {
                     if members.is_empty() {
                         members.push(piece_id);
                     }
+                    *rotation_anim.borrow_mut() = None;
+                    rotation_anim_handle.borrow_mut().take();
+                    rotation_queue.borrow_mut().clear();
+                    animating_members.set(Vec::new());
+                    dragging_members.set(members.clone());
                     let pos = positions_snapshot
                         .get(piece_id)
                         .copied()
@@ -2745,6 +3774,47 @@ fn app() -> Html {
                     event.prevent_default();
                 })
             };
+            let debug_overlay = if show_debug_value {
+                let label = format!(
+                    "#{}\nx:{}\ny:{}\nr:{}",
+                    piece.id,
+                    fmt_f64(current.0),
+                    fmt_f64(current.1),
+                    fmt_f64(rotation)
+                );
+                html! {
+                    <>
+                        <circle
+                            class="piece-debug-center"
+                            cx={fmt_f64(center_x)}
+                            cy={fmt_f64(center_y)}
+                            r="3"
+                        />
+                        <text
+                            class="piece-debug-label"
+                            x={fmt_f64(center_x)}
+                            y={fmt_f64(center_y - 12.0)}
+                        >
+                            {label
+                                .lines()
+                                .enumerate()
+                                .map(|(idx, line)| {
+                                    html! {
+                                        <tspan
+                                            x={fmt_f64(center_x)}
+                                            dy={if idx == 0 { "-20" } else { "20" }}
+                                        >
+                                            {line}
+                                        </tspan>
+                                    }
+                                })
+                                .collect::<Html>()}
+                        </text>
+                    </>
+                }
+            } else {
+                html! {}
+            };
             let node = html! {
                 <g
                     key={piece.id.to_string()}
@@ -2781,6 +3851,7 @@ fn app() -> Html {
                         class="piece-outline piece-outline-dark"
                         d={path_d.clone()}
                     />
+                    {debug_overlay}
                 </g>
             };
             nodes.push(node);
@@ -2816,10 +3887,18 @@ fn app() -> Html {
             </>
         };
 
+        let mut svg_class = if show_debug_value {
+            "puzzle-image debug".to_string()
+        } else {
+            "puzzle-image".to_string()
+        };
+        if !animations_enabled_value {
+            svg_class.push_str(" no-anim");
+        }
         (
             html! {
                 <svg
-                    class="puzzle-image"
+                    class={svg_class}
                     viewBox={view_box}
                     width={fmt_f64(view_width)}
                     height={fmt_f64(view_height)}
@@ -2862,15 +3941,73 @@ fn app() -> Html {
             { "source" }
         </a>
     };
+    let preview_class = match *preview_corner {
+        PreviewCorner::BottomLeft => "preview-box corner-bl",
+        PreviewCorner::BottomRight => "preview-box corner-br",
+        PreviewCorner::TopLeft => "preview-box corner-tl",
+        PreviewCorner::TopRight => "preview-box corner-tr",
+    };
+    let on_preview_horizontal = {
+        let preview_corner = preview_corner.clone();
+        Callback::from(move |_| {
+            let next = match *preview_corner {
+                PreviewCorner::BottomLeft => PreviewCorner::BottomRight,
+                PreviewCorner::BottomRight => PreviewCorner::BottomLeft,
+                PreviewCorner::TopLeft => PreviewCorner::TopRight,
+                PreviewCorner::TopRight => PreviewCorner::TopLeft,
+            };
+            preview_corner.set(next);
+        })
+    };
+    let on_preview_vertical = {
+        let preview_corner = preview_corner.clone();
+        Callback::from(move |_| {
+            let next = match *preview_corner {
+                PreviewCorner::BottomLeft => PreviewCorner::TopLeft,
+                PreviewCorner::BottomRight => PreviewCorner::TopRight,
+                PreviewCorner::TopLeft => PreviewCorner::BottomLeft,
+                PreviewCorner::TopRight => PreviewCorner::BottomRight,
+            };
+            preview_corner.set(next);
+        })
+    };
+    let preview_arrow_horizontal = match *preview_corner {
+        PreviewCorner::BottomLeft | PreviewCorner::TopLeft => "preview-arrow preview-arrow-right",
+        PreviewCorner::BottomRight | PreviewCorner::TopRight => "preview-arrow preview-arrow-left",
+    };
+    let preview_arrow_vertical = match *preview_corner {
+        PreviewCorner::BottomLeft | PreviewCorner::BottomRight => "preview-arrow preview-arrow-up",
+        PreviewCorner::TopLeft | PreviewCorner::TopRight => "preview-arrow preview-arrow-down",
+    };
     let preview_box = html! {
-        <aside class="preview-box">
-            <img src={IMAGE_SRC} alt="Puzzle preview" />
+        <aside class={preview_class}>
+            <button
+                class={preview_arrow_horizontal}
+                type="button"
+                aria-label="Move preview horizontally"
+                onclick={on_preview_horizontal}
+            >
+                <svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
+                    <polyline points="4,2 8,6 4,10" />
+                </svg>
+            </button>
+            <button
+                class={preview_arrow_vertical}
+                type="button"
+                aria-label="Move preview vertically"
+                onclick={on_preview_vertical}
+            >
+                <svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
+                    <polyline points="4,2 8,6 4,10" />
+                </svg>
+            </button>
+            <img src={IMAGE_SRC} alt="preview" />
         </aside>
     };
     let controls_panel = if show_controls_value {
         html! {
             <aside class="controls">
-                <h2>{ "Puzzle Controls" }</h2>
+                <h2>{ "Debug Panel" }</h2>
                 <p class={status_class}>{ status_label }</p>
                 <div class="control">
                     <label>
@@ -2922,6 +4059,20 @@ fn app() -> Html {
                     />
                 </div>
                 <div class="control">
+                    <label for="animations-enabled">
+                        { "Animations" }
+                        <span class="control-value">
+                            { if animations_enabled_value { "On" } else { "Off" } }
+                        </span>
+                    </label>
+                    <input
+                        id="animations-enabled"
+                        type="checkbox"
+                        checked={animations_enabled_value}
+                        onchange={on_animations_toggle}
+                    />
+                </div>
+                <div class="control">
                     <label for="rotation-enabled">
                         { "Rotation" }
                         <span class="control-value">
@@ -2933,6 +4084,35 @@ fn app() -> Html {
                         type="checkbox"
                         checked={rotation_enabled_value}
                         onchange={on_rotation_toggle}
+                    />
+                </div>
+                <div class="control">
+                    <label for="rotation-noise">
+                        { "Rotation noise" }
+                        <span class="control-value">{ fmt_f64(rotation_noise_value) }</span>
+                    </label>
+                    <input
+                        id="rotation-noise"
+                        type="range"
+                        min={ROTATION_NOISE_MIN.to_string()}
+                        max={ROTATION_NOISE_MAX.to_string()}
+                        step="0.1"
+                        value={rotation_noise_value.to_string()}
+                        oninput={on_rotation_noise}
+                    />
+                </div>
+                <div class="control">
+                    <label for="debug-enabled">
+                        { "Debug overlay" }
+                        <span class="control-value">
+                            { if show_debug_value { "On" } else { "Off" } }
+                        </span>
+                    </label>
+                    <input
+                        id="debug-enabled"
+                        type="checkbox"
+                        checked={show_debug_value}
+                        onchange={on_debug_toggle}
                     />
                 </div>
                 <div class="control">
@@ -3128,4 +4308,74 @@ fn app() -> Html {
 
 fn main() {
     yew::Renderer::<App>::new().render();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn assert_close(actual: f64, expected: f64) {
+        let delta = (actual - expected).abs();
+        assert!(
+            delta <= 1e-6,
+            "expected {:.6} got {:.6} (delta {:.6})",
+            expected,
+            actual,
+            delta
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn align_group_sets_uniform_rotation() {
+        let cols = 3usize;
+        let piece_width = 100.0;
+        let piece_height = 100.0;
+        let mut positions = vec![(0.0, 0.0); 4];
+        let mut rotations = vec![0.0; 4];
+        rotations[0] = 11.027;
+        rotations[1] = 359.504;
+        positions[0] = (12.0, -44.0);
+        positions[1] = (180.0, 36.0);
+        let members = vec![0usize, 1usize];
+        let anchor_id = 0usize;
+        let anchor_center = (50.0, 50.0);
+        let target_rot = 11.027;
+
+        align_group_to_anchor(
+            &mut positions,
+            &mut rotations,
+            &members,
+            anchor_id,
+            anchor_center,
+            target_rot,
+            cols,
+            piece_width,
+            piece_height,
+        );
+
+        for id in &members {
+            assert_close(rotations[*id], normalize_angle(target_rot));
+        }
+
+        let base_rotation = rotations[members[0]];
+        for id in &members[1..] {
+            assert_close(rotations[*id], base_rotation);
+        }
+
+        for id in 0..rotations.len() {
+            if !members.contains(&id) {
+                assert_close(rotations[id], 0.0);
+            }
+        }
+
+        let (dx, dy) = rotate_vec(piece_width, 0.0, normalize_angle(target_rot));
+        let expected_center = (anchor_center.0 + dx, anchor_center.1 + dy);
+        let pos = positions[1];
+        let center = (pos.0 + piece_width * 0.5, pos.1 + piece_height * 0.5);
+        assert_close(center.0, expected_center.0);
+        assert_close(center.1, expected_center.1);
+    }
 }
