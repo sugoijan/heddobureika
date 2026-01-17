@@ -15,7 +15,6 @@ use yew::prelude::*;
 
 const IMAGE_SRC: &str = "puzzles/zoe-potter.jpg";
 const PUZZLE_SEED: u64 = 0x5EED_5EED_25_20;
-const MAX_TAB_DEPTH_RATIO: f64 = 0.32;
 const MAX_LINE_BEND_RATIO: f64 = 0.2;
 const SNAP_DISTANCE_RATIO: f64 = 0.18;
 const CONNECT_DISTANCE_RATIO: f64 = 0.06;
@@ -43,25 +42,25 @@ const TAB_WIDTH_RANGE: f64 = 0.16;
 const TAB_DEPTH_MIN: f64 = 0.2;
 const TAB_DEPTH_MAX: f64 = 1.1;
 const TAB_DEPTH_RANGE: f64 = 0.35;
-const SHOULDER_SCALE: f64 = 0.78;
-const DP_RATIO_MIN: f64 = 0.1;
-const DP_RATIO_MAX: f64 = 0.7;
-const DP_RATIO_RANGE: f64 = 0.16;
-const NECK_WEIGHT_MIN: f64 = 6.0;
-const NECK_WEIGHT_MAX: f64 = 26.0;
-const NECK_WEIGHT_RANGE: f64 = 8.0;
-const MID_WEIGHT_MIN: f64 = 6.0;
-const MID_WEIGHT_MAX: f64 = 28.0;
-const MID_WEIGHT_RANGE: f64 = 8.0;
-const KNOB_WEIGHT_MIN: f64 = 16.0;
-const KNOB_WEIGHT_MAX: f64 = 70.0;
-const KNOB_WEIGHT_RANGE: f64 = 18.0;
+const TAB_SIZE_SCALE_MIN: f64 = 0.1;
+const TAB_SIZE_SCALE_MAX: f64 = 0.5;
+const TAB_SIZE_MIN_LIMIT: f64 = 0.02;
+const TAB_SIZE_MAX_LIMIT: f64 = 0.24;
+const JITTER_STRENGTH_MIN: f64 = 0.0;
+const JITTER_STRENGTH_MAX: f64 = 0.3;
+const JITTER_LEN_BIAS_MIN: f64 = 0.0;
+const JITTER_LEN_BIAS_MAX: f64 = 1.0;
+const TAB_DEPTH_CAP_MIN: f64 = 0.2;
+const TAB_DEPTH_CAP_MAX: f64 = 0.45;
+const CURVE_DETAIL_MIN: f64 = 0.5;
+const CURVE_DETAIL_MAX: f64 = 3.0;
 const SKEW_RANGE_MAX: f64 = 0.2;
 const VARIATION_MIN: f64 = 0.0;
 const VARIATION_MAX: f64 = 1.0;
 const LINE_BEND_MIN: f64 = 0.0;
 const EDGE_STEP_DIV: f64 = 6.0;
 const EDGE_STEP_MIN: f64 = 6.0;
+const CORNER_RADIUS_RATIO: f64 = 0.08;
 const STORAGE_KEY: &str = "heddobureika.board.v1";
 const STORAGE_VERSION: u32 = 1;
 const DIR_UP: usize = 0;
@@ -78,19 +77,33 @@ struct Piece {
 
 #[derive(Clone, Copy, Debug)]
 struct EdgeParams {
-    tab_width: f64,
+    tab_size: f64,
     tab_depth: f64,
-    shoulder: f64,
-    skew: f64,
-    dp_ratio: f64,
-    neck_weight: f64,
-    mid_weight: f64,
-    knob_weight: f64,
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TabSide {
+    Tab,
+    Blank,
+}
+
+impl TabSide {
+    fn sign(self) -> i8 {
+        match self {
+            TabSide::Tab => 1,
+            TabSide::Blank => -1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Edge {
-    tab_dir: i8,
+    tab_side: TabSide,
     params: EdgeParams,
 }
 
@@ -205,11 +218,14 @@ struct SavedBoard {
 struct ShapeSettings {
     tab_width: f64,
     tab_depth: f64,
-    dp_ratio: f64,
+    tab_size_scale: f64,
+    tab_size_min: f64,
+    tab_size_max: f64,
+    jitter_strength: f64,
+    jitter_len_bias: f64,
+    tab_depth_cap: f64,
+    curve_detail: f64,
     skew_range: f64,
-    neck_weight: f64,
-    mid_weight: f64,
-    knob_weight: f64,
     variation: f64,
     line_bend_ratio: f64,
 }
@@ -217,14 +233,17 @@ struct ShapeSettings {
 impl Default for ShapeSettings {
     fn default() -> Self {
         Self {
-            tab_width: 0.6,
-            tab_depth: 0.43,
-            dp_ratio: 0.5,
-            skew_range: 0.05,
-            neck_weight: 8.0,
-            mid_weight: 8.5,
-            knob_weight: 42.0,
-            variation: 0.05,
+            tab_width: 0.43,
+            tab_depth: 0.98,
+            tab_size_scale: 0.25,
+            tab_size_min: 0.04,
+            tab_size_max: 0.16,
+            jitter_strength: 0.13,
+            jitter_len_bias: 0.4,
+            tab_depth_cap: 0.32,
+            curve_detail: 1.4,
+            skew_range: 0.18,
+            variation: 0.16,
             line_bend_ratio: 0.06,
         }
     }
@@ -845,7 +864,7 @@ fn edge_from_seed(seed: u64, settings: &ShapeSettings) -> Edge {
     let variation = settings
         .variation
         .clamp(VARIATION_MIN, VARIATION_MAX);
-    let tab_width = jitter_value(
+    let tab_size_raw = jitter_value(
         seed,
         0,
         settings.tab_width,
@@ -854,7 +873,7 @@ fn edge_from_seed(seed: u64, settings: &ShapeSettings) -> Edge {
         TAB_WIDTH_MAX,
         variation,
     );
-    let tab_depth = jitter_value(
+    let tab_depth_raw = jitter_value(
         seed,
         2,
         settings.tab_depth,
@@ -863,59 +882,48 @@ fn edge_from_seed(seed: u64, settings: &ShapeSettings) -> Edge {
         TAB_DEPTH_MAX,
         variation,
     );
-    let dp_ratio = jitter_value(
-        seed,
-        3,
-        settings.dp_ratio,
-        DP_RATIO_RANGE,
-        DP_RATIO_MIN,
-        DP_RATIO_MAX,
-        variation,
-    );
-    let neck_weight = jitter_value(
-        seed,
-        4,
-        settings.neck_weight,
-        NECK_WEIGHT_RANGE,
-        NECK_WEIGHT_MIN,
-        NECK_WEIGHT_MAX,
-        variation,
-    );
-    let mid_weight = jitter_value(
-        seed,
-        5,
-        settings.mid_weight,
-        MID_WEIGHT_RANGE,
-        MID_WEIGHT_MIN,
-        MID_WEIGHT_MAX,
-        variation,
-    );
-    let knob_weight = jitter_value(
-        seed,
-        6,
-        settings.knob_weight,
-        KNOB_WEIGHT_RANGE,
-        KNOB_WEIGHT_MIN,
-        KNOB_WEIGHT_MAX,
-        variation,
-    );
-    let skew_range = settings.skew_range.clamp(0.0, SKEW_RANGE_MAX);
-    let skew = (rand_unit(seed, 7) * 2.0 - 1.0) * skew_range;
-    let tab_dir = if rand_unit(seed, 8) < 0.5 { 1 } else { -1 };
-
-    let shoulder = ((1.0 - tab_width) * 0.5) * SHOULDER_SCALE;
+    let tab_size_scale = settings
+        .tab_size_scale
+        .clamp(TAB_SIZE_SCALE_MIN, TAB_SIZE_SCALE_MAX);
+    let tab_size_min = settings
+        .tab_size_min
+        .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
+    let tab_size_max = settings
+        .tab_size_max
+        .clamp(tab_size_min, TAB_SIZE_MAX_LIMIT);
+    let tab_size = (tab_size_raw * tab_size_scale).clamp(tab_size_min, tab_size_max);
+    let tab_depth = tab_depth_raw.clamp(TAB_DEPTH_MIN, TAB_DEPTH_MAX);
+    let jitter_strength = settings
+        .jitter_strength
+        .clamp(JITTER_STRENGTH_MIN, JITTER_STRENGTH_MAX);
+    let jitter_base = (variation * jitter_strength).clamp(0.0, jitter_strength);
+    let skew_ratio = (settings.skew_range / SKEW_RANGE_MAX).clamp(0.0, 1.0);
+    let jitter_len_bias = settings
+        .jitter_len_bias
+        .clamp(JITTER_LEN_BIAS_MIN, JITTER_LEN_BIAS_MAX);
+    let jitter_len = jitter_base * (jitter_len_bias + (1.0 - jitter_len_bias) * skew_ratio);
+    let jitter_depth = jitter_base * tab_depth;
+    let a = rand_range(seed, 3, -jitter_depth, jitter_depth);
+    let b = rand_range(seed, 4, -jitter_len, jitter_len);
+    let c = rand_range(seed, 5, -jitter_depth, jitter_depth);
+    let d = rand_range(seed, 6, -jitter_len, jitter_len);
+    let e = rand_range(seed, 7, -jitter_depth, jitter_depth);
+    let tab_side = if rand_unit(seed, 8) < 0.5 {
+        TabSide::Tab
+    } else {
+        TabSide::Blank
+    };
 
     Edge {
-        tab_dir,
+        tab_side,
         params: EdgeParams {
-            tab_width,
+            tab_size,
             tab_depth,
-            shoulder,
-            skew,
-            dp_ratio,
-            neck_weight,
-            mid_weight,
-            knob_weight,
+            a,
+            b,
+            c,
+            d,
+            e,
         },
     }
 }
@@ -999,74 +1007,97 @@ fn build_line_waves(
     (horizontal, vertical)
 }
 
+fn cubic_point(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    t: f64,
+) -> (f64, f64) {
+    let u = 1.0 - t;
+    let tt = t * t;
+    let uu = u * u;
+    let uuu = uu * u;
+    let ttt = tt * t;
+    (
+        uuu * p0.0 + 3.0 * uu * t * p1.0 + 3.0 * u * tt * p2.0 + ttt * p3.0,
+        uuu * p0.1 + 3.0 * uu * t * p1.1 + 3.0 * u * tt * p2.1 + ttt * p3.1,
+    )
+}
+
+fn cubic_segments(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    steps: usize,
+) -> Vec<Segment> {
+    let mut segments = Vec::with_capacity(steps.max(1));
+    let steps = steps.max(1);
+    for step in 1..=steps {
+        let t = step as f64 / steps as f64;
+        let (x, y) = cubic_point(p0, p1, p2, p3, t);
+        segments.push(Segment::LineTo { x, y });
+    }
+    segments
+}
+
 fn edge_segments(
     len: f64,
     depth_base: f64,
     edge: Option<&Edge>,
-    sign: i8,
+    tab_sign: i8,
+    depth_limit: f64,
+    curve_detail: f64,
 ) -> Vec<Segment> {
     let edge = match edge {
-        Some(edge) if sign != 0 => edge,
+        Some(edge) if tab_sign != 0 => edge,
         _ => return vec![Segment::LineTo { x: len, y: 0.0 }],
     };
 
     let params = edge.params;
-    let tab_width = len * params.tab_width;
-    let depth_limit = depth_base * MAX_TAB_DEPTH_RATIO;
-    let mut depth = tab_width * params.tab_depth * sign as f64;
-    if depth > depth_limit {
-        depth = depth_limit;
+    let depth_limit = depth_limit.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+    let t_len = params.tab_size;
+    let mut t_depth = t_len * params.tab_depth;
+    let max_t_depth = depth_limit / 3.0;
+    if t_depth > max_t_depth {
+        t_depth = max_t_depth;
     }
-    if depth < -depth_limit {
-        depth = -depth_limit;
-    }
-    let shoulder = len * params.shoulder;
-
-    let mut center = len * 0.5 + len * params.skew;
-    let min_center = shoulder + tab_width / 2.0;
-    let max_center = len - shoulder - tab_width / 2.0;
-    if center < min_center {
-        center = min_center;
-    }
-    if center > max_center {
-        center = max_center;
+    let max_jitter_depth = (depth_limit - 3.0 * t_depth).max(0.0);
+    let mut a = params.a.clamp(-depth_limit, depth_limit);
+    let mut c = params.c.clamp(-max_jitter_depth, max_jitter_depth);
+    let mut e = params.e.clamp(-depth_limit, depth_limit);
+    let b = params.b;
+    let d = params.d;
+    if max_jitter_depth == 0.0 {
+        a = 0.0;
+        c = 0.0;
+        e = 0.0;
     }
 
-    let left = center - tab_width / 2.0;
-    let right = center + tab_width / 2.0;
-    let pm = center;
-    let dp = tab_width * params.dp_ratio;
+    let sign = tab_sign as f64;
+    let l = |v: f64| len * v;
+    let w = |v: f64| depth_base * v * sign;
 
-    let control_points = [
-        (left, 0.0),
-        (pm, 0.0),
-        (pm - dp, depth),
-        (pm, depth * 1.15),
-        (pm + dp, depth),
-        (pm, 0.0),
-        (right, 0.0),
-    ];
-    let weights = [
-        1.0,
-        params.neck_weight,
-        params.mid_weight,
-        params.knob_weight,
-        params.mid_weight,
-        params.neck_weight,
-        1.0,
-    ];
-    let spline_points = bspline_rational_points(&control_points, &weights, 3, 24);
+    let p0 = (l(0.0), w(0.0));
+    let p1 = (l(0.2), w(a));
+    let p2 = (l(0.5 + b + d), w(-t_depth + c));
+    let p3 = (l(0.5 - t_len + b), w(t_depth + c));
+    let p4 = (l(0.5 - 2.0 * t_len + b - d), w(3.0 * t_depth + c));
+    let p5 = (l(0.5 + 2.0 * t_len + b - d), w(3.0 * t_depth + c));
+    let p6 = (l(0.5 + t_len + b), w(t_depth + c));
+    let p7 = (l(0.5 + b + d), w(-t_depth + c));
+    let p8 = (l(0.8), w(e));
+    let p9 = (l(1.0), w(0.0));
 
-    let mut segments = Vec::with_capacity(2 + spline_points.len());
-    if left > 0.0 {
-        segments.push(Segment::LineTo { x: left, y: 0.0 });
-    }
-    for (x, y) in spline_points.into_iter().skip(1) {
-        segments.push(Segment::LineTo { x, y });
-    }
-    if right < len {
-        segments.push(Segment::LineTo { x: len, y: 0.0 });
-    }
+    let base_steps = (len / EDGE_STEP_MIN).ceil() as usize;
+    let detail = curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
+    let steps = ((base_steps as f64) * detail).round() as usize;
+    let steps = steps.max(8);
+    let mut segments = Vec::with_capacity(steps * 3);
+    segments.extend(cubic_segments(p0, p1, p2, p3, steps));
+    segments.extend(cubic_segments(p3, p4, p5, p6, steps));
+    segments.extend(cubic_segments(p6, p7, p8, p9, steps));
     segments
 }
 
@@ -1093,100 +1124,6 @@ fn reverse_segments(segments: &[Segment]) -> Vec<Segment> {
     reversed
 }
 
-fn build_knot_vector(control_len: usize, degree: usize) -> Vec<f64> {
-    let n = control_len.saturating_sub(1);
-    let p = degree;
-    let mut knots = vec![0.0; n + p + 2];
-    let max_value = (n - p + 1) as f64;
-    for i in 0..knots.len() {
-        if i <= p {
-            knots[i] = 0.0;
-        } else if i >= n + 1 {
-            knots[i] = max_value;
-        } else {
-            knots[i] = (i - p) as f64;
-        }
-    }
-    knots
-}
-
-fn find_span(u: f64, degree: usize, knots: &[f64], control_len: usize) -> usize {
-    let n = control_len.saturating_sub(1);
-    if u >= knots[n + 1] {
-        return n;
-    }
-    if u <= knots[degree] {
-        return degree;
-    }
-    let mut low = degree;
-    let mut high = n + 1;
-    let mut mid = (low + high) / 2;
-    while u < knots[mid] || u >= knots[mid + 1] {
-        if u < knots[mid] {
-            high = mid;
-        } else {
-            low = mid;
-        }
-        mid = (low + high) / 2;
-    }
-    mid
-}
-
-fn basis_funs(span: usize, u: f64, degree: usize, knots: &[f64]) -> Vec<f64> {
-    let mut left = vec![0.0; degree + 1];
-    let mut right = vec![0.0; degree + 1];
-    let mut n = vec![0.0; degree + 1];
-    n[0] = 1.0;
-    for j in 1..=degree {
-        left[j] = u - knots[span + 1 - j];
-        right[j] = knots[span + j] - u;
-        let mut saved = 0.0;
-        for r in 0..j {
-            let denom = right[r + 1] + left[j - r];
-            let temp = if denom == 0.0 { 0.0 } else { n[r] / denom };
-            n[r] = saved + right[r + 1] * temp;
-            saved = left[j - r] * temp;
-        }
-        n[j] = saved;
-    }
-    n
-}
-
-fn bspline_rational_points(
-    control_points: &[(f64, f64)],
-    weights: &[f64],
-    degree: usize,
-    samples: usize,
-) -> Vec<(f64, f64)> {
-    let control_len = control_points.len();
-    let knots = build_knot_vector(control_len, degree);
-    let max_u = knots[control_len];
-    let mut points = Vec::with_capacity(samples + 1);
-
-    for i in 0..=samples {
-        let u = max_u * (i as f64) / (samples as f64);
-        let span = find_span(u, degree, &knots, control_len);
-        let basis = basis_funs(span, u, degree, &knots);
-        let mut denom = 0.0;
-        let mut x = 0.0;
-        let mut y = 0.0;
-        for (j, coeff) in basis.iter().enumerate() {
-            let idx = span - degree + j;
-            let weight = weights[idx];
-            let influence = coeff * weight;
-            denom += influence;
-            x += influence * control_points[idx].0;
-            y += influence * control_points[idx].1;
-        }
-        if denom != 0.0 {
-            x /= denom;
-            y /= denom;
-        }
-        points.push((x, y));
-    }
-    points
-}
-
 fn map_point(
     orientation: EdgeOrientation,
     origin: (f64, f64),
@@ -1205,6 +1142,66 @@ fn map_point(
     };
     let (wx, wy) = warp_point(gx + dx, gy + dy, warp);
     (wx - dx, wy - dy)
+}
+
+fn map_local_point(
+    offset: (f64, f64),
+    warp: &WarpField<'_>,
+    x: f64,
+    y: f64,
+) -> (f64, f64) {
+    let (wx, wy) = warp_point(offset.0 + x, offset.1 + y, warp);
+    (wx - offset.0, wy - offset.1)
+}
+
+fn append_local_points(
+    path: &mut String,
+    offset: (f64, f64),
+    warp: &WarpField<'_>,
+    points: &[(f64, f64)],
+) {
+    for &(x, y) in points {
+        let (gx, gy) = map_local_point(offset, warp, x, y);
+        let _ = write!(path, " L {} {}", fmt_f64(gx), fmt_f64(gy));
+    }
+}
+
+fn build_local_path(
+    offset: (f64, f64),
+    warp: &WarpField<'_>,
+    points: &[(f64, f64)],
+) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+    let (sx, sy) = map_local_point(offset, warp, points[0].0, points[0].1);
+    let mut path = String::new();
+    let _ = write!(path, "M {} {}", fmt_f64(sx), fmt_f64(sy));
+    append_local_points(&mut path, offset, warp, &points[1..]);
+    path
+}
+
+fn corner_arc_points(
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+    steps: usize,
+) -> Vec<(f64, f64)> {
+    let steps = steps.max(1);
+    let mut end = end_angle;
+    if end < start_angle {
+        end += 2.0 * std::f64::consts::PI;
+    }
+    let span = end - start_angle;
+    let mut points = Vec::with_capacity(steps + 1);
+    for step in 0..=steps {
+        let t = step as f64 / steps as f64;
+        let angle = start_angle + span * t;
+        points.push((cx + radius * angle.cos(), cy + radius * angle.sin()));
+    }
+    points
 }
 
 fn append_segments(
@@ -1285,6 +1282,8 @@ fn build_piece_path(
     horizontal: &[Vec<Option<Edge>>],
     vertical: &[Vec<Option<Edge>>],
     warp: &WarpField<'_>,
+    tab_depth_cap: f64,
+    curve_detail: f64,
 ) -> PiecePaths {
     let row = piece.row as usize;
     let col = piece.col as usize;
@@ -1296,30 +1295,132 @@ fn build_piece_path(
     let left_edge = vertical[row][col].as_ref();
     let right_edge = vertical[row][col + 1].as_ref();
 
-    let top_sign = top_edge.map(|edge| -edge.tab_dir).unwrap_or(0);
-    let right_sign = right_edge.map(|edge| edge.tab_dir).unwrap_or(0);
-    let bottom_sign = bottom_edge.map(|edge| edge.tab_dir).unwrap_or(0);
-    let left_sign = left_edge.map(|edge| -edge.tab_dir).unwrap_or(0);
+    let top_sign = top_edge.map(|edge| -edge.tab_side.sign()).unwrap_or(0);
+    let right_sign = right_edge.map(|edge| edge.tab_side.sign()).unwrap_or(0);
+    let bottom_sign = bottom_edge.map(|edge| edge.tab_side.sign()).unwrap_or(0);
+    let left_sign = left_edge.map(|edge| -edge.tab_side.sign()).unwrap_or(0);
 
-    let top_segments = edge_segments(piece_width, piece_height, top_edge, top_sign);
-    let right_segments = edge_segments(piece_height, piece_width, right_edge, right_sign);
-    let bottom_segments =
-        reverse_segments(&edge_segments(piece_width, piece_height, bottom_edge, bottom_sign));
-    let left_segments =
-        reverse_segments(&edge_segments(piece_height, piece_width, left_edge, left_sign));
+    let rows = horizontal.len().saturating_sub(1);
+    let cols = horizontal.first().map(|row| row.len()).unwrap_or(0);
+    let is_top = row == 0;
+    let is_left = col == 0;
+    let is_bottom = row + 1 == rows;
+    let is_right = col + 1 == cols;
+    let mut corner_radius = piece_width.min(piece_height) * CORNER_RADIUS_RATIO;
+    let max_corner = piece_width.min(piece_height) * 0.45;
+    if corner_radius > max_corner {
+        corner_radius = max_corner;
+    }
+    let round_tl = is_top && is_left && corner_radius > 0.0;
+    let round_tr = is_top && is_right && corner_radius > 0.0;
+    let round_br = is_bottom && is_right && corner_radius > 0.0;
+    let round_bl = is_bottom && is_left && corner_radius > 0.0;
+
+    let top_start_trim = if round_tl { corner_radius } else { 0.0 };
+    let top_end_trim = if round_tr { corner_radius } else { 0.0 };
+    let right_start_trim = if round_tr { corner_radius } else { 0.0 };
+    let right_end_trim = if round_br { corner_radius } else { 0.0 };
+    let bottom_start_trim = if round_br { corner_radius } else { 0.0 };
+    let bottom_end_trim = if round_bl { corner_radius } else { 0.0 };
+    let left_start_trim = if round_bl { corner_radius } else { 0.0 };
+    let left_end_trim = if round_tl { corner_radius } else { 0.0 };
+
+    let top_is_boundary = top_edge.is_none();
+    let right_is_boundary = right_edge.is_none();
+    let bottom_is_boundary = bottom_edge.is_none();
+    let left_is_boundary = left_edge.is_none();
+
+    let top_start = if top_is_boundary {
+        (top_start_trim, 0.0)
+    } else {
+        (0.0, 0.0)
+    };
+    let right_start = if right_is_boundary {
+        (right_start_trim, 0.0)
+    } else {
+        (0.0, 0.0)
+    };
+    let bottom_start = if bottom_is_boundary {
+        (piece_width - bottom_start_trim, 0.0)
+    } else {
+        (piece_width, 0.0)
+    };
+    let left_start = if left_is_boundary {
+        (piece_height - left_start_trim, 0.0)
+    } else {
+        (piece_height, 0.0)
+    };
+
+    let top_segments = if top_is_boundary {
+        vec![Segment::LineTo {
+            x: piece_width - top_end_trim,
+            y: 0.0,
+        }]
+    } else {
+        edge_segments(
+            piece_width,
+            piece_height,
+            top_edge,
+            top_sign,
+            tab_depth_cap,
+            curve_detail,
+        )
+    };
+    let right_segments = if right_is_boundary {
+        vec![Segment::LineTo {
+            x: piece_height - right_end_trim,
+            y: 0.0,
+        }]
+    } else {
+        edge_segments(
+            piece_height,
+            piece_width,
+            right_edge,
+            right_sign,
+            tab_depth_cap,
+            curve_detail,
+        )
+    };
+    let bottom_segments = if bottom_is_boundary {
+        vec![Segment::LineTo {
+            x: bottom_end_trim,
+            y: 0.0,
+        }]
+    } else {
+        reverse_segments(&edge_segments(
+            piece_width,
+            piece_height,
+            bottom_edge,
+            bottom_sign,
+            tab_depth_cap,
+            curve_detail,
+        ))
+    };
+    let left_segments = if left_is_boundary {
+        vec![Segment::LineTo {
+            x: left_end_trim,
+            y: 0.0,
+        }]
+    } else {
+        reverse_segments(&edge_segments(
+            piece_height,
+            piece_width,
+            left_edge,
+            left_sign,
+            tab_depth_cap,
+            curve_detail,
+        ))
+    };
 
     let offset = (piece_x, piece_y);
     let top_step = (piece_width / EDGE_STEP_DIV).max(EDGE_STEP_MIN);
     let side_step = (piece_height / EDGE_STEP_DIV).max(EDGE_STEP_MIN);
+    let arc_steps = ((curve_detail * 6.0).round() as usize).clamp(4, 24);
+    let pi = std::f64::consts::PI;
 
     let mut path = String::new();
-    let (start_x, start_y) = warp_point(piece_x, piece_y, warp);
-    let _ = write!(
-        path,
-        "M {} {}",
-        fmt_f64(start_x - piece_x),
-        fmt_f64(start_y - piece_y)
-    );
+    let (start_x, start_y) = map_local_point(offset, warp, top_start.0, top_start.1);
+    let _ = write!(path, "M {} {}", fmt_f64(start_x), fmt_f64(start_y));
     append_segments(
         &mut path,
         &top_segments,
@@ -1327,9 +1428,20 @@ fn build_piece_path(
         (0.0, 0.0),
         offset,
         warp,
-        (0.0, 0.0),
+        top_start,
         top_step,
     );
+    if round_tr {
+        let arc = corner_arc_points(
+            piece_width - corner_radius,
+            corner_radius,
+            corner_radius,
+            1.5 * pi,
+            2.0 * pi,
+            arc_steps,
+        );
+        append_local_points(&mut path, offset, warp, &arc[1..]);
+    }
     append_segments(
         &mut path,
         &right_segments,
@@ -1337,9 +1449,20 @@ fn build_piece_path(
         (piece_width, 0.0),
         offset,
         warp,
-        (0.0, 0.0),
+        right_start,
         side_step,
     );
+    if round_br {
+        let arc = corner_arc_points(
+            piece_width - corner_radius,
+            piece_height - corner_radius,
+            corner_radius,
+            0.0,
+            0.5 * pi,
+            arc_steps,
+        );
+        append_local_points(&mut path, offset, warp, &arc[1..]);
+    }
     append_segments(
         &mut path,
         &bottom_segments,
@@ -1347,9 +1470,20 @@ fn build_piece_path(
         (0.0, piece_height),
         offset,
         warp,
-        (piece_width, 0.0),
+        bottom_start,
         top_step,
     );
+    if round_bl {
+        let arc = corner_arc_points(
+            corner_radius,
+            piece_height - corner_radius,
+            corner_radius,
+            0.5 * pi,
+            pi,
+            arc_steps,
+        );
+        append_local_points(&mut path, offset, warp, &arc[1..]);
+    }
     append_segments(
         &mut path,
         &left_segments,
@@ -1357,46 +1491,128 @@ fn build_piece_path(
         (0.0, 0.0),
         offset,
         warp,
-        (piece_height, 0.0),
+        left_start,
         side_step,
     );
+    if round_tl {
+        let arc = corner_arc_points(
+            corner_radius,
+            corner_radius,
+            corner_radius,
+            pi,
+            1.5 * pi,
+            arc_steps,
+        );
+        append_local_points(&mut path, offset, warp, &arc[1..]);
+    }
     path.push_str(" Z");
-    let top_path = build_edge_path(
+
+    let mut top_path = build_edge_path(
         &top_segments,
         EdgeOrientation::Top,
         (0.0, 0.0),
         offset,
         warp,
-        (0.0, 0.0),
+        top_start,
         top_step,
     );
-    let right_path = build_edge_path(
+    let mut right_path = build_edge_path(
         &right_segments,
         EdgeOrientation::Right,
         (piece_width, 0.0),
         offset,
         warp,
-        (0.0, 0.0),
+        right_start,
         side_step,
     );
-    let bottom_path = build_edge_path(
+    let mut bottom_path = build_edge_path(
         &bottom_segments,
         EdgeOrientation::Bottom,
         (0.0, piece_height),
         offset,
         warp,
-        (piece_width, 0.0),
+        bottom_start,
         top_step,
     );
-    let left_path = build_edge_path(
+    let mut left_path = build_edge_path(
         &left_segments,
         EdgeOrientation::Left,
         (0.0, 0.0),
         offset,
         warp,
-        (piece_height, 0.0),
+        left_start,
         side_step,
     );
+
+    if round_tr {
+        let arc = corner_arc_points(
+            piece_width - corner_radius,
+            corner_radius,
+            corner_radius,
+            1.5 * pi,
+            2.0 * pi,
+            arc_steps,
+        );
+        let arc_path = build_local_path(offset, warp, &arc);
+        if !arc_path.is_empty() {
+            if !top_path.is_empty() {
+                top_path.push(' ');
+            }
+            top_path.push_str(&arc_path);
+        }
+    }
+    if round_br {
+        let arc = corner_arc_points(
+            piece_width - corner_radius,
+            piece_height - corner_radius,
+            corner_radius,
+            0.0,
+            0.5 * pi,
+            arc_steps,
+        );
+        let arc_path = build_local_path(offset, warp, &arc);
+        if !arc_path.is_empty() {
+            if !right_path.is_empty() {
+                right_path.push(' ');
+            }
+            right_path.push_str(&arc_path);
+        }
+    }
+    if round_bl {
+        let arc = corner_arc_points(
+            corner_radius,
+            piece_height - corner_radius,
+            corner_radius,
+            0.5 * pi,
+            pi,
+            arc_steps,
+        );
+        let arc_path = build_local_path(offset, warp, &arc);
+        if !arc_path.is_empty() {
+            if !bottom_path.is_empty() {
+                bottom_path.push(' ');
+            }
+            bottom_path.push_str(&arc_path);
+        }
+    }
+    if round_tl {
+        let arc = corner_arc_points(
+            corner_radius,
+            corner_radius,
+            corner_radius,
+            pi,
+            1.5 * pi,
+            arc_steps,
+        );
+        let arc_path = build_local_path(offset, warp, &arc);
+        if !arc_path.is_empty() {
+            if !left_path.is_empty() {
+                left_path.push(' ');
+            }
+            left_path.push_str(&arc_path);
+        }
+    }
+
     PiecePaths {
         outline: path,
         edges: [top_path, right_path, bottom_path, left_path],
@@ -1408,6 +1624,12 @@ fn app() -> Html {
     let image_size = use_state(|| None::<(u32, u32)>);
     let settings = use_state(ShapeSettings::default);
     let settings_value = (*settings).clone();
+    let depth_cap = settings_value
+        .tab_depth_cap
+        .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+    let curve_detail = settings_value
+        .curve_detail
+        .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
     let grid_index = use_state(|| DEFAULT_GRID_INDEX);
     let grid_index_value = *grid_index;
     let grid = GRID_PRESETS[grid_index_value];
@@ -1431,20 +1653,35 @@ fn app() -> Html {
     let tab_depth_input = on_setting_change(settings.clone(), |settings, value| {
         settings.tab_depth = value.clamp(TAB_DEPTH_MIN, TAB_DEPTH_MAX);
     });
-    let dp_ratio_input = on_setting_change(settings.clone(), |settings, value| {
-        settings.dp_ratio = value.clamp(DP_RATIO_MIN, DP_RATIO_MAX);
+    let tab_size_scale_input = on_setting_change(settings.clone(), |settings, value| {
+        settings.tab_size_scale = value.clamp(TAB_SIZE_SCALE_MIN, TAB_SIZE_SCALE_MAX);
+    });
+    let tab_size_min_input = on_setting_change(settings.clone(), |settings, value| {
+        let max_allowed = settings
+            .tab_size_max
+            .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
+        settings.tab_size_min = value.clamp(TAB_SIZE_MIN_LIMIT, max_allowed);
+    });
+    let tab_size_max_input = on_setting_change(settings.clone(), |settings, value| {
+        let min_allowed = settings
+            .tab_size_min
+            .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
+        settings.tab_size_max = value.clamp(min_allowed, TAB_SIZE_MAX_LIMIT);
     });
     let skew_input = on_setting_change(settings.clone(), |settings, value| {
         settings.skew_range = value.clamp(0.0, SKEW_RANGE_MAX);
     });
-    let neck_input = on_setting_change(settings.clone(), |settings, value| {
-        settings.neck_weight = value.clamp(NECK_WEIGHT_MIN, NECK_WEIGHT_MAX);
+    let jitter_strength_input = on_setting_change(settings.clone(), |settings, value| {
+        settings.jitter_strength = value.clamp(JITTER_STRENGTH_MIN, JITTER_STRENGTH_MAX);
     });
-    let mid_input = on_setting_change(settings.clone(), |settings, value| {
-        settings.mid_weight = value.clamp(MID_WEIGHT_MIN, MID_WEIGHT_MAX);
+    let jitter_len_bias_input = on_setting_change(settings.clone(), |settings, value| {
+        settings.jitter_len_bias = value.clamp(JITTER_LEN_BIAS_MIN, JITTER_LEN_BIAS_MAX);
     });
-    let knob_input = on_setting_change(settings.clone(), |settings, value| {
-        settings.knob_weight = value.clamp(KNOB_WEIGHT_MIN, KNOB_WEIGHT_MAX);
+    let tab_depth_cap_input = on_setting_change(settings.clone(), |settings, value| {
+        settings.tab_depth_cap = value.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+    });
+    let curve_detail_input = on_setting_change(settings.clone(), |settings, value| {
+        settings.curve_detail = value.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
     });
     let variation_input = on_setting_change(settings.clone(), |settings, value| {
         settings.variation = value.clamp(VARIATION_MIN, VARIATION_MAX);
@@ -1602,8 +1839,8 @@ fn app() -> Html {
                         let view_height = height as f64 * workspace_scale_value;
                         let view_min_x = (width as f64 - view_width) * 0.5;
                         let view_min_y = (height as f64 - view_height) * 0.5;
-                        let margin = piece_width.max(piece_height)
-                            * (MAX_TAB_DEPTH_RATIO + MAX_LINE_BEND_RATIO);
+                        let margin =
+                            piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
                         let nonce = time_nonce(*scramble_nonce);
                         let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
                         let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
@@ -2005,7 +2242,7 @@ fn app() -> Html {
         );
         let piece_width = width_f / grid.cols as f64;
         let piece_height = height_f / grid.rows as f64;
-        let max_depth = piece_width.max(piece_height) * MAX_TAB_DEPTH_RATIO;
+        let max_depth = piece_width.max(piece_height) * depth_cap;
         let pieces = build_pieces(grid.rows, grid.cols);
 
         let (horizontal, vertical) =
@@ -2029,6 +2266,12 @@ fn app() -> Html {
             .chain(vertical_waves.iter())
             .fold(0.0_f64, |acc, wave| acc.max(wave.amplitude.abs()));
         let mask_pad = max_depth + max_bend;
+        let mut frame_corner_radius = piece_width.min(piece_height) * CORNER_RADIUS_RATIO;
+        let max_corner_radius = piece_width.min(piece_height) * 0.45;
+        if frame_corner_radius > max_corner_radius {
+            frame_corner_radius = max_corner_radius;
+        }
+        let frame_corner_radius = fmt_f64(frame_corner_radius);
         let mask_x = fmt_f64(-mask_pad);
         let mask_y = fmt_f64(-mask_pad);
         let mask_width = fmt_f64(piece_width + mask_pad * 2.0);
@@ -2053,6 +2296,8 @@ fn app() -> Html {
                     &horizontal,
                     &vertical,
                     &warp_field,
+                    depth_cap,
+                    curve_detail,
                 );
                 (*piece, paths)
             })
@@ -4046,6 +4291,8 @@ fn app() -> Html {
                     y="0"
                     width={width.to_string()}
                     height={height.to_string()}
+                    rx={frame_corner_radius.clone()}
+                    ry={frame_corner_radius.clone()}
                 />
             </>
         };
@@ -4340,18 +4587,50 @@ fn app() -> Html {
                     />
                 </div>
                 <div class="control">
-                    <label for="dp-ratio">
-                        { "Neck width" }
-                        <span class="control-value">{ fmt_f64(settings_value.dp_ratio) }</span>
+                    <label for="tab-size-scale">
+                        { "Tab size scale" }
+                        <span class="control-value">
+                            { fmt_f64(settings_value.tab_size_scale) }
+                        </span>
                     </label>
                     <input
-                        id="dp-ratio"
+                        id="tab-size-scale"
                         type="range"
-                        min={DP_RATIO_MIN.to_string()}
-                        max={DP_RATIO_MAX.to_string()}
+                        min={TAB_SIZE_SCALE_MIN.to_string()}
+                        max={TAB_SIZE_SCALE_MAX.to_string()}
                         step="0.005"
-                        value={settings_value.dp_ratio.to_string()}
-                        oninput={dp_ratio_input}
+                        value={settings_value.tab_size_scale.to_string()}
+                        oninput={tab_size_scale_input}
+                    />
+                </div>
+                <div class="control">
+                    <label for="tab-size-min">
+                        { "Tab size min" }
+                        <span class="control-value">{ fmt_f64(settings_value.tab_size_min) }</span>
+                    </label>
+                    <input
+                        id="tab-size-min"
+                        type="range"
+                        min={TAB_SIZE_MIN_LIMIT.to_string()}
+                        max={settings_value.tab_size_max.to_string()}
+                        step="0.005"
+                        value={settings_value.tab_size_min.to_string()}
+                        oninput={tab_size_min_input}
+                    />
+                </div>
+                <div class="control">
+                    <label for="tab-size-max">
+                        { "Tab size max" }
+                        <span class="control-value">{ fmt_f64(settings_value.tab_size_max) }</span>
+                    </label>
+                    <input
+                        id="tab-size-max"
+                        type="range"
+                        min={settings_value.tab_size_min.to_string()}
+                        max={TAB_SIZE_MAX_LIMIT.to_string()}
+                        step="0.005"
+                        value={settings_value.tab_size_max.to_string()}
+                        oninput={tab_size_max_input}
                     />
                 </div>
                 <div class="control">
@@ -4370,51 +4649,6 @@ fn app() -> Html {
                     />
                 </div>
                 <div class="control">
-                    <label for="neck-weight">
-                        { "Neck weight" }
-                        <span class="control-value">{ fmt_f64(settings_value.neck_weight) }</span>
-                    </label>
-                    <input
-                        id="neck-weight"
-                        type="range"
-                        min={NECK_WEIGHT_MIN.to_string()}
-                        max={NECK_WEIGHT_MAX.to_string()}
-                        step="0.5"
-                        value={settings_value.neck_weight.to_string()}
-                        oninput={neck_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="mid-weight">
-                        { "Mid weight" }
-                        <span class="control-value">{ fmt_f64(settings_value.mid_weight) }</span>
-                    </label>
-                    <input
-                        id="mid-weight"
-                        type="range"
-                        min={MID_WEIGHT_MIN.to_string()}
-                        max={MID_WEIGHT_MAX.to_string()}
-                        step="0.5"
-                        value={settings_value.mid_weight.to_string()}
-                        oninput={mid_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="knob-weight">
-                        { "Knob weight" }
-                        <span class="control-value">{ fmt_f64(settings_value.knob_weight) }</span>
-                    </label>
-                    <input
-                        id="knob-weight"
-                        type="range"
-                        min={KNOB_WEIGHT_MIN.to_string()}
-                        max={KNOB_WEIGHT_MAX.to_string()}
-                        step="1"
-                        value={settings_value.knob_weight.to_string()}
-                        oninput={knob_input}
-                    />
-                </div>
-                <div class="control">
                     <label for="variation">
                         { "Variation" }
                         <span class="control-value">{ fmt_f64(settings_value.variation) }</span>
@@ -4430,6 +4664,40 @@ fn app() -> Html {
                     />
                 </div>
                 <div class="control">
+                    <label for="jitter-strength">
+                        { "Jitter strength" }
+                        <span class="control-value">
+                            { fmt_f64(settings_value.jitter_strength) }
+                        </span>
+                    </label>
+                    <input
+                        id="jitter-strength"
+                        type="range"
+                        min={JITTER_STRENGTH_MIN.to_string()}
+                        max={JITTER_STRENGTH_MAX.to_string()}
+                        step="0.005"
+                        value={settings_value.jitter_strength.to_string()}
+                        oninput={jitter_strength_input}
+                    />
+                </div>
+                <div class="control">
+                    <label for="jitter-len-bias">
+                        { "Length jitter bias" }
+                        <span class="control-value">
+                            { fmt_f64(settings_value.jitter_len_bias) }
+                        </span>
+                    </label>
+                    <input
+                        id="jitter-len-bias"
+                        type="range"
+                        min={JITTER_LEN_BIAS_MIN.to_string()}
+                        max={JITTER_LEN_BIAS_MAX.to_string()}
+                        step="0.01"
+                        value={settings_value.jitter_len_bias.to_string()}
+                        oninput={jitter_len_bias_input}
+                    />
+                </div>
+                <div class="control">
                     <label for="line-bend">
                         { "Grid bend" }
                         <span class="control-value">{ fmt_f64(settings_value.line_bend_ratio) }</span>
@@ -4442,6 +4710,40 @@ fn app() -> Html {
                         step="0.01"
                         value={settings_value.line_bend_ratio.to_string()}
                         oninput={line_bend_input}
+                    />
+                </div>
+                <div class="control">
+                    <label for="tab-depth-cap">
+                        { "Tab depth cap" }
+                        <span class="control-value">
+                            { fmt_f64(settings_value.tab_depth_cap) }
+                        </span>
+                    </label>
+                    <input
+                        id="tab-depth-cap"
+                        type="range"
+                        min={TAB_DEPTH_CAP_MIN.to_string()}
+                        max={TAB_DEPTH_CAP_MAX.to_string()}
+                        step="0.01"
+                        value={settings_value.tab_depth_cap.to_string()}
+                        oninput={tab_depth_cap_input}
+                    />
+                </div>
+                <div class="control">
+                    <label for="curve-detail">
+                        { "Curve detail" }
+                        <span class="control-value">
+                            { fmt_f64(settings_value.curve_detail) }
+                        </span>
+                    </label>
+                    <input
+                        id="curve-detail"
+                        type="range"
+                        min={CURVE_DETAIL_MIN.to_string()}
+                        max={CURVE_DETAIL_MAX.to_string()}
+                        step="0.05"
+                        value={settings_value.curve_detail.to_string()}
+                        oninput={curve_detail_input}
                     />
                 </div>
             </aside>
