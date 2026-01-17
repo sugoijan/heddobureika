@@ -29,7 +29,7 @@ const ROTATION_NOISE_DEFAULT: f64 = 0.6;
 const CLICK_MOVE_RATIO: f64 = 0.08;
 const CLICK_MAX_DURATION_MS: f64 = 240.0;
 const SNAP_ANIMATION_MS: f64 = 160.0;
-const FLIP_CHANCE: f64 = 0.3;
+const FLIP_CHANCE: f64 = 0.2;
 const RUBBER_BAND_RATIO: f64 = 0.35;
 const WORKSPACE_SCALE_MIN: f64 = 1.0;
 const WORKSPACE_SCALE_MAX: f64 = 2.5;
@@ -60,6 +60,8 @@ const SKEW_RANGE_MAX: f64 = 0.2;
 const VARIATION_MIN: f64 = 0.0;
 const VARIATION_MAX: f64 = 1.0;
 const LINE_BEND_MIN: f64 = 0.0;
+const EDGE_STEP_DIV: f64 = 6.0;
+const EDGE_STEP_MIN: f64 = 6.0;
 const STORAGE_KEY: &str = "heddobureika.board.v1";
 const STORAGE_VERSION: u32 = 1;
 const DIR_UP: usize = 0;
@@ -1246,6 +1248,36 @@ fn append_segments(
     }
 }
 
+struct PiecePaths {
+    outline: String,
+    edges: [String; 4],
+}
+
+fn build_edge_path(
+    segments: &[Segment],
+    orientation: EdgeOrientation,
+    origin: (f64, f64),
+    offset: (f64, f64),
+    warp: &WarpField<'_>,
+    start: (f64, f64),
+    max_segment_len: f64,
+) -> String {
+    let (sx, sy) = map_point(orientation, origin, offset, warp, start.0, start.1);
+    let mut path = String::new();
+    let _ = write!(path, "M {} {}", fmt_f64(sx), fmt_f64(sy));
+    append_segments(
+        &mut path,
+        segments,
+        orientation,
+        origin,
+        offset,
+        warp,
+        start,
+        max_segment_len,
+    );
+    path
+}
+
 fn build_piece_path(
     piece: &Piece,
     piece_width: f64,
@@ -1253,7 +1285,7 @@ fn build_piece_path(
     horizontal: &[Vec<Option<Edge>>],
     vertical: &[Vec<Option<Edge>>],
     warp: &WarpField<'_>,
-) -> String {
+) -> PiecePaths {
     let row = piece.row as usize;
     let col = piece.col as usize;
     let piece_x = piece.col as f64 * piece_width;
@@ -1277,8 +1309,8 @@ fn build_piece_path(
         reverse_segments(&edge_segments(piece_height, piece_width, left_edge, left_sign));
 
     let offset = (piece_x, piece_y);
-    let top_step = (piece_width / 10.0).max(4.0);
-    let side_step = (piece_height / 10.0).max(4.0);
+    let top_step = (piece_width / EDGE_STEP_DIV).max(EDGE_STEP_MIN);
+    let side_step = (piece_height / EDGE_STEP_DIV).max(EDGE_STEP_MIN);
 
     let mut path = String::new();
     let (start_x, start_y) = warp_point(piece_x, piece_y, warp);
@@ -1329,7 +1361,46 @@ fn build_piece_path(
         side_step,
     );
     path.push_str(" Z");
-    path
+    let top_path = build_edge_path(
+        &top_segments,
+        EdgeOrientation::Top,
+        (0.0, 0.0),
+        offset,
+        warp,
+        (0.0, 0.0),
+        top_step,
+    );
+    let right_path = build_edge_path(
+        &right_segments,
+        EdgeOrientation::Right,
+        (piece_width, 0.0),
+        offset,
+        warp,
+        (0.0, 0.0),
+        side_step,
+    );
+    let bottom_path = build_edge_path(
+        &bottom_segments,
+        EdgeOrientation::Bottom,
+        (0.0, piece_height),
+        offset,
+        warp,
+        (piece_width, 0.0),
+        top_step,
+    );
+    let left_path = build_edge_path(
+        &left_segments,
+        EdgeOrientation::Left,
+        (0.0, 0.0),
+        offset,
+        warp,
+        (piece_height, 0.0),
+        side_step,
+    );
+    PiecePaths {
+        outline: path,
+        edges: [top_path, right_path, bottom_path, left_path],
+    }
 }
 
 #[function_component(App)]
@@ -1404,6 +1475,7 @@ fn app() -> Html {
     let rotation_enabled_value = *rotation_enabled;
     let animations_enabled = use_state(|| false);
     let animations_enabled_value = *animations_enabled;
+    let hovered_id = use_state(|| None::<usize>);
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
     let scramble_nonce = use_state(|| 0u64);
@@ -1418,6 +1490,7 @@ fn app() -> Html {
     let show_debug_value = *show_debug;
     let dragging_members_value = (*dragging_members).clone();
     let animating_members_value = (*animating_members).clone();
+    let hovered_id_value = *hovered_id;
     let status_label = if solved_value { "Solved" } else { "In progress" };
     let status_class = if solved_value {
         "status status-solved"
@@ -1970,18 +2043,40 @@ fn app() -> Html {
         if center_max_y < center_min_y {
             center_max_y = center_min_y;
         }
-        let piece_shapes: Vec<(Piece, String)> = pieces
+        let piece_shapes: Vec<(Piece, PiecePaths)> = pieces
             .iter()
             .map(|piece| {
-                let path_d =
-                    build_piece_path(piece, piece_width, piece_height, &horizontal, &vertical, &warp_field);
-                (*piece, path_d)
+                let paths = build_piece_path(
+                    piece,
+                    piece_width,
+                    piece_height,
+                    &horizontal,
+                    &vertical,
+                    &warp_field,
+                );
+                (*piece, paths)
             })
             .collect();
 
         let positions_value = (*positions).clone();
         let rotations_value = (*rotations).clone();
         let flips_value = (*flips).clone();
+        let connections_value = (*connections).clone();
+        let hovered_group = if let Some(id) = hovered_id_value {
+            if id < connections_value.len() {
+                collect_group(&connections_value, id, grid.cols as usize, grid.rows as usize)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let mut hovered_mask = vec![false; (grid.cols * grid.rows) as usize];
+        for id in &hovered_group {
+            if *id < hovered_mask.len() {
+                hovered_mask[*id] = true;
+            }
+        }
         let mut dragging_mask = vec![false; (grid.cols * grid.rows) as usize];
         for id in &dragging_members_value {
             if *id < dragging_mask.len() {
@@ -3569,7 +3664,7 @@ fn app() -> Html {
 
         let mask_defs: Html = piece_shapes
             .iter()
-            .map(|(piece, path_d)| {
+            .map(|(piece, paths)| {
                 let mask_id = format!("piece-mask-{}", piece.id);
                 html! {
                     <mask
@@ -3589,14 +3684,14 @@ fn app() -> Html {
                             height={mask_height.clone()}
                             fill="black"
                         />
-                        <path d={path_d.clone()} fill="white" />
+                        <path d={paths.outline.clone()} fill="white" />
                     </mask>
                 }
             })
             .collect();
 
         let mut nodes = Vec::with_capacity(piece_shapes.len());
-        for (piece, path_d) in piece_shapes.iter() {
+        for (piece, paths) in piece_shapes.iter() {
             let piece_x = piece.col as f64 * piece_width;
             let piece_y = piece.row as f64 * piece_height;
             let current =
@@ -3630,22 +3725,81 @@ fn app() -> Html {
             let img_y = fmt_f64(-piece_y);
             let is_dragging = dragging_mask.get(piece.id).copied().unwrap_or(false);
             let is_animating = animating_mask.get(piece.id).copied().unwrap_or(false);
-            let class = if is_dragging {
+            let is_hovered = hovered_mask.get(piece.id).copied().unwrap_or(false);
+            let mut class = if is_dragging {
                 if flipped {
-                    "piece dragging flipped"
+                    "piece dragging flipped".to_string()
                 } else {
-                    "piece dragging"
+                    "piece dragging".to_string()
                 }
             } else if is_animating {
                 if flipped {
-                    "piece animating flipped"
+                    "piece animating flipped".to_string()
                 } else {
-                    "piece animating"
+                    "piece animating".to_string()
                 }
             } else if flipped {
-                "piece flipped"
+                "piece flipped".to_string()
             } else {
-                "piece"
+                "piece".to_string()
+            };
+            if is_hovered {
+                class.push_str(" hovered");
+            }
+            let connection = connections_value
+                .get(piece.id)
+                .copied()
+                .unwrap_or([false; 4]);
+            let mut external_path = String::new();
+            let mut connected_path = String::new();
+            for (dir, edge_path) in [
+                (DIR_UP, &paths.edges[DIR_UP]),
+                (DIR_RIGHT, &paths.edges[DIR_RIGHT]),
+                (DIR_DOWN, &paths.edges[DIR_DOWN]),
+                (DIR_LEFT, &paths.edges[DIR_LEFT]),
+            ] {
+                let connected = connection.get(dir).copied().unwrap_or(false);
+                let target = if connected {
+                    &mut connected_path
+                } else {
+                    &mut external_path
+                };
+                if !target.is_empty() {
+                    target.push(' ');
+                }
+                target.push_str(edge_path);
+            }
+            let external_outline = if external_path.is_empty() {
+                html! {}
+            } else {
+                html! {
+                    <>
+                        <path
+                            class="piece-outline piece-outline-light edge-external"
+                            d={external_path.clone()}
+                        />
+                        <path
+                            class="piece-outline piece-outline-dark edge-external"
+                            d={external_path}
+                        />
+                    </>
+                }
+            };
+            let connected_outline = if connected_path.is_empty() {
+                html! {}
+            } else {
+                html! {
+                    <>
+                        <path
+                            class="piece-outline piece-outline-light edge-connected"
+                            d={connected_path.clone()}
+                        />
+                        <path
+                            class="piece-outline piece-outline-dark edge-connected"
+                            d={connected_path}
+                        />
+                    </>
+                }
             };
             let start_drag: Rc<dyn Fn(f64, f64, bool, bool, Option<i32>)> = {
                 let positions = positions.clone();
@@ -3774,6 +3928,19 @@ fn app() -> Html {
                     event.prevent_default();
                 })
             };
+            let on_piece_enter = {
+                let hovered_id = hovered_id.clone();
+                let piece_id = piece.id;
+                Callback::from(move |_| {
+                    hovered_id.set(Some(piece_id));
+                })
+            };
+            let on_piece_leave = {
+                let hovered_id = hovered_id.clone();
+                Callback::from(move |_| {
+                    hovered_id.set(None);
+                })
+            };
             let debug_overlay = if show_debug_value {
                 let label = format!(
                     "#{}\nx:{}\ny:{}\nr:{}",
@@ -3822,7 +3989,10 @@ fn app() -> Html {
                     transform={transform}
                     onmousedown={on_piece_down}
                     ontouchstart={on_piece_touch}
+                    onmouseenter={on_piece_enter}
+                    onmouseleave={on_piece_leave}
                 >
+                    {external_outline}
                     <rect
                         class="piece-back"
                         x={img_x.clone()}
@@ -3842,15 +4012,8 @@ fn app() -> Html {
                         preserveAspectRatio="xMidYMid meet"
                         mask={mask_ref}
                     />
-                    <path class="piece-hitbox" d={path_d.clone()} />
-                    <path
-                        class="piece-outline piece-outline-light"
-                        d={path_d.clone()}
-                    />
-                    <path
-                        class="piece-outline piece-outline-dark"
-                        d={path_d.clone()}
-                    />
+                    <path class="piece-hitbox" d={paths.outline.clone()} />
+                    {connected_outline}
                     {debug_overlay}
                 </g>
             };
@@ -4029,93 +4192,6 @@ fn app() -> Html {
                     </select>
                 </div>
                 <div class="control">
-                    <label for="workspace-scale">
-                        { "Workspace scale" }
-                        <span class="control-value">{ fmt_f64(workspace_scale_value) }</span>
-                    </label>
-                    <input
-                        id="workspace-scale"
-                        type="range"
-                        min={WORKSPACE_SCALE_MIN.to_string()}
-                        max={WORKSPACE_SCALE_MAX.to_string()}
-                        step="0.05"
-                        value={workspace_scale_value.to_string()}
-                        oninput={on_workspace_scale}
-                    />
-                </div>
-                <div class="control">
-                    <label for="frame-snap">
-                        { "Frame snap" }
-                        <span class="control-value">{ fmt_f64(frame_snap_ratio_value) }</span>
-                    </label>
-                    <input
-                        id="frame-snap"
-                        type="range"
-                        min={FRAME_SNAP_MIN.to_string()}
-                        max={FRAME_SNAP_MAX.to_string()}
-                        step="0.05"
-                        value={frame_snap_ratio_value.to_string()}
-                        oninput={on_frame_snap}
-                    />
-                </div>
-                <div class="control">
-                    <label for="animations-enabled">
-                        { "Animations" }
-                        <span class="control-value">
-                            { if animations_enabled_value { "On" } else { "Off" } }
-                        </span>
-                    </label>
-                    <input
-                        id="animations-enabled"
-                        type="checkbox"
-                        checked={animations_enabled_value}
-                        onchange={on_animations_toggle}
-                    />
-                </div>
-                <div class="control">
-                    <label for="rotation-enabled">
-                        { "Rotation" }
-                        <span class="control-value">
-                            { if rotation_enabled_value { "On" } else { "Off" } }
-                        </span>
-                    </label>
-                    <input
-                        id="rotation-enabled"
-                        type="checkbox"
-                        checked={rotation_enabled_value}
-                        onchange={on_rotation_toggle}
-                    />
-                </div>
-                <div class="control">
-                    <label for="rotation-noise">
-                        { "Rotation noise" }
-                        <span class="control-value">{ fmt_f64(rotation_noise_value) }</span>
-                    </label>
-                    <input
-                        id="rotation-noise"
-                        type="range"
-                        min={ROTATION_NOISE_MIN.to_string()}
-                        max={ROTATION_NOISE_MAX.to_string()}
-                        step="0.1"
-                        value={rotation_noise_value.to_string()}
-                        oninput={on_rotation_noise}
-                    />
-                </div>
-                <div class="control">
-                    <label for="debug-enabled">
-                        { "Debug overlay" }
-                        <span class="control-value">
-                            { if show_debug_value { "On" } else { "Off" } }
-                        </span>
-                    </label>
-                    <input
-                        id="debug-enabled"
-                        type="checkbox"
-                        checked={show_debug_value}
-                        onchange={on_debug_toggle}
-                    />
-                </div>
-                <div class="control">
                     <button
                         class="control-button"
                         type="button"
@@ -4154,6 +4230,84 @@ fn app() -> Html {
                     >
                         { "Unflip all" }
                     </button>
+                </div>
+                <div class="control">
+                    <label for="workspace-scale">
+                        { "Workspace scale" }
+                        <span class="control-value">{ fmt_f64(workspace_scale_value) }</span>
+                    </label>
+                    <input
+                        id="workspace-scale"
+                        type="range"
+                        min={WORKSPACE_SCALE_MIN.to_string()}
+                        max={WORKSPACE_SCALE_MAX.to_string()}
+                        step="0.05"
+                        value={workspace_scale_value.to_string()}
+                        oninput={on_workspace_scale}
+                    />
+                </div>
+                <div class="control">
+                    <label for="animations-enabled">
+                        { "Animations: " } { if animations_enabled_value { "On" } else { "Off" } }
+                        <input
+                            id="animations-enabled"
+                            type="checkbox"
+                            checked={animations_enabled_value}
+                            onchange={on_animations_toggle}
+                        />
+                    </label>
+                </div>
+                <div class="control">
+                    <label for="frame-snap">
+                        { "Frame snap" }
+                        <span class="control-value">{ fmt_f64(frame_snap_ratio_value) }</span>
+                    </label>
+                    <input
+                        id="frame-snap"
+                        type="range"
+                        min={FRAME_SNAP_MIN.to_string()}
+                        max={FRAME_SNAP_MAX.to_string()}
+                        step="0.05"
+                        value={frame_snap_ratio_value.to_string()}
+                        oninput={on_frame_snap}
+                    />
+                </div>
+                <div class="control">
+                    <label for="rotation-enabled">
+                        { "Rotation: " } { if rotation_enabled_value { "On" } else { "Off" } }
+                        <input
+                            id="rotation-enabled"
+                            type="checkbox"
+                            checked={rotation_enabled_value}
+                            onchange={on_rotation_toggle}
+                        />
+                    </label>
+                </div>
+                <div class="control">
+                    <label for="rotation-noise">
+                        { "Rotation noise" }
+                        <span class="control-value">{ fmt_f64(rotation_noise_value) }</span>
+                    </label>
+                    <input
+                        id="rotation-noise"
+                        type="range"
+                        min={ROTATION_NOISE_MIN.to_string()}
+                        max={ROTATION_NOISE_MAX.to_string()}
+                        step="0.1"
+                        value={rotation_noise_value.to_string()}
+                        oninput={on_rotation_noise}
+                    />
+                </div>
+                <div class="control">
+                    <label for="debug-enabled">
+                        { "Debug overlay: " } { if show_debug_value { "On" } else { "Off" } }
+                        <input
+                            id="debug-enabled"
+                            type="checkbox"
+                            checked={show_debug_value}
+                            onchange={on_debug_toggle}
+                        />
+                    </label>
                 </div>
                 <div class="control">
                     <label for="tab-width">

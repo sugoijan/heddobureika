@@ -103,26 +103,38 @@ body {
 }
 
 .piece-outline-light {
-  stroke: rgba(255, 255, 255, 0.8);
-  stroke-width: 1.6;
+  stroke: rgba(255, 255, 255, 0.86);
+  stroke-width: 1.9;
 }
 
 .piece-outline-dark {
-  stroke: rgba(0, 0, 0, 0.55);
-  stroke-width: 0.9;
-  mix-blend-mode: multiply;
+  stroke: rgba(0, 0, 0, 0.65);
+  stroke-width: 1.1;
 }
 
-.piece:hover .piece-image {
-  opacity: 0.9;
+.piece-outline.edge-connected {
+  opacity: 1;
 }
 
-.piece:hover .piece-outline-light {
-  stroke: rgba(255, 255, 255, 0.95);
+.piece.hovered .piece-image {
+  opacity: 1;
 }
 
-.piece:hover .piece-outline-dark {
-  stroke: rgba(0, 0, 0, 0.8);
+.piece.hovered:not(.flipped) .piece-outline.edge-external {
+  opacity: 1;
+}
+
+.piece.hovered:not(.flipped) .piece-outline-light.edge-external {
+  stroke: white;
+}
+
+.piece.hovered:not(.flipped) .piece-outline-dark.edge-external {
+  stroke: black;
+  stroke-width: 2;
+}
+
+.piece.hovered.flipped .piece-outline.edge-external {
+  opacity: 0.2;
 }
 
 .piece.flipped .piece-image {
@@ -145,6 +157,7 @@ body {
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 12px;
   box-shadow: 0 16px 32px rgba(0, 0, 0, 0.18);
+  font-family: monospace;
 }
 
 .controls-hint {
