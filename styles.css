@@ -16,7 +16,7 @@ body {
   max-width: 100%;
   height: auto;
   display: block;
-  touch-action: none;
+  touch-action: manipulation;
 }
 
 .workspace-bounds {
@@ -83,6 +83,11 @@ body {
   pointer-events: none;
 }
 
+.piece-outline-group {
+  isolation: isolate;
+  pointer-events: none;
+}
+
 .piece-outline {
   fill: none;
   vector-effect: non-scaling-stroke;
@@ -103,24 +108,28 @@ body {
 }
 
 .piece-outline-light {
-  stroke: rgba(255, 255, 255, 0.86);
-  stroke-width: 1.9;
+  stroke: white;
+  stroke-width: 1.5;
 }
 
 .piece-outline-dark {
-  stroke: rgba(0, 0, 0, 0.65);
-  stroke-width: 1.1;
+  stroke: black;
+  stroke-width: 1;
 }
 
-.piece-outline.edge-connected {
+.piece-outline-group.edge-external {
   opacity: 1;
+}
+
+.piece-outline-group.edge-connected {
+  opacity: 0.6;
 }
 
 .piece.hovered .piece-image {
   opacity: 1;
 }
 
-.piece.hovered:not(.flipped) .piece-outline.edge-external {
+.piece.hovered:not(.flipped) .piece-outline-group.edge-external {
   opacity: 1;
 }
 
@@ -133,7 +142,7 @@ body {
   stroke-width: 2;
 }
 
-.piece.hovered.flipped .piece-outline.edge-external {
+.piece.hovered.flipped .piece-outline-group.edge-external {
   opacity: 0.2;
 }
 
@@ -152,12 +161,14 @@ body {
   z-index: 10;
   width: 260px;
   max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 212px);
   padding: 12px 14px 10px;
   background: rgba(255, 255, 255, 0.88);
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 12px;
   box-shadow: 0 16px 32px rgba(0, 0, 0, 0.18);
   font-family: monospace;
+  overflow-y: auto;
 }
 
 .controls-hint {

@@ -16,12 +16,17 @@ use yew::prelude::*;
 const IMAGE_SRC: &str = "puzzles/zoe-potter.jpg";
 const PUZZLE_SEED: u64 = 0x5EED_5EED_25_20;
 const MAX_LINE_BEND_RATIO: f64 = 0.2;
-const SNAP_DISTANCE_RATIO: f64 = 0.18;
-const CONNECT_DISTANCE_RATIO: f64 = 0.06;
-const SOLVE_TOLERANCE_RATIO: f64 = 0.08;
+const SNAP_DISTANCE_RATIO_DEFAULT: f64 = 0.200;
+const SNAP_DISTANCE_RATIO_MIN: f64 = 0.050;
+const SNAP_DISTANCE_RATIO_MAX: f64 = 0.350;
+const SOLVE_TOLERANCE_RATIO: f64 = 0.080;
 const ROTATION_STEP_DEG: f64 = 90.0;
-const ROTATION_SNAP_TOLERANCE_DEG: f64 = 3.0;
+const ROTATION_SNAP_TOLERANCE_DEFAULT_DEG: f64 = 5.0;
+const ROTATION_SNAP_TOLERANCE_MIN_DEG: f64 = 0.5;
+const ROTATION_SNAP_TOLERANCE_MAX_DEG: f64 = 12.0;
 const ROTATION_SOLVE_TOLERANCE_DEG: f64 = 1.5;
+const ROTATION_LOCK_THRESHOLD_DEFAULT: usize = 4;
+const ROTATION_LOCK_THRESHOLD_MIN: usize = 1;
 const ROTATION_NOISE_MIN: f64 = 0.0;
 const ROTATION_NOISE_MAX: f64 = 6.0;
 const ROTATION_NOISE_DEFAULT: f64 = 0.6;
@@ -30,7 +35,7 @@ const CLICK_MAX_DURATION_MS: f64 = 240.0;
 const SNAP_ANIMATION_MS: f64 = 160.0;
 const FLIP_CHANCE: f64 = 0.2;
 const RUBBER_BAND_RATIO: f64 = 0.35;
-const WORKSPACE_SCALE_MIN: f64 = 1.0;
+const WORKSPACE_SCALE_MIN: f64 = 0.4;
 const WORKSPACE_SCALE_MAX: f64 = 2.5;
 const WORKSPACE_SCALE_DEFAULT: f64 = 1.7;
 const FRAME_SNAP_MIN: f64 = 0.4;
@@ -60,7 +65,7 @@ const VARIATION_MAX: f64 = 1.0;
 const LINE_BEND_MIN: f64 = 0.0;
 const EDGE_STEP_DIV: f64 = 6.0;
 const EDGE_STEP_MIN: f64 = 6.0;
-const CORNER_RADIUS_RATIO: f64 = 0.08;
+const CORNER_RADIUS_RATIO: f64 = 0.05;
 const STORAGE_KEY: &str = "heddobureika.board.v1";
 const STORAGE_VERSION: u32 = 1;
 const DIR_UP: usize = 0;
@@ -250,46 +255,113 @@ impl Default for ShapeSettings {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct GridPreset {
-    label: &'static str,
+struct GridChoice {
+    target_count: u32,
     cols: u32,
     rows: u32,
+    actual_count: u32,
 }
 
-const GRID_PRESETS: [GridPreset; 5] = [
-    GridPreset {
-        label: "10 x 8",
-        cols: 10,
-        rows: 8,
-    },
-    GridPreset {
-        label: "15 x 12",
-        cols: 15,
-        rows: 12,
-    },
-    GridPreset {
-        label: "20 x 16",
-        cols: 20,
-        rows: 16,
-    },
-    GridPreset {
-        label: "25 x 20",
-        cols: 25,
-        rows: 20,
-    },
-    GridPreset {
-        label: "30 x 24",
-        cols: 30,
-        rows: 24,
-    },
+const TARGET_PIECE_COUNTS: [u32; 11] = [
+    50, 100, 150, 300, 500, 750, 1000, 1500, 2000, 3000, 5000,
 ];
+const DEFAULT_TARGET_COUNT: u32 = 100;
+const GRID_REL_COUNT_TOL: f64 = 0.05;
+const GRID_PIECE_RATIO_MAX: f64 = 1.42;
+const GRID_ROW_MIN: u32 = 2;
+const GRID_ROW_WIDEN: f64 = 1.5;
+const GRID_NEIGHBOR_COLS: i32 = 3;
+const GRID_SCORE_COUNT: f64 = 1.0;
+const GRID_SCORE_GRID: f64 = 1.0;
+const GRID_SCORE_PIECE: f64 = 0.5;
+const SOLVE_TIME_FACTOR: f64 = 4.1;
+const SOLVE_TIME_EXPONENT: f64 = 1.3;
 
-const DEFAULT_GRID_INDEX: usize = 0;
+const FALLBACK_GRID: GridChoice = GridChoice {
+    target_count: 80,
+    cols: 10,
+    rows: 8,
+    actual_count: 80,
+};
 
-fn grid_preset_index(cols: u32, rows: u32) -> Option<usize> {
-    GRID_PRESETS
+fn grid_choice_index(choices: &[GridChoice], cols: u32, rows: u32) -> Option<usize> {
+    choices
         .iter()
-        .position(|preset| preset.cols == cols && preset.rows == rows)
+        .position(|choice| choice.cols == cols && choice.rows == rows)
+}
+
+fn grid_choice_label(choice: &GridChoice) -> String {
+    if choice.actual_count == choice.target_count {
+        format!(
+            "{} pieces ({}x{})",
+            choice.target_count, choice.cols, choice.rows
+        )
+    } else {
+        format!(
+            "{} pieces ({}x{}, actual {})",
+            choice.target_count, choice.cols, choice.rows, choice.actual_count
+        )
+    }
+}
+
+fn best_grid_for_count(width: u32, height: u32, target: u32) -> Option<GridChoice> {
+    if target == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    let aspect = width as f64 / height as f64;
+    let piece_ratio_max = GRID_PIECE_RATIO_MAX.max(1.0);
+    let piece_ratio_min = 1.0 / piece_ratio_max;
+    let base = (target as f64).sqrt().ceil() as u32;
+    let r_hi = ((base as f64) * GRID_ROW_WIDEN).ceil() as u32;
+    let r_hi = r_hi.max(GRID_ROW_MIN);
+    let mut best: Option<(GridChoice, f64)> = None;
+    for r in GRID_ROW_MIN..=r_hi {
+        let c_star = target as f64 / r as f64;
+        let c0 = c_star.round() as i32;
+        for dc in -GRID_NEIGHBOR_COLS..=GRID_NEIGHBOR_COLS {
+            let c = c0 + dc;
+            if c < 2 {
+                continue;
+            }
+            let actual = r as i32 * c;
+            let actual_u = actual as u32;
+            let rel_err = ((actual_u as f64) - (target as f64)).abs() / target as f64;
+            if rel_err > GRID_REL_COUNT_TOL {
+                continue;
+            }
+            let grid_ratio = c as f64 / r as f64;
+            let piece_ratio = aspect / grid_ratio;
+            if piece_ratio < piece_ratio_min || piece_ratio > piece_ratio_max {
+                continue;
+            }
+            let eps = 1e-12;
+            let count_term = rel_err.powi(2);
+            let grid_term = ((grid_ratio + eps) / (aspect + eps)).ln().powi(2);
+            let piece_term = (piece_ratio + eps).ln().powi(2);
+            let score =
+                GRID_SCORE_COUNT * count_term + GRID_SCORE_GRID * grid_term + GRID_SCORE_PIECE * piece_term;
+            let choice = GridChoice {
+                target_count: target,
+                cols: c as u32,
+                rows: r,
+                actual_count: actual_u,
+            };
+            match &best {
+                Some((_best_choice, best_score)) if score >= *best_score => {}
+                _ => {
+                    best = Some((choice, score));
+                }
+            }
+        }
+    }
+    best.map(|(choice, _)| choice)
+}
+
+fn build_grid_choices(width: u32, height: u32) -> Vec<GridChoice> {
+    TARGET_PIECE_COUNTS
+        .iter()
+        .filter_map(|target| best_grid_for_count(width, height, *target))
+        .collect()
 }
 
 fn validate_saved_board(state: &SavedBoard, total: usize) -> bool {
@@ -388,6 +460,33 @@ fn build_pieces(rows: u32, cols: u32) -> Vec<Piece> {
 
 fn fmt_f64(value: f64) -> String {
     format!("{:.3}", value)
+}
+
+fn format_time_unit(value: u64, unit: &str) -> String {
+    if value == 1 {
+        format!("~{} {}", value, unit)
+    } else {
+        format!("~{} {}s", value, unit)
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "~0 seconds".to_string();
+    }
+    if seconds < 90.0 {
+        return format_time_unit(seconds.round().max(1.0) as u64, "second");
+    }
+    let minutes = seconds / 60.0;
+    if minutes < 90.0 {
+        return format_time_unit(minutes.round().max(1.0) as u64, "minute");
+    }
+    let hours = minutes / 60.0;
+    if hours < 36.0 {
+        return format_time_unit(hours.round().max(1.0) as u64, "hour");
+    }
+    let days = hours / 24.0;
+    format_time_unit(days.round().max(1.0) as u64, "day")
 }
 
 fn jitter_value(
@@ -676,8 +775,8 @@ fn angle_delta(target: f64, current: f64) -> f64 {
     diff
 }
 
-fn angle_matches(a: f64, b: f64) -> bool {
-    angle_delta(a, b).abs() <= ROTATION_SNAP_TOLERANCE_DEG
+fn angle_matches(a: f64, b: f64, tolerance: f64) -> bool {
+    angle_delta(a, b).abs() <= tolerance
 }
 
 fn next_snap_rotation(angle: f64) -> f64 {
@@ -685,11 +784,16 @@ fn next_snap_rotation(angle: f64) -> f64 {
     normalize_angle(next * ROTATION_STEP_DEG)
 }
 
-fn click_rotation_delta(current_angle: f64, noise: f64, noise_range: f64) -> f64 {
+fn click_rotation_delta(
+    current_angle: f64,
+    noise: f64,
+    noise_range: f64,
+    snap_tolerance: f64,
+) -> f64 {
     let mut target = next_snap_rotation(current_angle + noise);
     target = normalize_angle(target + noise);
     let min_step = if noise_range > 0.0 {
-        noise_range.max(ROTATION_SNAP_TOLERANCE_DEG)
+        noise_range.max(snap_tolerance)
     } else {
         0.0
     };
@@ -765,6 +869,793 @@ fn align_group_to_anchor(
             *rot = target_rot;
         }
     }
+}
+
+fn connect_aligned_neighbors(
+    members: &[usize],
+    positions: &[(f64, f64)],
+    rotations: &[f64],
+    flips: &[bool],
+    connections: &mut Vec<[bool; 4]>,
+    cols: usize,
+    rows: usize,
+    piece_width: f64,
+    piece_height: f64,
+    snap_distance: f64,
+    rotation_snap_tolerance: f64,
+    rotation_enabled: bool,
+) {
+    let group_rot = members
+        .first()
+        .and_then(|id| rotations.get(*id))
+        .copied()
+        .unwrap_or(0.0);
+    for member in members {
+        if *member >= positions.len() {
+            continue;
+        }
+        if flips.get(*member).copied().unwrap_or(false) {
+            continue;
+        }
+        let current = positions[*member];
+        let center_a = (
+            current.0 + piece_width * 0.5,
+            current.1 + piece_height * 0.5,
+        );
+        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
+            if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
+                if flips.get(neighbor).copied().unwrap_or(false) {
+                    continue;
+                }
+                let rot_b = rotations.get(neighbor).copied().unwrap_or(0.0);
+                if rotation_enabled
+                    && !angle_matches(group_rot, rot_b, rotation_snap_tolerance)
+                {
+                    continue;
+                }
+                let base = match dir {
+                    DIR_LEFT => (-piece_width, 0.0),
+                    DIR_RIGHT => (piece_width, 0.0),
+                    DIR_UP => (0.0, -piece_height),
+                    DIR_DOWN => (0.0, piece_height),
+                    _ => (0.0, 0.0),
+                };
+                let expected_rot = if rotation_enabled { group_rot } else { 0.0 };
+                let (vx, vy) = rotate_vec(base.0, base.1, expected_rot);
+                let neighbor_pos = positions[neighbor];
+                let center_b = (
+                    neighbor_pos.0 + piece_width * 0.5,
+                    neighbor_pos.1 + piece_height * 0.5,
+                );
+                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
+                let dx = actual.0 - vx;
+                let dy = actual.1 - vy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= snap_distance {
+                    set_connection(connections, *member, dir, true, cols, rows);
+                }
+            }
+        }
+    }
+}
+
+fn frame_center_bounds_for_rotation(
+    frame_width: f64,
+    frame_height: f64,
+    piece_width: f64,
+    piece_height: f64,
+    rotation: f64,
+) -> (f64, f64, f64, f64) {
+    let rotation = normalize_angle(rotation);
+    let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
+    let (rot_w, rot_h) = if swap {
+        (piece_height, piece_width)
+    } else {
+        (piece_width, piece_height)
+    };
+    let min_x = rot_w * 0.5;
+    let min_y = rot_h * 0.5;
+    let mut max_x = frame_width - rot_w * 0.5;
+    let mut max_y = frame_height - rot_h * 0.5;
+    if max_x < min_x {
+        max_x = min_x;
+    }
+    if max_y < min_y {
+        max_y = min_y;
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
+fn apply_snaps_for_group(
+    members: &[usize],
+    positions: &mut Vec<(f64, f64)>,
+    rotations: &mut Vec<f64>,
+    flips: &[bool],
+    connections: &mut Vec<[bool; 4]>,
+    cols: usize,
+    rows: usize,
+    piece_width: f64,
+    piece_height: f64,
+    snap_distance: f64,
+    frame_snap_ratio: f64,
+    center_min_x: f64,
+    center_max_x: f64,
+    center_min_y: f64,
+    center_max_y: f64,
+    view_min_x: f64,
+    view_min_y: f64,
+    view_width: f64,
+    view_height: f64,
+    rotation_snap_tolerance: f64,
+    rotation_enabled: bool,
+) -> Vec<usize> {
+    let total = cols * rows;
+    if members.is_empty() || total == 0 {
+        return Vec::new();
+    }
+    let mut in_group = vec![false; total];
+    for member in members {
+        if *member < in_group.len() {
+            in_group[*member] = true;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SnapCandidate {
+        member: usize,
+        dir: usize,
+        center_b: (f64, f64),
+        rot_b: f64,
+        base: (f64, f64),
+        dist: f64,
+    }
+
+    let mut candidates = Vec::new();
+    for member in members {
+        if *member >= positions.len() {
+            continue;
+        }
+        if flips.get(*member).copied().unwrap_or(false) {
+            continue;
+        }
+        let current = positions[*member];
+        let center_a = (
+            current.0 + piece_width * 0.5,
+            current.1 + piece_height * 0.5,
+        );
+        let rot_a = rotations.get(*member).copied().unwrap_or(0.0);
+        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
+            if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
+                if in_group[neighbor] {
+                    continue;
+                }
+                if flips.get(neighbor).copied().unwrap_or(false) {
+                    continue;
+                }
+                let rot_b = rotations.get(neighbor).copied().unwrap_or(0.0);
+                if !angle_matches(rot_a, rot_b, rotation_snap_tolerance) {
+                    continue;
+                }
+                let base = match dir {
+                    DIR_LEFT => (-piece_width, 0.0),
+                    DIR_RIGHT => (piece_width, 0.0),
+                    DIR_UP => (0.0, -piece_height),
+                    DIR_DOWN => (0.0, piece_height),
+                    _ => (0.0, 0.0),
+                };
+                let expected_rot = if rotation_enabled { rot_b } else { rot_a };
+                let (vx, vy) = rotate_vec(base.0, base.1, expected_rot);
+                let neighbor_pos = positions[neighbor];
+                let center_b = (
+                    neighbor_pos.0 + piece_width * 0.5,
+                    neighbor_pos.1 + piece_height * 0.5,
+                );
+                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
+                let dx = actual.0 - vx;
+                let dy = actual.1 - vy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= snap_distance {
+                    candidates.push(SnapCandidate {
+                        member: *member,
+                        dir,
+                        center_b,
+                        rot_b,
+                        base,
+                        dist,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut snap_anchor: Option<(usize, (f64, f64), f64)> = None;
+    if !candidates.is_empty() {
+        let mut best_index = None;
+        let mut best_count = 0usize;
+        let mut best_error = f64::INFINITY;
+        let mut best_dist = f64::INFINITY;
+        let mut best_anchor_id = 0usize;
+        let mut best_anchor_center = (0.0, 0.0);
+        let mut best_target_rot = 0.0;
+        let mut best_candidate = None;
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let target_rot = if rotation_enabled {
+                normalize_angle(candidate.rot_b)
+            } else {
+                0.0
+            };
+            let anchor_id = candidate.member;
+            let anchor_row = (anchor_id / cols) as i32;
+            let anchor_col = (anchor_id % cols) as i32;
+            let expected = rotate_vec(candidate.base.0, candidate.base.1, target_rot);
+            let anchor_center = (
+                candidate.center_b.0 - expected.0,
+                candidate.center_b.1 - expected.1,
+            );
+
+            let mut min_cx = f64::INFINITY;
+            let mut max_cx = f64::NEG_INFINITY;
+            let mut min_cy = f64::INFINITY;
+            let mut max_cy = f64::NEG_INFINITY;
+            for id in members {
+                let transformed = aligned_center_from_anchor(
+                    anchor_row,
+                    anchor_col,
+                    anchor_center,
+                    *id,
+                    cols,
+                    piece_width,
+                    piece_height,
+                    target_rot,
+                );
+                min_cx = min_cx.min(transformed.0);
+                max_cx = max_cx.max(transformed.0);
+                min_cy = min_cy.min(transformed.1);
+                max_cy = max_cy.max(transformed.1);
+            }
+            let can_snap = min_cx.is_finite()
+                && min_cy.is_finite()
+                && min_cx >= center_min_x
+                && max_cx <= center_max_x
+                && min_cy >= center_min_y
+                && max_cy <= center_max_y;
+            if !can_snap {
+                continue;
+            }
+
+            let mut count = 0usize;
+            let mut error_sum = 0.0;
+            for other in &candidates {
+                if rotation_enabled
+                    && !angle_matches(target_rot, other.rot_b, rotation_snap_tolerance)
+                {
+                    continue;
+                }
+                let new_center = aligned_center_from_anchor(
+                    anchor_row,
+                    anchor_col,
+                    anchor_center,
+                    other.member,
+                    cols,
+                    piece_width,
+                    piece_height,
+                    target_rot,
+                );
+                let expected = rotate_vec(other.base.0, other.base.1, target_rot);
+                let actual = (
+                    other.center_b.0 - new_center.0,
+                    other.center_b.1 - new_center.1,
+                );
+                let dx = actual.0 - expected.0;
+                let dy = actual.1 - expected.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= snap_distance {
+                    count += 1;
+                    error_sum += dist;
+                }
+            }
+
+            if count > best_count
+                || (count == best_count
+                    && (error_sum < best_error
+                        || (error_sum == best_error && candidate.dist < best_dist)))
+            {
+                best_index = Some(idx);
+                best_count = count;
+                best_error = error_sum;
+                best_dist = candidate.dist;
+                best_anchor_id = anchor_id;
+                best_anchor_center = anchor_center;
+                best_target_rot = target_rot;
+                best_candidate = Some(*candidate);
+            }
+        }
+
+        if let Some(_best_idx) = best_index {
+            align_group_to_anchor(
+                positions,
+                rotations,
+                members,
+                best_anchor_id,
+                best_anchor_center,
+                best_target_rot,
+                cols,
+                piece_width,
+                piece_height,
+            );
+
+            if let Some(candidate) = best_candidate {
+                set_connection(
+                    connections,
+                    candidate.member,
+                    candidate.dir,
+                    true,
+                    cols,
+                    rows,
+                );
+            }
+
+            for candidate in &candidates {
+                if rotation_enabled
+                    && !angle_matches(best_target_rot, candidate.rot_b, rotation_snap_tolerance)
+                {
+                    continue;
+                }
+                let new_center = aligned_center_from_anchor(
+                    (best_anchor_id / cols) as i32,
+                    (best_anchor_id % cols) as i32,
+                    best_anchor_center,
+                    candidate.member,
+                    cols,
+                    piece_width,
+                    piece_height,
+                    best_target_rot,
+                );
+                let expected = rotate_vec(candidate.base.0, candidate.base.1, best_target_rot);
+                let actual = (
+                    candidate.center_b.0 - new_center.0,
+                    candidate.center_b.1 - new_center.1,
+                );
+                let dx = actual.0 - expected.0;
+                let dy = actual.1 - expected.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= snap_distance {
+                    set_connection(
+                        connections,
+                        candidate.member,
+                        candidate.dir,
+                        true,
+                        cols,
+                        rows,
+                    );
+                }
+            }
+
+            snap_anchor = Some((best_anchor_id, best_anchor_center, best_target_rot));
+        }
+    }
+
+    let mut group_after = members
+        .first()
+        .map(|id| collect_group(connections, *id, cols, rows))
+        .unwrap_or_default();
+    if rotation_enabled {
+        if let Some((anchor_id, anchor_center, target_rot)) = snap_anchor {
+            if !group_after.is_empty() {
+                align_group_to_anchor(
+                    positions,
+                    rotations,
+                    &group_after,
+                    anchor_id,
+                    anchor_center,
+                    target_rot,
+                    cols,
+                    piece_width,
+                    piece_height,
+                );
+            }
+        }
+    }
+    if !group_after.is_empty() {
+        let frame_width = cols as f64 * piece_width;
+        let frame_height = rows as f64 * piece_height;
+        let corner_snap_distance = snap_distance * frame_snap_ratio;
+        let group_rot = group_after
+            .first()
+            .and_then(|id| rotations.get(*id))
+            .copied()
+            .unwrap_or(0.0);
+        let mut corner_snapped = false;
+        if rotation_enabled && group_after.len() < total && corner_snap_distance > 0.0 {
+            let mut best_corner = None;
+            let target_center_for = |corner: usize, rotation: f64| {
+                let rotation = normalize_angle(rotation);
+                let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
+                let (offset_x, offset_y) = if swap {
+                    (piece_height * 0.5, piece_width * 0.5)
+                } else {
+                    (piece_width * 0.5, piece_height * 0.5)
+                };
+                match corner {
+                    0 => (offset_x, offset_y),
+                    1 => (frame_width - offset_x, offset_y),
+                    2 => (frame_width - offset_x, frame_height - offset_y),
+                    3 => (offset_x, frame_height - offset_y),
+                    _ => (offset_x, offset_y),
+                }
+            };
+            for id in &group_after {
+                if *id >= positions.len() {
+                    continue;
+                }
+                if flips.get(*id).copied().unwrap_or(false) {
+                    continue;
+                }
+                let row = *id / cols;
+                let col = *id % cols;
+                let piece_corner = if row == 0 && col == 0 {
+                    Some(0usize)
+                } else if row == 0 && col + 1 == cols {
+                    Some(1usize)
+                } else if row + 1 == rows && col + 1 == cols {
+                    Some(2usize)
+                } else if row + 1 == rows && col == 0 {
+                    Some(3usize)
+                } else {
+                    None
+                };
+                let piece_corner = match piece_corner {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let current = positions[*id];
+                let current_center = (
+                    current.0 + piece_width * 0.5,
+                    current.1 + piece_height * 0.5,
+                );
+                for target_corner in 0..4usize {
+                    let steps = (target_corner + 4 - piece_corner) % 4;
+                    let target_rot = normalize_angle(steps as f64 * ROTATION_STEP_DEG);
+                    if rotation_enabled
+                        && !angle_matches(group_rot, target_rot, rotation_snap_tolerance)
+                    {
+                        continue;
+                    }
+                    let target_center = target_center_for(target_corner, target_rot);
+                    let dx = current_center.0 - target_center.0;
+                    let dy = current_center.1 - target_center.1;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist > corner_snap_distance {
+                        continue;
+                    }
+                    let anchor_row = (*id / cols) as i32;
+                    let anchor_col = (*id % cols) as i32;
+                    let (frame_min_x, frame_max_x, frame_min_y, frame_max_y) =
+                        frame_center_bounds_for_rotation(
+                            frame_width,
+                            frame_height,
+                            piece_width,
+                            piece_height,
+                            target_rot,
+                        );
+                    let mut min_cx = f64::INFINITY;
+                    let mut max_cx = f64::NEG_INFINITY;
+                    let mut min_cy = f64::INFINITY;
+                    let mut max_cy = f64::NEG_INFINITY;
+                    for member in &group_after {
+                        let center = aligned_center_from_anchor(
+                            anchor_row,
+                            anchor_col,
+                            target_center,
+                            *member,
+                            cols,
+                            piece_width,
+                            piece_height,
+                            target_rot,
+                        );
+                        min_cx = min_cx.min(center.0);
+                        max_cx = max_cx.max(center.0);
+                        min_cy = min_cy.min(center.1);
+                        max_cy = max_cy.max(center.1);
+                    }
+                    let can_snap = min_cx.is_finite()
+                        && min_cy.is_finite()
+                        && min_cx >= frame_min_x
+                        && max_cx <= frame_max_x
+                        && min_cy >= frame_min_y
+                        && max_cy <= frame_max_y;
+                    if !can_snap {
+                        continue;
+                    }
+                    let should_replace = match best_corner {
+                        None => true,
+                        Some((_best_id, _best_center, _best_rot, best_dist)) => dist < best_dist,
+                    };
+                    if should_replace {
+                        best_corner = Some((*id, target_center, target_rot, dist));
+                    }
+                }
+            }
+            if let Some((anchor_id, anchor_center, target_rot, _)) = best_corner {
+                align_group_to_anchor(
+                    positions,
+                    rotations,
+                    &group_after,
+                    anchor_id,
+                    anchor_center,
+                    target_rot,
+                    cols,
+                    piece_width,
+                    piece_height,
+                );
+                corner_snapped = true;
+            }
+        }
+        if rotation_enabled
+            && !corner_snapped
+            && group_after.len() < total
+            && corner_snap_distance > 0.0
+        {
+            let mut best_edge = None;
+            for id in &group_after {
+                if *id >= positions.len() {
+                    continue;
+                }
+                if flips.get(*id).copied().unwrap_or(false) {
+                    continue;
+                }
+                let row = *id / cols;
+                let col = *id % cols;
+                let is_corner = (row == 0 || row + 1 == rows) && (col == 0 || col + 1 == cols);
+                if is_corner {
+                    continue;
+                }
+                let edge_side = if row == 0 {
+                    Some(DIR_UP)
+                } else if row + 1 == rows {
+                    Some(DIR_DOWN)
+                } else if col == 0 {
+                    Some(DIR_LEFT)
+                } else if col + 1 == cols {
+                    Some(DIR_RIGHT)
+                } else {
+                    None
+                };
+                let edge_side = match edge_side {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let current = positions[*id];
+                let current_center = (
+                    current.0 + piece_width * 0.5,
+                    current.1 + piece_height * 0.5,
+                );
+                for target_edge in 0..4usize {
+                    let steps = (target_edge + 4 - edge_side) % 4;
+                    let target_rot = normalize_angle(steps as f64 * ROTATION_STEP_DEG);
+                    if rotation_enabled
+                        && !angle_matches(group_rot, target_rot, rotation_snap_tolerance)
+                    {
+                        continue;
+                    }
+                    let swap = ((target_rot / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
+                    let (rot_w, rot_h) = if swap {
+                        (piece_height, piece_width)
+                    } else {
+                        (piece_width, piece_height)
+                    };
+                    let target_center = match target_edge {
+                        DIR_UP => (current_center.0, rot_h * 0.5),
+                        DIR_RIGHT => (frame_width - rot_w * 0.5, current_center.1),
+                        DIR_DOWN => (current_center.0, frame_height - rot_h * 0.5),
+                        DIR_LEFT => (rot_w * 0.5, current_center.1),
+                        _ => (current_center.0, current_center.1),
+                    };
+                    let dist = if target_edge == DIR_UP || target_edge == DIR_DOWN {
+                        (current_center.1 - target_center.1).abs()
+                    } else {
+                        (current_center.0 - target_center.0).abs()
+                    };
+                    if dist > corner_snap_distance {
+                        continue;
+                    }
+                    let anchor_row = (*id / cols) as i32;
+                    let anchor_col = (*id % cols) as i32;
+                    let (frame_min_x, frame_max_x, frame_min_y, frame_max_y) =
+                        frame_center_bounds_for_rotation(
+                            frame_width,
+                            frame_height,
+                            piece_width,
+                            piece_height,
+                            target_rot,
+                        );
+                    let mut min_cx = f64::INFINITY;
+                    let mut max_cx = f64::NEG_INFINITY;
+                    let mut min_cy = f64::INFINITY;
+                    let mut max_cy = f64::NEG_INFINITY;
+                    for member in &group_after {
+                        let center = aligned_center_from_anchor(
+                            anchor_row,
+                            anchor_col,
+                            target_center,
+                            *member,
+                            cols,
+                            piece_width,
+                            piece_height,
+                            target_rot,
+                        );
+                        min_cx = min_cx.min(center.0);
+                        max_cx = max_cx.max(center.0);
+                        min_cy = min_cy.min(center.1);
+                        max_cy = max_cy.max(center.1);
+                    }
+                    let can_snap = min_cx.is_finite()
+                        && min_cy.is_finite()
+                        && min_cx >= frame_min_x
+                        && max_cx <= frame_max_x
+                        && min_cy >= frame_min_y
+                        && max_cy <= frame_max_y;
+                    if !can_snap {
+                        continue;
+                    }
+                    let should_replace = match best_edge {
+                        None => true,
+                        Some((_best_id, _best_center, _best_rot, best_dist)) => dist < best_dist,
+                    };
+                    if should_replace {
+                        best_edge = Some((*id, target_center, target_rot, dist));
+                    }
+                }
+            }
+            if let Some((anchor_id, anchor_center, target_rot, _)) = best_edge {
+                align_group_to_anchor(
+                    positions,
+                    rotations,
+                    &group_after,
+                    anchor_id,
+                    anchor_center,
+                    target_rot,
+                    cols,
+                    piece_width,
+                    piece_height,
+                );
+            }
+        }
+
+        if group_after.len() == total {
+            let stage_center_x = view_min_x + view_width * 0.5;
+            let stage_center_y = view_min_y + view_height * 0.5;
+            let target_center = (
+                stage_center_x - frame_width * 0.5 + piece_width * 0.5,
+                stage_center_y - frame_height * 0.5 + piece_height * 0.5,
+            );
+            align_group_to_anchor(
+                positions,
+                rotations,
+                &group_after,
+                0,
+                target_center,
+                0.0,
+                cols,
+                piece_width,
+                piece_height,
+            );
+        } else {
+            let mut in_group = vec![false; total];
+            for id in &group_after {
+                if *id < in_group.len() {
+                    in_group[*id] = true;
+                }
+            }
+            let mut has_borders = true;
+            'border_check: for row in 0..rows {
+                for col in 0..cols {
+                    if row == 0 || row + 1 == rows || col == 0 || col + 1 == cols {
+                        let id = row * cols + col;
+                        if !in_group[id] {
+                            has_borders = false;
+                            break 'border_check;
+                        }
+                    }
+                }
+            }
+            if has_borders {
+                let frame_snap_distance = snap_distance * frame_snap_ratio;
+                let anchor_id = 0usize;
+                if let Some(anchor_pos) = positions.get(anchor_id) {
+                    let current_center = (
+                        anchor_pos.0 + piece_width * 0.5,
+                        anchor_pos.1 + piece_height * 0.5,
+                    );
+                    let target_center = (piece_width * 0.5, piece_height * 0.5);
+                    let dx = current_center.0 - target_center.0;
+                    let dy = current_center.1 - target_center.1;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let rotation_ok =
+                        !rotation_enabled || angle_matches(group_rot, 0.0, rotation_snap_tolerance);
+                    if dist <= frame_snap_distance && rotation_ok {
+                        align_group_to_anchor(
+                            positions,
+                            rotations,
+                            &group_after,
+                            anchor_id,
+                            target_center,
+                            0.0,
+                            cols,
+                            piece_width,
+                            piece_height,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let clamp_ids: &[usize] = if group_after.is_empty() {
+        members
+    } else {
+        &group_after
+    };
+    if !clamp_ids.is_empty() {
+        let mut min_cx = f64::INFINITY;
+        let mut max_cx = f64::NEG_INFINITY;
+        let mut min_cy = f64::INFINITY;
+        let mut max_cy = f64::NEG_INFINITY;
+        for id in clamp_ids {
+            if let Some(pos) = positions.get(*id) {
+                let center_x = pos.0 + piece_width * 0.5;
+                let center_y = pos.1 + piece_height * 0.5;
+                min_cx = min_cx.min(center_x);
+                max_cx = max_cx.max(center_x);
+                min_cy = min_cy.min(center_y);
+                max_cy = max_cy.max(center_y);
+            }
+        }
+        if min_cx.is_finite() && min_cy.is_finite() {
+            let mut shift_x = 0.0;
+            let mut shift_y = 0.0;
+            if min_cx < center_min_x {
+                shift_x = center_min_x - min_cx;
+            } else if max_cx > center_max_x {
+                shift_x = center_max_x - max_cx;
+            }
+            if min_cy < center_min_y {
+                shift_y = center_min_y - min_cy;
+            } else if max_cy > center_max_y {
+                shift_y = center_max_y - max_cy;
+            }
+            if shift_x != 0.0 || shift_y != 0.0 {
+                for id in clamp_ids {
+                    if let Some(pos) = positions.get_mut(*id) {
+                        *pos = (pos.0 + shift_x, pos.1 + shift_y);
+                    }
+                }
+            }
+        }
+    }
+
+    if !clamp_ids.is_empty() {
+        connect_aligned_neighbors(
+            clamp_ids,
+            positions,
+            rotations,
+            flips,
+            connections,
+            cols,
+            rows,
+            piece_width,
+            piece_height,
+            snap_distance,
+            rotation_snap_tolerance,
+            rotation_enabled,
+        );
+        if let Some(anchor_id) = clamp_ids.first() {
+            group_after = collect_group(connections, *anchor_id, cols, rows);
+        }
+    }
+
+    group_after
 }
 
 fn time_nonce(previous: u64) -> u64 {
@@ -1622,6 +2513,7 @@ fn build_piece_path(
 #[function_component(App)]
 fn app() -> Html {
     let image_size = use_state(|| None::<(u32, u32)>);
+    let image_size_value = *image_size;
     let settings = use_state(ShapeSettings::default);
     let settings_value = (*settings).clone();
     let depth_cap = settings_value
@@ -1630,20 +2522,47 @@ fn app() -> Html {
     let curve_detail = settings_value
         .curve_detail
         .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
-    let grid_index = use_state(|| DEFAULT_GRID_INDEX);
+    let mut grid_choices = if let Some((width, height)) = image_size_value {
+        build_grid_choices(width, height)
+    } else {
+        Vec::new()
+    };
+    if image_size_value.is_some() && grid_choices.is_empty() {
+        grid_choices.push(FALLBACK_GRID);
+    }
+    let grid_default_index = grid_choices
+        .iter()
+        .position(|choice| choice.target_count == DEFAULT_TARGET_COUNT)
+        .unwrap_or(0);
+    let grid_index = use_state(|| grid_default_index);
     let grid_index_value = *grid_index;
-    let grid = GRID_PRESETS[grid_index_value];
-    let grid_label = format!(
-        "{} ({} pieces)",
-        grid.label,
-        grid.cols * grid.rows
-    );
-    let grid_options: Html = GRID_PRESETS
+    let grid = grid_choices
+        .get(grid_index_value)
+        .copied()
+        .or_else(|| grid_choices.first().copied())
+        .unwrap_or(FALLBACK_GRID);
+    let total = (grid.cols * grid.rows) as usize;
+    let grid_label = if image_size_value.is_some() && !grid_choices.is_empty() {
+        grid_choice_label(&grid)
+    } else {
+        "--".to_string()
+    };
+    let solve_time_label = if image_size_value.is_some() {
+        let pieces = grid.actual_count as f64;
+        format_duration(SOLVE_TIME_FACTOR * pieces.powf(SOLVE_TIME_EXPONENT))
+    } else {
+        "--".to_string()
+    };
+    let grid_options: Html = grid_choices
         .iter()
         .enumerate()
-        .map(|(index, preset)| {
-            let label = format!("{} ({} pieces)", preset.label, preset.cols * preset.rows);
-            html! { <option value={index.to_string()}>{label}</option> }
+        .map(|(index, choice)| {
+            let label = grid_choice_label(choice);
+            html! {
+                <option value={index.to_string()} selected={index == grid_index_value}>
+                    {label}
+                </option>
+            }
         })
         .collect();
 
@@ -1701,6 +2620,7 @@ fn app() -> Html {
     let drag_handlers = use_mut_ref(DragHandlers::default);
     let restore_state = use_mut_ref(|| None::<SavedBoard>);
     let restore_attempted = use_mut_ref(|| false);
+    let grid_initialized = use_mut_ref(|| false);
     let svg_ref = use_node_ref();
     let workspace_scale = use_state(|| WORKSPACE_SCALE_DEFAULT);
     let workspace_scale_value = *workspace_scale;
@@ -1715,6 +2635,12 @@ fn app() -> Html {
     let hovered_id = use_state(|| None::<usize>);
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
+    let rotation_snap_tolerance = use_state(|| ROTATION_SNAP_TOLERANCE_DEFAULT_DEG);
+    let rotation_snap_tolerance_value = *rotation_snap_tolerance;
+    let rotation_lock_threshold = use_state(|| ROTATION_LOCK_THRESHOLD_DEFAULT);
+    let rotation_lock_threshold_value = *rotation_lock_threshold;
+    let snap_distance_ratio = use_state(|| SNAP_DISTANCE_RATIO_DEFAULT);
+    let snap_distance_ratio_value = *snap_distance_ratio;
     let scramble_nonce = use_state(|| 0u64);
     let scramble_nonce_value = *scramble_nonce;
     let frame_snap_ratio = use_state(|| FRAME_SNAP_DEFAULT);
@@ -1740,7 +2666,6 @@ fn app() -> Html {
         html! {}
     };
 
-    let image_size_value = *image_size;
     let seed_label = if image_size_value.is_some() {
         let cols = grid.cols as usize;
         let rows = grid.rows as usize;
@@ -1767,70 +2692,100 @@ fn app() -> Html {
         let solved = solved.clone();
         let scramble_nonce = scramble_nonce.clone();
         let grid_index = grid_index.clone();
+        let grid_choices = grid_choices.clone();
+        let grid_default_index = grid_default_index;
         let restore_state = restore_state.clone();
         let restore_attempted = restore_attempted.clone();
+        let grid_initialized = grid_initialized.clone();
         use_effect_with(
             (grid_index_value, image_size_value),
             move |(grid_index_value, image_size_value)| {
                 if let Some((width, height)) = *image_size_value {
+                    let mut allow_scramble = true;
                     let mut skip_scramble = false;
-                    let saved_state = {
-                        let mut attempted = restore_attempted.borrow_mut();
-                        if !*attempted {
-                            *attempted = true;
-                            *restore_state.borrow_mut() = load_saved_board();
-                        }
-                        restore_state.borrow_mut().take()
-                    };
-                    if let Some(state) = saved_state {
-                        if state.image_width == width && state.image_height == height {
-                            if let Some(saved_index) =
-                                grid_preset_index(state.cols, state.rows)
-                            {
-                                if saved_index != *grid_index_value {
-                                    *restore_state.borrow_mut() = Some(state);
-                                    grid_index.set(saved_index);
-                                    skip_scramble = true;
-                                } else {
-                                    let cols = state.cols as usize;
-                                    let rows = state.rows as usize;
-                                    let total = cols * rows;
-                                    if validate_saved_board(&state, total) {
-                                        let piece_width = width as f64 / state.cols as f64;
-                                        let piece_height = height as f64 / state.rows as f64;
-                                        positions.set(state.positions.clone());
-                                        rotations.set(state.rotations.clone());
-                                        flips.set(state.flips.clone());
-                                        connections.set(state.connections.clone());
-                                        z_order.set(state.z_order.clone());
-                                        scramble_nonce.set(state.scramble_nonce);
-                                        active_id.set(None);
-                                        dragging_members.set(Vec::new());
-                                        animating_members.set(Vec::new());
-                                        *rotation_anim.borrow_mut() = None;
-                                        rotation_anim_handle.borrow_mut().take();
-                                        rotation_queue.borrow_mut().clear();
-                                        *drag_state.borrow_mut() = None;
-                                        let solved_now = is_solved(
-                                            &state.positions,
-                                            &state.rotations,
-                                            &state.flips,
-                                            &state.connections,
-                                            cols,
-                                            rows,
-                                            piece_width,
-                                            piece_height,
-                                            rotation_enabled_value,
-                                        );
-                                        solved.set(solved_now);
+                    if grid_choices.is_empty() {
+                        allow_scramble = false;
+                    } else if *grid_index_value >= grid_choices.len() {
+                        grid_index.set(grid_default_index.min(grid_choices.len() - 1));
+                        *grid_initialized.borrow_mut() = true;
+                        allow_scramble = false;
+                    }
+                    if allow_scramble {
+                        let saved_state = {
+                            let mut attempted = restore_attempted.borrow_mut();
+                            if !*attempted {
+                                *attempted = true;
+                                *restore_state.borrow_mut() = load_saved_board();
+                            }
+                            restore_state.borrow_mut().take()
+                        };
+                        if let Some(state) = saved_state {
+                            if state.image_width == width && state.image_height == height {
+                                if let Some(saved_index) =
+                                    grid_choice_index(&grid_choices, state.cols, state.rows)
+                                {
+                                    if saved_index != *grid_index_value {
+                                        *restore_state.borrow_mut() = Some(state);
+                                        grid_index.set(saved_index);
+                                        *grid_initialized.borrow_mut() = true;
                                         skip_scramble = true;
+                                    } else {
+                                        let cols = state.cols as usize;
+                                        let rows = state.rows as usize;
+                                        let total = cols * rows;
+                                        if validate_saved_board(&state, total) {
+                                            let piece_width = width as f64 / state.cols as f64;
+                                            let piece_height = height as f64 / state.rows as f64;
+                                            positions.set(state.positions.clone());
+                                            rotations.set(state.rotations.clone());
+                                            flips.set(state.flips.clone());
+                                            connections.set(state.connections.clone());
+                                            z_order.set(state.z_order.clone());
+                                            scramble_nonce.set(state.scramble_nonce);
+                                            active_id.set(None);
+                                            dragging_members.set(Vec::new());
+                                            animating_members.set(Vec::new());
+                                            *rotation_anim.borrow_mut() = None;
+                                            rotation_anim_handle.borrow_mut().take();
+                                            rotation_queue.borrow_mut().clear();
+                                            *drag_state.borrow_mut() = None;
+                                            let solved_now = is_solved(
+                                                &state.positions,
+                                                &state.rotations,
+                                                &state.flips,
+                                                &state.connections,
+                                                cols,
+                                                rows,
+                                                piece_width,
+                                                piece_height,
+                                                rotation_enabled_value,
+                                            );
+                                            solved.set(solved_now);
+                                            *grid_initialized.borrow_mut() = true;
+                                            skip_scramble = true;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    if !skip_scramble {
-                        let grid = GRID_PRESETS[*grid_index_value];
+                    if allow_scramble && !skip_scramble {
+                        let mut initialized = grid_initialized.borrow_mut();
+                        if !*initialized {
+                            if *grid_index_value != grid_default_index {
+                                grid_index.set(grid_default_index);
+                                *initialized = true;
+                                allow_scramble = false;
+                            } else {
+                                *initialized = true;
+                            }
+                        }
+                    }
+                    if allow_scramble && !skip_scramble {
+                        let grid = grid_choices
+                            .get(*grid_index_value)
+                            .copied()
+                            .unwrap_or(FALLBACK_GRID);
                         let cols = grid.cols as usize;
                         let rows = grid.rows as usize;
                         let piece_width = width as f64 / grid.cols as f64;
@@ -1884,10 +2839,11 @@ fn app() -> Html {
 
     let on_grid_change = {
         let grid_index = grid_index.clone();
+        let grid_choices_len = grid_choices.len();
         Callback::from(move |event: Event| {
             let select: HtmlSelectElement = event.target_unchecked_into();
             if let Ok(value) = select.value().parse::<usize>() {
-                if value < GRID_PRESETS.len() {
+                if value < grid_choices_len {
                     grid_index.set(value);
                 }
             }
@@ -1911,6 +2867,18 @@ fn app() -> Html {
             }
         })
     };
+    let on_snap_distance = {
+        let snap_distance_ratio = snap_distance_ratio.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f64>() {
+                snap_distance_ratio.set(value.clamp(
+                    SNAP_DISTANCE_RATIO_MIN,
+                    SNAP_DISTANCE_RATIO_MAX,
+                ));
+            }
+        })
+    };
     let on_rotation_toggle = {
         let rotation_enabled = rotation_enabled.clone();
         let rotations = rotations.clone();
@@ -1919,6 +2887,7 @@ fn app() -> Html {
         let connections = connections.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
+        let grid_choices = grid_choices.clone();
         let solved = solved.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
@@ -1933,7 +2902,10 @@ fn app() -> Html {
                 zeroed
             };
             if let Some((width, height)) = *image_size {
-                let grid = GRID_PRESETS[*grid_index];
+                let grid = grid_choices
+                    .get(*grid_index)
+                    .copied()
+                    .unwrap_or(FALLBACK_GRID);
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
                 let piece_width = width as f64 / grid.cols as f64;
@@ -1962,6 +2934,33 @@ fn app() -> Html {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f64>() {
                 rotation_noise.set(value.clamp(ROTATION_NOISE_MIN, ROTATION_NOISE_MAX));
+            }
+        })
+    };
+    let on_rotation_snap_tolerance = {
+        let rotation_snap_tolerance = rotation_snap_tolerance.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f64>() {
+                rotation_snap_tolerance.set(value.clamp(
+                    ROTATION_SNAP_TOLERANCE_MIN_DEG,
+                    ROTATION_SNAP_TOLERANCE_MAX_DEG,
+                ));
+            }
+        })
+    };
+    let on_rotation_lock_threshold = {
+        let rotation_lock_threshold = rotation_lock_threshold.clone();
+        let positions = positions.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f64>() {
+                let max_value = positions.len().max(ROTATION_LOCK_THRESHOLD_MIN);
+                let rounded = value.round() as usize;
+                let clamped = rounded
+                    .max(ROTATION_LOCK_THRESHOLD_MIN)
+                    .min(max_value);
+                rotation_lock_threshold.set(clamped);
             }
         })
     };
@@ -1999,6 +2998,7 @@ fn app() -> Html {
         let z_order = z_order.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
+        let grid_choices = grid_choices.clone();
         let scramble_nonce = scramble_nonce.clone();
         let active_id = active_id.clone();
         let animating_members = animating_members.clone();
@@ -2029,7 +3029,10 @@ fn app() -> Html {
             )| {
                 if active_id_value.is_none() && animating_members_value.is_empty() {
                     if let Some((width, height)) = *image_size_value {
-                        let grid = GRID_PRESETS[*grid_index_value];
+                        let grid = grid_choices
+                            .get(*grid_index_value)
+                            .copied()
+                            .unwrap_or(FALLBACK_GRID);
                         let total = (grid.cols * grid.rows) as usize;
                         if positions_value.len() == total
                             && rotations_value.len() == total
@@ -2442,8 +3445,18 @@ fn app() -> Html {
         let drag_move_touch = {
             let svg_ref = svg_ref.clone();
             let drag_state = drag_state.clone();
+            let active_id = active_id.clone();
+            let dragging_members = dragging_members.clone();
             let drag_move_common = drag_move_common.clone();
             move |event: &TouchEvent| {
+                if event.touches().length() > 1 {
+                    if drag_state.borrow().is_some() {
+                        active_id.set(None);
+                        dragging_members.set(Vec::new());
+                        *drag_state.borrow_mut() = None;
+                    }
+                    return;
+                }
                 let touch_id = drag_state
                     .borrow()
                     .as_ref()
@@ -2489,9 +3502,7 @@ fn app() -> Html {
                     let start_rotations_all = next_rotations.clone();
                     let cols = grid.cols as usize;
                     let rows = grid.rows as usize;
-                    let snap_distance = piece_width.min(piece_height) * SNAP_DISTANCE_RATIO;
-                    let connect_distance =
-                        piece_width.min(piece_height) * CONNECT_DISTANCE_RATIO;
+                    let snap_distance = piece_width.min(piece_height) * snap_distance_ratio_value;
                     let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
                     let start_group_animation = {
                         let positions = positions.clone();
@@ -2506,11 +3517,24 @@ fn app() -> Html {
                         let rotation_enabled_value = rotation_enabled_value;
                         let rotation_noise_value = rotation_noise_value;
                         let animations_enabled_value = animations_enabled_value;
+                        let rotation_snap_tolerance_value = rotation_snap_tolerance_value;
                         let cols = cols;
                         let rows = rows;
                         let piece_width = piece_width;
                         let piece_height = piece_height;
-                        move |anim: RotationAnimation| {
+                        let frame_snap_ratio_value = frame_snap_ratio_value;
+                        let snap_distance_ratio_value = snap_distance_ratio_value;
+                        let center_min_x = center_min_x;
+                        let center_max_x = center_max_x;
+                        let center_min_y = center_min_y;
+                        let center_max_y = center_max_y;
+                        let view_min_x = view_min_x;
+                        let view_min_y = view_min_y;
+                        let view_width = view_width;
+                        let view_height = view_height;
+                        move |anim: RotationAnimation,
+                              connections_override: Option<Vec<[bool; 4]>>| {
+                            let connections_override = connections_override.map(Rc::new);
                             if !animations_enabled_value {
                                 rotation_queue.borrow_mut().clear();
                                 let mut next_positions = (*positions).clone();
@@ -2589,13 +3613,47 @@ fn app() -> Html {
                                         }
                                     }
                                 }
+                                let should_snap = matches!(&anim.kind, AnimationKind::Pivot { .. });
+                                let mut connections_snapshot = connections_override
+                                    .as_ref()
+                                    .map(|snapshot| (**snapshot).clone())
+                                    .unwrap_or_else(|| (*connections).clone());
+                                let flips_snapshot = (*flips).clone();
+                                if should_snap {
+                                    let snap_distance = piece_width.min(piece_height)
+                                        * snap_distance_ratio_value;
+                                    apply_snaps_for_group(
+                                        &anim.members,
+                                        &mut next_positions,
+                                        &mut next_rotations,
+                                        &flips_snapshot,
+                                        &mut connections_snapshot,
+                                        cols,
+                                        rows,
+                                        piece_width,
+                                        piece_height,
+                                        snap_distance,
+                                        frame_snap_ratio_value,
+                                        center_min_x,
+                                        center_max_x,
+                                        center_min_y,
+                                        center_max_y,
+                                        view_min_x,
+                                        view_min_y,
+                                        view_width,
+                                        view_height,
+                                        rotation_snap_tolerance_value,
+                                        rotation_enabled_value,
+                                    );
+                                }
                                 positions.set(next_positions.clone());
                                 rotations.set(next_rotations.clone());
+                                if should_snap || connections_override.is_some() {
+                                    connections.set(connections_snapshot.clone());
+                                }
                                 animating_members.set(Vec::new());
                                 *rotation_anim.borrow_mut() = None;
                                 rotation_anim_handle.borrow_mut().take();
-                                let flips_snapshot = (*flips).clone();
-                                let connections_snapshot = (*connections).clone();
                                 let solved_now = is_solved(
                                     &next_positions,
                                     &next_rotations,
@@ -2624,6 +3682,7 @@ fn app() -> Html {
                             let animating_members = animating_members.clone();
                             let rotation_anim_handle_for_tick = rotation_anim_handle.clone();
                             let rotation_queue = rotation_queue.clone();
+                            let connections_override = connections_override.clone();
                             let interval = Interval::new(16, move || {
                                 let now = Date::now();
                                 let anim = match rotation_anim.borrow().clone() {
@@ -2757,6 +3816,7 @@ fn app() -> Html {
                                             current_angle,
                                             next_step.noise,
                                             rotation_noise_value,
+                                            rotation_snap_tolerance_value,
                                         );
                                         *rotation_anim.borrow_mut() = Some(RotationAnimation {
                                             start_time: Date::now(),
@@ -2775,11 +3835,50 @@ fn app() -> Html {
                                     }
                                     *rotation_anim.borrow_mut() = None;
                                     animating_members.set(Vec::new());
+                                    let should_snap =
+                                        matches!(&anim.kind, AnimationKind::Pivot { .. });
+                                    let mut snapped_positions = next_positions.clone();
+                                    let mut snapped_rotations = next_rotations.clone();
+                                    let mut connections_snapshot = connections_override
+                                        .as_ref()
+                                        .map(|snapshot| (**snapshot).clone())
+                                        .unwrap_or_else(|| (*connections).clone());
                                     let flips_snapshot = (*flips).clone();
-                                    let connections_snapshot = (*connections).clone();
+                                    if should_snap {
+                                        let snap_distance = piece_width.min(piece_height)
+                                            * snap_distance_ratio_value;
+                                        apply_snaps_for_group(
+                                            &anim.members,
+                                            &mut snapped_positions,
+                                            &mut snapped_rotations,
+                                            &flips_snapshot,
+                                            &mut connections_snapshot,
+                                            cols,
+                                            rows,
+                                            piece_width,
+                                            piece_height,
+                                            snap_distance,
+                                            frame_snap_ratio_value,
+                                            center_min_x,
+                                            center_max_x,
+                                            center_min_y,
+                                            center_max_y,
+                                            view_min_x,
+                                            view_min_y,
+                                            view_width,
+                                            view_height,
+                                            rotation_snap_tolerance_value,
+                                            rotation_enabled_value,
+                                        );
+                                    }
+                                    positions.set(snapped_positions.clone());
+                                    rotations.set(snapped_rotations.clone());
+                                    if should_snap || connections_override.is_some() {
+                                        connections.set(connections_snapshot.clone());
+                                    }
                                     let solved_now = is_solved(
-                                        &next_positions,
-                                        &next_rotations,
+                                        &snapped_positions,
+                                        &snapped_rotations,
                                         &flips_snapshot,
                                         &connections_snapshot,
                                         cols,
@@ -2858,6 +3957,7 @@ fn app() -> Html {
                             if rotation_enabled_value && !drag.members.is_empty() {
                                 let pivot_x = drag.start_x;
                                 let pivot_y = drag.start_y;
+                                let members = drag.members.clone();
                                 let mut noise = 0.0;
                                 if rotation_noise_value > 0.0 {
                                     let noise_seed = splitmix64(
@@ -2867,12 +3967,11 @@ fn app() -> Html {
                                     );
                                     noise = rand_range(
                                         noise_seed,
-                                        drag.members.len() as u64,
+                                        members.len() as u64,
                                         -rotation_noise_value,
                                         rotation_noise_value,
                                     );
                                 }
-                                let members = drag.members.clone();
                                 if animations_enabled_value {
                                     if let Some(active_anim) = rotation_anim.borrow().clone() {
                                         if active_anim.members.contains(&click_id) {
@@ -2891,14 +3990,34 @@ fn app() -> Html {
                                         }
                                     }
                                 }
-                                let current_angle = drag
-                                    .members
+                                let current_angle = members
                                     .first()
                                     .and_then(|id| next_rotations.get(*id))
                                     .copied()
                                     .unwrap_or(0.0);
-                                let delta =
-                                    click_rotation_delta(current_angle, noise, rotation_noise_value);
+                                let group_size = members.len();
+                                let total = cols * rows;
+                                let rotation_locked =
+                                    group_size == total || group_size > rotation_lock_threshold_value;
+                                if group_size > 1
+                                    && rotation_locked
+                                    && angle_matches(
+                                        current_angle,
+                                        0.0,
+                                        rotation_snap_tolerance_value,
+                                    )
+                                {
+                                    active_id.set(None);
+                                    dragging_members.set(Vec::new());
+                                    *drag_state.borrow_mut() = None;
+                                    return true;
+                                }
+                                let delta = click_rotation_delta(
+                                    current_angle,
+                                    noise,
+                                    rotation_noise_value,
+                                    rotation_snap_tolerance_value,
+                                );
                                 let mut start_positions = Vec::with_capacity(members.len());
                                 let mut start_rotations = Vec::with_capacity(members.len());
                                 for member in &members {
@@ -2911,18 +4030,21 @@ fn app() -> Html {
                                     start_rotations.push(rot);
                                 }
                                 rotation_queue.borrow_mut().clear();
-                                start_group_animation(RotationAnimation {
-                                    start_time: Date::now(),
-                                    duration: SNAP_ANIMATION_MS,
-                                    members: members.clone(),
-                                    start_positions,
-                                    start_rotations,
-                                    kind: AnimationKind::Pivot {
-                                        pivot_x,
-                                        pivot_y,
-                                        delta,
+                                start_group_animation(
+                                    RotationAnimation {
+                                        start_time: Date::now(),
+                                        duration: SNAP_ANIMATION_MS,
+                                        members: members.clone(),
+                                        start_positions,
+                                        start_rotations,
+                                        kind: AnimationKind::Pivot {
+                                            pivot_x,
+                                            pivot_y,
+                                            delta,
+                                        },
                                     },
-                                });
+                                    None,
+                                );
                                 dragging_members.set(Vec::new());
                                 active_id.set(None);
                                 *drag_state.borrow_mut() = None;
@@ -2930,627 +4052,29 @@ fn app() -> Html {
                             }
                         }
                     }
-                    let mut in_group = vec![false; cols * rows];
-                    for member in &drag.members {
-                        if *member < in_group.len() {
-                            in_group[*member] = true;
-                        }
-                    }
-
-                    #[derive(Clone, Copy)]
-                    struct SnapCandidate {
-                        member: usize,
-                        dir: usize,
-                        center_b: (f64, f64),
-                        rot_b: f64,
-                        base: (f64, f64),
-                        dist: f64,
-                    }
-
-                    let mut candidates = Vec::new();
-                    for member in &drag.members {
-                        if *member >= next.len() {
-                            continue;
-                        }
-                        if next_flips.get(*member).copied().unwrap_or(false) {
-                            continue;
-                        }
-                        let current = next[*member];
-                        let center_a = (
-                            current.0 + piece_width * 0.5,
-                            current.1 + piece_height * 0.5,
-                        );
-                        let rot_a = next_rotations.get(*member).copied().unwrap_or(0.0);
-                        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-                            if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
-                                if in_group[neighbor] {
-                                    continue;
-                                }
-                                if next_flips.get(neighbor).copied().unwrap_or(false) {
-                                    continue;
-                                }
-                                let rot_b = next_rotations.get(neighbor).copied().unwrap_or(0.0);
-                                if !rotation_enabled_value && !angle_matches(rot_a, rot_b) {
-                                    continue;
-                                }
-                                let base = match dir {
-                                    DIR_LEFT => (-piece_width, 0.0),
-                                    DIR_RIGHT => (piece_width, 0.0),
-                                    DIR_UP => (0.0, -piece_height),
-                                    DIR_DOWN => (0.0, piece_height),
-                                    _ => (0.0, 0.0),
-                                };
-                                let expected_rot = if rotation_enabled_value { rot_b } else { rot_a };
-                                let (vx, vy) = rotate_vec(base.0, base.1, expected_rot);
-                                let neighbor_pos = next[neighbor];
-                                let center_b = (
-                                    neighbor_pos.0 + piece_width * 0.5,
-                                    neighbor_pos.1 + piece_height * 0.5,
-                                );
-                                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
-                                let dx = actual.0 - vx;
-                                let dy = actual.1 - vy;
-                                let dist = (dx * dx + dy * dy).sqrt();
-                                if dist <= snap_distance {
-                                    candidates.push(SnapCandidate {
-                                        member: *member,
-                                        dir,
-                                        center_b,
-                                        rot_b,
-                                        base,
-                                        dist,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    let mut snap_anchor: Option<(usize, (f64, f64), f64)> = None;
-                    if !candidates.is_empty() {
-                        let mut best_index = None;
-                        let mut best_count = 0usize;
-                        let mut best_error = f64::INFINITY;
-                        let mut best_dist = f64::INFINITY;
-                        let mut best_anchor_id = 0usize;
-                        let mut best_anchor_center = (0.0, 0.0);
-                        let mut best_target_rot = 0.0;
-
-                        for (idx, candidate) in candidates.iter().enumerate() {
-                            let target_rot = if rotation_enabled_value {
-                                normalize_angle(candidate.rot_b)
-                            } else {
-                                0.0
-                            };
-                            let anchor_id = candidate.member;
-                            let anchor_row = (anchor_id / cols) as i32;
-                            let anchor_col = (anchor_id % cols) as i32;
-                            let expected =
-                                rotate_vec(candidate.base.0, candidate.base.1, target_rot);
-                            let anchor_center = (
-                                candidate.center_b.0 - expected.0,
-                                candidate.center_b.1 - expected.1,
-                            );
-
-                            let mut min_cx = f64::INFINITY;
-                            let mut max_cx = f64::NEG_INFINITY;
-                            let mut min_cy = f64::INFINITY;
-                            let mut max_cy = f64::NEG_INFINITY;
-                            for id in &drag.members {
-                                    let transformed = aligned_center_from_anchor(
-                                        anchor_row,
-                                        anchor_col,
-                                        anchor_center,
-                                        *id,
-                                        cols,
-                                        piece_width,
-                                        piece_height,
-                                        target_rot,
-                                    );
-                                    min_cx = min_cx.min(transformed.0);
-                                    max_cx = max_cx.max(transformed.0);
-                                    min_cy = min_cy.min(transformed.1);
-                                    max_cy = max_cy.max(transformed.1);
-                            }
-                            let can_snap = min_cx.is_finite()
-                                && min_cy.is_finite()
-                                && min_cx >= center_min_x
-                                && max_cx <= center_max_x
-                                && min_cy >= center_min_y
-                                && max_cy <= center_max_y;
-                            if !can_snap {
-                                continue;
-                            }
-
-                            let mut count = 0usize;
-                            let mut error_sum = 0.0;
-                            for other in &candidates {
-                                if rotation_enabled_value
-                                    && !angle_matches(target_rot, other.rot_b)
-                                {
-                                    continue;
-                                }
-                                let new_center = aligned_center_from_anchor(
-                                    anchor_row,
-                                    anchor_col,
-                                    anchor_center,
-                                    other.member,
-                                    cols,
-                                    piece_width,
-                                    piece_height,
-                                    target_rot,
-                                );
-                                let expected =
-                                    rotate_vec(other.base.0, other.base.1, target_rot);
-                                let actual = (
-                                    other.center_b.0 - new_center.0,
-                                    other.center_b.1 - new_center.1,
-                                );
-                                let dx = actual.0 - expected.0;
-                                let dy = actual.1 - expected.1;
-                                let dist = (dx * dx + dy * dy).sqrt();
-                                if dist <= connect_distance {
-                                    count += 1;
-                                    error_sum += dist;
-                                }
-                            }
-
-                            if count > best_count
-                                || (count == best_count
-                                    && (error_sum < best_error
-                                        || (error_sum == best_error
-                                            && candidate.dist < best_dist)))
-                            {
-                                best_index = Some(idx);
-                                best_count = count;
-                                best_error = error_sum;
-                                best_dist = candidate.dist;
-                                best_anchor_id = anchor_id;
-                                best_anchor_center = anchor_center;
-                                best_target_rot = target_rot;
-                            }
-                        }
-
-                        if let Some(_best_idx) = best_index {
-                            align_group_to_anchor(
-                                &mut next,
-                                &mut next_rotations,
-                                &drag.members,
-                                best_anchor_id,
-                                best_anchor_center,
-                                best_target_rot,
-                                cols,
-                                piece_width,
-                                piece_height,
-                            );
-
-                            for candidate in &candidates {
-                                if rotation_enabled_value
-                                    && !angle_matches(best_target_rot, candidate.rot_b)
-                                {
-                                    continue;
-                                }
-                                let new_center = aligned_center_from_anchor(
-                                    (best_anchor_id / cols) as i32,
-                                    (best_anchor_id % cols) as i32,
-                                    best_anchor_center,
-                                    candidate.member,
-                                    cols,
-                                    piece_width,
-                                    piece_height,
-                                    best_target_rot,
-                                );
-                                let expected =
-                                    rotate_vec(candidate.base.0, candidate.base.1, best_target_rot);
-                                let actual = (
-                                    candidate.center_b.0 - new_center.0,
-                                    candidate.center_b.1 - new_center.1,
-                                );
-                                let dx = actual.0 - expected.0;
-                                let dy = actual.1 - expected.1;
-                                let dist = (dx * dx + dy * dy).sqrt();
-                                if dist <= connect_distance {
-                                    set_connection(
-                                        &mut next_connections,
-                                        candidate.member,
-                                        candidate.dir,
-                                        true,
-                                        cols,
-                                        rows,
-                                    );
-                                }
-                            }
-
-                            snap_anchor =
-                                Some((best_anchor_id, best_anchor_center, best_target_rot));
-                        }
-                    }
-
-                    let group_after = drag
-                        .members
-                        .first()
-                        .map(|id| collect_group(&next_connections, *id, cols, rows))
-                        .unwrap_or_default();
-                    if rotation_enabled_value {
-                        if let Some((anchor_id, anchor_center, target_rot)) = snap_anchor {
-                            if !group_after.is_empty() {
-                                align_group_to_anchor(
-                                    &mut next,
-                                    &mut next_rotations,
-                                    &group_after,
-                                    anchor_id,
-                                    anchor_center,
-                                    target_rot,
-                                    cols,
-                                    piece_width,
-                                    piece_height,
-                                );
-                            }
-                        }
-                    }
-                    if !group_after.is_empty() {
-                        let frame_width = cols as f64 * piece_width;
-                        let frame_height = rows as f64 * piece_height;
-                        let corner_snap_distance = snap_distance * frame_snap_ratio_value;
-                        let mut corner_snapped = false;
-                        if rotation_enabled_value
-                            && group_after.len() < cols * rows
-                            && corner_snap_distance > 0.0
-                        {
-                            let mut best_corner = None;
-                            let target_center_for = |corner: usize, rotation: f64| {
-                                let rotation = normalize_angle(rotation);
-                                let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
-                                let (offset_x, offset_y) = if swap {
-                                    (piece_height * 0.5, piece_width * 0.5)
-                                } else {
-                                    (piece_width * 0.5, piece_height * 0.5)
-                                };
-                                match corner {
-                                    0 => (offset_x, offset_y),
-                                    1 => (frame_width - offset_x, offset_y),
-                                    2 => (frame_width - offset_x, frame_height - offset_y),
-                                    3 => (offset_x, frame_height - offset_y),
-                                    _ => (offset_x, offset_y),
-                                }
-                            };
-                            for id in &group_after {
-                                if *id >= next.len() {
-                                    continue;
-                                }
-                                if next_flips.get(*id).copied().unwrap_or(false) {
-                                    continue;
-                                }
-                                let row = *id / cols;
-                                let col = *id % cols;
-                                let piece_corner = if row == 0 && col == 0 {
-                                    Some(0usize)
-                                } else if row == 0 && col + 1 == cols {
-                                    Some(1usize)
-                                } else if row + 1 == rows && col + 1 == cols {
-                                    Some(2usize)
-                                } else if row + 1 == rows && col == 0 {
-                                    Some(3usize)
-                                } else {
-                                    None
-                                };
-                                let piece_corner = match piece_corner {
-                                    Some(value) => value,
-                                    None => continue,
-                                };
-                                let current = next[*id];
-                                let current_center = (
-                                    current.0 + piece_width * 0.5,
-                                    current.1 + piece_height * 0.5,
-                                );
-                                for target_corner in 0..4usize {
-                                    let steps = (target_corner + 4 - piece_corner) % 4;
-                                    let target_rot =
-                                        normalize_angle(steps as f64 * ROTATION_STEP_DEG);
-                                    let target_center = target_center_for(target_corner, target_rot);
-                                    let dx = current_center.0 - target_center.0;
-                                    let dy = current_center.1 - target_center.1;
-                                    let dist = (dx * dx + dy * dy).sqrt();
-                                    if dist > corner_snap_distance {
-                                        continue;
-                                    }
-                                    let anchor_row = (*id / cols) as i32;
-                                    let anchor_col = (*id % cols) as i32;
-                                    let mut min_cx = f64::INFINITY;
-                                    let mut max_cx = f64::NEG_INFINITY;
-                                    let mut min_cy = f64::INFINITY;
-                                    let mut max_cy = f64::NEG_INFINITY;
-                                    for member in &group_after {
-                                        let center = aligned_center_from_anchor(
-                                            anchor_row,
-                                            anchor_col,
-                                            target_center,
-                                            *member,
-                                            cols,
-                                            piece_width,
-                                            piece_height,
-                                            target_rot,
-                                        );
-                                        min_cx = min_cx.min(center.0);
-                                        max_cx = max_cx.max(center.0);
-                                        min_cy = min_cy.min(center.1);
-                                        max_cy = max_cy.max(center.1);
-                                    }
-                                    let can_snap = min_cx.is_finite()
-                                        && min_cy.is_finite()
-                                        && min_cx >= center_min_x
-                                        && max_cx <= center_max_x
-                                        && min_cy >= center_min_y
-                                        && max_cy <= center_max_y;
-                                    if !can_snap {
-                                        continue;
-                                    }
-                                    let should_replace = match best_corner {
-                                        None => true,
-                                        Some((_best_id, _best_center, _best_rot, best_dist)) => {
-                                            dist < best_dist
-                                        }
-                                    };
-                                    if should_replace {
-                                        best_corner =
-                                            Some((*id, target_center, target_rot, dist));
-                                    }
-                                }
-                            }
-                            if let Some((anchor_id, anchor_center, target_rot, _)) = best_corner {
-                                align_group_to_anchor(
-                                    &mut next,
-                                    &mut next_rotations,
-                                    &group_after,
-                                    anchor_id,
-                                    anchor_center,
-                                    target_rot,
-                                    cols,
-                                    piece_width,
-                                    piece_height,
-                                );
-                                corner_snapped = true;
-                            }
-                        }
-                        if rotation_enabled_value
-                            && !corner_snapped
-                            && group_after.len() < cols * rows
-                            && corner_snap_distance > 0.0
-                        {
-                            let mut best_edge = None;
-                            for id in &group_after {
-                                if *id >= next.len() {
-                                    continue;
-                                }
-                                if next_flips.get(*id).copied().unwrap_or(false) {
-                                    continue;
-                                }
-                                let row = *id / cols;
-                                let col = *id % cols;
-                                let is_corner = (row == 0 || row + 1 == rows)
-                                    && (col == 0 || col + 1 == cols);
-                                if is_corner {
-                                    continue;
-                                }
-                                let edge_side = if row == 0 {
-                                    Some(DIR_UP)
-                                } else if row + 1 == rows {
-                                    Some(DIR_DOWN)
-                                } else if col == 0 {
-                                    Some(DIR_LEFT)
-                                } else if col + 1 == cols {
-                                    Some(DIR_RIGHT)
-                                } else {
-                                    None
-                                };
-                                let edge_side = match edge_side {
-                                    Some(value) => value,
-                                    None => continue,
-                                };
-                                let current = next[*id];
-                                let current_center = (
-                                    current.0 + piece_width * 0.5,
-                                    current.1 + piece_height * 0.5,
-                                );
-                                for target_edge in 0..4usize {
-                                    let steps = (target_edge + 4 - edge_side) % 4;
-                                    let target_rot =
-                                        normalize_angle(steps as f64 * ROTATION_STEP_DEG);
-                                    let swap =
-                                        ((target_rot / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
-                                    let (rot_w, rot_h) = if swap {
-                                        (piece_height, piece_width)
-                                    } else {
-                                        (piece_width, piece_height)
-                                    };
-                                    let target_center = match target_edge {
-                                        DIR_UP => (current_center.0, rot_h * 0.5),
-                                        DIR_RIGHT => (frame_width - rot_w * 0.5, current_center.1),
-                                        DIR_DOWN => (
-                                            current_center.0,
-                                            frame_height - rot_h * 0.5,
-                                        ),
-                                        DIR_LEFT => (rot_w * 0.5, current_center.1),
-                                        _ => (current_center.0, current_center.1),
-                                    };
-                                    let dist = if target_edge == DIR_UP || target_edge == DIR_DOWN {
-                                        (current_center.1 - target_center.1).abs()
-                                    } else {
-                                        (current_center.0 - target_center.0).abs()
-                                    };
-                                    if dist > corner_snap_distance {
-                                        continue;
-                                    }
-                                    let anchor_row = (*id / cols) as i32;
-                                    let anchor_col = (*id % cols) as i32;
-                                    let mut min_cx = f64::INFINITY;
-                                    let mut max_cx = f64::NEG_INFINITY;
-                                    let mut min_cy = f64::INFINITY;
-                                    let mut max_cy = f64::NEG_INFINITY;
-                                    for member in &group_after {
-                                        let center = aligned_center_from_anchor(
-                                            anchor_row,
-                                            anchor_col,
-                                            target_center,
-                                            *member,
-                                            cols,
-                                            piece_width,
-                                            piece_height,
-                                            target_rot,
-                                        );
-                                        min_cx = min_cx.min(center.0);
-                                        max_cx = max_cx.max(center.0);
-                                        min_cy = min_cy.min(center.1);
-                                        max_cy = max_cy.max(center.1);
-                                    }
-                                    let can_snap = min_cx.is_finite()
-                                        && min_cy.is_finite()
-                                        && min_cx >= center_min_x
-                                        && max_cx <= center_max_x
-                                        && min_cy >= center_min_y
-                                        && max_cy <= center_max_y;
-                                    if !can_snap {
-                                        continue;
-                                    }
-                                    let should_replace = match best_edge {
-                                        None => true,
-                                        Some((_best_id, _best_center, _best_rot, best_dist)) => {
-                                            dist < best_dist
-                                        }
-                                    };
-                                    if should_replace {
-                                        best_edge =
-                                            Some((*id, target_center, target_rot, dist));
-                                    }
-                                }
-                            }
-                            if let Some((anchor_id, anchor_center, target_rot, _)) = best_edge {
-                                align_group_to_anchor(
-                                    &mut next,
-                                    &mut next_rotations,
-                                    &group_after,
-                                    anchor_id,
-                                    anchor_center,
-                                    target_rot,
-                                    cols,
-                                    piece_width,
-                                    piece_height,
-                                );
-                            }
-                        }
-
-                        if group_after.len() == cols * rows {
-                            let stage_center_x = view_min_x + view_width * 0.5;
-                            let stage_center_y = view_min_y + view_height * 0.5;
-                            let target_center = (
-                                stage_center_x - frame_width * 0.5 + piece_width * 0.5,
-                                stage_center_y - frame_height * 0.5 + piece_height * 0.5,
-                            );
-                            align_group_to_anchor(
-                                &mut next,
-                                &mut next_rotations,
-                                &group_after,
-                                0,
-                                target_center,
-                                0.0,
-                                cols,
-                                piece_width,
-                                piece_height,
-                            );
-                        } else {
-                            let mut in_group = vec![false; cols * rows];
-                            for id in &group_after {
-                                if *id < in_group.len() {
-                                    in_group[*id] = true;
-                                }
-                            }
-                            let mut has_borders = true;
-                            'border_check: for row in 0..rows {
-                                for col in 0..cols {
-                                    if row == 0
-                                        || row + 1 == rows
-                                        || col == 0
-                                        || col + 1 == cols
-                                    {
-                                        let id = row * cols + col;
-                                        if !in_group[id] {
-                                            has_borders = false;
-                                            break 'border_check;
-                                        }
-                                    }
-                                }
-                            }
-                            if has_borders {
-                                let frame_snap_distance = snap_distance * frame_snap_ratio_value;
-                                let anchor_id = 0usize;
-                                if let Some(anchor_pos) = next.get(anchor_id) {
-                                    let current_center = (
-                                        anchor_pos.0 + piece_width * 0.5,
-                                        anchor_pos.1 + piece_height * 0.5,
-                                    );
-                                    let target_center = (piece_width * 0.5, piece_height * 0.5);
-                                    let dx = current_center.0 - target_center.0;
-                                    let dy = current_center.1 - target_center.1;
-                                    let dist = (dx * dx + dy * dy).sqrt();
-                                    if dist <= frame_snap_distance {
-                                        align_group_to_anchor(
-                                            &mut next,
-                                            &mut next_rotations,
-                                            &group_after,
-                                            anchor_id,
-                                            target_center,
-                                            0.0,
-                                            cols,
-                                            piece_width,
-                                            piece_height,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let clamp_ids: &[usize] = if group_after.is_empty() {
-                        &drag.members
-                    } else {
-                        &group_after
-                    };
-                    if !clamp_ids.is_empty() {
-                        let mut min_cx = f64::INFINITY;
-                        let mut max_cx = f64::NEG_INFINITY;
-                        let mut min_cy = f64::INFINITY;
-                        let mut max_cy = f64::NEG_INFINITY;
-                        for id in clamp_ids {
-                            if let Some(pos) = next.get(*id) {
-                                let center_x = pos.0 + piece_width * 0.5;
-                                let center_y = pos.1 + piece_height * 0.5;
-                                min_cx = min_cx.min(center_x);
-                                max_cx = max_cx.max(center_x);
-                                min_cy = min_cy.min(center_y);
-                                max_cy = max_cy.max(center_y);
-                            }
-                        }
-                        if min_cx.is_finite() && min_cy.is_finite() {
-                            let mut shift_x = 0.0;
-                            let mut shift_y = 0.0;
-                            if min_cx < center_min_x {
-                                shift_x = center_min_x - min_cx;
-                            } else if max_cx > center_max_x {
-                                shift_x = center_max_x - max_cx;
-                            }
-                            if min_cy < center_min_y {
-                                shift_y = center_min_y - min_cy;
-                            } else if max_cy > center_max_y {
-                                shift_y = center_max_y - max_cy;
-                            }
-                            if shift_x != 0.0 || shift_y != 0.0 {
-                                for id in clamp_ids {
-                                    if let Some(pos) = next.get_mut(*id) {
-                                        *pos = (pos.0 + shift_x, pos.1 + shift_y);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let group_after = apply_snaps_for_group(
+                        &drag.members,
+                        &mut next,
+                        &mut next_rotations,
+                        &next_flips,
+                        &mut next_connections,
+                        cols,
+                        rows,
+                        piece_width,
+                        piece_height,
+                        snap_distance,
+                        frame_snap_ratio_value,
+                        center_min_x,
+                        center_max_x,
+                        center_min_y,
+                        center_max_y,
+                        view_min_x,
+                        view_min_y,
+                        view_width,
+                        view_height,
+                        rotation_snap_tolerance_value,
+                        rotation_enabled_value,
+                    );
 
                     let mut pending_animation = None;
                     if rotation_enabled_value && !group_after.is_empty() {
@@ -3614,9 +4138,10 @@ fn app() -> Html {
                         }
                     }
                     if let Some(anim) = pending_animation {
+                        let connections_snapshot = next_connections.clone();
                         connections.set(next_connections);
                         flips.set(next_flips);
-                        start_group_animation(anim);
+                        start_group_animation(anim, Some(connections_snapshot));
                         active_id.set(None);
                         dragging_members.set(Vec::new());
                         *drag_state.borrow_mut() = None;
@@ -4018,7 +4543,7 @@ fn app() -> Html {
                 html! {}
             } else {
                 html! {
-                    <>
+                    <g class="piece-outline-group edge-external">
                         <path
                             class="piece-outline piece-outline-light edge-external"
                             d={external_path.clone()}
@@ -4027,14 +4552,17 @@ fn app() -> Html {
                             class="piece-outline piece-outline-dark edge-external"
                             d={external_path}
                         />
-                    </>
+                    </g>
                 }
             };
             let connected_outline = if connected_path.is_empty() {
                 html! {}
             } else {
                 html! {
-                    <>
+                    <g
+                        class="piece-outline-group edge-connected"
+                        mask={mask_ref.clone()}
+                    >
                         <path
                             class="piece-outline piece-outline-light edge-connected"
                             d={connected_path.clone()}
@@ -4043,7 +4571,7 @@ fn app() -> Html {
                             class="piece-outline piece-outline-dark edge-connected"
                             d={connected_path}
                         />
-                    </>
+                    </g>
                 }
             };
             let start_drag: Rc<dyn Fn(f64, f64, bool, bool, Option<i32>)> = {
@@ -4155,6 +4683,9 @@ fn app() -> Html {
                 let svg_ref = svg_ref.clone();
                 let start_drag = start_drag.clone();
                 Callback::from(move |event: TouchEvent| {
+                    if event.touches().length() > 1 {
+                        return;
+                    }
                     if let Some(touch) = touch_from_event(&event, None, true) {
                         let touch_id = Some(touch.identifier());
                         if let Some((x, y)) = touch_event_to_svg_coords(
@@ -4170,7 +4701,6 @@ fn app() -> Html {
                             start_drag(x, y, false, false, touch_id);
                         }
                     }
-                    event.prevent_default();
                 })
             };
             let on_piece_enter = {
@@ -4417,12 +4947,18 @@ fn app() -> Html {
     let controls_panel = if show_controls_value {
         html! {
             <aside class="controls">
-                <h2>{ "Debug Panel" }</h2>
+                <h2>{ "Dev Panel" }</h2>
                 <p class={status_class}>{ status_label }</p>
                 <div class="control">
                     <label>
                         { "Seed" }
                         <span class="control-value">{ seed_label }</span>
+                    </label>
+                </div>
+                <div class="control">
+                    <label>
+                        { "Expected solve time" }
+                        <span class="control-value">{ solve_time_label }</span>
                     </label>
                 </div>
                 <div class="control">
@@ -4432,7 +4968,6 @@ fn app() -> Html {
                     </label>
                     <select
                         id="grid-select"
-                        value={grid_index_value.to_string()}
                         onchange={on_grid_change}
                     >
                         {grid_options}
@@ -4517,6 +5052,51 @@ fn app() -> Html {
                         step="0.05"
                         value={frame_snap_ratio_value.to_string()}
                         oninput={on_frame_snap}
+                    />
+                </div>
+                <div class="control">
+                    <label for="snap-distance">
+                        { "Snap distance tol" }
+                        <span class="control-value">{ fmt_f64(snap_distance_ratio_value) }</span>
+                    </label>
+                    <input
+                        id="snap-distance"
+                        type="range"
+                        min={SNAP_DISTANCE_RATIO_MIN.to_string()}
+                        max={SNAP_DISTANCE_RATIO_MAX.to_string()}
+                        step="0.01"
+                        value={snap_distance_ratio_value.to_string()}
+                        oninput={on_snap_distance}
+                    />
+                </div>
+                <div class="control">
+                    <label for="rotation-snap-tolerance">
+                        { "Snap angle tol (deg)" }
+                        <span class="control-value">{ fmt_f64(rotation_snap_tolerance_value) }</span>
+                    </label>
+                    <input
+                        id="rotation-snap-tolerance"
+                        type="range"
+                        min={ROTATION_SNAP_TOLERANCE_MIN_DEG.to_string()}
+                        max={ROTATION_SNAP_TOLERANCE_MAX_DEG.to_string()}
+                        step="0.5"
+                        value={rotation_snap_tolerance_value.to_string()}
+                        oninput={on_rotation_snap_tolerance}
+                    />
+                </div>
+                <div class="control">
+                    <label for="rotation-lock-threshold">
+                        { "Aligned rotate <= " }
+                        <span class="control-value">{ rotation_lock_threshold_value }</span>
+                    </label>
+                    <input
+                        id="rotation-lock-threshold"
+                        type="range"
+                        min={ROTATION_LOCK_THRESHOLD_MIN.to_string()}
+                        max={total.max(ROTATION_LOCK_THRESHOLD_MIN).to_string()}
+                        step="1"
+                        value={rotation_lock_threshold_value.to_string()}
+                        oninput={on_rotation_lock_threshold}
                     />
                 </div>
                 <div class="control">
