@@ -22,8 +22,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - name: Cache cargo + trunk
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cargo/bin
       - name: Install Trunk
-        run: cargo install trunk --locked
+        run: |
+          if ! command -v trunk >/dev/null; then
+            cargo install trunk --locked
+          fi
       - name: Set public url
         run: |
           REPO_NAME="${{ github.event.repository.name }}"
