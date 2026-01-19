@@ -1,4 +1,5 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
+use gloo::render::{request_animation_frame, AnimationFrame};
 use gloo::timers::callback::Interval;
 use js_sys::Date;
 use serde::{Deserialize, Serialize};
@@ -14,60 +15,63 @@ use web_sys::{
 use yew::prelude::*;
 
 const IMAGE_SRC: &str = "puzzles/zoe-potter.jpg";
-const PUZZLE_SEED: u64 = 0x5EED_5EED_25_20;
-const MAX_LINE_BEND_RATIO: f64 = 0.2;
-const SNAP_DISTANCE_RATIO_DEFAULT: f64 = 0.200;
-const SNAP_DISTANCE_RATIO_MIN: f64 = 0.050;
-const SNAP_DISTANCE_RATIO_MAX: f64 = 0.350;
-const SOLVE_TOLERANCE_RATIO: f64 = 0.080;
-const ROTATION_STEP_DEG: f64 = 90.0;
-const ROTATION_SNAP_TOLERANCE_DEFAULT_DEG: f64 = 5.0;
-const ROTATION_SNAP_TOLERANCE_MIN_DEG: f64 = 0.5;
-const ROTATION_SNAP_TOLERANCE_MAX_DEG: f64 = 12.0;
-const ROTATION_SOLVE_TOLERANCE_DEG: f64 = 1.5;
+const PUZZLE_SEED: u32 = 0x5EED_2520;
+const MAX_LINE_BEND_RATIO: f32 = 0.2;
+const SNAP_DISTANCE_RATIO_DEFAULT: f32 = 0.200;
+const SNAP_DISTANCE_RATIO_MIN: f32 = 0.050;
+const SNAP_DISTANCE_RATIO_MAX: f32 = 0.350;
+const SOLVE_TOLERANCE_RATIO: f32 = 0.080;
+const ROTATION_STEP_DEG: f32 = 90.0;
+const ROTATION_SNAP_TOLERANCE_DEFAULT_DEG: f32 = 5.0;
+const ROTATION_SNAP_TOLERANCE_MIN_DEG: f32 = 0.5;
+const ROTATION_SNAP_TOLERANCE_MAX_DEG: f32 = 12.0;
+const ROTATION_SOLVE_TOLERANCE_DEG: f32 = 1.5;
 const ROTATION_LOCK_THRESHOLD_DEFAULT: usize = 4;
 const ROTATION_LOCK_THRESHOLD_MIN: usize = 1;
-const ROTATION_NOISE_MIN: f64 = 0.0;
-const ROTATION_NOISE_MAX: f64 = 6.0;
-const ROTATION_NOISE_DEFAULT: f64 = 0.6;
-const CLICK_MOVE_RATIO: f64 = 0.08;
-const CLICK_MAX_DURATION_MS: f64 = 240.0;
-const SNAP_ANIMATION_MS: f64 = 160.0;
-const FLIP_CHANCE: f64 = 0.2;
-const RUBBER_BAND_RATIO: f64 = 0.35;
-const WORKSPACE_SCALE_MIN: f64 = 0.4;
-const WORKSPACE_SCALE_MAX: f64 = 2.5;
-const WORKSPACE_SCALE_DEFAULT: f64 = 1.7;
-const FRAME_SNAP_MIN: f64 = 0.4;
-const FRAME_SNAP_MAX: f64 = 3.0;
-const FRAME_SNAP_DEFAULT: f64 = 1.0;
-const TAB_WIDTH_MIN: f64 = 0.2;
-const TAB_WIDTH_MAX: f64 = 0.72;
-const TAB_WIDTH_RANGE: f64 = 0.16;
-const TAB_DEPTH_MIN: f64 = 0.2;
-const TAB_DEPTH_MAX: f64 = 1.1;
-const TAB_DEPTH_RANGE: f64 = 0.35;
-const TAB_SIZE_SCALE_MIN: f64 = 0.1;
-const TAB_SIZE_SCALE_MAX: f64 = 0.5;
-const TAB_SIZE_MIN_LIMIT: f64 = 0.02;
-const TAB_SIZE_MAX_LIMIT: f64 = 0.24;
-const JITTER_STRENGTH_MIN: f64 = 0.0;
-const JITTER_STRENGTH_MAX: f64 = 0.3;
-const JITTER_LEN_BIAS_MIN: f64 = 0.0;
-const JITTER_LEN_BIAS_MAX: f64 = 1.0;
-const TAB_DEPTH_CAP_MIN: f64 = 0.2;
-const TAB_DEPTH_CAP_MAX: f64 = 0.45;
-const CURVE_DETAIL_MIN: f64 = 0.5;
-const CURVE_DETAIL_MAX: f64 = 3.0;
-const SKEW_RANGE_MAX: f64 = 0.2;
-const VARIATION_MIN: f64 = 0.0;
-const VARIATION_MAX: f64 = 1.0;
-const LINE_BEND_MIN: f64 = 0.0;
-const EDGE_STEP_DIV: f64 = 6.0;
-const EDGE_STEP_MIN: f64 = 6.0;
-const CORNER_RADIUS_RATIO: f64 = 0.05;
-const STORAGE_KEY: &str = "heddobureika.board.v1";
-const STORAGE_VERSION: u32 = 1;
+const ROTATION_NOISE_MIN: f32 = 0.0;
+const ROTATION_NOISE_MAX: f32 = 6.0;
+const ROTATION_NOISE_DEFAULT: f32 = 0.6;
+const EMBOSS_OFFSET: f32 = 2.0;
+const EMBOSS_RIM: f32 = 1.0;
+const EMBOSS_OPACITY: f32 = 0.2;
+const CLICK_MOVE_RATIO: f32 = 0.08;
+const CLICK_MAX_DURATION_MS: f32 = 240.0;
+const SNAP_ANIMATION_MS: f32 = 160.0;
+const FLIP_CHANCE: f32 = 0.2;
+const RUBBER_BAND_RATIO: f32 = 0.35;
+const WORKSPACE_SCALE_MIN: f32 = 0.4;
+const WORKSPACE_SCALE_MAX: f32 = 2.5;
+const WORKSPACE_SCALE_DEFAULT: f32 = 1.7;
+const FRAME_SNAP_MIN: f32 = 0.4;
+const FRAME_SNAP_MAX: f32 = 3.0;
+const FRAME_SNAP_DEFAULT: f32 = 1.0;
+const TAB_WIDTH_MIN: f32 = 0.2;
+const TAB_WIDTH_MAX: f32 = 0.72;
+const TAB_WIDTH_RANGE: f32 = 0.16;
+const TAB_DEPTH_MIN: f32 = 0.2;
+const TAB_DEPTH_MAX: f32 = 1.1;
+const TAB_DEPTH_RANGE: f32 = 0.35;
+const TAB_SIZE_SCALE_MIN: f32 = 0.1;
+const TAB_SIZE_SCALE_MAX: f32 = 0.5;
+const TAB_SIZE_MIN_LIMIT: f32 = 0.02;
+const TAB_SIZE_MAX_LIMIT: f32 = 0.24;
+const JITTER_STRENGTH_MIN: f32 = 0.0;
+const JITTER_STRENGTH_MAX: f32 = 0.3;
+const JITTER_LEN_BIAS_MIN: f32 = 0.0;
+const JITTER_LEN_BIAS_MAX: f32 = 1.0;
+const TAB_DEPTH_CAP_MIN: f32 = 0.2;
+const TAB_DEPTH_CAP_MAX: f32 = 0.45;
+const CURVE_DETAIL_MIN: f32 = 0.5;
+const CURVE_DETAIL_MAX: f32 = 3.0;
+const SKEW_RANGE_MAX: f32 = 0.2;
+const VARIATION_MIN: f32 = 0.0;
+const VARIATION_MAX: f32 = 1.0;
+const LINE_BEND_MIN: f32 = 0.0;
+const EDGE_STEP_DIV: f32 = 6.0;
+const EDGE_STEP_MIN: f32 = 6.0;
+const CORNER_RADIUS_RATIO: f32 = 0.05;
+const STORAGE_KEY: &str = "heddobureika.board.v2";
+const STORAGE_VERSION: u32 = 2;
 const DIR_UP: usize = 0;
 const DIR_RIGHT: usize = 1;
 const DIR_DOWN: usize = 2;
@@ -82,13 +86,13 @@ struct Piece {
 
 #[derive(Clone, Copy, Debug)]
 struct EdgeParams {
-    tab_size: f64,
-    tab_depth: f64,
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-    e: f64,
+    tab_size: f32,
+    tab_depth: f32,
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,70 +126,70 @@ enum EdgeOrientation {
 
 #[derive(Clone, Copy)]
 enum Segment {
-    LineTo { x: f64, y: f64 },
+    LineTo { x: f32, y: f32 },
 }
 
 #[derive(Clone, Copy)]
 struct LineWave {
-    amplitude: f64,
-    skew: f64,
+    amplitude: f32,
+    skew: f32,
 }
 
 struct WarpField<'a> {
-    width: f64,
-    height: f64,
+    width: f32,
+    height: f32,
     horizontal: &'a [LineWave],
     vertical: &'a [LineWave],
 }
 
 #[derive(Clone, Debug)]
 struct DragState {
-    start_x: f64,
-    start_y: f64,
-    start_time: f64,
+    start_x: f32,
+    start_y: f32,
+    start_time: f32,
     primary_id: usize,
     touch_id: Option<i32>,
     rotate_mode: bool,
-    pivot_x: f64,
-    pivot_y: f64,
-    start_angle: f64,
+    pivot_x: f32,
+    pivot_y: f32,
+    start_angle: f32,
     members: Vec<usize>,
-    start_positions: Vec<(f64, f64)>,
-    start_rotations: Vec<f64>,
+    start_positions: Vec<(f32, f32)>,
+    start_rotations: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
 enum AnimationKind {
     Pivot {
-        pivot_x: f64,
-        pivot_y: f64,
-        delta: f64,
+        pivot_x: f32,
+        pivot_y: f32,
+        delta: f32,
     },
     Anchor {
         anchor_id: usize,
-        start_center: (f64, f64),
-        target_center: (f64, f64),
-        start_rot: f64,
-        target_rot: f64,
+        start_center: (f32, f32),
+        target_center: (f32, f32),
+        start_rot: f32,
+        target_rot: f32,
     },
 }
 
 #[derive(Clone, Debug)]
 struct RotationAnimation {
-    start_time: f64,
-    duration: f64,
+    start_time: f32,
+    duration: f32,
     members: Vec<usize>,
-    start_positions: Vec<(f64, f64)>,
-    start_rotations: Vec<f64>,
+    start_positions: Vec<(f32, f32)>,
+    start_rotations: Vec<f32>,
     kind: AnimationKind,
 }
 
 #[derive(Clone, Debug)]
 struct QueuedRotation {
     members: Vec<usize>,
-    pivot_x: f64,
-    pivot_y: f64,
-    noise: f64,
+    pivot_x: f32,
+    pivot_y: f32,
+    noise: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -194,6 +198,13 @@ enum PreviewCorner {
     BottomRight,
     TopLeft,
     TopRight,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ThemeMode {
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Default)]
@@ -211,28 +222,28 @@ struct SavedBoard {
     rows: u32,
     image_width: u32,
     image_height: u32,
-    positions: Vec<(f64, f64)>,
-    rotations: Vec<f64>,
+    positions: Vec<(f32, f32)>,
+    rotations: Vec<f32>,
     flips: Vec<bool>,
     connections: Vec<[bool; 4]>,
     z_order: Vec<usize>,
-    scramble_nonce: u64,
+    scramble_nonce: u32,
 }
 
 #[derive(Clone, PartialEq)]
 struct ShapeSettings {
-    tab_width: f64,
-    tab_depth: f64,
-    tab_size_scale: f64,
-    tab_size_min: f64,
-    tab_size_max: f64,
-    jitter_strength: f64,
-    jitter_len_bias: f64,
-    tab_depth_cap: f64,
-    curve_detail: f64,
-    skew_range: f64,
-    variation: f64,
-    line_bend_ratio: f64,
+    tab_width: f32,
+    tab_depth: f32,
+    tab_size_scale: f32,
+    tab_size_min: f32,
+    tab_size_max: f32,
+    jitter_strength: f32,
+    jitter_len_bias: f32,
+    tab_depth_cap: f32,
+    curve_detail: f32,
+    skew_range: f32,
+    variation: f32,
+    line_bend_ratio: f32,
 }
 
 impl Default for ShapeSettings {
@@ -266,16 +277,16 @@ const TARGET_PIECE_COUNTS: [u32; 11] = [
     50, 100, 150, 300, 500, 750, 1000, 1500, 2000, 3000, 5000,
 ];
 const DEFAULT_TARGET_COUNT: u32 = 100;
-const GRID_REL_COUNT_TOL: f64 = 0.05;
-const GRID_PIECE_RATIO_MAX: f64 = 1.42;
+const GRID_REL_COUNT_TOL: f32 = 0.05;
+const GRID_PIECE_RATIO_MAX: f32 = 1.42;
 const GRID_ROW_MIN: u32 = 2;
-const GRID_ROW_WIDEN: f64 = 1.5;
+const GRID_ROW_WIDEN: f32 = 1.5;
 const GRID_NEIGHBOR_COLS: i32 = 3;
-const GRID_SCORE_COUNT: f64 = 1.0;
-const GRID_SCORE_GRID: f64 = 1.0;
-const GRID_SCORE_PIECE: f64 = 0.5;
-const SOLVE_TIME_FACTOR: f64 = 4.1;
-const SOLVE_TIME_EXPONENT: f64 = 1.3;
+const GRID_SCORE_COUNT: f32 = 1.0;
+const GRID_SCORE_GRID: f32 = 1.0;
+const GRID_SCORE_PIECE: f32 = 0.5;
+const SOLVE_TIME_FACTOR: f32 = 4.1;
+const SOLVE_TIME_EXPONENT: f32 = 1.3;
 
 const FALLBACK_GRID: GridChoice = GridChoice {
     target_count: 80,
@@ -308,15 +319,15 @@ fn best_grid_for_count(width: u32, height: u32, target: u32) -> Option<GridChoic
     if target == 0 || width == 0 || height == 0 {
         return None;
     }
-    let aspect = width as f64 / height as f64;
+    let aspect = width as f32 / height as f32;
     let piece_ratio_max = GRID_PIECE_RATIO_MAX.max(1.0);
     let piece_ratio_min = 1.0 / piece_ratio_max;
-    let base = (target as f64).sqrt().ceil() as u32;
-    let r_hi = ((base as f64) * GRID_ROW_WIDEN).ceil() as u32;
+    let base = (target as f32).sqrt().ceil() as u32;
+    let r_hi = ((base as f32) * GRID_ROW_WIDEN).ceil() as u32;
     let r_hi = r_hi.max(GRID_ROW_MIN);
-    let mut best: Option<(GridChoice, f64)> = None;
+    let mut best: Option<(GridChoice, f32)> = None;
     for r in GRID_ROW_MIN..=r_hi {
-        let c_star = target as f64 / r as f64;
+        let c_star = target as f32 / r as f32;
         let c0 = c_star.round() as i32;
         for dc in -GRID_NEIGHBOR_COLS..=GRID_NEIGHBOR_COLS {
             let c = c0 + dc;
@@ -325,11 +336,11 @@ fn best_grid_for_count(width: u32, height: u32, target: u32) -> Option<GridChoic
             }
             let actual = r as i32 * c;
             let actual_u = actual as u32;
-            let rel_err = ((actual_u as f64) - (target as f64)).abs() / target as f64;
+            let rel_err = ((actual_u as f32) - (target as f32)).abs() / target as f32;
             if rel_err > GRID_REL_COUNT_TOL {
                 continue;
             }
-            let grid_ratio = c as f64 / r as f64;
+            let grid_ratio = c as f32 / r as f32;
             let piece_ratio = aspect / grid_ratio;
             if piece_ratio < piece_ratio_min || piece_ratio > piece_ratio_max {
                 continue;
@@ -411,12 +422,12 @@ fn save_board_state(state: &SavedBoard) {
     let _ = storage.set_item(STORAGE_KEY, &raw);
 }
 
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-fn sample_line_wave(lines: &[LineWave], t: f64) -> LineWave {
-    let last = lines.len().saturating_sub(1) as f64;
+fn sample_line_wave(lines: &[LineWave], t: f32) -> LineWave {
+    let last = lines.len().saturating_sub(1) as f32;
     if last <= 0.0 {
         return LineWave {
             amplitude: 0.0,
@@ -426,7 +437,7 @@ fn sample_line_wave(lines: &[LineWave], t: f64) -> LineWave {
     let clamped = t.clamp(0.0, 1.0) * last;
     let idx = clamped.floor() as usize;
     let next = (idx + 1).min(lines.len().saturating_sub(1));
-    let frac = clamped - idx as f64;
+    let frac = clamped - idx as f32;
     let current = lines[idx];
     let following = lines[next];
     LineWave {
@@ -435,15 +446,15 @@ fn sample_line_wave(lines: &[LineWave], t: f64) -> LineWave {
     }
 }
 
-fn warp_point(x: f64, y: f64, warp: &WarpField<'_>) -> (f64, f64) {
+fn warp_point(x: f32, y: f32, warp: &WarpField<'_>) -> (f32, f32) {
     let u = (x / warp.width).clamp(0.0, 1.0);
     let v = (y / warp.height).clamp(0.0, 1.0);
     let h_wave = sample_line_wave(warp.horizontal, v);
     let v_wave = sample_line_wave(warp.vertical, u);
     let u_skew = (u + h_wave.skew * u * (1.0 - u)).clamp(0.0, 1.0);
     let v_skew = (v + v_wave.skew * v * (1.0 - v)).clamp(0.0, 1.0);
-    let dy = h_wave.amplitude * (std::f64::consts::PI * u_skew).sin();
-    let dx = v_wave.amplitude * (std::f64::consts::PI * v_skew).sin();
+    let dy = h_wave.amplitude * (std::f32::consts::PI * u_skew).sin();
+    let dx = v_wave.amplitude * (std::f32::consts::PI * v_skew).sin();
     (x + dx, y + dy)
 }
 
@@ -458,11 +469,70 @@ fn build_pieces(rows: u32, cols: u32) -> Vec<Piece> {
     pieces
 }
 
-fn fmt_f64(value: f64) -> String {
+fn is_border_piece(row: usize, col: usize, rows: usize, cols: usize) -> bool {
+    row == 0 || row + 1 == rows || col == 0 || col + 1 == cols
+}
+
+fn count_connections(
+    connections: &[[bool; 4]],
+    cols: usize,
+    rows: usize,
+) -> (usize, usize, usize, usize) {
+    if cols == 0 || rows == 0 {
+        return (0, 0, 0, 0);
+    }
+    let mut connected = 0;
+    let mut border_connected = 0;
+    let mut total_expected = 0;
+    let mut border_expected = 0;
+    for row in 0..rows {
+        for col in 0..cols {
+            let id = row * cols + col;
+            let is_border = is_border_piece(row, col, rows, cols);
+            if col + 1 < cols {
+                total_expected += 1;
+                let neighbor_border = is_border_piece(row, col + 1, rows, cols);
+                if is_border && neighbor_border {
+                    border_expected += 1;
+                }
+                if id < connections.len() && connections[id][DIR_RIGHT] {
+                    connected += 1;
+                    if is_border && neighbor_border {
+                        border_connected += 1;
+                    }
+                }
+            }
+            if row + 1 < rows {
+                total_expected += 1;
+                let neighbor_border = is_border_piece(row + 1, col, rows, cols);
+                if is_border && neighbor_border {
+                    border_expected += 1;
+                }
+                if id < connections.len() && connections[id][DIR_DOWN] {
+                    connected += 1;
+                    if is_border && neighbor_border {
+                        border_connected += 1;
+                    }
+                }
+            }
+        }
+    }
+    (connected, border_connected, total_expected, border_expected)
+}
+
+fn fmt_f32(value: f32) -> String {
     format!("{:.3}", value)
 }
 
-fn format_time_unit(value: u64, unit: &str) -> String {
+fn format_progress(count: usize, total: usize) -> String {
+    if total == 0 {
+        return "--".to_string();
+    }
+    let pct = (count as f32 / total as f32) * 100.0;
+    format!("{}/{} ({:.0}%)", count, total, pct)
+}
+
+fn format_time_unit(value: u32, unit: &str) -> String {
     if value == 1 {
         format!("~{} {}", value, unit)
     } else {
@@ -470,34 +540,34 @@ fn format_time_unit(value: u64, unit: &str) -> String {
     }
 }
 
-fn format_duration(seconds: f64) -> String {
+fn format_duration(seconds: f32) -> String {
     if !seconds.is_finite() || seconds <= 0.0 {
         return "~0 seconds".to_string();
     }
     if seconds < 90.0 {
-        return format_time_unit(seconds.round().max(1.0) as u64, "second");
+        return format_time_unit(seconds.round().max(1.0) as u32, "second");
     }
     let minutes = seconds / 60.0;
     if minutes < 90.0 {
-        return format_time_unit(minutes.round().max(1.0) as u64, "minute");
+        return format_time_unit(minutes.round().max(1.0) as u32, "minute");
     }
     let hours = minutes / 60.0;
     if hours < 36.0 {
-        return format_time_unit(hours.round().max(1.0) as u64, "hour");
+        return format_time_unit(hours.round().max(1.0) as u32, "hour");
     }
     let days = hours / 24.0;
-    format_time_unit(days.round().max(1.0) as u64, "day")
+    format_time_unit(days.round().max(1.0) as u32, "day")
 }
 
 fn jitter_value(
-    seed: u64,
-    salt: u64,
-    base: f64,
-    range: f64,
-    min: f64,
-    max: f64,
-    variation: f64,
-) -> f64 {
+    seed: u32,
+    salt: u32,
+    base: f32,
+    range: f32,
+    min: f32,
+    max: f32,
+    variation: f32,
+) -> f32 {
     let jitter = rand_unit(seed, salt) * 2.0 - 1.0;
     let value = base + jitter * range * variation;
     value.clamp(min, max)
@@ -506,18 +576,22 @@ fn jitter_value(
 fn event_to_svg_coords(
     event: &MouseEvent,
     svg_ref: &NodeRef,
-    view_min_x: f64,
-    view_min_y: f64,
-    view_width: f64,
-    view_height: f64,
-) -> Option<(f64, f64)> {
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+) -> Option<(f32, f32)> {
     let svg = svg_ref.cast::<Element>()?;
     let rect = svg.get_bounding_client_rect();
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+    let rect_width = rect.width() as f32;
+    let rect_height = rect.height() as f32;
+    if rect_width <= 0.0 || rect_height <= 0.0 {
         return None;
     }
-    let x = view_min_x + (event.client_x() as f64 - rect.left()) * view_width / rect.width();
-    let y = view_min_y + (event.client_y() as f64 - rect.top()) * view_height / rect.height();
+    let rect_left = rect.left() as f32;
+    let rect_top = rect.top() as f32;
+    let x = view_min_x + (event.client_x() as f32 - rect_left) * view_width / rect_width;
+    let y = view_min_y + (event.client_y() as f32 - rect_top) * view_height / rect_height;
     Some((x, y))
 }
 
@@ -544,31 +618,35 @@ fn touch_from_event(event: &TouchEvent, touch_id: Option<i32>, use_changed: bool
 fn touch_event_to_svg_coords(
     event: &TouchEvent,
     svg_ref: &NodeRef,
-    view_min_x: f64,
-    view_min_y: f64,
-    view_width: f64,
-    view_height: f64,
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
     touch_id: Option<i32>,
     use_changed: bool,
-) -> Option<(f64, f64)> {
+) -> Option<(f32, f32)> {
     let svg = svg_ref.cast::<Element>()?;
     let rect = svg.get_bounding_client_rect();
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+    let rect_width = rect.width() as f32;
+    let rect_height = rect.height() as f32;
+    if rect_width <= 0.0 || rect_height <= 0.0 {
         return None;
     }
     let touch = touch_from_event(event, touch_id, use_changed)?;
-    let x = view_min_x + (touch.client_x() as f64 - rect.left()) * view_width / rect.width();
-    let y = view_min_y + (touch.client_y() as f64 - rect.top()) * view_height / rect.height();
+    let rect_left = rect.left() as f32;
+    let rect_top = rect.top() as f32;
+    let x = view_min_x + (touch.client_x() as f32 - rect_left) * view_width / rect_width;
+    let y = view_min_y + (touch.client_y() as f32 - rect_top) * view_height / rect_height;
     Some((x, y))
 }
 
 fn on_setting_change<F>(settings: UseStateHandle<ShapeSettings>, updater: F) -> Callback<InputEvent>
 where
-    F: Fn(&mut ShapeSettings, f64) + 'static,
+    F: Fn(&mut ShapeSettings, f32) + 'static,
 {
     Callback::from(move |event: InputEvent| {
         let input: HtmlInputElement = event.target_unchecked_into();
-        if let Ok(value) = input.value().parse::<f64>() {
+        if let Ok(value) = input.value().parse::<f32>() {
             let mut next = (*settings).clone();
             updater(&mut next, value);
             settings.set(next);
@@ -668,14 +746,14 @@ fn is_fully_connected(connections: &[[bool; 4]], cols: usize, rows: usize) -> bo
 }
 
 fn is_solved(
-    positions: &[(f64, f64)],
-    rotations: &[f64],
+    positions: &[(f32, f32)],
+    rotations: &[f32],
     flips: &[bool],
     connections: &[[bool; 4]],
     cols: usize,
     rows: usize,
-    piece_width: f64,
-    piece_height: f64,
+    piece_width: f32,
+    piece_height: f32,
     rotation_enabled: bool,
 ) -> bool {
     let total = cols * rows;
@@ -707,8 +785,8 @@ fn is_solved(
         for col in 0..cols {
             let id = row * cols + col;
             if let Some(pos) = positions.get(id) {
-                let target_x = col as f64 * piece_width;
-                let target_y = row as f64 * piece_height;
+                let target_x = col as f32 * piece_width;
+                let target_y = row as f32 * piece_height;
                 let dx = pos.0 - target_x;
                 let dy = pos.1 - target_y;
                 if dx * dx + dy * dy > tolerance_sq {
@@ -722,25 +800,25 @@ fn is_solved(
     true
 }
 
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e3779b97f4a7c15);
+fn splitmix32(mut value: u32) -> u32 {
+    value = value.wrapping_add(0x9E37_79B9);
     let mut z = value;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
+    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
+    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
+    z ^ (z >> 16)
 }
 
-fn rand_unit(seed: u64, salt: u64) -> f64 {
-    let mixed = splitmix64(seed ^ salt);
-    let top = mixed >> 11;
-    top as f64 / ((1u64 << 53) as f64)
+fn rand_unit(seed: u32, salt: u32) -> f32 {
+    let mixed = splitmix32(seed ^ salt);
+    let top = mixed >> 8;
+    top as f32 / ((1u32 << 24) as f32)
 }
 
-fn rand_range(seed: u64, salt: u64, min: f64, max: f64) -> f64 {
+fn rand_range(seed: u32, salt: u32, min: f32, max: f32) -> f32 {
     min + (max - min) * rand_unit(seed, salt)
 }
 
-fn rubber_band_distance(delta: f64, limit: f64) -> f64 {
+fn rubber_band_distance(delta: f32, limit: f32) -> f32 {
     if limit <= 0.0 {
         return 0.0;
     }
@@ -749,7 +827,7 @@ fn rubber_band_distance(delta: f64, limit: f64) -> f64 {
     sign * (limit * abs / (limit + abs))
 }
 
-fn rubber_band_clamp(value: f64, min: f64, max: f64, limit: f64) -> f64 {
+fn rubber_band_clamp(value: f32, min: f32, max: f32, limit: f32) -> f32 {
     if value < min {
         min + rubber_band_distance(value - min, limit)
     } else if value > max {
@@ -759,7 +837,7 @@ fn rubber_band_clamp(value: f64, min: f64, max: f64, limit: f64) -> f64 {
     }
 }
 
-fn normalize_angle(mut angle: f64) -> f64 {
+fn normalize_angle(mut angle: f32) -> f32 {
     angle = angle % 360.0;
     if angle < 0.0 {
         angle += 360.0;
@@ -767,7 +845,7 @@ fn normalize_angle(mut angle: f64) -> f64 {
     angle
 }
 
-fn angle_delta(target: f64, current: f64) -> f64 {
+fn angle_delta(target: f32, current: f32) -> f32 {
     let mut diff = normalize_angle(target - current);
     if diff > 180.0 {
         diff -= 360.0;
@@ -775,21 +853,21 @@ fn angle_delta(target: f64, current: f64) -> f64 {
     diff
 }
 
-fn angle_matches(a: f64, b: f64, tolerance: f64) -> bool {
+fn angle_matches(a: f32, b: f32, tolerance: f32) -> bool {
     angle_delta(a, b).abs() <= tolerance
 }
 
-fn next_snap_rotation(angle: f64) -> f64 {
+fn next_snap_rotation(angle: f32) -> f32 {
     let next = (angle / ROTATION_STEP_DEG).floor() + 1.0;
     normalize_angle(next * ROTATION_STEP_DEG)
 }
 
 fn click_rotation_delta(
-    current_angle: f64,
-    noise: f64,
-    noise_range: f64,
-    snap_tolerance: f64,
-) -> f64 {
+    current_angle: f32,
+    noise: f32,
+    noise_range: f32,
+    snap_tolerance: f32,
+) -> f32 {
     let mut target = next_snap_rotation(current_angle + noise);
     target = normalize_angle(target + noise);
     let min_step = if noise_range > 0.0 {
@@ -803,14 +881,14 @@ fn click_rotation_delta(
     angle_delta(target, current_angle)
 }
 
-fn rotate_vec(x: f64, y: f64, angle_deg: f64) -> (f64, f64) {
+fn rotate_vec(x: f32, y: f32, angle_deg: f32) -> (f32, f32) {
     let radians = angle_deg.to_radians();
     let cos = radians.cos();
     let sin = radians.sin();
     (x * cos - y * sin, x * sin + y * cos)
 }
 
-fn rotate_point(x: f64, y: f64, origin_x: f64, origin_y: f64, angle_deg: f64) -> (f64, f64) {
+fn rotate_point(x: f32, y: f32, origin_x: f32, origin_y: f32, angle_deg: f32) -> (f32, f32) {
     let (dx, dy) = (x - origin_x, y - origin_y);
     let (rx, ry) = rotate_vec(dx, dy, angle_deg);
     (origin_x + rx, origin_y + ry)
@@ -819,31 +897,31 @@ fn rotate_point(x: f64, y: f64, origin_x: f64, origin_y: f64, angle_deg: f64) ->
 fn aligned_center_from_anchor(
     anchor_row: i32,
     anchor_col: i32,
-    anchor_center: (f64, f64),
+    anchor_center: (f32, f32),
     member_id: usize,
     cols: usize,
-    piece_width: f64,
-    piece_height: f64,
-    rotation: f64,
-) -> (f64, f64) {
+    piece_width: f32,
+    piece_height: f32,
+    rotation: f32,
+) -> (f32, f32) {
     let row = (member_id / cols) as i32;
     let col = (member_id % cols) as i32;
-    let dx = (col - anchor_col) as f64 * piece_width;
-    let dy = (row - anchor_row) as f64 * piece_height;
+    let dx = (col - anchor_col) as f32 * piece_width;
+    let dy = (row - anchor_row) as f32 * piece_height;
     let (rx, ry) = rotate_vec(dx, dy, rotation);
     (anchor_center.0 + rx, anchor_center.1 + ry)
 }
 
 fn align_group_to_anchor(
-    positions: &mut Vec<(f64, f64)>,
-    rotations: &mut Vec<f64>,
+    positions: &mut Vec<(f32, f32)>,
+    rotations: &mut Vec<f32>,
     members: &[usize],
     anchor_id: usize,
-    anchor_center: (f64, f64),
-    target_rot: f64,
+    anchor_center: (f32, f32),
+    target_rot: f32,
     cols: usize,
-    piece_width: f64,
-    piece_height: f64,
+    piece_width: f32,
+    piece_height: f32,
 ) {
     if members.is_empty() || cols == 0 {
         return;
@@ -873,16 +951,16 @@ fn align_group_to_anchor(
 
 fn connect_aligned_neighbors(
     members: &[usize],
-    positions: &[(f64, f64)],
-    rotations: &[f64],
+    positions: &[(f32, f32)],
+    rotations: &[f32],
     flips: &[bool],
     connections: &mut Vec<[bool; 4]>,
     cols: usize,
     rows: usize,
-    piece_width: f64,
-    piece_height: f64,
-    snap_distance: f64,
-    rotation_snap_tolerance: f64,
+    piece_width: f32,
+    piece_height: f32,
+    snap_distance: f32,
+    rotation_snap_tolerance: f32,
     rotation_enabled: bool,
 ) {
     let group_rot = members
@@ -940,12 +1018,12 @@ fn connect_aligned_neighbors(
 }
 
 fn frame_center_bounds_for_rotation(
-    frame_width: f64,
-    frame_height: f64,
-    piece_width: f64,
-    piece_height: f64,
-    rotation: f64,
-) -> (f64, f64, f64, f64) {
+    frame_width: f32,
+    frame_height: f32,
+    piece_width: f32,
+    piece_height: f32,
+    rotation: f32,
+) -> (f32, f32, f32, f32) {
     let rotation = normalize_angle(rotation);
     let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
     let (rot_w, rot_h) = if swap {
@@ -968,25 +1046,25 @@ fn frame_center_bounds_for_rotation(
 
 fn apply_snaps_for_group(
     members: &[usize],
-    positions: &mut Vec<(f64, f64)>,
-    rotations: &mut Vec<f64>,
+    positions: &mut Vec<(f32, f32)>,
+    rotations: &mut Vec<f32>,
     flips: &[bool],
     connections: &mut Vec<[bool; 4]>,
     cols: usize,
     rows: usize,
-    piece_width: f64,
-    piece_height: f64,
-    snap_distance: f64,
-    frame_snap_ratio: f64,
-    center_min_x: f64,
-    center_max_x: f64,
-    center_min_y: f64,
-    center_max_y: f64,
-    view_min_x: f64,
-    view_min_y: f64,
-    view_width: f64,
-    view_height: f64,
-    rotation_snap_tolerance: f64,
+    piece_width: f32,
+    piece_height: f32,
+    snap_distance: f32,
+    frame_snap_ratio: f32,
+    center_min_x: f32,
+    center_max_x: f32,
+    center_min_y: f32,
+    center_max_y: f32,
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+    rotation_snap_tolerance: f32,
     rotation_enabled: bool,
 ) -> Vec<usize> {
     let total = cols * rows;
@@ -1004,10 +1082,10 @@ fn apply_snaps_for_group(
     struct SnapCandidate {
         member: usize,
         dir: usize,
-        center_b: (f64, f64),
-        rot_b: f64,
-        base: (f64, f64),
-        dist: f64,
+        center_b: (f32, f32),
+        rot_b: f32,
+        base: (f32, f32),
+        dist: f32,
     }
 
     let mut candidates = Vec::new();
@@ -1068,12 +1146,12 @@ fn apply_snaps_for_group(
         }
     }
 
-    let mut snap_anchor: Option<(usize, (f64, f64), f64)> = None;
+    let mut snap_anchor: Option<(usize, (f32, f32), f32)> = None;
     if !candidates.is_empty() {
         let mut best_index = None;
         let mut best_count = 0usize;
-        let mut best_error = f64::INFINITY;
-        let mut best_dist = f64::INFINITY;
+        let mut best_error = f32::INFINITY;
+        let mut best_dist = f32::INFINITY;
         let mut best_anchor_id = 0usize;
         let mut best_anchor_center = (0.0, 0.0);
         let mut best_target_rot = 0.0;
@@ -1094,10 +1172,10 @@ fn apply_snaps_for_group(
                 candidate.center_b.1 - expected.1,
             );
 
-            let mut min_cx = f64::INFINITY;
-            let mut max_cx = f64::NEG_INFINITY;
-            let mut min_cy = f64::INFINITY;
-            let mut max_cy = f64::NEG_INFINITY;
+            let mut min_cx = f32::INFINITY;
+            let mut max_cx = f32::NEG_INFINITY;
+            let mut min_cy = f32::INFINITY;
+            let mut max_cy = f32::NEG_INFINITY;
             for id in members {
                 let transformed = aligned_center_from_anchor(
                     anchor_row,
@@ -1258,8 +1336,8 @@ fn apply_snaps_for_group(
         }
     }
     if !group_after.is_empty() {
-        let frame_width = cols as f64 * piece_width;
-        let frame_height = rows as f64 * piece_height;
+        let frame_width = cols as f32 * piece_width;
+        let frame_height = rows as f32 * piece_height;
         let corner_snap_distance = snap_distance * frame_snap_ratio;
         let group_rot = group_after
             .first()
@@ -1269,7 +1347,7 @@ fn apply_snaps_for_group(
         let mut corner_snapped = false;
         if rotation_enabled && group_after.len() < total && corner_snap_distance > 0.0 {
             let mut best_corner = None;
-            let target_center_for = |corner: usize, rotation: f64| {
+            let target_center_for = |corner: usize, rotation: f32| {
                 let rotation = normalize_angle(rotation);
                 let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
                 let (offset_x, offset_y) = if swap {
@@ -1316,7 +1394,7 @@ fn apply_snaps_for_group(
                 );
                 for target_corner in 0..4usize {
                     let steps = (target_corner + 4 - piece_corner) % 4;
-                    let target_rot = normalize_angle(steps as f64 * ROTATION_STEP_DEG);
+                    let target_rot = normalize_angle(steps as f32 * ROTATION_STEP_DEG);
                     if rotation_enabled
                         && !angle_matches(group_rot, target_rot, rotation_snap_tolerance)
                     {
@@ -1339,10 +1417,10 @@ fn apply_snaps_for_group(
                             piece_height,
                             target_rot,
                         );
-                    let mut min_cx = f64::INFINITY;
-                    let mut max_cx = f64::NEG_INFINITY;
-                    let mut min_cy = f64::INFINITY;
-                    let mut max_cy = f64::NEG_INFINITY;
+                    let mut min_cx = f32::INFINITY;
+                    let mut max_cx = f32::NEG_INFINITY;
+                    let mut min_cy = f32::INFINITY;
+                    let mut max_cy = f32::NEG_INFINITY;
                     for member in &group_after {
                         let center = aligned_center_from_anchor(
                             anchor_row,
@@ -1433,7 +1511,7 @@ fn apply_snaps_for_group(
                 );
                 for target_edge in 0..4usize {
                     let steps = (target_edge + 4 - edge_side) % 4;
-                    let target_rot = normalize_angle(steps as f64 * ROTATION_STEP_DEG);
+                    let target_rot = normalize_angle(steps as f32 * ROTATION_STEP_DEG);
                     if rotation_enabled
                         && !angle_matches(group_rot, target_rot, rotation_snap_tolerance)
                     {
@@ -1470,10 +1548,10 @@ fn apply_snaps_for_group(
                             piece_height,
                             target_rot,
                         );
-                    let mut min_cx = f64::INFINITY;
-                    let mut max_cx = f64::NEG_INFINITY;
-                    let mut min_cy = f64::INFINITY;
-                    let mut max_cy = f64::NEG_INFINITY;
+                    let mut min_cx = f32::INFINITY;
+                    let mut max_cx = f32::NEG_INFINITY;
+                    let mut min_cy = f32::INFINITY;
+                    let mut max_cy = f32::NEG_INFINITY;
                     for member in &group_after {
                         let center = aligned_center_from_anchor(
                             anchor_row,
@@ -1598,10 +1676,10 @@ fn apply_snaps_for_group(
         &group_after
     };
     if !clamp_ids.is_empty() {
-        let mut min_cx = f64::INFINITY;
-        let mut max_cx = f64::NEG_INFINITY;
-        let mut min_cy = f64::INFINITY;
-        let mut max_cy = f64::NEG_INFINITY;
+        let mut min_cx = f32::INFINITY;
+        let mut max_cx = f32::NEG_INFINITY;
+        let mut min_cy = f32::INFINITY;
+        let mut max_cy = f32::NEG_INFINITY;
         for id in clamp_ids {
             if let Some(pos) = positions.get(*id) {
                 let center_x = pos.0 + piece_width * 0.5;
@@ -1658,9 +1736,9 @@ fn apply_snaps_for_group(
     group_after
 }
 
-fn time_nonce(previous: u64) -> u64 {
-    let now = Date::now() as u64;
-    splitmix64(now ^ previous.wrapping_add(0x9e3779b97f4a7c15))
+fn time_nonce(previous: u32) -> u32 {
+    let now = Date::now() as u32;
+    splitmix32(now ^ previous.wrapping_add(0x9E37_79B9))
 }
 
 fn build_full_connections(cols: usize, rows: usize) -> Vec<[bool; 4]> {
@@ -1680,22 +1758,23 @@ fn build_full_connections(cols: usize, rows: usize) -> Vec<[bool; 4]> {
     connections
 }
 
-fn scramble_seed(base: u64, nonce: u64, cols: usize, rows: usize) -> u64 {
-    base ^ nonce.wrapping_mul(0x9e3779b97f4a7c15) ^ ((cols as u64) << 32) ^ rows as u64 ^ 0x5CA7_7EED
+fn scramble_seed(base: u32, nonce: u32, cols: usize, rows: usize) -> u32 {
+    let grid = ((cols as u32) << 16) ^ (rows as u32);
+    base ^ nonce.wrapping_mul(0x9E37_79B9) ^ grid ^ 0x5CA7_7EED
 }
 
 fn scramble_layout(
-    seed: u64,
+    seed: u32,
     cols: usize,
     rows: usize,
-    piece_width: f64,
-    piece_height: f64,
-    view_min_x: f64,
-    view_min_y: f64,
-    view_width: f64,
-    view_height: f64,
-    margin: f64,
-) -> (Vec<(f64, f64)>, Vec<usize>) {
+    piece_width: f32,
+    piece_height: f32,
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+    margin: f32,
+) -> (Vec<(f32, f32)>, Vec<usize>) {
     let total = cols * rows;
     let min_x = view_min_x + margin;
     let mut max_x = view_min_x + view_width - piece_width - margin;
@@ -1710,7 +1789,7 @@ fn scramble_layout(
 
     let mut positions = Vec::with_capacity(total);
     for id in 0..total {
-        let salt = (id as u64) << 1;
+        let salt = (id as u32) << 1;
         let x = rand_range(seed, salt, min_x, max_x);
         let y = rand_range(seed, salt + 1, min_y, max_y);
         positions.push((x, y));
@@ -1718,40 +1797,42 @@ fn scramble_layout(
 
     let mut order: Vec<usize> = (0..total).collect();
     for i in (1..order.len()).rev() {
-        let salt = 0xC0DE_u64 + i as u64;
-        let j = (rand_unit(seed, salt) * (i as f64 + 1.0)) as usize;
+        let salt = 0xC0DE_u32 + i as u32;
+        let j = (rand_unit(seed, salt) * (i as f32 + 1.0)) as usize;
         order.swap(i, j);
     }
     (positions, order)
 }
 
-fn scramble_rotations(seed: u64, total: usize, enabled: bool) -> Vec<f64> {
+fn scramble_rotations(seed: u32, total: usize, enabled: bool) -> Vec<f32> {
     if !enabled {
         return vec![0.0; total];
     }
     let mut rotations = Vec::with_capacity(total);
     for id in 0..total {
-        let salt = 0xC001_u64 + id as u64;
+        let salt = 0xC001_u32 + id as u32;
         rotations.push(rand_range(seed, salt, 0.0, 360.0));
     }
     rotations
 }
 
-fn scramble_flips(seed: u64, total: usize, chance: f64) -> Vec<bool> {
+fn scramble_flips(seed: u32, total: usize, chance: f32) -> Vec<bool> {
     let threshold = chance.clamp(0.0, 1.0);
     let mut flips = Vec::with_capacity(total);
     for id in 0..total {
-        let salt = 0xF11F_5EED_u64 + id as u64;
+        let salt = 0xF11F_5EED_u32 + id as u32;
         flips.push(rand_unit(seed, salt) < threshold);
     }
     flips
 }
 
-fn edge_seed(base: u64, orientation: u64, row: u32, col: u32) -> u64 {
-    base ^ (orientation << 56) ^ ((row as u64) << 28) ^ (col as u64)
+fn edge_seed(base: u32, orientation: u32, row: u32, col: u32) -> u32 {
+    base ^ orientation.wrapping_mul(0x9E37_79B9)
+        ^ row.wrapping_mul(0x85EB_CA6B)
+        ^ col.wrapping_mul(0xC2B2_AE35)
 }
 
-fn edge_from_seed(seed: u64, settings: &ShapeSettings) -> Edge {
+fn edge_from_seed(seed: u32, settings: &ShapeSettings) -> Edge {
     let variation = settings
         .variation
         .clamp(VARIATION_MIN, VARIATION_MAX);
@@ -1822,7 +1903,7 @@ fn edge_from_seed(seed: u64, settings: &ShapeSettings) -> Edge {
 fn build_edge_maps(
     rows: u32,
     cols: u32,
-    seed: u64,
+    seed: u32,
     settings: &ShapeSettings,
 ) -> (Vec<Vec<Option<Edge>>>, Vec<Vec<Option<Edge>>>) {
     let mut horizontal = vec![vec![None; cols as usize]; (rows + 1) as usize];
@@ -1844,14 +1925,14 @@ fn build_edge_maps(
     (horizontal, vertical)
 }
 
-fn line_wave(seed: u64, axis: u64, index: u32, max_amp: f64) -> LineWave {
+fn line_wave(seed: u32, axis: u32, index: u32, max_amp: f32) -> LineWave {
     if max_amp == 0.0 {
         return LineWave {
             amplitude: 0.0,
             skew: 0.0,
         };
     }
-    let salt = (axis << 32) | index as u64;
+    let salt = axis.wrapping_mul(0x9E37_79B9) ^ index;
     let amplitude = rand_range(seed ^ 0xB1EB_01DE, salt, -max_amp, max_amp);
     let skew = rand_range(seed ^ 0xA11C_E0DE, salt, -0.6, 0.6);
     LineWave { amplitude, skew }
@@ -1860,10 +1941,10 @@ fn line_wave(seed: u64, axis: u64, index: u32, max_amp: f64) -> LineWave {
 fn build_line_waves(
     rows: u32,
     cols: u32,
-    seed: u64,
-    piece_width: f64,
-    piece_height: f64,
-    line_bend_ratio: f64,
+    seed: u32,
+    piece_width: f32,
+    piece_height: f32,
+    line_bend_ratio: f32,
 ) -> (Vec<LineWave>, Vec<LineWave>) {
     let bend_ratio = line_bend_ratio.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
     let max_h = piece_height * bend_ratio;
@@ -1899,12 +1980,12 @@ fn build_line_waves(
 }
 
 fn cubic_point(
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
-    p3: (f64, f64),
-    t: f64,
-) -> (f64, f64) {
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+    t: f32,
+) -> (f32, f32) {
     let u = 1.0 - t;
     let tt = t * t;
     let uu = u * u;
@@ -1917,16 +1998,16 @@ fn cubic_point(
 }
 
 fn cubic_segments(
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
-    p3: (f64, f64),
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
     steps: usize,
 ) -> Vec<Segment> {
     let mut segments = Vec::with_capacity(steps.max(1));
     let steps = steps.max(1);
     for step in 1..=steps {
-        let t = step as f64 / steps as f64;
+        let t = step as f32 / steps as f32;
         let (x, y) = cubic_point(p0, p1, p2, p3, t);
         segments.push(Segment::LineTo { x, y });
     }
@@ -1934,12 +2015,12 @@ fn cubic_segments(
 }
 
 fn edge_segments(
-    len: f64,
-    depth_base: f64,
+    len: f32,
+    depth_base: f32,
     edge: Option<&Edge>,
     tab_sign: i8,
-    depth_limit: f64,
-    curve_detail: f64,
+    depth_limit: f32,
+    curve_detail: f32,
 ) -> Vec<Segment> {
     let edge = match edge {
         Some(edge) if tab_sign != 0 => edge,
@@ -1966,9 +2047,9 @@ fn edge_segments(
         e = 0.0;
     }
 
-    let sign = tab_sign as f64;
-    let l = |v: f64| len * v;
-    let w = |v: f64| depth_base * v * sign;
+    let sign = tab_sign as f32;
+    let l = |v: f32| len * v;
+    let w = |v: f32| depth_base * v * sign;
 
     let p0 = (l(0.0), w(0.0));
     let p1 = (l(0.2), w(a));
@@ -1983,7 +2064,7 @@ fn edge_segments(
 
     let base_steps = (len / EDGE_STEP_MIN).ceil() as usize;
     let detail = curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
-    let steps = ((base_steps as f64) * detail).round() as usize;
+    let steps = ((base_steps as f32) * detail).round() as usize;
     let steps = steps.max(8);
     let mut segments = Vec::with_capacity(steps * 3);
     segments.extend(cubic_segments(p0, p1, p2, p3, steps));
@@ -2017,12 +2098,12 @@ fn reverse_segments(segments: &[Segment]) -> Vec<Segment> {
 
 fn map_point(
     orientation: EdgeOrientation,
-    origin: (f64, f64),
-    offset: (f64, f64),
+    origin: (f32, f32),
+    offset: (f32, f32),
     warp: &WarpField<'_>,
-    x: f64,
-    y: f64,
-) -> (f64, f64) {
+    x: f32,
+    y: f32,
+) -> (f32, f32) {
     let (ox, oy) = origin;
     let (dx, dy) = offset;
     let (gx, gy) = match orientation {
@@ -2036,59 +2117,59 @@ fn map_point(
 }
 
 fn map_local_point(
-    offset: (f64, f64),
+    offset: (f32, f32),
     warp: &WarpField<'_>,
-    x: f64,
-    y: f64,
-) -> (f64, f64) {
+    x: f32,
+    y: f32,
+) -> (f32, f32) {
     let (wx, wy) = warp_point(offset.0 + x, offset.1 + y, warp);
     (wx - offset.0, wy - offset.1)
 }
 
 fn append_local_points(
     path: &mut String,
-    offset: (f64, f64),
+    offset: (f32, f32),
     warp: &WarpField<'_>,
-    points: &[(f64, f64)],
+    points: &[(f32, f32)],
 ) {
     for &(x, y) in points {
         let (gx, gy) = map_local_point(offset, warp, x, y);
-        let _ = write!(path, " L {} {}", fmt_f64(gx), fmt_f64(gy));
+        let _ = write!(path, " L {} {}", fmt_f32(gx), fmt_f32(gy));
     }
 }
 
 fn build_local_path(
-    offset: (f64, f64),
+    offset: (f32, f32),
     warp: &WarpField<'_>,
-    points: &[(f64, f64)],
+    points: &[(f32, f32)],
 ) -> String {
     if points.is_empty() {
         return String::new();
     }
     let (sx, sy) = map_local_point(offset, warp, points[0].0, points[0].1);
     let mut path = String::new();
-    let _ = write!(path, "M {} {}", fmt_f64(sx), fmt_f64(sy));
+    let _ = write!(path, "M {} {}", fmt_f32(sx), fmt_f32(sy));
     append_local_points(&mut path, offset, warp, &points[1..]);
     path
 }
 
 fn corner_arc_points(
-    cx: f64,
-    cy: f64,
-    radius: f64,
-    start_angle: f64,
-    end_angle: f64,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_angle: f32,
+    end_angle: f32,
     steps: usize,
-) -> Vec<(f64, f64)> {
+) -> Vec<(f32, f32)> {
     let steps = steps.max(1);
     let mut end = end_angle;
     if end < start_angle {
-        end += 2.0 * std::f64::consts::PI;
+        end += 2.0 * std::f32::consts::PI;
     }
     let span = end - start_angle;
     let mut points = Vec::with_capacity(steps + 1);
     for step in 0..=steps {
-        let t = step as f64 / steps as f64;
+        let t = step as f32 / steps as f32;
         let angle = start_angle + span * t;
         points.push((cx + radius * angle.cos(), cy + radius * angle.sin()));
     }
@@ -2099,17 +2180,17 @@ fn append_segments(
     path: &mut String,
     segments: &[Segment],
     orientation: EdgeOrientation,
-    origin: (f64, f64),
-    offset: (f64, f64),
+    origin: (f32, f32),
+    offset: (f32, f32),
     warp: &WarpField<'_>,
-    start: (f64, f64),
-    max_segment_len: f64,
+    start: (f32, f32),
+    max_segment_len: f32,
 ) {
     let mut current = start;
     let max_len = if max_segment_len > 0.0 {
         max_segment_len
     } else {
-        f64::INFINITY
+        f32::INFINITY
     };
     for segment in segments {
         match *segment {
@@ -2124,11 +2205,11 @@ fn append_segments(
                 }
                 .max(1);
                 for step in 1..=steps {
-                    let t = step as f64 / steps as f64;
+                    let t = step as f32 / steps as f32;
                     let px = current.0 + dx * t;
                     let py = current.1 + dy * t;
                     let (gx, gy) = map_point(orientation, origin, offset, warp, px, py);
-                    let _ = write!(path, " L {} {}", fmt_f64(gx), fmt_f64(gy));
+                    let _ = write!(path, " L {} {}", fmt_f32(gx), fmt_f32(gy));
                 }
                 current = (x, y);
             }
@@ -2144,15 +2225,15 @@ struct PiecePaths {
 fn build_edge_path(
     segments: &[Segment],
     orientation: EdgeOrientation,
-    origin: (f64, f64),
-    offset: (f64, f64),
+    origin: (f32, f32),
+    offset: (f32, f32),
     warp: &WarpField<'_>,
-    start: (f64, f64),
-    max_segment_len: f64,
+    start: (f32, f32),
+    max_segment_len: f32,
 ) -> String {
     let (sx, sy) = map_point(orientation, origin, offset, warp, start.0, start.1);
     let mut path = String::new();
-    let _ = write!(path, "M {} {}", fmt_f64(sx), fmt_f64(sy));
+    let _ = write!(path, "M {} {}", fmt_f32(sx), fmt_f32(sy));
     append_segments(
         &mut path,
         segments,
@@ -2168,18 +2249,18 @@ fn build_edge_path(
 
 fn build_piece_path(
     piece: &Piece,
-    piece_width: f64,
-    piece_height: f64,
+    piece_width: f32,
+    piece_height: f32,
     horizontal: &[Vec<Option<Edge>>],
     vertical: &[Vec<Option<Edge>>],
     warp: &WarpField<'_>,
-    tab_depth_cap: f64,
-    curve_detail: f64,
+    tab_depth_cap: f32,
+    curve_detail: f32,
 ) -> PiecePaths {
     let row = piece.row as usize;
     let col = piece.col as usize;
-    let piece_x = piece.col as f64 * piece_width;
-    let piece_y = piece.row as f64 * piece_height;
+    let piece_x = piece.col as f32 * piece_width;
+    let piece_y = piece.row as f32 * piece_height;
 
     let top_edge = horizontal[row][col].as_ref();
     let bottom_edge = horizontal[row + 1][col].as_ref();
@@ -2307,11 +2388,11 @@ fn build_piece_path(
     let top_step = (piece_width / EDGE_STEP_DIV).max(EDGE_STEP_MIN);
     let side_step = (piece_height / EDGE_STEP_DIV).max(EDGE_STEP_MIN);
     let arc_steps = ((curve_detail * 6.0).round() as usize).clamp(4, 24);
-    let pi = std::f64::consts::PI;
+    let pi = std::f32::consts::PI;
 
     let mut path = String::new();
     let (start_x, start_y) = map_local_point(offset, warp, top_start.0, top_start.1);
-    let _ = write!(path, "M {} {}", fmt_f64(start_x), fmt_f64(start_y));
+    let _ = write!(path, "M {} {}", fmt_f32(start_x), fmt_f32(start_y));
     append_segments(
         &mut path,
         &top_segments,
@@ -2548,7 +2629,7 @@ fn app() -> Html {
         "--".to_string()
     };
     let solve_time_label = if image_size_value.is_some() {
-        let pieces = grid.actual_count as f64;
+        let pieces = grid.actual_count as f32;
         format_duration(SOLVE_TIME_FACTOR * pieces.powf(SOLVE_TIME_EXPONENT))
     } else {
         "--".to_string()
@@ -2608,16 +2689,21 @@ fn app() -> Html {
     let line_bend_input = on_setting_change(settings.clone(), |settings, value| {
         settings.line_bend_ratio = value.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
     });
-    let positions = use_state(Vec::<(f64, f64)>::new);
+    let positions = use_state(Vec::<(f32, f32)>::new);
     let active_id = use_state(|| None::<usize>);
     let dragging_members = use_state(Vec::<usize>::new);
     let animating_members = use_state(Vec::<usize>::new);
     let drag_state = use_mut_ref(|| None::<DragState>);
+    let drag_frame = use_mut_ref(|| None::<AnimationFrame>);
+    let drag_pending = use_mut_ref(|| None::<(f32, f32)>);
     let rotation_anim = use_mut_ref(|| None::<RotationAnimation>);
     let rotation_anim_handle = use_mut_ref(|| None::<Interval>);
     let rotation_queue = use_mut_ref(|| VecDeque::<QueuedRotation>::new());
     let preview_corner = use_state(|| PreviewCorner::BottomLeft);
     let preview_revealed = use_state(|| false);
+    let theme_mode = use_state(|| ThemeMode::System);
+    let theme_mode_value = *theme_mode;
+    let theme_toggle_ref = use_node_ref();
     let drag_handlers = use_mut_ref(DragHandlers::default);
     let restore_state = use_mut_ref(|| None::<SavedBoard>);
     let restore_attempted = use_mut_ref(|| false);
@@ -2627,12 +2713,18 @@ fn app() -> Html {
     let workspace_scale_value = *workspace_scale;
     let z_order = use_state(Vec::<usize>::new);
     let connections = use_state(Vec::<[bool; 4]>::new);
-    let rotations = use_state(Vec::<f64>::new);
+    let rotations = use_state(Vec::<f32>::new);
     let flips = use_state(Vec::<bool>::new);
     let rotation_enabled = use_state(|| true);
     let rotation_enabled_value = *rotation_enabled;
     let animations_enabled = use_state(|| false);
     let animations_enabled_value = *animations_enabled;
+    let emboss_enabled = use_state(|| false);
+    let emboss_enabled_value = *emboss_enabled;
+    let fast_render = use_state(|| true);
+    let fast_render_value = *fast_render;
+    let fast_filter = use_state(|| true);
+    let fast_filter_value = *fast_filter;
     let hovered_id = use_state(|| None::<usize>);
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
@@ -2642,8 +2734,10 @@ fn app() -> Html {
     let rotation_lock_threshold_value = *rotation_lock_threshold;
     let snap_distance_ratio = use_state(|| SNAP_DISTANCE_RATIO_DEFAULT);
     let snap_distance_ratio_value = *snap_distance_ratio;
-    let scramble_nonce = use_state(|| 0u64);
+    let scramble_nonce = use_state(|| 0u32);
     let scramble_nonce_value = *scramble_nonce;
+    let save_revision = use_state(|| 0u32);
+    let save_revision_value = *save_revision;
     let frame_snap_ratio = use_state(|| FRAME_SNAP_DEFAULT);
     let frame_snap_ratio_value = *frame_snap_ratio;
     let solved = use_state(|| false);
@@ -2677,6 +2771,24 @@ fn app() -> Html {
         )
     } else {
         "--".to_string()
+    };
+    let (connections_label, border_connections_label) = if image_size_value.is_some() {
+        let connections_value = &*connections;
+        if connections_value.len() == total {
+            let (connected, border_connected, total_expected, border_expected) = count_connections(
+                connections_value,
+                grid.cols as usize,
+                grid.rows as usize,
+            );
+            (
+                format_progress(connected, total_expected),
+                format_progress(border_connected, border_expected),
+            )
+        } else {
+            ("--".to_string(), "--".to_string())
+        }
+    } else {
+        ("--".to_string(), "--".to_string())
     };
     {
         let positions = positions.clone();
@@ -2736,8 +2848,8 @@ fn app() -> Html {
                                         let rows = state.rows as usize;
                                         let total = cols * rows;
                                         if validate_saved_board(&state, total) {
-                                            let piece_width = width as f64 / state.cols as f64;
-                                            let piece_height = height as f64 / state.rows as f64;
+                                            let piece_width = width as f32 / state.cols as f32;
+                                            let piece_height = height as f32 / state.rows as f32;
                                             positions.set(state.positions.clone());
                                             rotations.set(state.rotations.clone());
                                             flips.set(state.flips.clone());
@@ -2790,18 +2902,18 @@ fn app() -> Html {
                             .unwrap_or(FALLBACK_GRID);
                         let cols = grid.cols as usize;
                         let rows = grid.rows as usize;
-                        let piece_width = width as f64 / grid.cols as f64;
-                        let piece_height = height as f64 / grid.rows as f64;
-                        let view_width = width as f64 * workspace_scale_value;
-                        let view_height = height as f64 * workspace_scale_value;
-                        let view_min_x = (width as f64 - view_width) * 0.5;
-                        let view_min_y = (height as f64 - view_height) * 0.5;
+                        let piece_width = width as f32 / grid.cols as f32;
+                        let piece_height = height as f32 / grid.rows as f32;
+                        let view_width = width as f32 * workspace_scale_value;
+                        let view_height = height as f32 * workspace_scale_value;
+                        let view_min_x = (width as f32 - view_width) * 0.5;
+                        let view_min_y = (height as f32 - view_height) * 0.5;
                         let margin =
                             piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
                         let nonce = time_nonce(*scramble_nonce);
                         let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
-                        let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
-                        let flip_seed = splitmix64(seed ^ 0xF11F_5EED);
+                        let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
+                        let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
                         let (next_positions, order) = scramble_layout(
                             seed,
                             cols,
@@ -2855,7 +2967,7 @@ fn app() -> Html {
         let workspace_scale = workspace_scale.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            if let Ok(value) = input.value().parse::<f64>() {
+            if let Ok(value) = input.value().parse::<f32>() {
                 workspace_scale.set(value.clamp(WORKSPACE_SCALE_MIN, WORKSPACE_SCALE_MAX));
             }
         })
@@ -2864,7 +2976,7 @@ fn app() -> Html {
         let frame_snap_ratio = frame_snap_ratio.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            if let Ok(value) = input.value().parse::<f64>() {
+            if let Ok(value) = input.value().parse::<f32>() {
                 frame_snap_ratio.set(value.clamp(FRAME_SNAP_MIN, FRAME_SNAP_MAX));
             }
         })
@@ -2873,7 +2985,7 @@ fn app() -> Html {
         let snap_distance_ratio = snap_distance_ratio.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            if let Ok(value) = input.value().parse::<f64>() {
+            if let Ok(value) = input.value().parse::<f32>() {
                 snap_distance_ratio.set(value.clamp(
                     SNAP_DISTANCE_RATIO_MIN,
                     SNAP_DISTANCE_RATIO_MAX,
@@ -2891,6 +3003,7 @@ fn app() -> Html {
         let grid_index = grid_index.clone();
         let grid_choices = grid_choices.clone();
         let solved = solved.clone();
+        let save_revision = save_revision.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
@@ -2910,8 +3023,8 @@ fn app() -> Html {
                     .unwrap_or(FALLBACK_GRID);
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
-                let piece_width = width as f64 / grid.cols as f64;
-                let piece_height = height as f64 / grid.rows as f64;
+                let piece_width = width as f32 / grid.cols as f32;
+                let piece_height = height as f32 / grid.rows as f32;
                 let positions_snapshot = (*positions).clone();
                 let flips_snapshot = (*flips).clone();
                 let connections_snapshot = (*connections).clone();
@@ -2928,13 +3041,14 @@ fn app() -> Html {
                 );
                 solved.set(solved_now);
             }
+            save_revision.set(save_revision.wrapping_add(1));
         })
     };
     let on_rotation_noise = {
         let rotation_noise = rotation_noise.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            if let Ok(value) = input.value().parse::<f64>() {
+            if let Ok(value) = input.value().parse::<f32>() {
                 rotation_noise.set(value.clamp(ROTATION_NOISE_MIN, ROTATION_NOISE_MAX));
             }
         })
@@ -2943,7 +3057,7 @@ fn app() -> Html {
         let rotation_snap_tolerance = rotation_snap_tolerance.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            if let Ok(value) = input.value().parse::<f64>() {
+            if let Ok(value) = input.value().parse::<f32>() {
                 rotation_snap_tolerance.set(value.clamp(
                     ROTATION_SNAP_TOLERANCE_MIN_DEG,
                     ROTATION_SNAP_TOLERANCE_MAX_DEG,
@@ -2956,7 +3070,7 @@ fn app() -> Html {
         let positions = positions.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            if let Ok(value) = input.value().parse::<f64>() {
+            if let Ok(value) = input.value().parse::<f32>() {
                 let max_value = positions.len().max(ROTATION_LOCK_THRESHOLD_MIN);
                 let rounded = value.round() as usize;
                 let clamped = rounded
@@ -2984,6 +3098,39 @@ fn app() -> Html {
             }
         })
     };
+    let on_emboss_toggle = {
+        let emboss_enabled = emboss_enabled.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            emboss_enabled.set(input.checked());
+        })
+    };
+    let on_theme_toggle = {
+        let theme_mode = theme_mode.clone();
+        Callback::from(move |event: MouseEvent| {
+            event.prevent_default();
+            let next = match *theme_mode {
+                ThemeMode::System => ThemeMode::Light,
+                ThemeMode::Light => ThemeMode::Dark,
+                ThemeMode::Dark => ThemeMode::System,
+            };
+            theme_mode.set(next);
+        })
+    };
+    let on_fast_render_toggle = {
+        let fast_render = fast_render.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            fast_render.set(input.checked());
+        })
+    };
+    let on_fast_filter_toggle = {
+        let fast_filter = fast_filter.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            fast_filter.set(input.checked());
+        })
+    };
     let on_debug_toggle = {
         let show_debug = show_debug.clone();
         Callback::from(move |event: Event| {
@@ -2991,6 +3138,40 @@ fn app() -> Html {
             show_debug.set(input.checked());
         })
     };
+
+    {
+        let theme_toggle_ref = theme_toggle_ref.clone();
+        use_effect_with(theme_mode_value, move |mode| {
+            if let Some(input) = theme_toggle_ref.cast::<HtmlInputElement>() {
+                let (checked, indeterminate) = match *mode {
+                    ThemeMode::System => (false, true),
+                    ThemeMode::Light => (false, false),
+                    ThemeMode::Dark => (true, false),
+                };
+                input.set_checked(checked);
+                input.set_indeterminate(indeterminate);
+            }
+            || ()
+        });
+    }
+
+    {
+        use_effect_with(theme_mode_value, move |mode| {
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    if let Some(body) = document.body() {
+                        let theme_value = match *mode {
+                            ThemeMode::System => "system",
+                            ThemeMode::Light => "light",
+                            ThemeMode::Dark => "dark",
+                        };
+                        let _ = body.set_attribute("data-theme", theme_value);
+                    }
+                }
+            }
+            || ()
+        });
+    }
 
     {
         let positions = positions.clone();
@@ -3004,65 +3185,47 @@ fn app() -> Html {
         let scramble_nonce = scramble_nonce.clone();
         let active_id = active_id.clone();
         let animating_members = animating_members.clone();
-        use_effect_with(
-            (
-                (*positions).clone(),
-                (*rotations).clone(),
-                (*flips).clone(),
-                (*connections).clone(),
-                (*z_order).clone(),
-                *grid_index,
-                *scramble_nonce,
-                *image_size,
-                *active_id,
-                (*animating_members).clone(),
-            ),
-            move |(
-                positions_value,
-                rotations_value,
-                flips_value,
-                connections_value,
-                z_order_value,
-                grid_index_value,
-                scramble_nonce_value,
-                image_size_value,
-                active_id_value,
-                animating_members_value,
-            )| {
-                if active_id_value.is_none() && animating_members_value.is_empty() {
-                    if let Some((width, height)) = *image_size_value {
-                        let grid = grid_choices
-                            .get(*grid_index_value)
-                            .copied()
-                            .unwrap_or(FALLBACK_GRID);
-                        let total = (grid.cols * grid.rows) as usize;
-                        if positions_value.len() == total
-                            && rotations_value.len() == total
-                            && flips_value.len() == total
-                            && connections_value.len() == total
-                            && z_order_value.len() == total
-                            && z_order_value.iter().all(|id| *id < total)
-                        {
-                            let state = SavedBoard {
-                                version: STORAGE_VERSION,
-                                cols: grid.cols,
-                                rows: grid.rows,
-                                image_width: width,
-                                image_height: height,
-                                positions: positions_value.clone(),
-                                rotations: rotations_value.clone(),
-                                flips: flips_value.clone(),
-                                connections: connections_value.clone(),
-                                z_order: z_order_value.clone(),
-                                scramble_nonce: *scramble_nonce_value,
-                            };
-                            save_board_state(&state);
-                        }
+        use_effect_with(save_revision_value, move |save_revision_value| {
+            let should_save =
+                *save_revision_value > 0 && active_id.is_none() && animating_members.is_empty();
+            if should_save {
+                if let Some((width, height)) = *image_size {
+                    let grid = grid_choices
+                        .get(*grid_index)
+                        .copied()
+                        .unwrap_or(FALLBACK_GRID);
+                    let total = (grid.cols * grid.rows) as usize;
+                    let positions_value = (*positions).clone();
+                    let rotations_value = (*rotations).clone();
+                    let flips_value = (*flips).clone();
+                    let connections_value = (*connections).clone();
+                    let z_order_value = (*z_order).clone();
+                    if positions_value.len() == total
+                        && rotations_value.len() == total
+                        && flips_value.len() == total
+                        && connections_value.len() == total
+                        && z_order_value.len() == total
+                        && z_order_value.iter().all(|id| *id < total)
+                    {
+                        let state = SavedBoard {
+                            version: STORAGE_VERSION,
+                            cols: grid.cols,
+                            rows: grid.rows,
+                            image_width: width,
+                            image_height: height,
+                            positions: positions_value,
+                            rotations: rotations_value,
+                            flips: flips_value,
+                            connections: connections_value,
+                            z_order: z_order_value,
+                            scramble_nonce: *scramble_nonce,
+                        };
+                        save_board_state(&state);
                     }
                 }
-                || ()
-            },
-        );
+            }
+            || ()
+        });
     }
 
     {
@@ -3232,21 +3395,21 @@ fn app() -> Html {
 
     let (content, on_scramble, on_solve, on_solve_rotation, on_unflip, scramble_disabled) =
         if let Some((width, height)) = *image_size {
-        let width_f = width as f64;
-        let height_f = height as f64;
+        let width_f = width as f32;
+        let height_f = height as f32;
         let view_width = width_f * workspace_scale_value;
         let view_height = height_f * workspace_scale_value;
         let view_min_x = (width_f - view_width) * 0.5;
         let view_min_y = (height_f - view_height) * 0.5;
         let view_box = format!(
             "{} {} {} {}",
-            fmt_f64(view_min_x),
-            fmt_f64(view_min_y),
-            fmt_f64(view_width),
-            fmt_f64(view_height)
+            fmt_f32(view_min_x),
+            fmt_f32(view_min_y),
+            fmt_f32(view_width),
+            fmt_f32(view_height)
         );
-        let piece_width = width_f / grid.cols as f64;
-        let piece_height = height_f / grid.rows as f64;
+        let piece_width = width_f / grid.cols as f32;
+        let piece_height = height_f / grid.rows as f32;
         let max_depth = piece_width.max(piece_height) * depth_cap;
         let pieces = build_pieces(grid.rows, grid.cols);
 
@@ -3269,18 +3432,29 @@ fn app() -> Html {
         let max_bend = horizontal_waves
             .iter()
             .chain(vertical_waves.iter())
-            .fold(0.0_f64, |acc, wave| acc.max(wave.amplitude.abs()));
+            .fold(0.0_f32, |acc, wave| acc.max(wave.amplitude.abs()));
         let mask_pad = max_depth + max_bend;
+        let base_w = piece_width + mask_pad * 2.0;
+        let base_h = piece_height + mask_pad * 2.0;
+        let base_diag = (base_w * base_w + base_h * base_h).sqrt();
+        let rotation_pad = (base_diag - base_w.max(base_h)) * 0.5;
+        let emboss_pad = EMBOSS_OFFSET.abs() + EMBOSS_RIM + rotation_pad;
         let mut frame_corner_radius = piece_width.min(piece_height) * CORNER_RADIUS_RATIO;
         let max_corner_radius = piece_width.min(piece_height) * 0.45;
         if frame_corner_radius > max_corner_radius {
             frame_corner_radius = max_corner_radius;
         }
-        let frame_corner_radius = fmt_f64(frame_corner_radius);
-        let mask_x = fmt_f64(-mask_pad);
-        let mask_y = fmt_f64(-mask_pad);
-        let mask_width = fmt_f64(piece_width + mask_pad * 2.0);
-        let mask_height = fmt_f64(piece_height + mask_pad * 2.0);
+        let frame_corner_radius = fmt_f32(frame_corner_radius);
+        let mask_x = fmt_f32(-mask_pad);
+        let mask_y = fmt_f32(-mask_pad);
+        let mask_width = fmt_f32(piece_width + mask_pad * 2.0);
+        let mask_height = fmt_f32(piece_height + mask_pad * 2.0);
+        let emboss_x = fmt_f32(-mask_pad - emboss_pad);
+        let emboss_y = fmt_f32(-mask_pad - emboss_pad);
+        let emboss_width = fmt_f32(piece_width + (mask_pad + emboss_pad) * 2.0);
+        let emboss_height = fmt_f32(piece_height + (mask_pad + emboss_pad) * 2.0);
+        let emboss_offset_neg = fmt_f32(-EMBOSS_OFFSET);
+        let emboss_rim_radius = fmt_f32(EMBOSS_RIM);
         let center_min_x = view_min_x + piece_width * 0.5;
         let center_min_y = view_min_y + piece_height * 0.5;
         let mut center_max_x = view_min_x + view_width - piece_width * 0.5;
@@ -3340,12 +3514,12 @@ fn app() -> Html {
             }
         }
         let z_order_value = (*z_order).clone();
-        let drag_move_common: Rc<dyn Fn(f64, f64) -> bool> = {
+        let drag_move_common: Rc<dyn Fn(f32, f32) -> bool> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
             let drag_state = drag_state.clone();
-            Rc::new(move |x: f64, y: f64| {
+            Rc::new(move |x: f32, y: f32| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     if drag.rotate_mode && rotation_enabled_value {
@@ -3387,10 +3561,10 @@ fn app() -> Html {
                         let mut dx = x - drag.start_x;
                         let mut dy = y - drag.start_y;
                         if !drag.start_positions.is_empty() {
-                            let mut min_start_x = f64::INFINITY;
-                            let mut max_start_x = f64::NEG_INFINITY;
-                            let mut min_start_y = f64::INFINITY;
-                            let mut max_start_y = f64::NEG_INFINITY;
+                            let mut min_start_x = f32::INFINITY;
+                            let mut max_start_x = f32::NEG_INFINITY;
+                            let mut min_start_y = f32::INFINITY;
+                            let mut max_start_y = f32::NEG_INFINITY;
                             for start in &drag.start_positions {
                                 let center_x = start.0 + piece_width * 0.5;
                                 let center_y = start.1 + piece_height * 0.5;
@@ -3426,9 +3600,32 @@ fn app() -> Html {
                 }
             })
         };
+        let schedule_drag_move: Rc<dyn Fn(f32, f32) -> bool> = {
+            let drag_move_common = drag_move_common.clone();
+            let drag_pending = drag_pending.clone();
+            let drag_frame = drag_frame.clone();
+            Rc::new(move |x, y| {
+                *drag_pending.borrow_mut() = Some((x, y));
+                if drag_frame.borrow().is_some() {
+                    return true;
+                }
+                let drag_pending = drag_pending.clone();
+                let drag_frame_for_tick = drag_frame.clone();
+                let drag_move_common = drag_move_common.clone();
+                let handle = request_animation_frame(move |_| {
+                    let coords = drag_pending.borrow_mut().take();
+                    drag_frame_for_tick.borrow_mut().take();
+                    if let Some((x, y)) = coords {
+                        drag_move_common(x, y);
+                    }
+                });
+                *drag_frame.borrow_mut() = Some(handle);
+                true
+            })
+        };
         let drag_move = {
             let svg_ref = svg_ref.clone();
-            let drag_move_common = drag_move_common.clone();
+            let schedule_drag_move = schedule_drag_move.clone();
             move |event: &MouseEvent| {
                 if let Some((x, y)) = event_to_svg_coords(
                     event,
@@ -3438,7 +3635,7 @@ fn app() -> Html {
                     view_width,
                     view_height,
                 ) {
-                    if drag_move_common(x, y) {
+                    if schedule_drag_move(x, y) {
                         event.prevent_default();
                     }
                 }
@@ -3449,13 +3646,17 @@ fn app() -> Html {
             let drag_state = drag_state.clone();
             let active_id = active_id.clone();
             let dragging_members = dragging_members.clone();
-            let drag_move_common = drag_move_common.clone();
+            let drag_pending = drag_pending.clone();
+            let drag_frame = drag_frame.clone();
+            let schedule_drag_move = schedule_drag_move.clone();
             move |event: &TouchEvent| {
                 if event.touches().length() > 1 {
                     if drag_state.borrow().is_some() {
                         active_id.set(None);
                         dragging_members.set(Vec::new());
                         *drag_state.borrow_mut() = None;
+                        drag_pending.borrow_mut().take();
+                        drag_frame.borrow_mut().take();
                     }
                     return;
                 }
@@ -3473,18 +3674,20 @@ fn app() -> Html {
                     touch_id,
                     false,
                 ) {
-                    if drag_move_common(x, y) {
+                    if schedule_drag_move(x, y) {
                         event.prevent_default();
                     }
                 }
             }
         };
-        let drag_release_common: Rc<dyn Fn(Option<(f64, f64)>) -> bool> = {
+        let drag_release_common: Rc<dyn Fn(Option<(f32, f32)>) -> bool> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
+            let drag_pending = drag_pending.clone();
+            let drag_frame = drag_frame.clone();
             let connections = connections.clone();
             let dragging_members = dragging_members.clone();
             let animating_members = animating_members.clone();
@@ -3492,7 +3695,8 @@ fn app() -> Html {
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
-            Rc::new(move |coords: Option<(f64, f64)>| {
+            let save_revision = save_revision.clone();
+            Rc::new(move |coords: Option<(f32, f32)>| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     let ctrl_flip = drag.rotate_mode;
@@ -3512,6 +3716,7 @@ fn app() -> Html {
                         let flips = flips.clone();
                         let connections = connections.clone();
                         let solved = solved.clone();
+                        let save_revision = save_revision.clone();
                         let rotation_anim = rotation_anim.clone();
                         let rotation_anim_handle = rotation_anim_handle.clone();
                         let animating_members = animating_members.clone();
@@ -3668,6 +3873,7 @@ fn app() -> Html {
                                     rotation_enabled_value,
                                 );
                                 solved.set(solved_now);
+                                save_revision.set(save_revision.wrapping_add(1));
                                 return;
                             }
                             let members = anim.members.clone();
@@ -3686,7 +3892,7 @@ fn app() -> Html {
                             let rotation_queue = rotation_queue.clone();
                             let connections_override = connections_override.clone();
                             let interval = Interval::new(16, move || {
-                                let now = Date::now();
+                                let now = Date::now() as f32;
                                 let anim = match rotation_anim.borrow().clone() {
                                     Some(value) => value,
                                     None => {
@@ -3821,7 +4027,7 @@ fn app() -> Html {
                                             rotation_snap_tolerance_value,
                                         );
                                         *rotation_anim.borrow_mut() = Some(RotationAnimation {
-                                            start_time: Date::now(),
+                                            start_time: Date::now() as f32,
                                             duration: SNAP_ANIMATION_MS,
                                             members: members.clone(),
                                             start_positions,
@@ -3890,6 +4096,7 @@ fn app() -> Html {
                                         rotation_enabled_value,
                                     );
                                     solved.set(solved_now);
+                                    save_revision.set(save_revision.wrapping_add(1));
                                     rotation_anim_handle_for_tick.borrow_mut().take();
                                 }
                             });
@@ -3900,7 +4107,7 @@ fn app() -> Html {
                         let dx = x - drag.start_x;
                         let dy = y - drag.start_y;
                         let dist = (dx * dx + dy * dy).sqrt();
-                        let elapsed = Date::now() - drag.start_time;
+                        let elapsed = Date::now() as f32 - drag.start_time;
                         if dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS {
                             let click_id = drag.primary_id;
                             let was_flipped = next_flips.get(click_id).copied().unwrap_or(false);
@@ -3925,9 +4132,12 @@ fn app() -> Html {
                                 rotations.set(next_rotations);
                                 flips.set(next_flips);
                                 solved.set(solved_now);
+                                save_revision.set(save_revision.wrapping_add(1));
                                 active_id.set(None);
                                 dragging_members.set(Vec::new());
                                 *drag_state.borrow_mut() = None;
+                                drag_pending.borrow_mut().take();
+                                drag_frame.borrow_mut().take();
                                 return true;
                             }
                             if was_flipped {
@@ -3951,9 +4161,12 @@ fn app() -> Html {
                                 rotations.set(next_rotations);
                                 flips.set(next_flips);
                                 solved.set(solved_now);
+                                save_revision.set(save_revision.wrapping_add(1));
                                 active_id.set(None);
                                 dragging_members.set(Vec::new());
                                 *drag_state.borrow_mut() = None;
+                                drag_pending.borrow_mut().take();
+                                drag_frame.borrow_mut().take();
                                 return true;
                             }
                             if rotation_enabled_value && !drag.members.is_empty() {
@@ -3962,14 +4175,14 @@ fn app() -> Html {
                                 let members = drag.members.clone();
                                 let mut noise = 0.0;
                                 if rotation_noise_value > 0.0 {
-                                    let noise_seed = splitmix64(
-                                        (drag.start_time as u64)
-                                            ^ (drag.primary_id as u64)
-                                                .wrapping_mul(0x9e3779b97f4a7c15),
+                                    let noise_seed = splitmix32(
+                                        (drag.start_time as u32)
+                                            ^ (drag.primary_id as u32)
+                                                .wrapping_mul(0x9E37_79B9),
                                     );
                                     noise = rand_range(
                                         noise_seed,
-                                        members.len() as u64,
+                                        members.len() as u32,
                                         -rotation_noise_value,
                                         rotation_noise_value,
                                     );
@@ -3988,6 +4201,8 @@ fn app() -> Html {
                                             dragging_members.set(Vec::new());
                                             active_id.set(None);
                                             *drag_state.borrow_mut() = None;
+                                            drag_pending.borrow_mut().take();
+                                            drag_frame.borrow_mut().take();
                                             return true;
                                         }
                                     }
@@ -4012,6 +4227,8 @@ fn app() -> Html {
                                     active_id.set(None);
                                     dragging_members.set(Vec::new());
                                     *drag_state.borrow_mut() = None;
+                                    drag_pending.borrow_mut().take();
+                                    drag_frame.borrow_mut().take();
                                     return true;
                                 }
                                 let delta = click_rotation_delta(
@@ -4034,7 +4251,7 @@ fn app() -> Html {
                                 rotation_queue.borrow_mut().clear();
                                 start_group_animation(
                                     RotationAnimation {
-                                        start_time: Date::now(),
+                                        start_time: Date::now() as f32,
                                         duration: SNAP_ANIMATION_MS,
                                         members: members.clone(),
                                         start_positions,
@@ -4050,6 +4267,8 @@ fn app() -> Html {
                                 dragging_members.set(Vec::new());
                                 active_id.set(None);
                                 *drag_state.borrow_mut() = None;
+                                drag_pending.borrow_mut().take();
+                                drag_frame.borrow_mut().take();
                                 return true;
                             }
                         }
@@ -4123,7 +4342,7 @@ fn app() -> Html {
                                     member_rotations.push(rot);
                                 }
                                 pending_animation = Some(RotationAnimation {
-                                    start_time: Date::now(),
+                                    start_time: Date::now() as f32,
                                     duration: SNAP_ANIMATION_MS,
                                     members: group_after.clone(),
                                     start_positions: member_positions,
@@ -4147,6 +4366,8 @@ fn app() -> Html {
                         active_id.set(None);
                         dragging_members.set(Vec::new());
                         *drag_state.borrow_mut() = None;
+                        drag_pending.borrow_mut().take();
+                        drag_frame.borrow_mut().take();
                         return true;
                     }
 
@@ -4166,9 +4387,12 @@ fn app() -> Html {
                     rotations.set(next_rotations);
                     flips.set(next_flips);
                     solved.set(solved_now);
+                    save_revision.set(save_revision.wrapping_add(1));
                     active_id.set(None);
                     dragging_members.set(Vec::new());
                     *drag_state.borrow_mut() = None;
+                    drag_pending.borrow_mut().take();
+                    drag_frame.borrow_mut().take();
                     return true;
                 }
                 false
@@ -4242,6 +4466,7 @@ fn app() -> Html {
             let rotation_queue = rotation_queue.clone();
             let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
+            let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
@@ -4252,8 +4477,8 @@ fn app() -> Html {
                 let next_nonce = time_nonce(*scramble_nonce);
                 scramble_nonce.set(next_nonce);
                 let seed = scramble_seed(PUZZLE_SEED, next_nonce, cols, rows);
-                let rotation_seed = splitmix64(seed ^ 0xC0DE_F00D);
-                let flip_seed = splitmix64(seed ^ 0xF11F_5EED);
+                let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
+                let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
                 let (next_positions, order) = scramble_layout(
                     seed,
                     cols,
@@ -4283,6 +4508,7 @@ fn app() -> Html {
                 rotation_queue.borrow_mut().clear();
                 *drag_state.borrow_mut() = None;
                 solved.set(false);
+                save_revision.set(save_revision.wrapping_add(1));
             })
         };
         let on_solve = {
@@ -4299,6 +4525,7 @@ fn app() -> Html {
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
+            let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
@@ -4310,8 +4537,8 @@ fn app() -> Html {
                 for row in 0..rows {
                     for col in 0..cols {
                         next_positions.push((
-                            col as f64 * piece_width,
-                            row as f64 * piece_height,
+                            col as f32 * piece_width,
+                            row as f32 * piece_height,
                         ));
                     }
                 }
@@ -4329,6 +4556,7 @@ fn app() -> Html {
                 rotation_queue.borrow_mut().clear();
                 *drag_state.borrow_mut() = None;
                 solved.set(true);
+                save_revision.set(save_revision.wrapping_add(1));
             })
         };
         let on_solve_rotation = {
@@ -4342,6 +4570,7 @@ fn app() -> Html {
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
+            let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
@@ -4371,6 +4600,7 @@ fn app() -> Html {
                 *rotation_anim.borrow_mut() = None;
                 rotation_anim_handle.borrow_mut().take();
                 rotation_queue.borrow_mut().clear();
+                save_revision.set(save_revision.wrapping_add(1));
             })
         };
         let on_unflip = {
@@ -4384,6 +4614,7 @@ fn app() -> Html {
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
             let solved = solved.clone();
+            let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
@@ -4413,6 +4644,7 @@ fn app() -> Html {
                 *rotation_anim.borrow_mut() = None;
                 rotation_anim_handle.borrow_mut().take();
                 rotation_queue.borrow_mut().clear();
+                save_revision.set(save_revision.wrapping_add(1));
             })
         };
 
@@ -4432,6 +4664,70 @@ fn app() -> Html {
                 <circle cx="21" cy="7" r="1.8" fill={color_pattern_fg2} />
                 <circle cx="7" cy="21" r="1.8" fill={color_pattern_fg2} />
             </pattern>
+        };
+
+        let emboss_opacity = format!("{}", fmt_f32(EMBOSS_OPACITY));
+        let emboss_filter_body = html! {
+            <>
+                <@{"feComponentTransfer"} in="SourceAlpha" result="a">
+                    <@{"feFuncA"} type="linear" slope="1" />
+                </@>
+                <@{"feOffset"} in="a" dx={emboss_offset_neg.clone()} dy={emboss_offset_neg.clone()} result="aOff" />
+                <@{"feFlood"} flood-color="#000" result="black" />
+                <@{"feComposite"} in="black" in2="a" operator="in" result="blackShape" />
+                <@{"feFlood"} flood-color="#fff" flood-opacity="0.6" result="white" />
+                <@{"feComposite"} in="white" in2="aOff" operator="in" result="whiteShape" />
+                <@{"feMorphology"} in="whiteShape" operator="erode" radius="0.6" result="whiteThin"/>
+                <@{"feGaussianBlur"} in="whiteThin" stdDeviation="0.5" result="whiteShapeBlur"/>
+                <@{"feComposite"} in="whiteShapeBlur" in2="blackShape" operator="over" result="overlayFull"/>
+                <@{"feMorphology"} in="a" operator="erode" radius={emboss_rim_radius.clone()} result="aInner" />
+                <@{"feComposite"} in="a" in2="aInner" operator="arithmetic" k1="0" k2="1" k3="-1" k4="0" result="rim" />
+                <@{"feComposite"} in="overlayFull" in2="rim" operator="in" result="overlayRim" />
+                <@{"feComponentTransfer"} in="overlayRim" result="overlayRimOpacity">
+                  <@{"feFuncA"} type="linear" slope={emboss_opacity}/>
+                </@>
+                <@{"feMerge"}>
+                    <@{"feMergeNode"} in="SourceGraphic" />
+                    <@{"feMergeNode"} in="overlayRimOpacity" />
+                </@>
+            </>
+        };
+        let emboss_filter = if fast_filter_value {
+            let filter_res = format!(
+                "{} {}",
+                fmt_f32(piece_width * 0.2),
+                fmt_f32(piece_height * 0.2)
+            );
+            html! {
+                <filter
+                    id="emboss"
+                    x={emboss_x.clone()}
+                    y={emboss_y.clone()}
+                    width={emboss_width.clone()}
+                    height={emboss_height.clone()}
+                    filterUnits="userSpaceOnUse"
+                    primitiveUnits="userSpaceOnUse"
+                    color-interpolation-filters="linearRGB"
+                    filterRes={filter_res}
+                >
+                    {emboss_filter_body}
+                </filter>
+            }
+        } else {
+            html! {
+                <filter
+                    id="emboss"
+                    x={emboss_x.clone()}
+                    y={emboss_y.clone()}
+                    width={emboss_width.clone()}
+                    height={emboss_height.clone()}
+                    filterUnits="userSpaceOnUse"
+                    primitiveUnits="userSpaceOnUse"
+                    color-interpolation-filters="linearRGB"
+                >
+                    {emboss_filter_body}
+                </filter>
+            }
         };
 
         let mask_defs: Html = piece_shapes
@@ -4464,8 +4760,8 @@ fn app() -> Html {
 
         let mut nodes = Vec::with_capacity(piece_shapes.len());
         for (piece, paths) in piece_shapes.iter() {
-            let piece_x = piece.col as f64 * piece_width;
-            let piece_y = piece.row as f64 * piece_height;
+            let piece_x = piece.col as f32 * piece_width;
+            let piece_y = piece.row as f32 * piece_height;
             let current =
                 positions_value.get(piece.id).copied().unwrap_or((piece_x, piece_y));
             let rotation = rotations_value.get(piece.id).copied().unwrap_or(0.0);
@@ -4475,26 +4771,29 @@ fn app() -> Html {
             let flip_transform = if flipped {
                 format!(
                     " translate({} {}) scale(-1 1) translate(-{} -{})",
-                    fmt_f64(center_x),
-                    fmt_f64(center_y),
-                    fmt_f64(center_x),
-                    fmt_f64(center_y)
+                    fmt_f32(center_x),
+                    fmt_f32(center_y),
+                    fmt_f32(center_x),
+                    fmt_f32(center_y)
                 )
             } else {
                 String::new()
             };
-            let transform = format!(
-                "translate({} {}){} rotate({} {} {})",
-                fmt_f64(current.0),
-                fmt_f64(current.1),
+            let outer_transform = format!(
+                "translate({} {})",
+                fmt_f32(current.0),
+                fmt_f32(current.1)
+            );
+            let inner_transform = format!(
+                "{} rotate({} {} {})",
                 flip_transform,
-                fmt_f64(rotation),
-                fmt_f64(center_x),
-                fmt_f64(center_y)
+                fmt_f32(rotation),
+                fmt_f32(center_x),
+                fmt_f32(center_y)
             );
             let mask_ref = format!("url(#piece-mask-{})", piece.id);
-            let img_x = fmt_f64(-piece_x);
-            let img_y = fmt_f64(-piece_y);
+            let img_x = fmt_f32(-piece_x);
+            let img_y = fmt_f32(-piece_y);
             let is_dragging = dragging_mask.get(piece.id).copied().unwrap_or(false);
             let is_animating = animating_mask.get(piece.id).copied().unwrap_or(false);
             let is_hovered = hovered_mask.get(piece.id).copied().unwrap_or(false);
@@ -4523,7 +4822,6 @@ fn app() -> Html {
                 .copied()
                 .unwrap_or([false; 4]);
             let mut external_path = String::new();
-            let mut connected_path = String::new();
             for (dir, edge_path) in [
                 (DIR_UP, &paths.edges[DIR_UP]),
                 (DIR_RIGHT, &paths.edges[DIR_RIGHT]),
@@ -4531,52 +4829,30 @@ fn app() -> Html {
                 (DIR_LEFT, &paths.edges[DIR_LEFT]),
             ] {
                 let connected = connection.get(dir).copied().unwrap_or(false);
-                let target = if connected {
-                    &mut connected_path
-                } else {
-                    &mut external_path
-                };
-                if !target.is_empty() {
-                    target.push(' ');
+                if !connected {
+                    if !external_path.is_empty() {
+                        external_path.push(' ');
+                    }
+                    external_path.push_str(edge_path);
                 }
-                target.push_str(edge_path);
             }
             let external_outline = if external_path.is_empty() {
                 html! {}
             } else {
                 html! {
                     <g class="piece-outline-group edge-external">
-                        <path
-                            class="piece-outline piece-outline-light edge-external"
-                            d={external_path.clone()}
-                        />
-                        <path
-                            class="piece-outline piece-outline-dark edge-external"
-                            d={external_path}
-                        />
+                        <path class="piece-outline edge-external" d={external_path} />
                     </g>
                 }
             };
-            let connected_outline = if connected_path.is_empty() {
+            let simple_outline = if emboss_enabled_value {
                 html! {}
             } else {
                 html! {
-                    <g
-                        class="piece-outline-group edge-connected"
-                        mask={mask_ref.clone()}
-                    >
-                        <path
-                            class="piece-outline piece-outline-light edge-connected"
-                            d={connected_path.clone()}
-                        />
-                        <path
-                            class="piece-outline piece-outline-dark edge-connected"
-                            d={connected_path}
-                        />
-                    </g>
+                    <path class="piece-outline piece-outline-simple" d={paths.outline.clone()} />
                 }
             };
-            let start_drag: Rc<dyn Fn(f64, f64, bool, bool, Option<i32>)> = {
+            let start_drag: Rc<dyn Fn(f32, f32, bool, bool, Option<i32>)> = {
                 let positions = positions.clone();
                 let rotations = rotations.clone();
                 let drag_state = drag_state.clone();
@@ -4650,7 +4926,7 @@ fn app() -> Html {
                     *drag_state.borrow_mut() = Some(DragState {
                         start_x: x,
                         start_y: y,
-                        start_time: Date::now(),
+                        start_time: Date::now() as f32,
                         primary_id: piece_id,
                         touch_id,
                         rotate_mode,
@@ -4722,22 +4998,22 @@ fn app() -> Html {
                 let label = format!(
                     "#{}\nx:{}\ny:{}\nr:{}",
                     piece.id,
-                    fmt_f64(current.0),
-                    fmt_f64(current.1),
-                    fmt_f64(rotation)
+                    fmt_f32(current.0),
+                    fmt_f32(current.1),
+                    fmt_f32(rotation)
                 );
                 html! {
                     <>
                         <circle
                             class="piece-debug-center"
-                            cx={fmt_f64(center_x)}
-                            cy={fmt_f64(center_y)}
+                            cx={fmt_f32(center_x)}
+                            cy={fmt_f32(center_y)}
                             r="3"
                         />
                         <text
                             class="piece-debug-label"
-                            x={fmt_f64(center_x)}
-                            y={fmt_f64(center_y - 12.0)}
+                            x={fmt_f32(center_x)}
+                            y={fmt_f32(center_y - 12.0)}
                         >
                             {label
                                 .lines()
@@ -4745,7 +5021,7 @@ fn app() -> Html {
                                 .map(|(idx, line)| {
                                     html! {
                                         <tspan
-                                            x={fmt_f64(center_x)}
+                                            x={fmt_f32(center_x)}
                                             dy={if idx == 0 { "-20" } else { "20" }}
                                         >
                                             {line}
@@ -4759,39 +5035,52 @@ fn app() -> Html {
             } else {
                 html! {}
             };
+            let emboss_target = if emboss_enabled_value {
+                "url(#emboss)"
+            } else {
+                "none"
+            };
             let node = html! {
                 <g
                     key={piece.id.to_string()}
                     class={class}
-                    transform={transform}
+                    transform={outer_transform}
                     onmousedown={on_piece_down}
                     ontouchstart={on_piece_touch}
                     onmouseenter={on_piece_enter}
                     onmouseleave={on_piece_leave}
                 >
-                    {external_outline}
-                    <rect
-                        class="piece-back"
-                        x={img_x.clone()}
-                        y={img_y.clone()}
-                        width={width.to_string()}
-                        height={height.to_string()}
-                        fill="url(#piece-back-pattern)"
-                        mask={mask_ref.clone()}
-                    />
-                    <image
-                        class="piece-image"
-                        href={IMAGE_SRC}
-                        x={img_x}
-                        y={img_y}
-                        width={width.to_string()}
-                        height={height.to_string()}
-                        preserveAspectRatio="xMidYMid meet"
-                        mask={mask_ref}
-                    />
-                    <path class="piece-hitbox" d={paths.outline.clone()} />
-                    {connected_outline}
-                    {debug_overlay}
+                    <g transform={inner_transform.clone()}>
+                        {external_outline}
+                        <path class="piece-hitbox" d={paths.outline.clone()} />
+                    </g>
+                    <g class="piece-surface" filter={emboss_target}>
+                        <g transform={inner_transform.clone()}>
+                            <rect
+                                class="piece-back"
+                                x={img_x.clone()}
+                                y={img_y.clone()}
+                                width={width.to_string()}
+                                height={height.to_string()}
+                                fill="url(#piece-back-pattern)"
+                                mask={mask_ref.clone()}
+                            />
+                            <image
+                                class="piece-image"
+                                href={IMAGE_SRC}
+                                x={img_x}
+                                y={img_y}
+                                width={width.to_string()}
+                                height={height.to_string()}
+                                preserveAspectRatio="xMidYMid meet"
+                                mask={mask_ref}
+                            />
+                        </g>
+                    </g>
+                    <g transform={inner_transform}>
+                        {simple_outline}
+                        {debug_overlay}
+                    </g>
                 </g>
             };
             nodes.push(node);
@@ -4808,21 +5097,22 @@ fn app() -> Html {
         let on_context_menu = Callback::from(|event: MouseEvent| {
             event.prevent_default();
         });
+        let bounds_inset = 1;
         let bounds = html! {
             <>
                 <rect
                     class="workspace-bounds"
-                    x={fmt_f64(view_min_x)}
-                    y={fmt_f64(view_min_y)}
-                    width={fmt_f64(view_width)}
-                    height={fmt_f64(view_height)}
+                    x={fmt_f32(view_min_x)}
+                    y={fmt_f32(view_min_y)}
+                    width={fmt_f32(view_width)}
+                    height={fmt_f32(view_height)}
                 />
                 <rect
                     class="puzzle-bounds"
-                    x="0"
-                    y="0"
-                    width={width.to_string()}
-                    height={height.to_string()}
+                    x={bounds_inset.to_string()}
+                    y={bounds_inset.to_string()}
+                    width={(width - 2 * bounds_inset).to_string()}
+                    height={(height - 2 * bounds_inset).to_string()}
                     rx={frame_corner_radius.clone()}
                     ry={frame_corner_radius.clone()}
                 />
@@ -4837,19 +5127,24 @@ fn app() -> Html {
         if !animations_enabled_value {
             svg_class.push_str(" no-anim");
         }
+        if fast_render_value {
+            svg_class.push_str(" fast-render");
+        }
         (
             html! {
                 <svg
+                    xmlns="http://www.w3.org/2000/svg"
                     class={svg_class}
                     viewBox={view_box}
-                    width={fmt_f64(view_width)}
-                    height={fmt_f64(view_height)}
+                    width={fmt_f32(view_width)}
+                    height={fmt_f32(view_height)}
                     preserveAspectRatio="xMidYMid meet"
                     ref={svg_ref}
                     oncontextmenu={on_context_menu}
                 >
                     <defs>
                         {back_pattern}
+                        {emboss_filter}
                         {mask_defs}
                     </defs>
                     {bounds}
@@ -5013,6 +5308,18 @@ fn app() -> Html {
                     </label>
                 </div>
                 <div class="control">
+                    <label>
+                        { "Connections" }
+                        <span class="control-value">{ connections_label }</span>
+                    </label>
+                </div>
+                <div class="control">
+                    <label>
+                        { "Border connections" }
+                        <span class="control-value">{ border_connections_label }</span>
+                    </label>
+                </div>
+                <div class="control">
                     <label for="grid-select">
                         { "Grid" }
                         <span class="control-value">{ grid_label }</span>
@@ -5067,7 +5374,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="workspace-scale">
                         { "Workspace scale" }
-                        <span class="control-value">{ fmt_f64(workspace_scale_value) }</span>
+                        <span class="control-value">{ fmt_f32(workspace_scale_value) }</span>
                     </label>
                     <input
                         id="workspace-scale"
@@ -5091,9 +5398,58 @@ fn app() -> Html {
                     </label>
                 </div>
                 <div class="control">
+                    <label for="emboss-enabled">
+                        { "Emboss: " } { if emboss_enabled_value { "On" } else { "Off" } }
+                        <input
+                            id="emboss-enabled"
+                            type="checkbox"
+                            checked={emboss_enabled_value}
+                            onchange={on_emboss_toggle}
+                        />
+                    </label>
+                </div>
+                <div class="control">
+                    <label for="theme-mode">
+                        { "Theme: " }
+                        { match theme_mode_value {
+                            ThemeMode::System => "System",
+                            ThemeMode::Light => "Light",
+                            ThemeMode::Dark => "Dark",
+                        } }
+                        <input
+                            id="theme-mode"
+                            type="checkbox"
+                            ref={theme_toggle_ref}
+                            onclick={on_theme_toggle}
+                        />
+                    </label>
+                </div>
+                <div class="control">
+                    <label for="fast-render">
+                        { "Fast render: " } { if fast_render_value { "On" } else { "Off" } }
+                        <input
+                            id="fast-render"
+                            type="checkbox"
+                            checked={fast_render_value}
+                            onchange={on_fast_render_toggle}
+                        />
+                    </label>
+                </div>
+                <div class="control">
+                    <label for="fast-filter">
+                        { "Fast filter: " } { if fast_filter_value { "On" } else { "Off" } }
+                        <input
+                            id="fast-filter"
+                            type="checkbox"
+                            checked={fast_filter_value}
+                            onchange={on_fast_filter_toggle}
+                        />
+                    </label>
+                </div>
+                <div class="control">
                     <label for="frame-snap">
                         { "Frame snap" }
-                        <span class="control-value">{ fmt_f64(frame_snap_ratio_value) }</span>
+                        <span class="control-value">{ fmt_f32(frame_snap_ratio_value) }</span>
                     </label>
                     <input
                         id="frame-snap"
@@ -5108,7 +5464,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="snap-distance">
                         { "Snap distance tol" }
-                        <span class="control-value">{ fmt_f64(snap_distance_ratio_value) }</span>
+                        <span class="control-value">{ fmt_f32(snap_distance_ratio_value) }</span>
                     </label>
                     <input
                         id="snap-distance"
@@ -5123,7 +5479,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="rotation-snap-tolerance">
                         { "Snap angle tol (deg)" }
-                        <span class="control-value">{ fmt_f64(rotation_snap_tolerance_value) }</span>
+                        <span class="control-value">{ fmt_f32(rotation_snap_tolerance_value) }</span>
                     </label>
                     <input
                         id="rotation-snap-tolerance"
@@ -5164,7 +5520,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="rotation-noise">
                         { "Rotation noise" }
-                        <span class="control-value">{ fmt_f64(rotation_noise_value) }</span>
+                        <span class="control-value">{ fmt_f32(rotation_noise_value) }</span>
                     </label>
                     <input
                         id="rotation-noise"
@@ -5190,7 +5546,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="tab-width">
                         { "Tab size" }
-                        <span class="control-value">{ fmt_f64(settings_value.tab_width) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.tab_width) }</span>
                     </label>
                     <input
                         id="tab-width"
@@ -5205,7 +5561,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="tab-depth">
                         { "Tab depth" }
-                        <span class="control-value">{ fmt_f64(settings_value.tab_depth) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.tab_depth) }</span>
                     </label>
                     <input
                         id="tab-depth"
@@ -5221,7 +5577,7 @@ fn app() -> Html {
                     <label for="tab-size-scale">
                         { "Tab size scale" }
                         <span class="control-value">
-                            { fmt_f64(settings_value.tab_size_scale) }
+                            { fmt_f32(settings_value.tab_size_scale) }
                         </span>
                     </label>
                     <input
@@ -5237,7 +5593,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="tab-size-min">
                         { "Tab size min" }
-                        <span class="control-value">{ fmt_f64(settings_value.tab_size_min) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.tab_size_min) }</span>
                     </label>
                     <input
                         id="tab-size-min"
@@ -5252,7 +5608,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="tab-size-max">
                         { "Tab size max" }
-                        <span class="control-value">{ fmt_f64(settings_value.tab_size_max) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.tab_size_max) }</span>
                     </label>
                     <input
                         id="tab-size-max"
@@ -5267,7 +5623,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="skew-range">
                         { "Center skew" }
-                        <span class="control-value">{ fmt_f64(settings_value.skew_range) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.skew_range) }</span>
                     </label>
                     <input
                         id="skew-range"
@@ -5282,7 +5638,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="variation">
                         { "Variation" }
-                        <span class="control-value">{ fmt_f64(settings_value.variation) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.variation) }</span>
                     </label>
                     <input
                         id="variation"
@@ -5298,7 +5654,7 @@ fn app() -> Html {
                     <label for="jitter-strength">
                         { "Jitter strength" }
                         <span class="control-value">
-                            { fmt_f64(settings_value.jitter_strength) }
+                            { fmt_f32(settings_value.jitter_strength) }
                         </span>
                     </label>
                     <input
@@ -5315,7 +5671,7 @@ fn app() -> Html {
                     <label for="jitter-len-bias">
                         { "Length jitter bias" }
                         <span class="control-value">
-                            { fmt_f64(settings_value.jitter_len_bias) }
+                            { fmt_f32(settings_value.jitter_len_bias) }
                         </span>
                     </label>
                     <input
@@ -5331,7 +5687,7 @@ fn app() -> Html {
                 <div class="control">
                     <label for="line-bend">
                         { "Grid bend" }
-                        <span class="control-value">{ fmt_f64(settings_value.line_bend_ratio) }</span>
+                        <span class="control-value">{ fmt_f32(settings_value.line_bend_ratio) }</span>
                     </label>
                     <input
                         id="line-bend"
@@ -5347,7 +5703,7 @@ fn app() -> Html {
                     <label for="tab-depth-cap">
                         { "Tab depth cap" }
                         <span class="control-value">
-                            { fmt_f64(settings_value.tab_depth_cap) }
+                            { fmt_f32(settings_value.tab_depth_cap) }
                         </span>
                     </label>
                     <input
@@ -5364,7 +5720,7 @@ fn app() -> Html {
                     <label for="curve-detail">
                         { "Curve detail" }
                         <span class="control-value">
-                            { fmt_f64(settings_value.curve_detail) }
+                            { fmt_f32(settings_value.curve_detail) }
                         </span>
                     </label>
                     <input
@@ -5404,7 +5760,7 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn assert_close(actual: f64, expected: f64) {
+    fn assert_close(actual: f32, expected: f32) {
         let delta = (actual - expected).abs();
         assert!(
             delta <= 1e-6,
