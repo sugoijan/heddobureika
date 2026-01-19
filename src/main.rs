@@ -2617,6 +2617,7 @@ fn app() -> Html {
     let rotation_anim_handle = use_mut_ref(|| None::<Interval>);
     let rotation_queue = use_mut_ref(|| VecDeque::<QueuedRotation>::new());
     let preview_corner = use_state(|| PreviewCorner::BottomLeft);
+    let preview_revealed = use_state(|| false);
     let drag_handlers = use_mut_ref(DragHandlers::default);
     let restore_state = use_mut_ref(|| None::<SavedBoard>);
     let restore_attempted = use_mut_ref(|| false);
@@ -2654,6 +2655,7 @@ fn app() -> Html {
     let dragging_members_value = (*dragging_members).clone();
     let animating_members_value = (*animating_members).clone();
     let hovered_id_value = *hovered_id;
+    let preview_revealed_value = *preview_revealed;
     let status_label = if solved_value { "Solved" } else { "In progress" };
     let status_class = if solved_value {
         "status status-solved"
@@ -4881,11 +4883,39 @@ fn app() -> Html {
             { "source" }
         </a>
     };
-    let preview_class = match *preview_corner {
-        PreviewCorner::BottomLeft => "preview-box corner-bl",
-        PreviewCorner::BottomRight => "preview-box corner-br",
-        PreviewCorner::TopLeft => "preview-box corner-tl",
-        PreviewCorner::TopRight => "preview-box corner-tr",
+    let preview_corner_class = match *preview_corner {
+        PreviewCorner::BottomLeft => "corner-bl",
+        PreviewCorner::BottomRight => "corner-br",
+        PreviewCorner::TopLeft => "corner-tl",
+        PreviewCorner::TopRight => "corner-tr",
+    };
+    let preview_state_class = if preview_revealed_value {
+        "preview-revealed"
+    } else {
+        "preview-hidden"
+    };
+    let preview_class = format!(
+        "preview-box {} {}",
+        preview_corner_class, preview_state_class
+    );
+    let on_preview_toggle = {
+        let preview_revealed = preview_revealed.clone();
+        Callback::from(move |_| {
+            preview_revealed.set(!*preview_revealed);
+        })
+    };
+    let preview_toggle_label = if preview_revealed_value {
+        "Hide preview"
+    } else {
+        "Show preview"
+    };
+    let on_preview_hide = {
+        let preview_revealed = preview_revealed.clone();
+        Callback::from(move |_| {
+            if *preview_revealed {
+                preview_revealed.set(false);
+            }
+        })
     };
     let on_preview_horizontal = {
         let preview_corner = preview_corner.clone();
@@ -4919,8 +4949,29 @@ fn app() -> Html {
         PreviewCorner::BottomLeft | PreviewCorner::BottomRight => "preview-arrow preview-arrow-up",
         PreviewCorner::TopLeft | PreviewCorner::TopRight => "preview-arrow preview-arrow-down",
     };
+    let preview_toggle_slash = if preview_revealed_value {
+        html! { <line class="preview-toggle-slash" x1="5" y1="19" x2="19" y2="5" /> }
+    } else {
+        html! {}
+    };
     let preview_box = html! {
         <aside class={preview_class}>
+            <button
+                class="preview-toggle"
+                type="button"
+                aria-label={preview_toggle_label}
+                aria-pressed={if preview_revealed_value { "true" } else { "false" }}
+                onclick={on_preview_toggle}
+            >
+                <svg class="preview-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                        class="preview-toggle-eye"
+                        d="M2 12c2.4-4.2 5.8-6.4 10-6.4s7.6 2.2 10 6.4c-2.4 4.2-5.8 6.4-10 6.4S4.4 16.2 2 12z"
+                    />
+                    <circle class="preview-toggle-pupil" cx="12" cy="12" r="3.2" />
+                    {preview_toggle_slash}
+                </svg>
+            </button>
             <button
                 class={preview_arrow_horizontal}
                 type="button"
@@ -4941,7 +4992,7 @@ fn app() -> Html {
                     <polyline points="4,2 8,6 4,10" />
                 </svg>
             </button>
-            <img src={IMAGE_SRC} alt="preview" />
+            <img src={IMAGE_SRC} alt="preview" onclick={on_preview_hide} />
         </aside>
     };
     let controls_panel = if show_controls_value {
