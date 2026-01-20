@@ -1,0 +1,148 @@
+struct Globals {
+    view_min: vec2<f32>,
+    view_size: vec2<f32>,
+    image_size: vec2<f32>,
+    atlas_size: vec2<f32>,
+    piece_size: vec2<f32>,
+    mask_pad: vec2<f32>,
+    render_mode: f32,
+    output_gamma: f32,
+    _pad: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> globals: Globals;
+
+@group(0) @binding(1)
+var art_tex: texture_2d<f32>;
+
+@group(0) @binding(2)
+var mask_tex: texture_2d<f32>;
+
+@group(0) @binding(3)
+var tex_sampler: sampler;
+
+struct VertexIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) inst_pos: vec2<f32>,
+    @location(2) inst_size: vec2<f32>,
+    @location(3) inst_rot: f32,
+    @location(4) inst_flip: f32,
+    @location(5) inst_hover: f32,
+    @location(6) inst_piece_origin: vec2<f32>,
+    @location(7) inst_mask_origin: vec2<f32>,
+};
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) art_uv: vec2<f32>,
+    @location(1) mask_uv: vec2<f32>,
+    @location(2) local_pos: vec2<f32>,
+    @location(3) flip: f32,
+    @location(4) hover: f32,
+};
+
+fn rotate_point(p: vec2<f32>, angle: f32) -> vec2<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec2<f32>(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    let full_size = input.inst_size + globals.mask_pad * 2.0;
+    let local = (input.pos + vec2<f32>(0.5, 0.5)) * full_size;
+    var local_geom = local;
+    let is_flipped = input.inst_flip > 0.5;
+    if (is_flipped) {
+        local_geom.x = full_size.x - local_geom.x;
+    }
+    let center = globals.mask_pad + input.inst_size * 0.5;
+    let angle = (select(input.inst_rot, -input.inst_rot, is_flipped)) * 0.017453292;
+    let rotated = rotate_point(local_geom - center, angle) + center;
+    let world = (input.inst_pos - globals.mask_pad) + rotated;
+    let ndc_x = (world.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - (world.y - globals.view_min.y) / globals.view_size.y * 2.0;
+    out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    let piece_local = local - globals.mask_pad;
+    out.art_uv = (input.inst_piece_origin + piece_local) / globals.image_size;
+    out.mask_uv = (input.inst_mask_origin + piece_local) / globals.atlas_size;
+    out.local_pos = piece_local;
+    out.flip = input.inst_flip;
+    out.hover = input.inst_hover;
+    return out;
+}
+
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    return pow(color, vec3<f32>(2.2));
+}
+
+fn apply_output_gamma(color: vec3<f32>) -> vec3<f32> {
+    return pow(color, vec3<f32>(globals.output_gamma));
+}
+
+fn back_pattern(local_pos: vec2<f32>) -> vec3<f32> {
+    let tile = vec2<f32>(28.0, 28.0);
+    let p = local_pos - floor(local_pos / tile) * tile;
+    let bg = srgb_to_linear(vec3<f32>(0.56, 0.36, 0.20));
+    let fg1 = srgb_to_linear(vec3<f32>(0.45, 0.27, 0.14));
+    let fg2 = srgb_to_linear(vec3<f32>(0.23, 0.14, 0.09));
+    var color = bg;
+    if (distance(p, vec2<f32>(7.0, 7.0)) < 2.8) {
+        color = fg1;
+    }
+    if (distance(p, vec2<f32>(21.0, 21.0)) < 2.8) {
+        color = fg1;
+    }
+    if (distance(p, vec2<f32>(21.0, 7.0)) < 1.8) {
+        color = fg2;
+    }
+    if (distance(p, vec2<f32>(7.0, 21.0)) < 1.8) {
+        color = fg2;
+    }
+    return color;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let mask = textureSample(mask_tex, tex_sampler, input.mask_uv).r;
+    let outline_threshold = 0.05;
+    if (globals.render_mode > 0.5) {
+        if (input.hover < 0.5) {
+            return vec4<f32>(0.0);
+        }
+	let outline_stroke_width_px = 2.0;
+        let texel = vec2<f32>(outline_stroke_width_px, outline_stroke_width_px) / globals.atlas_size;
+        let left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, 0.0)).r;
+        let right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, 0.0)).r;
+        let up = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, -texel.y)).r;
+        let down = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, texel.y)).r;
+        let max_neighbor = max(max(left, right), max(up, down));
+        let edge = select(0.0, 1.0, mask < outline_threshold && max_neighbor > outline_threshold);
+        let outline = srgb_to_linear(vec3<f32>(1.0, 0.0, 0.0));
+        return vec4<f32>(apply_output_gamma(outline), edge);
+    }
+    if (mask < outline_threshold) {
+        discard;
+    }
+    let edge_alpha = smoothstep(outline_threshold, outline_threshold + 0.15, mask);
+
+    var rgb: vec3<f32>;
+    var alpha: f32;
+    if (input.flip > 0.5) {
+        rgb = back_pattern(input.local_pos);
+        alpha = edge_alpha;
+    } else {
+        let art = textureSample(art_tex, tex_sampler, input.art_uv);
+        rgb = art.rgb;
+        alpha = art.a * edge_alpha;
+    }
+    if (input.hover > 1.5) {
+        let center = globals.piece_size * 0.5;
+        let dot = select(0.0, 1.0, distance(input.local_pos, center) < 4.0);
+        let dot_color = srgb_to_linear(vec3<f32>(0.0, 1.0, 0.0));
+        rgb = rgb * (1.0 - dot) + dot_color * dot;
+    }
+    return vec4<f32>(apply_output_gamma(rgb), alpha);
+}

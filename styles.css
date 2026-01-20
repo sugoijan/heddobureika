@@ -4,6 +4,10 @@ body {
   padding: 0;
 }
 
+.hidden {
+  display: none;
+}
+
 .app {
   min-height: 100vh;
   display: flex;
@@ -18,6 +22,22 @@ body {
   display: block;
   touch-action: manipulation;
   isolation: isolate;
+}
+
+.puzzle-canvas {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  touch-action: manipulation;
+  cursor: default;
+}
+
+.puzzle-canvas.hover {
+  cursor: grab;
+}
+
+.puzzle-canvas.dragging {
+  cursor: grabbing;
 }
 
 .workspace-bounds {
@@ -35,6 +55,7 @@ body {
   vector-effect: non-scaling-stroke;
   pointer-events: none;
 }
+
 
 .piece {
   cursor: grab;
