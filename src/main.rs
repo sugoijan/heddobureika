@@ -76,6 +76,208 @@ fn now_ms() -> f32 {
     (Date::now() % 1_000_000.0) as f32
 }
 
+fn piece_local_offset(
+    id: usize,
+    anchor: usize,
+    cols: usize,
+    piece_width: f32,
+    piece_height: f32,
+) -> (f32, f32) {
+    let col = (id % cols) as f32;
+    let row = (id / cols) as f32;
+    let anchor_col = (anchor % cols) as f32;
+    let anchor_row = (anchor / cols) as f32;
+    (
+        (col - anchor_col) * piece_width,
+        (row - anchor_row) * piece_height,
+    )
+}
+
+fn derive_piece_state(
+    anchor_of: &[usize],
+    group_pos: &[(f32, f32)],
+    group_rot: &[f32],
+    cols: usize,
+    piece_width: f32,
+    piece_height: f32,
+) -> (Vec<(f32, f32)>, Vec<f32>) {
+    let total = anchor_of.len();
+    let mut positions = vec![(0.0, 0.0); total];
+    let mut rotations = vec![0.0; total];
+    for id in 0..total {
+        let anchor = anchor_of[id];
+        if anchor >= group_pos.len() || anchor >= group_rot.len() {
+            continue;
+        }
+        let base = group_pos[anchor];
+        let rot = group_rot[anchor];
+        let (dx, dy) = piece_local_offset(id, anchor, cols, piece_width, piece_height);
+        let (rx, ry) = rotate_vec(dx, dy, rot);
+        positions[id] = (base.0 + rx, base.1 + ry);
+        rotations[id] = rot;
+    }
+    (positions, rotations)
+}
+
+fn build_group_order_from_piece_order(piece_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
+    let total = anchor_of.len();
+    let mut seen = vec![false; total];
+    let mut group_order = Vec::new();
+    for &id in piece_order {
+        if id >= total {
+            continue;
+        }
+        let anchor = anchor_of[id];
+        if anchor < total && !seen[anchor] {
+            seen[anchor] = true;
+            group_order.push(anchor);
+        }
+    }
+    for anchor in 0..total {
+        if anchor_of[anchor] == anchor && !seen[anchor] {
+            group_order.push(anchor);
+        }
+    }
+    group_order
+}
+
+fn build_piece_order_from_groups(group_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
+    let total = anchor_of.len();
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); total];
+    for id in 0..total {
+        let anchor = anchor_of[id];
+        if anchor < total {
+            members[anchor].push(id);
+        }
+    }
+    for group in &mut members {
+        if group.len() > 1 {
+            group.sort_unstable();
+        }
+    }
+    let mut group_seen = vec![false; total];
+    for &anchor in group_order {
+        if anchor < total {
+            group_seen[anchor] = true;
+        }
+    }
+    let mut order = Vec::with_capacity(total);
+    for &anchor in group_order {
+        if anchor < total {
+            order.extend_from_slice(&members[anchor]);
+        }
+    }
+    for anchor in 0..total {
+        if anchor_of[anchor] == anchor && !group_seen[anchor] {
+            order.extend_from_slice(&members[anchor]);
+        }
+    }
+    if order.len() < total {
+        let mut seen = vec![false; total];
+        for &id in &order {
+            if id < total {
+                seen[id] = true;
+            }
+        }
+        for id in 0..total {
+            if !seen[id] {
+                order.push(id);
+            }
+        }
+    }
+    order
+}
+
+fn rebuild_groups_from_piece_state(
+    positions: &[(f32, f32)],
+    rotations: &[f32],
+    connections: &[[bool; 4]],
+    cols: usize,
+    rows: usize,
+    piece_order: Option<&[usize]>,
+) -> (Vec<usize>, Vec<(f32, f32)>, Vec<f32>, Vec<usize>) {
+    let total = cols * rows;
+    let mut anchor_of = vec![0usize; total];
+    let mut group_pos = vec![(0.0, 0.0); total];
+    let mut group_rot = vec![0.0; total];
+    let groups = groups_from_connections(connections, cols, rows);
+    for group in &groups {
+        if group.is_empty() {
+            continue;
+        }
+        let anchor = group[0];
+        for &id in group {
+            if id < total {
+                anchor_of[id] = anchor;
+            }
+        }
+        if anchor < positions.len() {
+            group_pos[anchor] = positions[anchor];
+        }
+        if anchor < rotations.len() {
+            group_rot[anchor] = rotations[anchor];
+        }
+    }
+    let group_order = if let Some(order) = piece_order {
+        build_group_order_from_piece_order(order, &anchor_of)
+    } else {
+        let mut order = Vec::new();
+        for id in 0..total {
+            if anchor_of[id] == id {
+                order.push(id);
+            }
+        }
+        order
+    };
+    (anchor_of, group_pos, group_rot, group_order)
+}
+
+fn rebuild_group_state(
+    positions: &[(f32, f32)],
+    rotations: &[f32],
+    connections: &[[bool; 4]],
+    cols: usize,
+    rows: usize,
+    piece_width: f32,
+    piece_height: f32,
+    piece_order: Option<&[usize]>,
+) -> (
+    Vec<usize>,
+    Vec<(f32, f32)>,
+    Vec<f32>,
+    Vec<usize>,
+    Vec<(f32, f32)>,
+    Vec<f32>,
+    Vec<usize>,
+) {
+    let (anchor_of, group_pos, group_rot, group_order) = rebuild_groups_from_piece_state(
+        positions,
+        rotations,
+        connections,
+        cols,
+        rows,
+        piece_order,
+    );
+    let (derived_positions, derived_rotations) = derive_piece_state(
+        &anchor_of,
+        &group_pos,
+        &group_rot,
+        cols,
+        piece_width,
+        piece_height,
+    );
+    let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
+    (
+        anchor_of,
+        group_pos,
+        group_rot,
+        group_order,
+        derived_positions,
+        derived_rotations,
+        piece_order,
+    )
+}
+
 fn event_to_svg_coords(
     event: &MouseEvent,
     svg_ref: &NodeRef,
@@ -500,6 +702,10 @@ fn app() -> Html {
         settings.line_bend_ratio = value.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
     });
     let positions = use_state(Vec::<(f32, f32)>::new);
+    let group_anchor = use_state(Vec::<usize>::new);
+    let group_pos = use_state(Vec::<(f32, f32)>::new);
+    let group_rot = use_state(Vec::<f32>::new);
+    let group_order = use_state(Vec::<usize>::new);
     let active_id = use_state(|| None::<usize>);
     let active_id_value = *active_id;
     let dragging_members = use_state(Vec::<usize>::new);
@@ -631,6 +837,10 @@ fn app() -> Html {
         let rotation_queue = rotation_queue.clone();
         let z_order = z_order.clone();
         let connections = connections.clone();
+        let group_anchor = group_anchor.clone();
+        let group_pos = group_pos.clone();
+        let group_rot = group_rot.clone();
+        let group_order = group_order.clone();
         let rotations = rotations.clone();
         let flips = flips.clone();
         let solved = solved.clone();
@@ -680,22 +890,29 @@ fn app() -> Html {
                                         if validate_saved_board(&state, total) {
                                             let piece_width = width as f32 / state.cols as f32;
                                             let piece_height = height as f32 / state.rows as f32;
-                                            positions.set(state.positions.clone());
-                                            rotations.set(state.rotations.clone());
-                                            flips.set(state.flips.clone());
-                                            connections.set(state.connections.clone());
-                                            z_order.set(state.z_order.clone());
-                                            scramble_nonce.set(state.scramble_nonce);
-                                            active_id.set(None);
-                                            dragging_members.set(Vec::new());
-                                            animating_members.set(Vec::new());
-                                            *rotation_anim.borrow_mut() = None;
-                                            rotation_anim_handle.borrow_mut().take();
-                                            rotation_queue.borrow_mut().clear();
-                                            *drag_state.borrow_mut() = None;
+                                            let (anchor_of, group_positions, group_rotations, order) =
+                                                rebuild_groups_from_piece_state(
+                                                    &state.positions,
+                                                    &state.rotations,
+                                                    &state.connections,
+                                                    cols,
+                                                    rows,
+                                                    Some(&state.z_order),
+                                                );
+                                            let (derived_positions, derived_rotations) =
+                                                derive_piece_state(
+                                                    &anchor_of,
+                                                    &group_positions,
+                                                    &group_rotations,
+                                                    cols,
+                                                    piece_width,
+                                                    piece_height,
+                                                );
+                                            let piece_order =
+                                                build_piece_order_from_groups(&order, &anchor_of);
                                             let solved_now = is_solved(
-                                                &state.positions,
-                                                &state.rotations,
+                                                &derived_positions,
+                                                &derived_rotations,
                                                 &state.flips,
                                                 &state.connections,
                                                 cols,
@@ -704,6 +921,23 @@ fn app() -> Html {
                                                 piece_height,
                                                 rotation_enabled_value,
                                             );
+                                            positions.set(derived_positions);
+                                            rotations.set(derived_rotations);
+                                            flips.set(state.flips.clone());
+                                            connections.set(state.connections.clone());
+                                            z_order.set(piece_order);
+                                            group_anchor.set(anchor_of);
+                                            group_pos.set(group_positions);
+                                            group_rot.set(group_rotations);
+                                            group_order.set(order);
+                                            scramble_nonce.set(state.scramble_nonce);
+                                            active_id.set(None);
+                                            dragging_members.set(Vec::new());
+                                            animating_members.set(Vec::new());
+                                            *rotation_anim.borrow_mut() = None;
+                                            rotation_anim_handle.borrow_mut().take();
+                                            rotation_queue.borrow_mut().clear();
+                                            *drag_state.borrow_mut() = None;
                                             solved.set(solved_now);
                                             *grid_initialized.borrow_mut() = true;
                                             skip_scramble = true;
@@ -756,7 +990,26 @@ fn app() -> Html {
                             view_height,
                             margin,
                         );
-                        positions.set(next_positions);
+                        let rotations_scrambled = scramble_rotations(
+                            rotation_seed,
+                            cols * rows,
+                            rotation_enabled_value,
+                        );
+                        let anchor_of = (0..cols * rows).collect::<Vec<_>>();
+                        let group_positions = next_positions.clone();
+                        let group_rotations = rotations_scrambled.clone();
+                        let group_order_value = order.clone();
+                        let (derived_positions, derived_rotations) = derive_piece_state(
+                            &anchor_of,
+                            &group_positions,
+                            &group_rotations,
+                            cols,
+                            piece_width,
+                            piece_height,
+                        );
+                        let piece_order =
+                            build_piece_order_from_groups(&group_order_value, &anchor_of);
+                        positions.set(derived_positions);
                         active_id.set(None);
                         dragging_members.set(Vec::new());
                         animating_members.set(Vec::new());
@@ -764,13 +1017,13 @@ fn app() -> Html {
                         rotation_anim_handle.borrow_mut().take();
                         rotation_queue.borrow_mut().clear();
                         *drag_state.borrow_mut() = None;
-                        z_order.set(order);
+                        z_order.set(piece_order);
                         connections.set(vec![[false; 4]; cols * rows]);
-                        rotations.set(scramble_rotations(
-                            rotation_seed,
-                            cols * rows,
-                            rotation_enabled_value,
-                        ));
+                        rotations.set(derived_rotations);
+                        group_anchor.set(anchor_of);
+                        group_pos.set(group_positions);
+                        group_rot.set(group_rotations);
+                        group_order.set(group_order_value);
                         flips.set(scramble_flips(flip_seed, cols * rows, FLIP_CHANCE));
                         solved.set(false);
                         scramble_nonce.set(nonce);
@@ -829,6 +1082,11 @@ fn app() -> Html {
         let flips = flips.clone();
         let positions = positions.clone();
         let connections = connections.clone();
+        let group_anchor = group_anchor.clone();
+        let group_pos = group_pos.clone();
+        let group_rot = group_rot.clone();
+        let group_order = group_order.clone();
+        let z_order = z_order.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
         let grid_choices = grid_choices.clone();
@@ -843,7 +1101,6 @@ fn app() -> Html {
                 (*rotations).clone()
             } else {
                 let zeroed = vec![0.0; total];
-                rotations.set(zeroed.clone());
                 zeroed
             };
             if let Some((width, height)) = *image_size {
@@ -858,9 +1115,33 @@ fn app() -> Html {
                 let positions_snapshot = (*positions).clone();
                 let flips_snapshot = (*flips).clone();
                 let connections_snapshot = (*connections).clone();
-                let solved_now = is_solved(
+                let order_snapshot = (*z_order).clone();
+                let order_opt = if order_snapshot.len() == cols * rows {
+                    Some(order_snapshot.as_slice())
+                } else {
+                    None
+                };
+                let (
+                    anchor_of,
+                    group_positions,
+                    group_rotations,
+                    group_order_value,
+                    derived_positions,
+                    derived_rotations,
+                    piece_order,
+                ) = rebuild_group_state(
                     &positions_snapshot,
                     &rotations_snapshot,
+                    &connections_snapshot,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    order_opt,
+                );
+                let solved_now = is_solved(
+                    &derived_positions,
+                    &derived_rotations,
                     &flips_snapshot,
                     &connections_snapshot,
                     cols,
@@ -869,6 +1150,13 @@ fn app() -> Html {
                     piece_height,
                     enabled,
                 );
+                positions.set(derived_positions);
+                rotations.set(derived_rotations);
+                group_anchor.set(anchor_of);
+                group_pos.set(group_positions);
+                group_rot.set(group_rotations);
+                group_order.set(group_order_value);
+                z_order.set(piece_order);
                 solved.set(solved_now);
             }
             save_revision.set(save_revision.wrapping_add(1));
@@ -1721,6 +2009,7 @@ fn app() -> Html {
             })
             .collect();
 
+        let cols = grid.cols as usize;
         let positions_value = (*positions).clone();
         let rotations_value = (*rotations).clone();
         let flips_value = (*flips).clone();
@@ -1759,6 +2048,9 @@ fn app() -> Html {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
+            let group_anchor = group_anchor.clone();
+            let group_pos = group_pos.clone();
+            let group_rot = group_rot.clone();
             let drag_state = drag_state.clone();
             Rc::new(move |x: f32, y: f32| {
                 let drag = drag_state.borrow().clone();
@@ -1766,74 +2058,129 @@ fn app() -> Html {
                     if drag.rotate_mode && rotation_enabled_value {
                         let current_angle = (y - drag.pivot_y).atan2(x - drag.pivot_x);
                         let delta_deg = (current_angle - drag.start_angle).to_degrees();
-                        let mut next = (*positions).clone();
-                        let mut next_rotations = (*rotations).clone();
                         let flips_snapshot = &*flips;
-                        for (index, member) in drag.members.iter().enumerate() {
-                            if let Some(start) = drag.start_positions.get(index) {
-                                let center_x = start.0 + piece_width * 0.5;
-                                let center_y = start.1 + piece_height * 0.5;
-                                let (rx, ry) = rotate_point(
-                                    center_x,
-                                    center_y,
-                                    drag.pivot_x,
-                                    drag.pivot_y,
-                                    delta_deg,
+                        let mut next_group_pos = (*group_pos).clone();
+                        let mut next_group_rot = (*group_rot).clone();
+                        let anchor_id = drag.anchor_id;
+                        if anchor_id < next_group_pos.len() && anchor_id < next_group_rot.len() {
+                            let anchor_center = (
+                                drag.anchor_pos.0 + piece_width * 0.5,
+                                drag.anchor_pos.1 + piece_height * 0.5,
+                            );
+                            let (rx, ry) = rotate_point(
+                                anchor_center.0,
+                                anchor_center.1,
+                                drag.pivot_x,
+                                drag.pivot_y,
+                                delta_deg,
+                            );
+                            next_group_pos[anchor_id] = (
+                                rx - piece_width * 0.5,
+                                ry - piece_height * 0.5,
+                            );
+                            let flipped = flips_snapshot.get(anchor_id).copied().unwrap_or(false);
+                            let signed_delta = if flipped { -delta_deg } else { delta_deg };
+                            next_group_rot[anchor_id] =
+                                normalize_angle(drag.anchor_rot + signed_delta);
+                            let anchor_of = &*group_anchor;
+                            if !anchor_of.is_empty() {
+                                let (derived_positions, derived_rotations) = derive_piece_state(
+                                    anchor_of,
+                                    &next_group_pos,
+                                    &next_group_rot,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
                                 );
-                                if let Some(pos) = next.get_mut(*member) {
-                                    *pos = (
-                                        rx - piece_width * 0.5,
-                                        ry - piece_height * 0.5,
-                                    );
-                                }
-                                if let Some(rot) = next_rotations.get_mut(*member) {
-                                    let start_rot =
-                                        drag.start_rotations.get(index).copied().unwrap_or(0.0);
-                                    let flipped = flips_snapshot.get(*member).copied().unwrap_or(false);
-                                    let signed_delta = if flipped { -delta_deg } else { delta_deg };
-                                    *rot = normalize_angle(start_rot + signed_delta);
-                                }
+                                positions.set(derived_positions);
+                                rotations.set(derived_rotations);
                             }
+                            group_pos.set(next_group_pos);
+                            group_rot.set(next_group_rot);
                         }
-                        positions.set(next);
-                        rotations.set(next_rotations);
                         true
                     } else {
                         let mut dx = x - drag.start_x;
                         let mut dy = y - drag.start_y;
                         if !drag.start_positions.is_empty() {
-                            let mut min_start_x = f32::INFINITY;
-                            let mut max_start_x = f32::NEG_INFINITY;
-                            let mut min_start_y = f32::INFINITY;
-                            let mut max_start_y = f32::NEG_INFINITY;
+                            let rubber_limit = piece_width.min(piece_height) * RUBBER_BAND_RATIO;
+                            let (bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y) =
+                                if drag.members.len() > 1 {
+                                    let mut min_x = center_min_x + piece_width;
+                                    let mut max_x = center_max_x - piece_width;
+                                    let mut min_y = center_min_y + piece_height;
+                                    let mut max_y = center_max_y - piece_height;
+                                    if max_x < min_x {
+                                        let mid = (center_min_x + center_max_x) * 0.5;
+                                        min_x = mid;
+                                        max_x = mid;
+                                    }
+                                    if max_y < min_y {
+                                        let mid = (center_min_y + center_max_y) * 0.5;
+                                        min_y = mid;
+                                        max_y = mid;
+                                    }
+                                    (min_x, max_x, min_y, max_y)
+                                } else {
+                                    (
+                                        center_min_x,
+                                        center_max_x,
+                                        center_min_y,
+                                        center_max_y,
+                                    )
+                                };
+                            let mut in_bounds = false;
+                            let mut best_dx = dx;
+                            let mut best_dy = dy;
+                            let mut best_dist = f32::INFINITY;
                             for start in &drag.start_positions {
                                 let center_x = start.0 + piece_width * 0.5;
                                 let center_y = start.1 + piece_height * 0.5;
-                                min_start_x = min_start_x.min(center_x);
-                                max_start_x = max_start_x.max(center_x);
-                                min_start_y = min_start_y.min(center_y);
-                                max_start_y = max_start_y.max(center_y);
+                                let min_dx = bounds_min_x - center_x;
+                                let max_dx = bounds_max_x - center_x;
+                                let min_dy = bounds_min_y - center_y;
+                                let max_dy = bounds_max_y - center_y;
+                                if dx >= min_dx && dx <= max_dx && dy >= min_dy && dy <= max_dy {
+                                    in_bounds = true;
+                                    break;
+                                }
+                                let cand_dx = rubber_band_clamp(dx, min_dx, max_dx, rubber_limit);
+                                let cand_dy = rubber_band_clamp(dy, min_dy, max_dy, rubber_limit);
+                                let delta_dx = cand_dx - dx;
+                                let delta_dy = cand_dy - dy;
+                                let dist = delta_dx * delta_dx + delta_dy * delta_dy;
+                                if dist < best_dist {
+                                    best_dist = dist;
+                                    best_dx = cand_dx;
+                                    best_dy = cand_dy;
+                                }
                             }
-                            let min_dx = center_min_x - min_start_x;
-                            let max_dx = center_max_x - max_start_x;
-                            let min_dy = center_min_y - min_start_y;
-                            let max_dy = center_max_y - max_start_y;
-                            let rubber_limit = piece_width.min(piece_height) * RUBBER_BAND_RATIO;
-                            if min_dx <= max_dx {
-                                dx = rubber_band_clamp(dx, min_dx, max_dx, rubber_limit);
-                            }
-                            if min_dy <= max_dy {
-                                dy = rubber_band_clamp(dy, min_dy, max_dy, rubber_limit);
+                            if !in_bounds {
+                                dx = best_dx;
+                                dy = best_dy;
                             }
                         }
-                        let mut next = (*positions).clone();
-                        for (index, member) in drag.members.iter().enumerate() {
-                            if let Some(pos) = next.get_mut(*member) {
-                                let start = drag.start_positions[index];
-                                *pos = (start.0 + dx, start.1 + dy);
+                        let mut next_group_pos = (*group_pos).clone();
+                        let anchor_id = drag.anchor_id;
+                        if anchor_id < next_group_pos.len() {
+                            next_group_pos[anchor_id] =
+                                (drag.anchor_pos.0 + dx, drag.anchor_pos.1 + dy);
+                            let anchor_of = &*group_anchor;
+                            if !anchor_of.is_empty() {
+                                let group_rot_snapshot = (*group_rot).clone();
+                                let (derived_positions, derived_rotations) = derive_piece_state(
+                                    anchor_of,
+                                    &next_group_pos,
+                                    &group_rot_snapshot,
+                                    cols,
+                                    piece_width,
+                                    piece_height,
+                                );
+                                positions.set(derived_positions);
+                                rotations.set(derived_rotations);
                             }
+                            group_pos.set(next_group_pos);
                         }
-                        positions.set(next);
                         true
                     }
                 } else {
@@ -1949,6 +2296,11 @@ fn app() -> Html {
             let rotation_anim = rotation_anim.clone();
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
+            let group_anchor = group_anchor.clone();
+            let group_pos = group_pos.clone();
+            let group_rot = group_rot.clone();
+            let group_order = group_order.clone();
+            let z_order = z_order.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             Rc::new(move |coords: Option<(f32, f32)>| {
@@ -1970,6 +2322,11 @@ fn app() -> Html {
                         let rotations = rotations.clone();
                         let flips = flips.clone();
                         let connections = connections.clone();
+                        let group_anchor = group_anchor.clone();
+                        let group_pos = group_pos.clone();
+                        let group_rot = group_rot.clone();
+                        let group_order = group_order.clone();
+                        let z_order = z_order.clone();
                         let solved = solved.clone();
                         let save_revision = save_revision.clone();
                         let rotation_anim = rotation_anim.clone();
@@ -2108,17 +2465,33 @@ fn app() -> Html {
                                         rotation_enabled_value,
                                     );
                                 }
-                                positions.set(next_positions.clone());
-                                rotations.set(next_rotations.clone());
-                                if should_snap || connections_override.is_some() {
-                                    connections.set(connections_snapshot.clone());
-                                }
-                                animating_members.set(Vec::new());
-                                *rotation_anim.borrow_mut() = None;
-                                rotation_anim_handle.borrow_mut().take();
-                                let solved_now = is_solved(
+                                let order_snapshot = (*z_order).clone();
+                                let order_opt = if order_snapshot.len() == cols * rows {
+                                    Some(order_snapshot.as_slice())
+                                } else {
+                                    None
+                                };
+                                let (
+                                    anchor_of,
+                                    group_positions,
+                                    group_rotations,
+                                    group_order_value,
+                                    derived_positions,
+                                    derived_rotations,
+                                    piece_order,
+                                ) = rebuild_group_state(
                                     &next_positions,
                                     &next_rotations,
+                                    &connections_snapshot,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    order_opt,
+                                );
+                                let solved_now = is_solved(
+                                    &derived_positions,
+                                    &derived_rotations,
                                     &flips_snapshot,
                                     &connections_snapshot,
                                     cols,
@@ -2127,6 +2500,17 @@ fn app() -> Html {
                                     piece_height,
                                     rotation_enabled_value,
                                 );
+                                positions.set(derived_positions);
+                                rotations.set(derived_rotations);
+                                connections.set(connections_snapshot);
+                                group_anchor.set(anchor_of);
+                                group_pos.set(group_positions);
+                                group_rot.set(group_rotations);
+                                group_order.set(group_order_value);
+                                z_order.set(piece_order);
+                                animating_members.set(Vec::new());
+                                *rotation_anim.borrow_mut() = None;
+                                rotation_anim_handle.borrow_mut().take();
                                 solved.set(solved_now);
                                 save_revision.set(save_revision.wrapping_add(1));
                                 return;
@@ -2334,14 +2718,33 @@ fn app() -> Html {
                                             rotation_enabled_value,
                                         );
                                     }
-                                    positions.set(snapped_positions.clone());
-                                    rotations.set(snapped_rotations.clone());
-                                    if should_snap || connections_override.is_some() {
-                                        connections.set(connections_snapshot.clone());
-                                    }
-                                    let solved_now = is_solved(
+                                    let order_snapshot = (*z_order).clone();
+                                    let order_opt = if order_snapshot.len() == cols * rows {
+                                        Some(order_snapshot.as_slice())
+                                    } else {
+                                        None
+                                    };
+                                    let (
+                                        anchor_of,
+                                        group_positions,
+                                        group_rotations,
+                                        group_order_value,
+                                        derived_positions,
+                                        derived_rotations,
+                                        piece_order,
+                                    ) = rebuild_group_state(
                                         &snapped_positions,
                                         &snapped_rotations,
+                                        &connections_snapshot,
+                                        cols,
+                                        rows,
+                                        piece_width,
+                                        piece_height,
+                                        order_opt,
+                                    );
+                                    let solved_now = is_solved(
+                                        &derived_positions,
+                                        &derived_rotations,
                                         &flips_snapshot,
                                         &connections_snapshot,
                                         cols,
@@ -2350,6 +2753,14 @@ fn app() -> Html {
                                         piece_height,
                                         rotation_enabled_value,
                                     );
+                                    positions.set(derived_positions);
+                                    rotations.set(derived_rotations);
+                                    connections.set(connections_snapshot);
+                                    group_anchor.set(anchor_of);
+                                    group_pos.set(group_positions);
+                                    group_rot.set(group_rotations);
+                                    group_order.set(group_order_value);
+                                    z_order.set(piece_order);
                                     solved.set(solved_now);
                                     save_revision.set(save_revision.wrapping_add(1));
                                     rotation_anim_handle_for_tick.borrow_mut().take();
@@ -2374,9 +2785,33 @@ fn app() -> Html {
                                     *flip = !*flip;
                                 }
                                 clear_piece_connections(&mut next_connections, click_id, cols, rows);
-                                let solved_now = is_solved(
+                                let order_snapshot = (*z_order).clone();
+                                let order_opt = if order_snapshot.len() == cols * rows {
+                                    Some(order_snapshot.as_slice())
+                                } else {
+                                    None
+                                };
+                                let (
+                                    anchor_of,
+                                    group_positions,
+                                    group_rotations,
+                                    group_order_value,
+                                    derived_positions,
+                                    derived_rotations,
+                                    piece_order,
+                                ) = rebuild_group_state(
                                     &next,
                                     &next_rotations,
+                                    &next_connections,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    order_opt,
+                                );
+                                let solved_now = is_solved(
+                                    &derived_positions,
+                                    &derived_rotations,
                                     &next_flips,
                                     &next_connections,
                                     cols,
@@ -2385,10 +2820,15 @@ fn app() -> Html {
                                     piece_height,
                                     rotation_enabled_value,
                                 );
-                                positions.set(next);
+                                positions.set(derived_positions);
+                                rotations.set(derived_rotations);
                                 connections.set(next_connections);
-                                rotations.set(next_rotations);
                                 flips.set(next_flips);
+                                group_anchor.set(anchor_of);
+                                group_pos.set(group_positions);
+                                group_rot.set(group_rotations);
+                                group_order.set(group_order_value);
+                                z_order.set(piece_order);
                                 solved.set(solved_now);
                                 save_revision.set(save_revision.wrapping_add(1));
                                 active_id.set(None);
@@ -2403,9 +2843,33 @@ fn app() -> Html {
                                     *flip = false;
                                 }
                                 clear_piece_connections(&mut next_connections, click_id, cols, rows);
-                                let solved_now = is_solved(
+                                let order_snapshot = (*z_order).clone();
+                                let order_opt = if order_snapshot.len() == cols * rows {
+                                    Some(order_snapshot.as_slice())
+                                } else {
+                                    None
+                                };
+                                let (
+                                    anchor_of,
+                                    group_positions,
+                                    group_rotations,
+                                    group_order_value,
+                                    derived_positions,
+                                    derived_rotations,
+                                    piece_order,
+                                ) = rebuild_group_state(
                                     &next,
                                     &next_rotations,
+                                    &next_connections,
+                                    cols,
+                                    rows,
+                                    piece_width,
+                                    piece_height,
+                                    order_opt,
+                                );
+                                let solved_now = is_solved(
+                                    &derived_positions,
+                                    &derived_rotations,
                                     &next_flips,
                                     &next_connections,
                                     cols,
@@ -2414,10 +2878,15 @@ fn app() -> Html {
                                     piece_height,
                                     rotation_enabled_value,
                                 );
-                                positions.set(next);
+                                positions.set(derived_positions);
+                                rotations.set(derived_rotations);
                                 connections.set(next_connections);
-                                rotations.set(next_rotations);
                                 flips.set(next_flips);
+                                group_anchor.set(anchor_of);
+                                group_pos.set(group_positions);
+                                group_rot.set(group_rotations);
+                                group_order.set(group_order_value);
+                                z_order.set(piece_order);
                                 solved.set(solved_now);
                                 save_revision.set(save_revision.wrapping_add(1));
                                 active_id.set(None);
@@ -2629,9 +3098,33 @@ fn app() -> Html {
                         return true;
                     }
 
-                    let solved_now = is_solved(
+                    let order_snapshot = (*z_order).clone();
+                    let order_opt = if order_snapshot.len() == cols * rows {
+                        Some(order_snapshot.as_slice())
+                    } else {
+                        None
+                    };
+                    let (
+                        anchor_of,
+                        group_positions,
+                        group_rotations,
+                        group_order_value,
+                        derived_positions,
+                        derived_rotations,
+                        piece_order,
+                    ) = rebuild_group_state(
                         &next,
                         &next_rotations,
+                        &next_connections,
+                        cols,
+                        rows,
+                        piece_width,
+                        piece_height,
+                        order_opt,
+                    );
+                    let solved_now = is_solved(
+                        &derived_positions,
+                        &derived_rotations,
                         &next_flips,
                         &next_connections,
                         cols,
@@ -2640,10 +3133,15 @@ fn app() -> Html {
                         piece_height,
                         rotation_enabled_value,
                     );
-                    positions.set(next);
+                    positions.set(derived_positions);
+                    rotations.set(derived_rotations);
                     connections.set(next_connections);
-                    rotations.set(next_rotations);
                     flips.set(next_flips);
+                    group_anchor.set(anchor_of);
+                    group_pos.set(group_positions);
+                    group_rot.set(group_rotations);
+                    group_order.set(group_order_value);
+                    z_order.set(piece_order);
                     solved.set(solved_now);
                     save_revision.set(save_revision.wrapping_add(1));
                     active_id.set(None);
@@ -2729,6 +3227,10 @@ fn app() -> Html {
             let z_order = z_order.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
+            let group_anchor = group_anchor.clone();
+            let group_pos = group_pos.clone();
+            let group_rot = group_rot.clone();
+            let group_order = group_order.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let dragging_members = dragging_members.clone();
@@ -2763,14 +3265,35 @@ fn app() -> Html {
                     view_height,
                     mask_pad,
                 );
-                positions.set(next_positions);
-                connections.set(vec![[false; 4]; total]);
-                z_order.set(order);
-                rotations.set(scramble_rotations(
-                    rotation_seed,
-                    total,
-                    rotation_enabled_value,
-                ));
+                let next_rotations =
+                    scramble_rotations(rotation_seed, total, rotation_enabled_value);
+                let next_connections = vec![[false; 4]; total];
+                let (
+                    anchor_of,
+                    group_positions,
+                    group_rotations,
+                    group_order_value,
+                    derived_positions,
+                    derived_rotations,
+                    piece_order,
+                ) = rebuild_group_state(
+                    &next_positions,
+                    &next_rotations,
+                    &next_connections,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    Some(order.as_slice()),
+                );
+                positions.set(derived_positions);
+                rotations.set(derived_rotations);
+                connections.set(next_connections);
+                group_anchor.set(anchor_of);
+                group_pos.set(group_positions);
+                group_rot.set(group_rotations);
+                group_order.set(group_order_value);
+                z_order.set(piece_order);
                 flips.set(scramble_flips(flip_seed, total, FLIP_CHANCE));
                 active_id.set(None);
                 dragging_members.set(Vec::new());
@@ -2789,6 +3312,10 @@ fn app() -> Html {
             let z_order = z_order.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
+            let group_anchor = group_anchor.clone();
+            let group_pos = group_pos.clone();
+            let group_rot = group_rot.clone();
+            let group_order = group_order.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let dragging_members = dragging_members.clone();
@@ -2815,10 +3342,34 @@ fn app() -> Html {
                     }
                 }
                 let order: Vec<usize> = (0..total).collect();
-                positions.set(next_positions);
-                connections.set(build_full_connections(cols, rows));
-                z_order.set(order);
-                rotations.set(vec![0.0; total]);
+                let next_rotations = vec![0.0; total];
+                let next_connections = build_full_connections(cols, rows);
+                let (
+                    anchor_of,
+                    group_positions,
+                    group_rotations,
+                    group_order_value,
+                    derived_positions,
+                    derived_rotations,
+                    piece_order,
+                ) = rebuild_group_state(
+                    &next_positions,
+                    &next_rotations,
+                    &next_connections,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    Some(order.as_slice()),
+                );
+                positions.set(derived_positions);
+                rotations.set(derived_rotations);
+                connections.set(next_connections);
+                group_anchor.set(anchor_of);
+                group_pos.set(group_positions);
+                group_rot.set(group_rotations);
+                group_order.set(group_order_value);
+                z_order.set(piece_order);
                 flips.set(vec![false; total]);
                 active_id.set(None);
                 dragging_members.set(Vec::new());
@@ -2836,6 +3387,11 @@ fn app() -> Html {
             let rotations = rotations.clone();
             let flips = flips.clone();
             let connections = connections.clone();
+            let group_anchor = group_anchor.clone();
+            let group_pos = group_pos.clone();
+            let group_rot = group_rot.clone();
+            let group_order = group_order.clone();
+            let z_order = z_order.clone();
             let dragging_members = dragging_members.clone();
             let animating_members = animating_members.clone();
             let rotation_anim = rotation_anim.clone();
@@ -2854,10 +3410,33 @@ fn app() -> Html {
                 let flips_snapshot = (*flips).clone();
                 let connections_snapshot = (*connections).clone();
                 let zeroed = vec![0.0; total];
-                rotations.set(zeroed.clone());
-                let solved_now = is_solved(
+                let order_snapshot = (*z_order).clone();
+                let order_opt = if order_snapshot.len() == total {
+                    Some(order_snapshot.as_slice())
+                } else {
+                    None
+                };
+                let (
+                    anchor_of,
+                    group_positions,
+                    group_rotations,
+                    group_order_value,
+                    derived_positions,
+                    derived_rotations,
+                    piece_order,
+                ) = rebuild_group_state(
                     &positions_snapshot,
                     &zeroed,
+                    &connections_snapshot,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    order_opt,
+                );
+                let solved_now = is_solved(
+                    &derived_positions,
+                    &derived_rotations,
                     &flips_snapshot,
                     &connections_snapshot,
                     cols,
@@ -2866,6 +3445,13 @@ fn app() -> Html {
                     piece_height,
                     rotation_enabled_value,
                 );
+                positions.set(derived_positions);
+                rotations.set(derived_rotations.clone());
+                group_anchor.set(anchor_of);
+                group_pos.set(group_positions);
+                group_rot.set(group_rotations);
+                group_order.set(group_order_value);
+                z_order.set(piece_order);
                 solved.set(solved_now);
                 dragging_members.set(Vec::new());
                 animating_members.set(Vec::new());
@@ -3033,6 +3619,10 @@ fn app() -> Html {
         let begin_drag: Rc<dyn Fn(usize, f32, f32, bool, bool, Option<i32>)> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
+            let group_anchor = group_anchor.clone();
+            let group_pos = group_pos.clone();
+            let group_rot = group_rot.clone();
+            let group_order = group_order.clone();
             let drag_state = drag_state.clone();
             let active_id = active_id.clone();
             let dragging_members = dragging_members.clone();
@@ -3046,10 +3636,10 @@ fn app() -> Html {
             let rows = grid.rows as usize;
             Rc::new(move |piece_id, x, y, shift_key, rotate_mode, touch_id| {
                 let positions_snapshot = (*positions).clone();
+                let rotations_snapshot = (*rotations).clone();
                 let mut connections_snapshot = (*connections).clone();
                 let mut members = if shift_key {
                     clear_piece_connections(&mut connections_snapshot, piece_id, cols, rows);
-                    connections.set(connections_snapshot);
                     vec![piece_id]
                 } else {
                     collect_group(&connections_snapshot, piece_id, cols, rows)
@@ -3057,6 +3647,58 @@ fn app() -> Html {
                 if members.is_empty() {
                     members.push(piece_id);
                 }
+                members.sort_unstable();
+                let order_snapshot = (*z_order).clone();
+                let order_opt = if order_snapshot.len() == cols * rows {
+                    Some(order_snapshot.as_slice())
+                } else {
+                    None
+                };
+                let (
+                    anchor_of,
+                    group_positions,
+                    group_rotations,
+                    mut group_order_value,
+                    derived_positions,
+                    derived_rotations,
+                    _piece_order,
+                ) = rebuild_group_state(
+                    &positions_snapshot,
+                    &rotations_snapshot,
+                    &connections_snapshot,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    order_opt,
+                );
+                if shift_key {
+                    connections.set(connections_snapshot.clone());
+                }
+                positions.set(derived_positions.clone());
+                rotations.set(derived_rotations.clone());
+                group_anchor.set(anchor_of.clone());
+                group_pos.set(group_positions.clone());
+                group_rot.set(group_rotations.clone());
+                let anchor_id = members.first().copied().unwrap_or(piece_id);
+                group_order_value.retain(|id| *id != anchor_id);
+                group_order_value.push(anchor_id);
+                let piece_order = build_piece_order_from_groups(&group_order_value, &anchor_of);
+                group_order.set(group_order_value);
+                z_order.set(piece_order);
+                let anchor_pos = group_positions
+                    .get(anchor_id)
+                    .copied()
+                    .or_else(|| derived_positions.get(anchor_id).copied())
+                    .unwrap_or((
+                        (anchor_id % cols) as f32 * piece_width,
+                        (anchor_id / cols) as f32 * piece_height,
+                    ));
+                let anchor_rot = group_rotations
+                    .get(anchor_id)
+                    .copied()
+                    .or_else(|| derived_rotations.get(anchor_id).copied())
+                    .unwrap_or(0.0);
                 *rotation_anim.borrow_mut() = None;
                 rotation_anim_handle.borrow_mut().take();
                 rotation_queue.borrow_mut().clear();
@@ -3068,45 +3710,26 @@ fn app() -> Html {
                     base_col as f32 * piece_width,
                     base_row as f32 * piece_height,
                 );
-                let pos = positions_snapshot.get(piece_id).copied().unwrap_or(base_pos);
+                let pos = derived_positions.get(piece_id).copied().unwrap_or(base_pos);
                 let pivot_x = pos.0 + piece_width * 0.5;
                 let pivot_y = pos.1 + piece_height * 0.5;
                 let start_angle = (y - pivot_y).atan2(x - pivot_x);
-                let mut order = (*z_order).clone();
-                let mut in_group = vec![false; cols * rows];
-                for id in &members {
-                    if *id < in_group.len() {
-                        in_group[*id] = true;
-                    }
-                }
-                let mut group_order = Vec::new();
-                for id in &order {
-                    if *id < in_group.len() && in_group[*id] {
-                        group_order.push(*id);
-                    }
-                }
-                order.retain(|id| !in_group.get(*id).copied().unwrap_or(false));
-                order.extend(group_order);
-                z_order.set(order);
                 let mut start_positions = Vec::with_capacity(members.len());
                 for id in &members {
-                    if let Some(start) = positions_snapshot.get(*id) {
+                    if let Some(start) = derived_positions.get(*id) {
                         start_positions.push(*start);
                     } else {
                         start_positions.push(pos);
                     }
-                }
-                let rotations_snapshot = (*rotations).clone();
-                let mut start_rotations = Vec::with_capacity(members.len());
-                for id in &members {
-                    let rot = rotations_snapshot.get(*id).copied().unwrap_or(0.0);
-                    start_rotations.push(rot);
                 }
                 *drag_state.borrow_mut() = Some(DragState {
                     start_x: x,
                     start_y: y,
                     start_time: now_ms(),
                     primary_id: piece_id,
+                    anchor_id,
+                    anchor_pos,
+                    anchor_rot,
                     touch_id,
                     rotate_mode,
                     pivot_x,
@@ -3114,7 +3737,6 @@ fn app() -> Html {
                     start_angle,
                     members,
                     start_positions,
-                    start_rotations,
                 });
                 active_id.set(Some(piece_id));
             })

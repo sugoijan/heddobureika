@@ -135,6 +135,9 @@ pub(crate) struct DragState {
     pub(crate) start_y: f32,
     pub(crate) start_time: f32,
     pub(crate) primary_id: usize,
+    pub(crate) anchor_id: usize,
+    pub(crate) anchor_pos: (f32, f32),
+    pub(crate) anchor_rot: f32,
     pub(crate) touch_id: Option<i32>,
     pub(crate) rotate_mode: bool,
     pub(crate) pivot_x: f32,
@@ -142,7 +145,6 @@ pub(crate) struct DragState {
     pub(crate) start_angle: f32,
     pub(crate) members: Vec<usize>,
     pub(crate) start_positions: Vec<(f32, f32)>,
-    pub(crate) start_rotations: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -613,6 +615,48 @@ pub(crate) fn collect_group(connections: &[[bool; 4]], start: usize, cols: usize
     group
 }
 
+pub(crate) fn groups_from_connections(
+    connections: &[[bool; 4]],
+    cols: usize,
+    rows: usize,
+) -> Vec<Vec<usize>> {
+    let total = cols * rows;
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut visited = vec![false; total];
+    let mut groups = Vec::new();
+    let mut queue = VecDeque::new();
+    for start in 0..total {
+        if visited[start] {
+            continue;
+        }
+        let mut group = Vec::new();
+        visited[start] = true;
+        queue.push_back(start);
+        while let Some(id) = queue.pop_front() {
+            group.push(id);
+            for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
+                if connections
+                    .get(id)
+                    .map(|edges| edges[dir])
+                    .unwrap_or(false)
+                {
+                    if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
+                        if !visited[neighbor] {
+                            visited[neighbor] = true;
+                            queue.push_back(neighbor);
+                        }
+                    }
+                }
+            }
+        }
+        group.sort_unstable();
+        groups.push(group);
+    }
+    groups
+}
+
 pub(crate) fn is_fully_connected(connections: &[[bool; 4]], cols: usize, rows: usize) -> bool {
     let total = cols * rows;
     if total == 0 || connections.len() != total {
@@ -947,6 +991,25 @@ pub(crate) fn apply_snaps_for_group(
     if members.is_empty() || total == 0 {
         return Vec::new();
     }
+    let (bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y) = if members.len() > 1 {
+        let mut min_x = center_min_x + piece_width;
+        let mut max_x = center_max_x - piece_width;
+        let mut min_y = center_min_y + piece_height;
+        let mut max_y = center_max_y - piece_height;
+        if max_x < min_x {
+            let mid = (center_min_x + center_max_x) * 0.5;
+            min_x = mid;
+            max_x = mid;
+        }
+        if max_y < min_y {
+            let mid = (center_min_y + center_max_y) * 0.5;
+            min_y = mid;
+            max_y = mid;
+        }
+        (min_x, max_x, min_y, max_y)
+    } else {
+        (center_min_x, center_max_x, center_min_y, center_max_y)
+    };
     let mut in_group = vec![false; total];
     for member in members {
         if *member < in_group.len() {
@@ -1070,10 +1133,10 @@ pub(crate) fn apply_snaps_for_group(
             }
             let can_snap = min_cx.is_finite()
                 && min_cy.is_finite()
-                && min_cx >= center_min_x
-                && max_cx <= center_max_x
-                && min_cy >= center_min_y
-                && max_cy <= center_max_y;
+                && min_cx >= bounds_min_x
+                && max_cx <= bounds_max_x
+                && min_cy >= bounds_min_y
+                && max_cy <= bounds_max_y;
             if !can_snap {
                 continue;
             }
@@ -1215,13 +1278,14 @@ pub(crate) fn apply_snaps_for_group(
         let frame_width = cols as f32 * piece_width;
         let frame_height = rows as f32 * piece_height;
         let corner_snap_distance = snap_distance * frame_snap_ratio;
+        let frame_snap_slop = corner_snap_distance * 0.25;
         let group_rot = group_after
             .first()
             .and_then(|id| rotations.get(*id))
             .copied()
             .unwrap_or(0.0);
         let mut corner_snapped = false;
-        if rotation_enabled && group_after.len() < total && corner_snap_distance > 0.0 {
+        if group_after.len() < total && corner_snap_distance > 0.0 {
             let mut best_corner = None;
             let target_center_for = |corner: usize, rotation: f32| {
                 let rotation = normalize_angle(rotation);
@@ -1315,10 +1379,10 @@ pub(crate) fn apply_snaps_for_group(
                     }
                     let can_snap = min_cx.is_finite()
                         && min_cy.is_finite()
-                        && min_cx >= frame_min_x
-                        && max_cx <= frame_max_x
-                        && min_cy >= frame_min_y
-                        && max_cy <= frame_max_y;
+                        && min_cx >= frame_min_x - frame_snap_slop
+                        && max_cx <= frame_max_x + frame_snap_slop
+                        && min_cy >= frame_min_y - frame_snap_slop
+                        && max_cy <= frame_max_y + frame_snap_slop;
                     if !can_snap {
                         continue;
                     }
@@ -1346,11 +1410,7 @@ pub(crate) fn apply_snaps_for_group(
                 corner_snapped = true;
             }
         }
-        if rotation_enabled
-            && !corner_snapped
-            && group_after.len() < total
-            && corner_snap_distance > 0.0
-        {
+        if !corner_snapped && group_after.len() < total && corner_snap_distance > 0.0 {
             let mut best_edge = None;
             for id in &group_after {
                 if *id >= positions.len() {
@@ -1446,10 +1506,10 @@ pub(crate) fn apply_snaps_for_group(
                     }
                     let can_snap = min_cx.is_finite()
                         && min_cy.is_finite()
-                        && min_cx >= frame_min_x
-                        && max_cx <= frame_max_x
-                        && min_cy >= frame_min_y
-                        && max_cy <= frame_max_y;
+                        && min_cx >= frame_min_x - frame_snap_slop
+                        && max_cx <= frame_max_x + frame_snap_slop
+                        && min_cy >= frame_min_y - frame_snap_slop
+                        && max_cy <= frame_max_y + frame_snap_slop;
                     if !can_snap {
                         continue;
                     }
@@ -1567,22 +1627,54 @@ pub(crate) fn apply_snaps_for_group(
             }
         }
         if min_cx.is_finite() && min_cy.is_finite() {
-            let mut shift_x = 0.0;
-            let mut shift_y = 0.0;
-            if min_cx < center_min_x {
-                shift_x = center_min_x - min_cx;
-            } else if max_cx > center_max_x {
-                shift_x = center_max_x - max_cx;
+            let mut any_inside = false;
+            for id in clamp_ids {
+                if let Some(pos) = positions.get(*id) {
+                    let center_x = pos.0 + piece_width * 0.5;
+                    let center_y = pos.1 + piece_height * 0.5;
+                    if center_x >= bounds_min_x
+                        && center_x <= bounds_max_x
+                        && center_y >= bounds_min_y
+                        && center_y <= bounds_max_y
+                    {
+                        any_inside = true;
+                        break;
+                    }
+                }
             }
-            if min_cy < center_min_y {
-                shift_y = center_min_y - min_cy;
-            } else if max_cy > center_max_y {
-                shift_y = center_max_y - max_cy;
-            }
-            if shift_x != 0.0 || shift_y != 0.0 {
+            if !any_inside {
+                let mut best_shift = (0.0, 0.0);
+                let mut best_dist = f32::INFINITY;
                 for id in clamp_ids {
-                    if let Some(pos) = positions.get_mut(*id) {
-                        *pos = (pos.0 + shift_x, pos.1 + shift_y);
+                    if let Some(pos) = positions.get(*id) {
+                        let center_x = pos.0 + piece_width * 0.5;
+                        let center_y = pos.1 + piece_height * 0.5;
+                        let mut shift_x = 0.0;
+                        let mut shift_y = 0.0;
+                        if center_x < bounds_min_x {
+                            shift_x = bounds_min_x - center_x;
+                        } else if center_x > bounds_max_x {
+                            shift_x = bounds_max_x - center_x;
+                        }
+                        if center_y < bounds_min_y {
+                            shift_y = bounds_min_y - center_y;
+                        } else if center_y > bounds_max_y {
+                            shift_y = bounds_max_y - center_y;
+                        }
+                        let dist = shift_x * shift_x + shift_y * shift_y;
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_shift = (shift_x, shift_y);
+                        }
+                    }
+                }
+                if best_dist.is_finite()
+                    && (best_shift.0 != 0.0 || best_shift.1 != 0.0)
+                {
+                    for id in clamp_ids {
+                        if let Some(pos) = positions.get_mut(*id) {
+                            *pos = (pos.0 + best_shift.0, pos.1 + best_shift.1);
+                        }
                     }
                 }
             }
