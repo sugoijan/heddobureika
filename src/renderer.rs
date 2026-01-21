@@ -1,4 +1,4 @@
-use crate::core::{GridChoice, Piece, PiecePaths, CORNER_RADIUS_RATIO};
+use crate::core::{GridChoice, Piece, PiecePaths, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM};
 use bytemuck::{Pod, Zeroable};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -45,6 +45,18 @@ pub(crate) struct Instance {
     pub(crate) _pad: f32,
     pub(crate) piece_origin: [f32; 2],
     pub(crate) mask_origin: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InstanceBatch {
+    pub(crate) start: u32,
+    pub(crate) count: u32,
+    pub(crate) draw_outline: bool,
+}
+
+pub(crate) struct InstanceSet {
+    pub(crate) instances: Vec<Instance>,
+    pub(crate) batches: Vec<InstanceBatch>,
 }
 
 impl Instance {
@@ -139,7 +151,8 @@ struct Globals {
     mask_pad: [f32; 2],
     render_mode: f32,
     output_gamma: f32,
-    _pad: [f32; 2],
+    emboss_strength: f32,
+    emboss_rim: f32,
 }
 
 #[repr(C, align(16))]
@@ -334,11 +347,11 @@ pub(crate) struct MaskAtlasData {
 }
 
 pub(crate) struct WgpuRenderer {
-    canvas: HtmlCanvasElement,
+    _canvas: HtmlCanvasElement,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    _config: wgpu::SurfaceConfiguration,
     pipeline_outline: wgpu::RenderPipeline,
     pipeline_fill: wgpu::RenderPipeline,
     frame_pipeline: wgpu::RenderPipeline,
@@ -347,11 +360,11 @@ pub(crate) struct WgpuRenderer {
     globals_buffer_outline: wgpu::Buffer,
     globals_buffer_fill: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
-    frame_globals_buffer: wgpu::Buffer,
+    _frame_globals_buffer: wgpu::Buffer,
     frame_bg_bind_group: wgpu::BindGroup,
-    frame_bg_globals_buffer: wgpu::Buffer,
+    _frame_bg_globals_buffer: wgpu::Buffer,
     frame_stroke_bind_group: wgpu::BindGroup,
-    frame_stroke_globals_buffer: wgpu::Buffer,
+    _frame_stroke_globals_buffer: wgpu::Buffer,
     globals: Globals,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -359,6 +372,8 @@ pub(crate) struct WgpuRenderer {
     frame_instance_buffer: wgpu::Buffer,
     index_count: u32,
     instance_count: u32,
+    instance_capacity: u32,
+    instance_batches: Vec<InstanceBatch>,
     frame_instance_count: u32,
     frame_bg_instance_buffer: wgpu::Buffer,
     frame_bg_instance_count: u32,
@@ -371,7 +386,7 @@ impl WgpuRenderer {
     pub(crate) async fn new(
         canvas: HtmlCanvasElement,
         image: HtmlImageElement,
-        pieces: Vec<Piece>,
+        _pieces: Vec<Piece>,
         _paths: Vec<PiecePaths>,
         _grid: GridChoice,
         piece_width: f32,
@@ -494,7 +509,8 @@ impl WgpuRenderer {
             mask_pad: [mask_pad, mask_pad],
             render_mode: 0.0,
             output_gamma,
-            _pad: [0.0; 2],
+            emboss_strength: 0.0,
+            emboss_rim: EMBOSS_RIM,
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals-buffer-fill"),
@@ -789,26 +805,16 @@ impl WgpuRenderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let mut instances = Vec::with_capacity(pieces.len());
-        for (index, piece) in pieces.iter().enumerate() {
-            let piece_x = piece.col as f32 * piece_width;
-            let piece_y = piece.row as f32 * piece_height;
-            let mask_origin = mask_atlas
-                .origins
-                .get(index)
-                .copied()
-                .unwrap_or([0.0, 0.0]);
-            instances.push(Instance {
-                pos: [piece_x, piece_y],
-                size: [piece_width, piece_height],
-                rotation: 0.0,
-                flip: 0.0,
-                hover: 0.0,
-                _pad: 0.0,
-                piece_origin: [piece_x, piece_y],
-                mask_origin,
-            });
-        }
+        let instances = vec![Instance {
+            pos: [0.0, 0.0],
+            size: [0.0, 0.0],
+            rotation: 0.0,
+            flip: 0.0,
+            hover: 0.0,
+            _pad: 0.0,
+            piece_origin: [0.0, 0.0],
+            mask_origin: [0.0, 0.0],
+        }];
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("piece-instance-buffer"),
             contents: bytemuck::cast_slice(&instances),
@@ -896,12 +902,12 @@ impl WgpuRenderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let mut renderer = Self {
-            canvas,
+        let renderer = Self {
+            _canvas: canvas,
             surface,
             device,
             queue,
-            config,
+            _config: config,
             pipeline_outline,
             pipeline_fill,
             frame_pipeline,
@@ -910,18 +916,20 @@ impl WgpuRenderer {
             globals_buffer_outline,
             globals_buffer_fill,
             frame_bind_group,
-            frame_globals_buffer,
+            _frame_globals_buffer: frame_globals_buffer,
             frame_bg_bind_group,
-            frame_bg_globals_buffer,
+            _frame_bg_globals_buffer: frame_bg_globals_buffer,
             frame_stroke_bind_group,
-            frame_stroke_globals_buffer,
+            _frame_stroke_globals_buffer: frame_stroke_globals_buffer,
             globals,
             vertex_buffer,
             index_buffer,
             instance_buffer,
             frame_instance_buffer,
             index_count: QUAD_INDICES.len() as u32,
-            instance_count: instances.len() as u32,
+            instance_count: 0,
+            instance_capacity: instances.len() as u32,
+            instance_batches: Vec::new(),
             frame_instance_count: frame_instances.len() as u32,
             frame_bg_instance_buffer,
             frame_bg_instance_count: frame_bg_instances.len() as u32,
@@ -929,7 +937,6 @@ impl WgpuRenderer {
             frame_stroke_instance_count: frame_stroke_instances.len() as u32,
             frame_clear_color,
         };
-        renderer.render();
         Ok(renderer)
     }
 
@@ -999,7 +1006,7 @@ impl WgpuRenderer {
         );
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("piece-outline-pass"),
+                label: Some("piece-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -1014,49 +1021,56 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            render_pass.set_pipeline(&self.pipeline_outline);
-            render_pass.set_bind_group(0, &self.bind_group_outline, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass
                 .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.index_count, 0, 0..self.instance_count);
-        }
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("piece-fill-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            render_pass.set_pipeline(&self.pipeline_fill);
-            render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.index_count, 0, 0..self.instance_count);
+            let stride = std::mem::size_of::<Instance>() as wgpu::BufferAddress;
+            for batch in &self.instance_batches {
+                if batch.count == 0 {
+                    continue;
+                }
+                let start = batch.start as wgpu::BufferAddress * stride;
+                let end = (batch.start + batch.count) as wgpu::BufferAddress * stride;
+                let slice = self.instance_buffer.slice(start..end);
+                if batch.draw_outline {
+                    render_pass.set_pipeline(&self.pipeline_outline);
+                    render_pass.set_bind_group(0, &self.bind_group_outline, &[]);
+                    render_pass.set_vertex_buffer(1, slice.clone());
+                    render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+                }
+                render_pass.set_pipeline(&self.pipeline_fill);
+                render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
+                render_pass.set_vertex_buffer(1, slice);
+                render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
 
-    pub(crate) fn update_instances(&mut self, instances: &[Instance]) {
-        self.instance_count = instances.len() as u32;
-        self.queue
-            .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+    pub(crate) fn update_instances(&mut self, set: InstanceSet) {
+        let needed = set.instances.len() as u32;
+        self.instance_count = needed;
+        if needed > self.instance_capacity {
+            self.instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("piece-instance-buffer"),
+                contents: bytemuck::cast_slice(&set.instances),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+            self.instance_capacity = needed;
+        } else {
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&set.instances),
+            );
+        }
+        self.instance_batches = set.batches;
+    }
+
+    pub(crate) fn set_emboss_enabled(&mut self, enabled: bool) {
+        self.globals.emboss_strength = if enabled { EMBOSS_OPACITY } else { 0.0 };
     }
 }
 
@@ -1108,7 +1122,7 @@ pub(crate) fn build_mask_atlas(
         .get_context("2d")?
         .ok_or_else(|| wasm_bindgen::JsValue::from_str("no 2d context"))?
         .dyn_into::<CanvasRenderingContext2d>()?;
-    ctx.set_fill_style(&wasm_bindgen::JsValue::from_str("black"));
+    ctx.set_fill_style_str("black");
     ctx.fill_rect(0.0, 0.0, atlas_width as f64, atlas_height as f64);
 
     let mut origins = vec![[0.0, 0.0]; pieces.len()];
@@ -1123,7 +1137,7 @@ pub(crate) fn build_mask_atlas(
         let offset_y = atlas_y as f64 + pad as f64;
         ctx.save();
         ctx.translate(offset_x, offset_y)?;
-        ctx.set_fill_style(&wasm_bindgen::JsValue::from_str("white"));
+        ctx.set_fill_style_str("white");
         ctx.fill_with_path_2d(&path2d);
         ctx.restore();
         origins[index] = [atlas_x as f32 + pad, atlas_y as f32 + pad];

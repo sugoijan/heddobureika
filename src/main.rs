@@ -8,16 +8,19 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Element, Event, HtmlCanvasElement, HtmlImageElement, HtmlInputElement, HtmlSelectElement,
-    InputEvent, KeyboardEvent, Touch, TouchEvent,
+    CanvasRenderingContext2d, Element, Event, HtmlCanvasElement, HtmlImageElement, HtmlInputElement,
+    HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent,
 };
 use yew::prelude::*;
 
 mod core;
 use crate::core::*;
 mod renderer;
-use crate::renderer::{build_mask_atlas, Instance, MaskAtlasData, WgpuRenderer};
+use crate::renderer::{
+    build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, WgpuRenderer,
+};
 
+const MAX_IMAGE_DIMENSION: u32 = 1024;
 const IMAGE_SRC: &str = "puzzles/zoe-potter.jpg";
 
 #[derive(Default)]
@@ -26,6 +29,14 @@ struct DragHandlers {
     on_release: Option<Rc<dyn Fn(&MouseEvent)>>,
     on_touch_move: Option<Rc<dyn Fn(&TouchEvent)>>,
     on_touch_release: Option<Rc<dyn Fn(&TouchEvent)>>,
+}
+
+#[derive(Clone, PartialEq)]
+struct HoverDeps {
+    hovered_id: Option<usize>,
+    active_id: Option<usize>,
+    dragging_members: Vec<usize>,
+    show_debug: bool,
 }
 
 fn load_saved_board() -> Option<SavedBoard> {
@@ -48,6 +59,21 @@ fn save_board_state(state: &SavedBoard) {
         return;
     };
     let _ = storage.set_item(STORAGE_KEY, &raw);
+}
+
+fn now_ms() -> f32 {
+    if let Some(window) = web_sys::window() {
+        if let Ok(perf) = Reflect::get(&window, &"performance".into()) {
+            if let Ok(now_fn) = Reflect::get(&perf, &"now".into()).and_then(|value| value.dyn_into::<Function>()) {
+                if let Ok(value) = now_fn.call0(&perf) {
+                    if let Some(ms) = value.as_f64() {
+                        return ms as f32;
+                    }
+                }
+            }
+        }
+    }
+    (Date::now() % 1_000_000.0) as f32
 }
 
 fn event_to_svg_coords(
@@ -115,6 +141,159 @@ fn touch_event_to_svg_coords(
     let x = view_min_x + (touch.client_x() as f32 - rect_left) * view_width / rect_width;
     let y = view_min_y + (touch.client_y() as f32 - rect_top) * view_height / rect_height;
     Some((x, y))
+}
+
+fn build_wgpu_instances(
+    positions: &[(f32, f32)],
+    rotations: &[f32],
+    flips: &[bool],
+    z_order: &[usize],
+    connections: &[[bool; 4]],
+    hovered_id: Option<usize>,
+    show_debug: bool,
+    cols: usize,
+    rows: usize,
+    piece_width: f32,
+    piece_height: f32,
+    mask_atlas: &MaskAtlasData,
+    highlighted_members: Option<&[usize]>,
+) -> InstanceSet {
+    let total = cols * rows;
+    if total == 0 {
+        return InstanceSet {
+            instances: Vec::new(),
+            batches: Vec::new(),
+        };
+    }
+    let fallback_order = if z_order.len() == total {
+        None
+    } else {
+        Some((0..total).collect::<Vec<_>>())
+    };
+    let order = match fallback_order.as_deref() {
+        Some(slice) => slice,
+        None => z_order,
+    };
+    let mut hovered_mask = vec![false; total];
+    if show_debug {
+        hovered_mask.fill(true);
+    } else if let Some(members) = highlighted_members {
+        for member in members {
+            if *member < hovered_mask.len() {
+                hovered_mask[*member] = true;
+            }
+        }
+    } else if let Some(id) = hovered_id {
+        if id < total && id < connections.len() {
+            for member in collect_group(connections, id, cols, rows) {
+                if member < hovered_mask.len() {
+                    hovered_mask[member] = true;
+                }
+            }
+        }
+    }
+    let mut group_id = vec![usize::MAX; total];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut queue = VecDeque::new();
+    for start in 0..total {
+        if group_id[start] != usize::MAX {
+            continue;
+        }
+        let gid = groups.len();
+        let mut members = Vec::new();
+        group_id[start] = gid;
+        queue.push_back(start);
+        while let Some(id) = queue.pop_front() {
+            members.push(id);
+            for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
+                if connections
+                    .get(id)
+                    .map(|edges| edges[dir])
+                    .unwrap_or(false)
+                {
+                    if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
+                        if group_id[neighbor] == usize::MAX {
+                            group_id[neighbor] = gid;
+                            queue.push_back(neighbor);
+                        }
+                    }
+                }
+            }
+        }
+        groups.push(members);
+    }
+    let mut group_members: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
+    let mut group_order = Vec::new();
+    let mut group_seen = vec![false; groups.len()];
+    for &id in order {
+        let gid = group_id[id];
+        group_members[gid].push(id);
+        if !group_seen[gid] {
+            group_seen[gid] = true;
+            group_order.push(gid);
+        }
+    }
+    let mut group_has_hover = vec![false; groups.len()];
+    for (gid, members) in group_members.iter().enumerate() {
+        if members.iter().any(|id| hovered_mask[*id]) {
+            group_has_hover[gid] = true;
+        }
+    }
+    let mut instances = Vec::with_capacity(order.len());
+    let mut batches: Vec<InstanceBatch> = Vec::new();
+    for gid in group_order {
+        let members = &group_members[gid];
+        if members.is_empty() {
+            continue;
+        }
+        let start = instances.len() as u32;
+        for &id in members {
+            let col = id % cols;
+            let row = id / cols;
+            let base_x = col as f32 * piece_width;
+            let base_y = row as f32 * piece_height;
+            let pos = positions.get(id).copied().unwrap_or((base_x, base_y));
+            let rotation = rotations.get(id).copied().unwrap_or(0.0);
+            let flipped = flips.get(id).copied().unwrap_or(false);
+            let hovered = hovered_mask.get(id).copied().unwrap_or(false);
+            let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
+            instances.push(Instance {
+                pos: [pos.0, pos.1],
+                size: [piece_width, piece_height],
+                rotation,
+                flip: if flipped { 1.0 } else { 0.0 },
+                hover: if show_debug {
+                    2.0
+                } else if hovered {
+                    1.0
+                } else {
+                    0.0
+                },
+                _pad: 0.0,
+                piece_origin: [base_x, base_y],
+                mask_origin,
+            });
+        }
+        let count = (instances.len() as u32) - start;
+        if count == 0 {
+            continue;
+        }
+        let draw_outline = show_debug || group_has_hover[gid];
+        if !show_debug && !draw_outline {
+            if let Some(last) = batches.last_mut() {
+                if !last.draw_outline {
+                    last.count += count;
+                    continue;
+                }
+            }
+        }
+        batches.push(InstanceBatch {
+            start,
+            count,
+            draw_outline,
+        });
+    }
+    InstanceSet { instances, batches }
 }
 
 fn pick_piece_at(
@@ -352,18 +531,18 @@ fn app() -> Html {
     let rotation_enabled_value = *rotation_enabled;
     let animations_enabled = use_state(|| false);
     let animations_enabled_value = *animations_enabled;
-    let emboss_enabled = use_state(|| false);
+    let emboss_enabled = use_state(|| true);
     let emboss_enabled_value = *emboss_enabled;
     let fast_render = use_state(|| true);
     let fast_render_value = *fast_render;
     let fast_filter = use_state(|| true);
     let fast_filter_value = *fast_filter;
-    let wgpu_enabled = use_state(|| false);
+    let wgpu_enabled = use_state(|| true);
     let wgpu_enabled_value = *wgpu_enabled;
     let wgpu_renderer = use_mut_ref(|| None::<WgpuRenderer>);
+    let pending_instances = use_mut_ref(|| None::<InstanceSet>);
     let mask_atlas = use_mut_ref(|| None::<Rc<MaskAtlasData>>);
-    let wgpu_revision = use_state(|| 0u32);
-    let wgpu_revision_value = *wgpu_revision;
+    let mask_atlas_revision = use_state(|| 0u32);
     let hovered_id = use_state(|| None::<usize>);
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
@@ -388,6 +567,19 @@ fn app() -> Html {
     let dragging_members_value = (*dragging_members).clone();
     let animating_members_value = (*animating_members).clone();
     let hovered_id_value = *hovered_id;
+    let board_ready_value = image_size_value.is_some()
+        && positions.len() == total
+        && rotations.len() == total
+        && flips.len() == total
+        && connections.len() == total
+        && z_order.len() == total;
+    let hover_deps = HoverDeps {
+        hovered_id: hovered_id_value,
+        active_id: active_id_value,
+        dragging_members: dragging_members_value.clone(),
+        show_debug: show_debug_value,
+    };
+    let mask_atlas_revision_value = *mask_atlas_revision;
     let preview_revealed_value = *preview_revealed;
     let status_label = if solved_value { "Solved" } else { "In progress" };
     let status_class = if solved_value {
@@ -822,12 +1014,23 @@ fn app() -> Html {
         let canvas_ref = canvas_ref.clone();
         let image_element = image_element.clone();
         let wgpu_renderer = wgpu_renderer.clone();
+        let pending_instances = pending_instances.clone();
         let mask_atlas = mask_atlas.clone();
-        let wgpu_revision = wgpu_revision.clone();
+        let mask_atlas_revision = mask_atlas_revision.clone();
         let hovered_id = hovered_id.clone();
+        let positions = positions.clone();
+        let rotations = rotations.clone();
+        let flips = flips.clone();
+        let z_order = z_order.clone();
+        let connections = connections.clone();
+        let dragging_members = dragging_members.clone();
+        let active_id = active_id.clone();
+        let show_debug = show_debug.clone();
+        let emboss_enabled = emboss_enabled.clone();
         use_effect_with(
             (
                 wgpu_enabled_value,
+                board_ready_value,
                 image_size_value,
                 grid,
                 settings_value.clone(),
@@ -838,6 +1041,7 @@ fn app() -> Html {
             ),
             move |(
                 wgpu_enabled_value,
+                board_ready_value,
                 image_size_value,
                 grid,
                 settings_value,
@@ -850,7 +1054,7 @@ fn app() -> Html {
                 if *wgpu_enabled_value {
                     hovered_id.set(None);
                 }
-                let build_inputs = if *wgpu_enabled_value {
+                let build_inputs = if *wgpu_enabled_value && *board_ready_value {
                     if let (Some((width, height)), Some(image), Some(canvas)) = (
                         *image_size_value,
                         (*image_element).clone(),
@@ -863,6 +1067,7 @@ fn app() -> Html {
                 } else {
                     wgpu_renderer.borrow_mut().take();
                     mask_atlas.borrow_mut().take();
+                    pending_instances.borrow_mut().take();
                     None
                 };
 
@@ -930,6 +1135,8 @@ fn app() -> Html {
                         }
                     };
                     *mask_atlas.borrow_mut() = Some(mask_atlas_data.clone());
+                    mask_atlas_revision
+                        .set(mask_atlas_revision.wrapping_add(1));
                     wgpu_renderer.borrow_mut().take();
                     let prefers_dark = prefers_dark_mode();
                     let is_dark_theme = match theme_mode_value {
@@ -937,7 +1144,9 @@ fn app() -> Html {
                         ThemeMode::Light => false,
                         ThemeMode::System => prefers_dark,
                     };
+                    let emboss_enabled_now = *emboss_enabled;
                     spawn_local(async move {
+                        let mask_atlas_for_instances = mask_atlas_data.clone();
                         match WgpuRenderer::new(
                             canvas,
                             image,
@@ -956,9 +1165,56 @@ fn app() -> Html {
                         )
                         .await
                         {
-                            Ok(renderer) => {
+                            Ok(mut renderer) => {
+                                renderer.set_emboss_enabled(emboss_enabled_now);
+                                let total = (grid.cols as usize) * (grid.rows as usize);
+                                if let Some(instances) = pending_instances.borrow_mut().take() {
+                                    if instances.instances.len() == total {
+                                        renderer.update_instances(instances);
+                                    }
+                                    renderer.render();
+                                } else {
+                                    let positions_snapshot = (*positions).clone();
+                                    let rotations_snapshot = (*rotations).clone();
+                                    let flips_snapshot = (*flips).clone();
+                                    let z_order_snapshot = (*z_order).clone();
+                                    let connections_snapshot = (*connections).clone();
+                                    let hovered_snapshot = *hovered_id;
+                                    let dragging_snapshot = (*dragging_members).clone();
+                                    let highlight_members = if (*active_id).is_some()
+                                        && !dragging_snapshot.is_empty()
+                                    {
+                                        Some(dragging_snapshot.as_slice())
+                                    } else {
+                                        None
+                                    };
+                                    let show_debug_snapshot = *show_debug;
+                                    let has_state = positions_snapshot.len() == total
+                                        && rotations_snapshot.len() == total
+                                        && flips_snapshot.len() == total
+                                        && z_order_snapshot.len() == total
+                                        && connections_snapshot.len() == total;
+                                    if has_state {
+                                        let instances = build_wgpu_instances(
+                                            &positions_snapshot,
+                                            &rotations_snapshot,
+                                            &flips_snapshot,
+                                            &z_order_snapshot,
+                                            &connections_snapshot,
+                                            hovered_snapshot,
+                                            show_debug_snapshot,
+                                            grid.cols as usize,
+                                            grid.rows as usize,
+                                            piece_width,
+                                            piece_height,
+                                            &mask_atlas_for_instances,
+                                            highlight_members,
+                                        );
+                                        renderer.update_instances(instances);
+                                    }
+                                    renderer.render();
+                                }
                                 *wgpu_renderer.borrow_mut() = Some(renderer);
-                                wgpu_revision.set(wgpu_revision.wrapping_add(1));
                             }
                             Err(err) => {
                                 web_sys::console::error_1(&err);
@@ -973,11 +1229,11 @@ fn app() -> Html {
 
     {
         let wgpu_renderer = wgpu_renderer.clone();
+        let pending_instances = pending_instances.clone();
         let mask_atlas = mask_atlas.clone();
         use_effect_with(
             (
                 wgpu_enabled_value,
-                wgpu_revision_value,
                 image_size_value,
                 grid,
                 (*positions).clone(),
@@ -985,12 +1241,12 @@ fn app() -> Html {
                 (*flips).clone(),
                 (*z_order).clone(),
                 (*connections).clone(),
-                hovered_id_value,
-                show_debug_value,
+                hover_deps.clone(),
+                emboss_enabled_value,
+                mask_atlas_revision_value,
             ),
             move |(
                 wgpu_enabled_value,
-                _wgpu_revision_value,
                 image_size_value,
                 grid,
                 positions_value,
@@ -998,8 +1254,9 @@ fn app() -> Html {
                 flips_value,
                 z_order_value,
                 connections_value,
-                hovered_id_value,
-                show_debug_value,
+                hover_deps,
+                emboss_enabled_value,
+                _mask_atlas_revision_value,
             )| {
                 let cleanup: fn() = || ();
                 if !*wgpu_enabled_value {
@@ -1008,69 +1265,60 @@ fn app() -> Html {
                 let Some((width, height)) = *image_size_value else {
                     return cleanup;
                 };
-                let Some(mask_atlas) = mask_atlas.borrow().as_ref().cloned() else {
-                    return cleanup;
-                };
-                let mut renderer_ref = wgpu_renderer.borrow_mut();
-                let Some(renderer) = renderer_ref.as_mut() else {
-                    return cleanup;
-                };
 
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
-                let total = cols * rows;
-                if total == 0 {
-                    return cleanup;
-                }
                 let piece_width = width as f32 / grid.cols as f32;
                 let piece_height = height as f32 / grid.rows as f32;
-                let order: Vec<usize> = if z_order_value.len() == total {
-                    z_order_value.to_vec()
-                } else {
-                    (0..total).collect()
+                let total = cols * rows;
+                let HoverDeps {
+                    hovered_id,
+                    active_id,
+                    dragging_members,
+                    show_debug,
+                } = hover_deps.clone();
+                let has_state = positions_value.len() == total
+                    && rotations_value.len() == total
+                    && flips_value.len() == total
+                    && z_order_value.len() == total
+                    && connections_value.len() == total;
+                if !has_state {
+                    pending_instances.borrow_mut().take();
+                    return cleanup;
+                }
+                let Some(mask_atlas) = mask_atlas.borrow().as_ref().cloned() else {
+                    pending_instances.borrow_mut().take();
+                    return cleanup;
                 };
-                let mut hovered_mask = vec![false; total];
-                if *show_debug_value {
-                    hovered_mask.fill(true);
-                } else if let Some(id) = *hovered_id_value {
-                    if id < total && id < connections_value.len() {
-                        for member in collect_group(&connections_value, id, cols, rows) {
-                            if member < hovered_mask.len() {
-                                hovered_mask[member] = true;
-                            }
-                        }
-                    }
+                let highlight_members = if active_id.is_some() && !dragging_members.is_empty() {
+                    Some(dragging_members.as_slice())
+                } else {
+                    None
+                };
+                let instances = build_wgpu_instances(
+                    &positions_value,
+                    &rotations_value,
+                    &flips_value,
+                    &z_order_value,
+                    &connections_value,
+                    hovered_id,
+                    show_debug,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    &mask_atlas,
+                    highlight_members,
+                );
+                let mut renderer_ref = wgpu_renderer.borrow_mut();
+                if let Some(renderer) = renderer_ref.as_mut() {
+                    renderer.set_emboss_enabled(*emboss_enabled_value);
+                    renderer.update_instances(instances);
+                    renderer.render();
+                    pending_instances.borrow_mut().take();
+                } else {
+                    *pending_instances.borrow_mut() = Some(instances);
                 }
-                let mut instances = Vec::with_capacity(order.len());
-                for id in order {
-                    let col = id % cols;
-                    let row = id / cols;
-                    let base_x = col as f32 * piece_width;
-                    let base_y = row as f32 * piece_height;
-                    let pos = positions_value.get(id).copied().unwrap_or((base_x, base_y));
-                    let rotation = rotations_value.get(id).copied().unwrap_or(0.0);
-                    let flipped = flips_value.get(id).copied().unwrap_or(false);
-                    let hovered = hovered_mask.get(id).copied().unwrap_or(false);
-                    let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
-                    instances.push(Instance {
-                        pos: [pos.0, pos.1],
-                        size: [piece_width, piece_height],
-                        rotation,
-                        flip: if flipped { 1.0 } else { 0.0 },
-                        hover: if *show_debug_value {
-                            2.0
-                        } else if hovered {
-                            1.0
-                        } else {
-                            0.0
-                        },
-                        _pad: 0.0,
-                        piece_origin: [base_x, base_y],
-                        mask_origin,
-                    });
-                }
-                renderer.update_instances(&instances);
-                renderer.render();
                 cleanup
             },
         );
@@ -1287,8 +1535,94 @@ fn app() -> Html {
                 let onload = Closure::<dyn FnMut()>::wrap(Box::new(move || {
                     let width = img_clone.natural_width();
                     let height = img_clone.natural_height();
-                    image_size.set(Some((width, height)));
-                    image_element.set(Some(img_clone.clone()));
+                    let max_dim = MAX_IMAGE_DIMENSION;
+                    let max_axis = width.max(height);
+                    if max_dim == 0 || max_axis <= max_dim {
+                        image_size.set(Some((width, height)));
+                        image_element.set(Some(img_clone.clone()));
+                        return;
+                    }
+                    let scale = (max_dim as f64) / (max_axis as f64);
+                    let target_w = ((width as f64) * scale).round().max(1.0) as u32;
+                    let target_h = ((height as f64) * scale).round().max(1.0) as u32;
+                    let document = match web_sys::window().and_then(|window| window.document()) {
+                        Some(doc) => doc,
+                        None => {
+                            image_size.set(Some((width, height)));
+                            image_element.set(Some(img_clone.clone()));
+                            return;
+                        }
+                    };
+                    let canvas = match document
+                        .create_element("canvas")
+                        .ok()
+                        .and_then(|node| node.dyn_into::<HtmlCanvasElement>().ok())
+                    {
+                        Some(canvas) => canvas,
+                        None => {
+                            image_size.set(Some((width, height)));
+                            image_element.set(Some(img_clone.clone()));
+                            return;
+                        }
+                    };
+                    canvas.set_width(target_w);
+                    canvas.set_height(target_h);
+                    let ctx = match canvas
+                        .get_context("2d")
+                        .ok()
+                        .flatten()
+                        .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok())
+                    {
+                        Some(ctx) => ctx,
+                        None => {
+                            image_size.set(Some((width, height)));
+                            image_element.set(Some(img_clone.clone()));
+                            return;
+                        }
+                    };
+                    ctx.set_image_smoothing_enabled(true);
+                    if ctx
+                        .draw_image_with_html_image_element_and_dw_and_dh(
+                            &img_clone,
+                            0.0,
+                            0.0,
+                            target_w as f64,
+                            target_h as f64,
+                        )
+                        .is_err()
+                    {
+                        image_size.set(Some((width, height)));
+                        image_element.set(Some(img_clone.clone()));
+                        return;
+                    }
+                    let data_url = match canvas.to_data_url() {
+                        Ok(data_url) => data_url,
+                        Err(_) => {
+                            image_size.set(Some((width, height)));
+                            image_element.set(Some(img_clone.clone()));
+                            return;
+                        }
+                    };
+                    let scaled = match HtmlImageElement::new() {
+                        Ok(image) => image,
+                        Err(_) => {
+                            image_size.set(Some((width, height)));
+                            image_element.set(Some(img_clone.clone()));
+                            return;
+                        }
+                    };
+                    let scaled_clone = scaled.clone();
+                    let image_size_scaled = image_size.clone();
+                    let image_element_scaled = image_element.clone();
+                    let onload_scaled = Closure::<dyn FnMut()>::wrap(Box::new(move || {
+                        let width = scaled_clone.natural_width();
+                        let height = scaled_clone.natural_height();
+                        image_size_scaled.set(Some((width, height)));
+                        image_element_scaled.set(Some(scaled_clone.clone()));
+                    }));
+                    scaled.set_onload(Some(onload_scaled.as_ref().unchecked_ref()));
+                    scaled.set_src(&data_url);
+                    onload_scaled.forget();
                 }));
                 img.set_onload(Some(onload.as_ref().unchecked_ref()));
                 img.set_src(IMAGE_SRC);
@@ -1391,7 +1725,9 @@ fn app() -> Html {
         let rotations_value = (*rotations).clone();
         let flips_value = (*flips).clone();
         let connections_value = (*connections).clone();
-        let hovered_group = if let Some(id) = hovered_id_value {
+        let hovered_group = if active_id_value.is_some() && !dragging_members_value.is_empty() {
+            dragging_members_value.clone()
+        } else if let Some(id) = hovered_id_value {
             if id < connections_value.len() {
                 collect_group(&connections_value, id, grid.cols as usize, grid.rows as usize)
             } else {
@@ -1811,7 +2147,7 @@ fn app() -> Html {
                             let rotation_queue = rotation_queue.clone();
                             let connections_override = connections_override.clone();
                             let interval = Interval::new(16, move || {
-                                let now = Date::now() as f32;
+                                let now = now_ms();
                                 let anim = match rotation_anim.borrow().clone() {
                                     Some(value) => value,
                                     None => {
@@ -1946,7 +2282,7 @@ fn app() -> Html {
                                             rotation_snap_tolerance_value,
                                         );
                                         *rotation_anim.borrow_mut() = Some(RotationAnimation {
-                                            start_time: Date::now() as f32,
+                                            start_time: now_ms(),
                                             duration: SNAP_ANIMATION_MS,
                                             members: members.clone(),
                                             start_positions,
@@ -2026,8 +2362,11 @@ fn app() -> Html {
                         let dx = x - drag.start_x;
                         let dy = y - drag.start_y;
                         let dist = (dx * dx + dy * dy).sqrt();
-                        let elapsed = Date::now() as f32 - drag.start_time;
-                        if dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS {
+                        let elapsed = now_ms() - drag.start_time;
+                        let quick_click = elapsed <= CLICK_QUICK_TAP_MS;
+                        if (dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS)
+                            || quick_click
+                        {
                             let click_id = drag.primary_id;
                             let was_flipped = next_flips.get(click_id).copied().unwrap_or(false);
                             if ctrl_flip {
@@ -2170,7 +2509,7 @@ fn app() -> Html {
                                 rotation_queue.borrow_mut().clear();
                                 start_group_animation(
                                     RotationAnimation {
-                                        start_time: Date::now() as f32,
+                                        start_time: now_ms(),
                                         duration: SNAP_ANIMATION_MS,
                                         members: members.clone(),
                                         start_positions,
@@ -2261,7 +2600,7 @@ fn app() -> Html {
                                     member_rotations.push(rot);
                                 }
                                 pending_animation = Some(RotationAnimation {
-                                    start_time: Date::now() as f32,
+                                    start_time: now_ms(),
                                     duration: SNAP_ANIMATION_MS,
                                     members: group_after.clone(),
                                     start_positions: member_positions,
@@ -2766,7 +3105,7 @@ fn app() -> Html {
                 *drag_state.borrow_mut() = Some(DragState {
                     start_x: x,
                     start_y: y,
-                    start_time: Date::now() as f32,
+                    start_time: now_ms(),
                     primary_id: piece_id,
                     touch_id,
                     rotate_mode,
@@ -3173,12 +3512,14 @@ fn app() -> Html {
                 let flips_snapshot = &*flips;
                 let order_snapshot = &*z_order;
                 let total = cols * rows;
-                let mut fallback_order = Vec::new();
-                let order = if order_snapshot.len() == total {
-                    order_snapshot.as_slice()
+                let fallback_order = if order_snapshot.len() == total {
+                    None
                 } else {
-                    fallback_order = (0..total).collect();
-                    fallback_order.as_slice()
+                    Some((0..total).collect::<Vec<_>>())
+                };
+                let order = match fallback_order.as_deref() {
+                    Some(slice) => slice,
+                    None => order_snapshot.as_slice(),
                 };
                 let hit = pick_piece_at(
                     x,
@@ -3244,7 +3585,7 @@ fn app() -> Html {
         } else if hovered_id_value.is_some() {
             canvas_class.push_str(" hover");
         }
-        let canvas_node = if wgpu_enabled_value {
+        let canvas_node = if wgpu_enabled_value && board_ready_value {
             html! {
                 <canvas
                     class={canvas_class}

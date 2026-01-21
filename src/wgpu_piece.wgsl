@@ -7,7 +7,8 @@ struct Globals {
     mask_pad: vec2<f32>,
     render_mode: f32,
     output_gamma: f32,
-    _pad: vec2<f32>,
+    emboss_strength: f32,
+    emboss_rim: f32,
 };
 
 @group(0) @binding(0)
@@ -40,6 +41,7 @@ struct VertexOut {
     @location(2) local_pos: vec2<f32>,
     @location(3) flip: f32,
     @location(4) hover: f32,
+    @location(5) rot: f32,
 };
 
 fn rotate_point(p: vec2<f32>, angle: f32) -> vec2<f32> {
@@ -71,6 +73,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.local_pos = piece_local;
     out.flip = input.inst_flip;
     out.hover = input.inst_hover;
+    out.rot = angle;
     return out;
 }
 
@@ -143,6 +146,37 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let dot = select(0.0, 1.0, distance(input.local_pos, center) < 4.0);
         let dot_color = srgb_to_linear(vec3<f32>(0.0, 1.0, 0.0));
         rgb = rgb * (1.0 - dot) + dot_color * dot;
+    }
+    if (globals.emboss_strength > 0.0) {
+        let texel = vec2<f32>(1.0, 1.0) / globals.atlas_size;
+        let left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, 0.0)).r;
+        let right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, 0.0)).r;
+        let up = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, -texel.y)).r;
+        let down = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, texel.y)).r;
+        let grad_local = vec2<f32>(right - left, down - up);
+        let grad_len = length(grad_local);
+        if (grad_len > 1e-4) {
+            let grad_dir = grad_local / grad_len;
+            let outer_mask = textureSample(
+                mask_tex,
+                tex_sampler,
+                input.mask_uv - grad_dir * texel * globals.emboss_rim,
+            ).r;
+            let rim = clamp(mask - outer_mask, 0.0, 1.0);
+            var normal = -grad_dir;
+            if (input.flip > 0.5) {
+                normal.x = -normal.x;
+            }
+            normal = rotate_point(normal, input.rot);
+            let light_dir = normalize(vec2<f32>(-1.0, -1.0));
+            let light = dot(normalize(normal), light_dir);
+            let highlight = max(light, 0.0);
+            let shadow = max(-light, 0.0);
+            let emboss = rim * globals.emboss_strength;
+	    // XXX: add a little bit of bias to both to be closer the SVG filter look
+            rgb = mix(rgb, vec3<f32>(1.0), emboss * highlight * 1.1);
+            rgb = mix(rgb, vec3<f32>(0.0), emboss * shadow * 1.5);
+        }
     }
     return vec4<f32>(apply_output_gamma(rgb), alpha);
 }
