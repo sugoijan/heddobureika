@@ -20,7 +20,6 @@ use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, WgpuRenderer,
 };
 
-const MAX_IMAGE_DIMENSION: u32 = 1024;
 const IMAGE_SRC: &str = "puzzles/zoe-samurai.jpg";
 const FPS_FONT_BYTES: &[u8] = include_bytes!("../fonts/kaorigel.ttf");
 
@@ -164,6 +163,33 @@ fn derive_piece_state(
         rotations[id] = rot;
     }
     (positions, rotations)
+}
+
+fn update_group_members_state(
+    members: &[usize],
+    anchor_id: usize,
+    group_pos: &[(f32, f32)],
+    group_rot: &[f32],
+    cols: usize,
+    piece_width: f32,
+    piece_height: f32,
+    positions: &mut [(f32, f32)],
+    rotations: &mut [f32],
+) {
+    if anchor_id >= group_pos.len() || anchor_id >= group_rot.len() {
+        return;
+    }
+    let base = group_pos[anchor_id];
+    let rot = group_rot[anchor_id];
+    for &id in members {
+        if id >= positions.len() || id >= rotations.len() {
+            continue;
+        }
+        let (dx, dy) = piece_local_offset(id, anchor_id, cols, piece_width, piece_height);
+        let (rx, ry) = rotate_vec(dx, dy, rot);
+        positions[id] = (base.0 + rx, base.1 + ry);
+        rotations[id] = rot;
+    }
 }
 
 fn build_group_order_from_piece_order(piece_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
@@ -652,7 +678,9 @@ fn prefers_dark_mode() -> bool {
 #[function_component(App)]
 fn app() -> Html {
     let image_size = use_state(|| None::<(u32, u32)>);
+    let image_revision = use_state(|| 0u32);
     let image_size_value = *image_size;
+    let image_revision_value = *image_revision;
     let image_element = use_state(|| None::<HtmlImageElement>);
     let settings = use_state(ShapeSettings::default);
     let settings_value = (*settings).clone();
@@ -753,6 +781,10 @@ fn app() -> Html {
     let group_pos = use_state(Vec::<(f32, f32)>::new);
     let group_rot = use_state(Vec::<f32>::new);
     let group_order = use_state(Vec::<usize>::new);
+    let positions_live = use_mut_ref(Vec::<(f32, f32)>::new);
+    let rotations_live = use_mut_ref(Vec::<f32>::new);
+    let group_pos_live = use_mut_ref(Vec::<(f32, f32)>::new);
+    let group_rot_live = use_mut_ref(Vec::<f32>::new);
     let active_id = use_state(|| None::<usize>);
     let active_id_value = *active_id;
     let dragging_members = use_state(Vec::<usize>::new);
@@ -784,6 +816,9 @@ fn app() -> Html {
     let rotation_enabled_value = *rotation_enabled;
     let render_settings = use_state(|| load_render_settings().unwrap_or_default());
     let render_settings_value = (*render_settings).clone();
+    let image_max_dim = render_settings_value
+        .image_max_dim
+        .clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
     let renderer_kind = render_settings_value.renderer;
     let svg_settings_value = render_settings_value.svg.clone();
     let wgpu_settings_value = render_settings_value.wgpu.clone();
@@ -793,6 +828,9 @@ fn app() -> Html {
     let svg_fast_render = svg_settings_value.fast_render;
     let svg_fast_filter = svg_settings_value.fast_filter;
     let wgpu_show_fps = wgpu_settings_value.show_fps;
+    let wgpu_edge_aa = wgpu_settings_value.edge_aa;
+    let wgpu_render_scale = wgpu_settings_value.render_scale;
+    let image_render_scale = wgpu_render_scale;
     let animations_enabled_value = !using_wgpu && svg_animations_enabled;
     let emboss_enabled_value = svg_emboss_enabled;
     let fast_render_value = svg_fast_render;
@@ -1316,6 +1354,41 @@ fn app() -> Html {
             render_settings.set(next);
         })
     };
+    let on_wgpu_edge_aa = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let mut next = (*render_settings).clone();
+                next.wgpu.edge_aa = value.clamp(WGPU_EDGE_AA_MIN, WGPU_EDGE_AA_MAX);
+                render_settings.set(next);
+            }
+        })
+    };
+    let on_image_max_dim = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<u32>() {
+                let mut next = (*render_settings).clone();
+                next.image_max_dim = value
+                    .clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
+                render_settings.set(next);
+            }
+        })
+    };
+    let on_wgpu_render_scale = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let mut next = (*render_settings).clone();
+                next.wgpu.render_scale =
+                    value.clamp(WGPU_RENDER_SCALE_MIN, WGPU_RENDER_SCALE_MAX);
+                render_settings.set(next);
+            }
+        })
+    };
     let on_theme_toggle = {
         let theme_mode = theme_mode.clone();
         let theme_toggle_ref = theme_toggle_ref.clone();
@@ -1405,28 +1478,34 @@ fn app() -> Html {
         let active_id = active_id.clone();
         let show_debug = show_debug.clone();
         let wgpu_show_fps = wgpu_show_fps;
+        let wgpu_edge_aa = wgpu_edge_aa;
+        let wgpu_render_scale = wgpu_render_scale;
         use_effect_with(
             (
                 using_wgpu,
                 board_ready_value,
                 image_size_value,
+                image_revision_value,
                 grid,
                 settings_value.clone(),
                 workspace_scale_value,
                 depth_cap,
                 curve_detail,
                 theme_mode_value,
+                wgpu_render_scale,
             ),
             move |(
                 using_wgpu,
                 board_ready_value,
                 image_size_value,
+                _image_revision_value,
                 grid,
                 settings_value,
                 workspace_scale_value,
                 depth_cap,
                 curve_detail,
                 theme_mode_value,
+                wgpu_render_scale,
             )| {
                 let cleanup: fn() = || ();
                 if *using_wgpu {
@@ -1522,6 +1601,7 @@ fn app() -> Html {
                         ThemeMode::Light => false,
                         ThemeMode::System => prefers_dark,
                     };
+                    let render_scale_value = *wgpu_render_scale;
                     spawn_local(async move {
                         let mask_atlas_for_instances = mask_atlas_data.clone();
                         match WgpuRenderer::new(
@@ -1538,6 +1618,7 @@ fn app() -> Html {
                             view_height,
                             mask_atlas_data,
                             mask_pad,
+                            render_scale_value,
                             is_dark_theme,
                         )
                         .await
@@ -1545,6 +1626,7 @@ fn app() -> Html {
                             Ok(mut renderer) => {
                                 renderer.set_emboss_enabled(true);
                                 renderer.set_font_bytes(FPS_FONT_BYTES.to_vec());
+                                renderer.set_edge_aa(wgpu_edge_aa);
                                 let total = (grid.cols as usize) * (grid.rows as usize);
                                 if let Some(instances) = pending_instances.borrow_mut().take() {
                                     if instances.instances.len() == total {
@@ -1611,7 +1693,7 @@ fn app() -> Html {
         let wgpu_renderer = wgpu_renderer.clone();
         let pending_instances = pending_instances.clone();
         let mask_atlas = mask_atlas.clone();
-        let wgpu_show_fps = wgpu_show_fps;
+        let wgpu_settings_value = wgpu_settings_value.clone();
         use_effect_with(
             (
                 using_wgpu,
@@ -1624,7 +1706,7 @@ fn app() -> Html {
                 (*connections).clone(),
                 hover_deps.clone(),
                 mask_atlas_revision_value,
-                wgpu_show_fps,
+                wgpu_settings_value,
             ),
             move |(
                 using_wgpu,
@@ -1637,7 +1719,7 @@ fn app() -> Html {
                 connections_value,
                 hover_deps,
                 _mask_atlas_revision_value,
-                wgpu_show_fps,
+                wgpu_settings_value,
             )| {
                 let cleanup: fn() = || ();
                 if !*using_wgpu {
@@ -1694,7 +1776,8 @@ fn app() -> Html {
                 let mut renderer_ref = wgpu_renderer.borrow_mut();
                 if let Some(renderer) = renderer_ref.as_mut() {
                     renderer.set_emboss_enabled(true);
-                    renderer.set_show_fps(*wgpu_show_fps);
+                    renderer.set_edge_aa(wgpu_settings_value.edge_aa);
+                    renderer.set_show_fps(wgpu_settings_value.show_fps);
                     renderer.update_instances(instances);
                     renderer.render();
                     pending_instances.borrow_mut().take();
@@ -1909,29 +1992,55 @@ fn app() -> Html {
     {
         let image_size = image_size.clone();
         let image_element = image_element.clone();
+        let image_revision = image_revision.clone();
         use_effect_with(
-            (),
-            move |_| {
+            (image_max_dim, image_render_scale),
+            move |(image_max_dim, image_render_scale)| {
                 let img = HtmlImageElement::new().expect("create image element");
                 let img_clone = img.clone();
+                let logical_max_dim = *image_max_dim;
+                let render_scale = image_render_scale
+                    .clamp(WGPU_RENDER_SCALE_MIN, WGPU_RENDER_SCALE_MAX);
+                let source_cap = (IMAGE_MAX_DIMENSION_MAX as f32 * WGPU_RENDER_SCALE_MAX)
+                    .round()
+                    .max(1.0) as u32;
+                let mut source_max_dim =
+                    ((logical_max_dim as f32) * render_scale).round().max(1.0) as u32;
+                if source_max_dim > source_cap {
+                    source_max_dim = source_cap;
+                }
                 let onload = Closure::<dyn FnMut()>::wrap(Box::new(move || {
                     let width = img_clone.natural_width();
                     let height = img_clone.natural_height();
-                    let max_dim = MAX_IMAGE_DIMENSION;
-                    let max_axis = width.max(height);
-                    if max_dim == 0 || max_axis <= max_dim {
-                        image_size.set(Some((width, height)));
+                    let max_axis = width.max(height).max(1);
+                    let logical_scale = if max_axis > logical_max_dim {
+                        (logical_max_dim as f64) / (max_axis as f64)
+                    } else {
+                        1.0
+                    };
+                    let logical_w = ((width as f64) * logical_scale).round().max(1.0) as u32;
+                    let logical_h = ((height as f64) * logical_scale).round().max(1.0) as u32;
+                    let source_scale = if max_axis > source_max_dim {
+                        (source_max_dim as f64) / (max_axis as f64)
+                    } else {
+                        1.0
+                    };
+                    let target_w = ((width as f64) * source_scale).round().max(1.0) as u32;
+                    let target_h = ((height as f64) * source_scale).round().max(1.0) as u32;
+                    if target_w == width && target_h == height {
+                        image_size.set(Some((logical_w, logical_h)));
                         image_element.set(Some(img_clone.clone()));
+                        let next = (*image_revision).wrapping_add(1);
+                        image_revision.set(next);
                         return;
                     }
-                    let scale = (max_dim as f64) / (max_axis as f64);
-                    let target_w = ((width as f64) * scale).round().max(1.0) as u32;
-                    let target_h = ((height as f64) * scale).round().max(1.0) as u32;
                     let document = match web_sys::window().and_then(|window| window.document()) {
                         Some(doc) => doc,
                         None => {
-                            image_size.set(Some((width, height)));
+                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
+                            let next = (*image_revision).wrapping_add(1);
+                            image_revision.set(next);
                             return;
                         }
                     };
@@ -1942,8 +2051,10 @@ fn app() -> Html {
                     {
                         Some(canvas) => canvas,
                         None => {
-                            image_size.set(Some((width, height)));
+                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
+                            let next = (*image_revision).wrapping_add(1);
+                            image_revision.set(next);
                             return;
                         }
                     };
@@ -1957,8 +2068,10 @@ fn app() -> Html {
                     {
                         Some(ctx) => ctx,
                         None => {
-                            image_size.set(Some((width, height)));
+                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
+                            let next = (*image_revision).wrapping_add(1);
+                            image_revision.set(next);
                             return;
                         }
                     };
@@ -1973,34 +2086,42 @@ fn app() -> Html {
                         )
                         .is_err()
                     {
-                        image_size.set(Some((width, height)));
+                        image_size.set(Some((logical_w, logical_h)));
                         image_element.set(Some(img_clone.clone()));
+                        let next = (*image_revision).wrapping_add(1);
+                        image_revision.set(next);
                         return;
                     }
                     let data_url = match canvas.to_data_url() {
                         Ok(data_url) => data_url,
                         Err(_) => {
-                            image_size.set(Some((width, height)));
+                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
+                            let next = (*image_revision).wrapping_add(1);
+                            image_revision.set(next);
                             return;
                         }
                     };
                     let scaled = match HtmlImageElement::new() {
                         Ok(image) => image,
                         Err(_) => {
-                            image_size.set(Some((width, height)));
+                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
+                            let next = (*image_revision).wrapping_add(1);
+                            image_revision.set(next);
                             return;
                         }
                     };
                     let scaled_clone = scaled.clone();
                     let image_size_scaled = image_size.clone();
                     let image_element_scaled = image_element.clone();
+                    let image_revision_scaled = image_revision.clone();
+                    let logical_size = (logical_w, logical_h);
                     let onload_scaled = Closure::<dyn FnMut()>::wrap(Box::new(move || {
-                        let width = scaled_clone.natural_width();
-                        let height = scaled_clone.natural_height();
-                        image_size_scaled.set(Some((width, height)));
+                        image_size_scaled.set(Some(logical_size));
                         image_element_scaled.set(Some(scaled_clone.clone()));
+                        let next = (*image_revision_scaled).wrapping_add(1);
+                        image_revision_scaled.set(next);
                     }));
                     scaled.set_onload(Some(onload_scaled.as_ref().unchecked_ref()));
                     scaled.set_src(&data_url);
@@ -2104,6 +2225,7 @@ fn app() -> Html {
             .collect();
 
         let cols = grid.cols as usize;
+        let rows = grid.rows as usize;
         let positions_value = (*positions).clone();
         let rotations_value = (*rotations).clone();
         let flips_value = (*flips).clone();
@@ -2141,21 +2263,111 @@ fn app() -> Html {
         let drag_move_common: Rc<dyn Fn(f32, f32) -> bool> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
+            let positions_live = positions_live.clone();
+            let rotations_live = rotations_live.clone();
             let flips = flips.clone();
             let group_anchor = group_anchor.clone();
             let group_pos = group_pos.clone();
             let group_rot = group_rot.clone();
+            let group_pos_live = group_pos_live.clone();
+            let group_rot_live = group_rot_live.clone();
             let drag_state = drag_state.clone();
+            let wgpu_renderer = wgpu_renderer.clone();
+            let mask_atlas = mask_atlas.clone();
+            let z_order = z_order.clone();
+            let connections = connections.clone();
+            let show_debug = show_debug.clone();
+            let using_wgpu = using_wgpu;
+            let wgpu_edge_aa = wgpu_edge_aa;
             Rc::new(move |x: f32, y: f32| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
+                    let render_wgpu = |positions_snapshot: &[(f32, f32)],
+                                       rotations_snapshot: &[f32],
+                                       drag: &DragState| {
+                        let mask_atlas_ref = mask_atlas.borrow();
+                        let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
+                            return;
+                        };
+                        let flips_snapshot = &*flips;
+                        let z_order_snapshot = &*z_order;
+                        let connections_snapshot = &*connections;
+                        let instances = build_wgpu_instances(
+                            positions_snapshot,
+                            rotations_snapshot,
+                            flips_snapshot,
+                            z_order_snapshot,
+                            connections_snapshot,
+                            None,
+                            *show_debug,
+                            cols,
+                            rows,
+                            piece_width,
+                            piece_height,
+                            mask_atlas,
+                            Some(drag.members.as_slice()),
+                        );
+                        let mut renderer_ref = wgpu_renderer.borrow_mut();
+                        if let Some(renderer) = renderer_ref.as_mut() {
+                            renderer.set_edge_aa(wgpu_edge_aa);
+                            renderer.update_instances(instances);
+                            renderer.render();
+                        }
+                    };
                     if drag.rotate_mode && rotation_enabled_value {
                         let current_angle = (y - drag.pivot_y).atan2(x - drag.pivot_x);
                         let delta_deg = (current_angle - drag.start_angle).to_degrees();
                         let flips_snapshot = &*flips;
+                        let anchor_id = drag.anchor_id;
+                        if using_wgpu {
+                            {
+                                let mut group_pos_ref = group_pos_live.borrow_mut();
+                                let mut group_rot_ref = group_rot_live.borrow_mut();
+                                if anchor_id < group_pos_ref.len()
+                                    && anchor_id < group_rot_ref.len()
+                                {
+                                    let anchor_center = (
+                                        drag.anchor_pos.0 + piece_width * 0.5,
+                                        drag.anchor_pos.1 + piece_height * 0.5,
+                                    );
+                                    let (rx, ry) = rotate_point(
+                                        anchor_center.0,
+                                        anchor_center.1,
+                                        drag.pivot_x,
+                                        drag.pivot_y,
+                                        delta_deg,
+                                    );
+                                    group_pos_ref[anchor_id] = (
+                                        rx - piece_width * 0.5,
+                                        ry - piece_height * 0.5,
+                                    );
+                                    let flipped =
+                                        flips_snapshot.get(anchor_id).copied().unwrap_or(false);
+                                    let signed_delta = if flipped { -delta_deg } else { delta_deg };
+                                    group_rot_ref[anchor_id] =
+                                        normalize_angle(drag.anchor_rot + signed_delta);
+                                    let mut positions_ref = positions_live.borrow_mut();
+                                    let mut rotations_ref = rotations_live.borrow_mut();
+                                    update_group_members_state(
+                                        &drag.members,
+                                        anchor_id,
+                                        &group_pos_ref,
+                                        &group_rot_ref,
+                                        cols,
+                                        piece_width,
+                                        piece_height,
+                                        &mut positions_ref,
+                                        &mut rotations_ref,
+                                    );
+                                }
+                            }
+                            let positions_snapshot = positions_live.borrow();
+                            let rotations_snapshot = rotations_live.borrow();
+                            render_wgpu(&positions_snapshot, &rotations_snapshot, &drag);
+                            return true;
+                        }
                         let mut next_group_pos = (*group_pos).clone();
                         let mut next_group_rot = (*group_rot).clone();
-                        let anchor_id = drag.anchor_id;
                         if anchor_id < next_group_pos.len() && anchor_id < next_group_rot.len() {
                             let anchor_center = (
                                 drag.anchor_pos.0 + piece_width * 0.5,
@@ -2253,6 +2465,34 @@ fn app() -> Html {
                                 dx = best_dx;
                                 dy = best_dy;
                             }
+                        }
+                        if using_wgpu {
+                            let anchor_id = drag.anchor_id;
+                            {
+                                let mut group_pos_ref = group_pos_live.borrow_mut();
+                                let group_rot_ref = group_rot_live.borrow();
+                                if anchor_id < group_pos_ref.len() {
+                                    group_pos_ref[anchor_id] =
+                                        (drag.anchor_pos.0 + dx, drag.anchor_pos.1 + dy);
+                                    let mut positions_ref = positions_live.borrow_mut();
+                                    let mut rotations_ref = rotations_live.borrow_mut();
+                                    update_group_members_state(
+                                        &drag.members,
+                                        anchor_id,
+                                        &group_pos_ref,
+                                        &group_rot_ref,
+                                        cols,
+                                        piece_width,
+                                        piece_height,
+                                        &mut positions_ref,
+                                        &mut rotations_ref,
+                                    );
+                                }
+                            }
+                            let positions_snapshot = positions_live.borrow();
+                            let rotations_snapshot = rotations_live.borrow();
+                            render_wgpu(&positions_snapshot, &rotations_snapshot, &drag);
+                            return true;
                         }
                         let mut next_group_pos = (*group_pos).clone();
                         let anchor_id = drag.anchor_id;
@@ -2379,6 +2619,8 @@ fn app() -> Html {
         let drag_release_common: Rc<dyn Fn(Option<(f32, f32)>) -> bool> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
+            let positions_live = positions_live.clone();
+            let rotations_live = rotations_live.clone();
             let flips = flips.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
@@ -2397,12 +2639,19 @@ fn app() -> Html {
             let z_order = z_order.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
+            let using_wgpu = using_wgpu;
             Rc::new(move |coords: Option<(f32, f32)>| {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     let ctrl_flip = drag.rotate_mode;
-                    let mut next = (*positions).clone();
-                    let mut next_rotations = (*rotations).clone();
+                    let (mut next, mut next_rotations) = if using_wgpu {
+                        (
+                            positions_live.borrow().clone(),
+                            rotations_live.borrow().clone(),
+                        )
+                    } else {
+                        ((*positions).clone(), (*rotations).clone())
+                    };
                     let mut next_flips = (*flips).clone();
                     let mut next_connections = (*connections).clone();
                     let start_positions_all = next.clone();
@@ -3713,9 +3962,13 @@ fn app() -> Html {
         let begin_drag: Rc<dyn Fn(usize, f32, f32, bool, bool, Option<i32>)> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
+            let positions_live = positions_live.clone();
+            let rotations_live = rotations_live.clone();
             let group_anchor = group_anchor.clone();
             let group_pos = group_pos.clone();
             let group_rot = group_rot.clone();
+            let group_pos_live = group_pos_live.clone();
+            let group_rot_live = group_rot_live.clone();
             let group_order = group_order.clone();
             let drag_state = drag_state.clone();
             let active_id = active_id.clone();
@@ -3728,6 +3981,7 @@ fn app() -> Html {
             let connections = connections.clone();
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
+            let using_wgpu = using_wgpu;
             Rc::new(move |piece_id, x, y, shift_key, rotate_mode, touch_id| {
                 let positions_snapshot = (*positions).clone();
                 let rotations_snapshot = (*rotations).clone();
@@ -3774,6 +4028,12 @@ fn app() -> Html {
                 group_anchor.set(anchor_of.clone());
                 group_pos.set(group_positions.clone());
                 group_rot.set(group_rotations.clone());
+                if using_wgpu {
+                    *positions_live.borrow_mut() = derived_positions.clone();
+                    *rotations_live.borrow_mut() = derived_rotations.clone();
+                    *group_pos_live.borrow_mut() = group_positions.clone();
+                    *group_rot_live.borrow_mut() = group_rotations.clone();
+                }
                 let anchor_id = members.first().copied().unwrap_or(piece_id);
                 group_order_value.retain(|id| *id != anchor_id);
                 group_order_value.push(anchor_id);
@@ -4204,9 +4464,14 @@ fn app() -> Html {
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let hovered_id = hovered_id.clone();
+            let active_id = active_id.clone();
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
+            let using_wgpu = using_wgpu;
             Callback::from(move |event: MouseEvent| {
+                if using_wgpu && active_id.is_some() {
+                    return;
+                }
                 let Some((x, y)) = event_to_svg_coords(
                     &event,
                     &canvas_ref,
@@ -4599,6 +4864,21 @@ fn app() -> Html {
                         </option>
                     </select>
                 </div>
+                <div class="control">
+                    <label for="image-max-dim">
+                        { "Image max dimension" }
+                        <span class="control-value">{ image_max_dim }</span>
+                    </label>
+                    <input
+                        id="image-max-dim"
+                        type="range"
+                        min={IMAGE_MAX_DIMENSION_MIN.to_string()}
+                        max={IMAGE_MAX_DIMENSION_MAX.to_string()}
+                        step="256"
+                        value={image_max_dim.to_string()}
+                        onchange={on_image_max_dim}
+                    />
+                </div>
                 { if renderer_kind == RendererKind::Svg {
                     html! {
                         <>
@@ -4666,6 +4946,36 @@ fn app() -> Html {
                                         onchange={on_wgpu_fps_toggle}
                                     />
                                 </label>
+                            </div>
+                            <div class="control">
+                                <label for="wgpu-edge-aa">
+                                    { "Edge AA" }
+                                    <span class="control-value">{ fmt_f32(wgpu_edge_aa) }</span>
+                                </label>
+                                <input
+                                    id="wgpu-edge-aa"
+                                    type="range"
+                                    min={WGPU_EDGE_AA_MIN.to_string()}
+                                    max={WGPU_EDGE_AA_MAX.to_string()}
+                                    step="0.01"
+                                    value={wgpu_edge_aa.to_string()}
+                                    oninput={on_wgpu_edge_aa}
+                                />
+                            </div>
+                            <div class="control">
+                                <label for="wgpu-render-scale">
+                                    { "Render scale" }
+                                    <span class="control-value">{ fmt_f32(wgpu_render_scale) }</span>
+                                </label>
+                                <input
+                                    id="wgpu-render-scale"
+                                    type="range"
+                                    min={WGPU_RENDER_SCALE_MIN.to_string()}
+                                    max={WGPU_RENDER_SCALE_MAX.to_string()}
+                                    step="0.05"
+                                    value={wgpu_render_scale.to_string()}
+                                    oninput={on_wgpu_render_scale}
+                                />
                             </div>
                         </>
                     }

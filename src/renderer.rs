@@ -1,4 +1,7 @@
-use crate::core::{GridChoice, Piece, PiecePaths, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM};
+use crate::core::{
+    GridChoice, Piece, PiecePaths, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM,
+    WGPU_EDGE_AA_DEFAULT, WGPU_RENDER_SCALE_MIN,
+};
 use bytemuck::{Pod, Zeroable};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -159,6 +162,9 @@ struct Globals {
     output_gamma: f32,
     emboss_strength: f32,
     emboss_rim: f32,
+    outline_width_px: f32,
+    edge_aa: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C, align(16))]
@@ -448,6 +454,7 @@ pub(crate) struct WgpuRenderer {
     fps_color: Color,
     fps_logged_missing_text_state: bool,
     fps_logged_prepare_error: bool,
+    render_scale: f32,
 }
 
 impl WgpuRenderer {
@@ -456,7 +463,7 @@ impl WgpuRenderer {
         image: HtmlImageElement,
         _pieces: Vec<Piece>,
         _paths: Vec<PiecePaths>,
-        _grid: GridChoice,
+        grid: GridChoice,
         piece_width: f32,
         piece_height: f32,
         view_min_x: f32,
@@ -465,14 +472,27 @@ impl WgpuRenderer {
         view_height: f32,
         mask_atlas: Rc<MaskAtlasData>,
         mask_pad: f32,
+        render_scale: f32,
         is_dark_theme: bool,
     ) -> Result<Self, wasm_bindgen::JsValue> {
         let (art_pixels, art_width, art_height) = image_to_rgba(&image)?;
+        let logical_width = piece_width * grid.cols as f32;
+        let logical_height = piece_height * grid.rows as f32;
 
-        let canvas_width = view_width.max(1.0).ceil() as u32;
-        let canvas_height = view_height.max(1.0).ceil() as u32;
+        let css_width = view_width.max(1.0);
+        let css_height = view_height.max(1.0);
+        let dpr = web_sys::window()
+            .map(|window| window.device_pixel_ratio())
+            .unwrap_or(1.0) as f32;
+        let render_scale = render_scale.max(WGPU_RENDER_SCALE_MIN) * dpr;
+        let canvas_width = (css_width * render_scale).max(1.0).ceil() as u32;
+        let canvas_height = (css_height * render_scale).max(1.0).ceil() as u32;
         canvas.set_width(canvas_width);
         canvas.set_height(canvas_height);
+        let _ = canvas.set_attribute(
+            "style",
+            &format!("width: {:.2}px; height: auto;", css_width),
+        );
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
@@ -571,7 +591,7 @@ impl WgpuRenderer {
         let globals = Globals {
             view_min: [view_min_x, view_min_y],
             view_size: [view_width, view_height],
-            image_size: [art_width as f32, art_height as f32],
+            image_size: [logical_width, logical_height],
             atlas_size: [mask_atlas.width as f32, mask_atlas.height as f32],
             piece_size: [piece_width, piece_height],
             mask_pad: [mask_pad, mask_pad],
@@ -579,6 +599,9 @@ impl WgpuRenderer {
             output_gamma,
             emboss_strength: 0.0,
             emboss_rim: EMBOSS_RIM,
+            outline_width_px: 2.0,
+            edge_aa: WGPU_EDGE_AA_DEFAULT,
+            _pad: [0.0; 2],
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals-buffer-fill"),
@@ -951,8 +974,8 @@ impl WgpuRenderer {
         let frame_stroke = 1.5;
         let frame_x = frame_inset + frame_stroke * 0.5;
         let frame_y = frame_inset + frame_stroke * 0.5;
-        let frame_w = (art_width as f32) - 2.0 * (frame_inset + frame_stroke * 0.5);
-        let frame_h = (art_height as f32) - 2.0 * (frame_inset + frame_stroke * 0.5);
+        let frame_w = logical_width - 2.0 * (frame_inset + frame_stroke * 0.5);
+        let frame_h = logical_height - 2.0 * (frame_inset + frame_stroke * 0.5);
         let corner_radius = (frame_corner_radius - frame_inset - frame_stroke * 0.5).max(0.0);
         let frame_instances = build_frame_dashes(
             frame_x,
@@ -1016,6 +1039,7 @@ impl WgpuRenderer {
             fps_color,
             fps_logged_missing_text_state: false,
             fps_logged_prepare_error: false,
+            render_scale,
         };
         Ok(renderer)
     }
@@ -1163,9 +1187,12 @@ impl WgpuRenderer {
                     right: self._config.width as i32,
                     bottom: self._config.height as i32,
                 };
-                let left = (self._config.width as f32 - FPS_TEXT_WIDTH - FPS_TEXT_PADDING_X)
-                    .max(0.0);
-                let top = FPS_TEXT_PADDING_Y;
+                let text_scale = self.render_scale;
+                let text_width = FPS_TEXT_WIDTH * text_scale;
+                let pad_x = FPS_TEXT_PADDING_X * text_scale;
+                let pad_y = FPS_TEXT_PADDING_Y * text_scale;
+                let left = (self._config.width as f32 - text_width - pad_x).max(0.0);
+                let top = pad_y;
                 let text_area = TextArea {
                     buffer: &text_state.buffer,
                     left,
@@ -1245,10 +1272,14 @@ impl WgpuRenderer {
         let viewport = Viewport::new(&self.device, &cache);
         let renderer =
             TextRenderer::new(&mut atlas, &self.device, wgpu::MultisampleState::default(), None);
-        let mut buffer = Buffer::new(&mut font_system, Metrics::new(FPS_FONT_SIZE, FPS_LINE_HEIGHT));
+        let scale = self.render_scale;
+        let font_size = FPS_FONT_SIZE * scale;
+        let line_height = FPS_LINE_HEIGHT * scale;
+        let text_width = FPS_TEXT_WIDTH * scale;
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
         buffer.set_size(
             &mut font_system,
-            Some(FPS_TEXT_WIDTH),
+            Some(text_width),
             Some(self._config.height as f32),
         );
         let mut state = GlyphonState {
@@ -1279,6 +1310,10 @@ impl WgpuRenderer {
             "WGPU FPS: font loaded ({} bytes)",
             font_len
         )));
+    }
+
+    pub(crate) fn set_edge_aa(&mut self, edge_aa: f32) {
+        self.globals.edge_aa = edge_aa.max(0.0);
     }
 
     pub(crate) fn set_show_fps(&mut self, enabled: bool) {

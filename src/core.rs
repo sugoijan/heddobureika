@@ -20,6 +20,15 @@ pub(crate) const ROTATION_NOISE_DEFAULT: f32 = 0.6;
 pub(crate) const EMBOSS_OFFSET: f32 = 2.0;
 pub(crate) const EMBOSS_RIM: f32 = 1.0;
 pub(crate) const EMBOSS_OPACITY: f32 = 0.2;
+pub(crate) const WGPU_EDGE_AA_MIN: f32 = 0.02;
+pub(crate) const WGPU_EDGE_AA_MAX: f32 = 2.0;
+pub(crate) const WGPU_EDGE_AA_DEFAULT: f32 = 1.0;
+pub(crate) const WGPU_RENDER_SCALE_MIN: f32 = 0.5;
+pub(crate) const WGPU_RENDER_SCALE_MAX: f32 = 2.0;
+pub(crate) const WGPU_RENDER_SCALE_DEFAULT: f32 = 2.0;
+pub(crate) const IMAGE_MAX_DIMENSION_MIN: u32 = 512;
+pub(crate) const IMAGE_MAX_DIMENSION_MAX: u32 = 4096;
+pub(crate) const IMAGE_MAX_DIMENSION_DEFAULT: u32 = 1280;
 pub(crate) const CLICK_MOVE_RATIO: f32 = 0.01;
 pub(crate) const CLICK_MAX_DURATION_MS: f32 = 240.0;
 pub(crate) const CLICK_QUICK_TAP_MS: f32 = 120.0;
@@ -250,16 +259,34 @@ impl Default for SvgRenderSettings {
 pub(crate) struct WgpuRenderSettings {
     #[serde(default)]
     pub(crate) show_fps: bool,
+    #[serde(default = "default_wgpu_edge_aa")]
+    pub(crate) edge_aa: f32,
+    #[serde(default = "default_wgpu_render_scale")]
+    pub(crate) render_scale: f32,
 }
 
 impl Default for WgpuRenderSettings {
     fn default() -> Self {
-        Self { show_fps: false }
+        Self {
+            show_fps: false,
+            edge_aa: WGPU_EDGE_AA_DEFAULT,
+            render_scale: WGPU_RENDER_SCALE_DEFAULT,
+        }
     }
+}
+
+fn default_wgpu_edge_aa() -> f32 {
+    WGPU_EDGE_AA_DEFAULT
+}
+
+fn default_wgpu_render_scale() -> f32 {
+    WGPU_RENDER_SCALE_DEFAULT
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RenderSettings {
+    #[serde(default = "default_image_max_dim")]
+    pub(crate) image_max_dim: u32,
     pub(crate) renderer: RendererKind,
     pub(crate) svg: SvgRenderSettings,
     pub(crate) wgpu: WgpuRenderSettings,
@@ -268,11 +295,16 @@ pub(crate) struct RenderSettings {
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
+            image_max_dim: IMAGE_MAX_DIMENSION_DEFAULT,
             renderer: RendererKind::Wgpu,
             svg: SvgRenderSettings::default(),
             wgpu: WgpuRenderSettings::default(),
         }
     }
+}
+
+fn default_image_max_dim() -> u32 {
+    IMAGE_MAX_DIMENSION_DEFAULT
 }
 
 #[derive(Clone, PartialEq)]

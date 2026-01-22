@@ -9,6 +9,9 @@ struct Globals {
     output_gamma: f32,
     emboss_strength: f32,
     emboss_rim: f32,
+    outline_width_px: f32,
+    edge_aa: f32,
+    _pad: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -111,25 +114,37 @@ fn back_pattern(local_pos: vec2<f32>) -> vec3<f32> {
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let mask = textureSample(mask_tex, tex_sampler, input.mask_uv).r;
     let outline_threshold = 0.05;
+    let mask_fwidth = abs(dpdx(mask)) + abs(dpdy(mask));
+    let edge_aa = max(mask_fwidth * globals.edge_aa, 1e-4);
     if (globals.render_mode > 0.5) {
         if (input.hover < 0.5) {
             return vec4<f32>(0.0);
         }
-	let outline_stroke_width_px = 2.0;
+        let outline_stroke_width_px = max(globals.outline_width_px, 0.5);
         let texel = vec2<f32>(outline_stroke_width_px, outline_stroke_width_px) / globals.atlas_size;
         let left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, 0.0)).r;
         let right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, 0.0)).r;
         let up = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, -texel.y)).r;
         let down = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, texel.y)).r;
-        let max_neighbor = max(max(left, right), max(up, down));
-        let edge = select(0.0, 1.0, mask < outline_threshold && max_neighbor > outline_threshold);
+        let up_left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, -texel.y)).r;
+        let up_right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, -texel.y)).r;
+        let down_left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, texel.y)).r;
+        let down_right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, texel.y)).r;
+        let max_cardinal = max(max(left, right), max(up, down));
+        let max_diagonal = max(max(up_left, up_right), max(down_left, down_right));
+        let max_neighbor = max(max_cardinal, max_diagonal);
+        let neighbor_fwidth = abs(dpdx(max_neighbor)) + abs(dpdy(max_neighbor));
+        let outline_aa = max(max(mask_fwidth, neighbor_fwidth) * globals.edge_aa, 1e-4);
+        let outside = 1.0 - smoothstep(outline_threshold, outline_threshold + outline_aa, mask);
+        let inside = smoothstep(outline_threshold, outline_threshold + outline_aa, max_neighbor);
+        let edge = outside * inside;
         let outline = srgb_to_linear(vec3<f32>(1.0, 0.0, 0.0));
         return vec4<f32>(apply_output_gamma(outline), edge);
     }
     if (mask < outline_threshold) {
         discard;
     }
-    let edge_alpha = smoothstep(outline_threshold, outline_threshold + 0.15, mask);
+    let edge_alpha = smoothstep(outline_threshold, outline_threshold + edge_aa, mask);
 
     var rgb: vec3<f32>;
     var alpha: f32;
