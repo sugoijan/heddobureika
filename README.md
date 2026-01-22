@@ -4,6 +4,8 @@
 
 A silly web-based jigsaw puzzle demo.
 
+![screenshot](./screenshot.png)
+
 Current puzzles:
 
 - `zoe-potter`: [source art here](https://x.com/zoe_IRIAM/status/1933655531409060301)
