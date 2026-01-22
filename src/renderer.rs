@@ -1,8 +1,14 @@
 use crate::core::{GridChoice, Piece, PiecePaths, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM};
 use bytemuck::{Pod, Zeroable};
+use glyphon::{
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+};
+use glyphon::cosmic_text::Align;
+use js_sys::Date;
 use std::rc::Rc;
-use wasm_bindgen::JsCast;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Path2d};
+use wasm_bindgen::{JsCast, JsValue};
+use web_sys::{console, CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Path2d};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -346,6 +352,61 @@ pub(crate) struct MaskAtlasData {
     pub(crate) origins: Vec<[f32; 2]>,
 }
 
+const FPS_SAMPLE_WINDOW_MS: f32 = 500.0;
+const FPS_LABEL_FALLBACK: &str = "-- fps";
+const FPS_FONT_FAMILY: &str = "KaoriGel";
+const FPS_FONT_SIZE: f32 = 12.0;
+const FPS_LINE_HEIGHT: f32 = 14.0;
+const FPS_TEXT_PADDING_X: f32 = 12.0;
+const FPS_TEXT_PADDING_Y: f32 = 12.0;
+const FPS_TEXT_WIDTH: f32 = 80.0;
+
+struct FpsTracker {
+    last_ms: f32,
+    frame_count: u32,
+}
+
+impl FpsTracker {
+    fn new() -> Self {
+        Self {
+            last_ms: now_ms(),
+            frame_count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_ms = now_ms();
+        self.frame_count = 0;
+    }
+
+    fn record_frame(&mut self, now_ms: f32) -> Option<f32> {
+        self.frame_count = self.frame_count.saturating_add(1);
+        let elapsed = now_ms - self.last_ms;
+        if elapsed >= FPS_SAMPLE_WINDOW_MS {
+            let fps = self.frame_count as f32 * 1000.0 / elapsed;
+            self.last_ms = now_ms;
+            self.frame_count = 0;
+            Some(fps)
+        } else {
+            None
+        }
+    }
+}
+
+struct GlyphonState {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    renderer: TextRenderer,
+    viewport: Viewport,
+    buffer: Buffer,
+    last_text: String,
+}
+
+fn now_ms() -> f32 {
+    (Date::now() % 1_000_000.0) as f32
+}
+
 pub(crate) struct WgpuRenderer {
     _canvas: HtmlCanvasElement,
     surface: wgpu::Surface<'static>,
@@ -380,6 +441,13 @@ pub(crate) struct WgpuRenderer {
     frame_stroke_instance_buffer: wgpu::Buffer,
     frame_stroke_instance_count: u32,
     frame_clear_color: wgpu::Color,
+    text_state: Option<GlyphonState>,
+    show_fps: bool,
+    fps_tracker: FpsTracker,
+    fps_text: String,
+    fps_color: Color,
+    fps_logged_missing_text_state: bool,
+    fps_logged_prepare_error: bool,
 }
 
 impl WgpuRenderer {
@@ -901,6 +969,11 @@ impl WgpuRenderer {
             contents: bytemuck::cast_slice(&frame_instances),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let fps_color = if is_dark_theme {
+            Color::rgb(255, 255, 255)
+        } else {
+            Color::rgb(24, 24, 24)
+        };
 
         let renderer = Self {
             _canvas: canvas,
@@ -936,6 +1009,13 @@ impl WgpuRenderer {
             frame_stroke_instance_buffer,
             frame_stroke_instance_count: frame_stroke_instances.len() as u32,
             frame_clear_color,
+            text_state: None,
+            show_fps: false,
+            fps_tracker: FpsTracker::new(),
+            fps_text: String::new(),
+            fps_color,
+            fps_logged_missing_text_state: false,
+            fps_logged_prepare_error: false,
         };
         Ok(renderer)
     }
@@ -1045,8 +1125,177 @@ impl WgpuRenderer {
             }
         }
 
+        let mut draw_text = false;
+        if self.show_fps {
+            if let Some(fps) = self.fps_tracker.record_frame(now_ms()) {
+                self.fps_text = format!("{:.0} fps", fps);
+            }
+            if self.fps_text.is_empty() {
+                self.fps_text = FPS_LABEL_FALLBACK.to_string();
+            }
+            if let Some(text_state) = self.text_state.as_mut() {
+                self.fps_logged_missing_text_state = false;
+                if text_state.last_text != self.fps_text {
+                    let attrs = Attrs::new().family(Family::Name(FPS_FONT_FAMILY));
+                    text_state.buffer.set_text(
+                        &mut text_state.font_system,
+                        &self.fps_text,
+                        &attrs,
+                        Shaping::Advanced,
+                        Some(Align::Right),
+                    );
+                    text_state
+                        .buffer
+                        .shape_until_scroll(&mut text_state.font_system, false);
+                    text_state.last_text.clear();
+                    text_state.last_text.push_str(&self.fps_text);
+                }
+                text_state.viewport.update(
+                    &self.queue,
+                    Resolution {
+                        width: self._config.width,
+                        height: self._config.height,
+                    },
+                );
+                let bounds = TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: self._config.width as i32,
+                    bottom: self._config.height as i32,
+                };
+                let left = (self._config.width as f32 - FPS_TEXT_WIDTH - FPS_TEXT_PADDING_X)
+                    .max(0.0);
+                let top = FPS_TEXT_PADDING_Y;
+                let text_area = TextArea {
+                    buffer: &text_state.buffer,
+                    left,
+                    top,
+                    scale: 1.0,
+                    bounds,
+                    default_color: self.fps_color,
+                    custom_glyphs: &[],
+                };
+                match text_state.renderer.prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut text_state.font_system,
+                    &mut text_state.atlas,
+                    &text_state.viewport,
+                    [text_area],
+                    &mut text_state.swash_cache,
+                ) {
+                    Ok(()) => {
+                        self.fps_logged_prepare_error = false;
+                        draw_text = true;
+                    }
+                    Err(err) => {
+                        if !self.fps_logged_prepare_error {
+                            console::warn_1(&JsValue::from_str(&format!(
+                                "WGPU FPS: text prepare failed: {err:?}"
+                            )));
+                            self.fps_logged_prepare_error = true;
+                        }
+                    }
+                }
+            } else if !self.fps_logged_missing_text_state {
+                console::warn_1(&JsValue::from_str(
+                    "WGPU FPS: enabled but font not loaded yet",
+                ));
+                self.fps_logged_missing_text_state = true;
+            }
+        }
+        if draw_text {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("text-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(text_state) = self.text_state.as_ref() {
+                let _ = text_state
+                    .renderer
+                    .render(&text_state.atlas, &text_state.viewport, &mut render_pass);
+            }
+        }
+
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+    }
+
+    pub(crate) fn set_font_bytes(&mut self, font_bytes: Vec<u8>) {
+        if self.text_state.is_some() {
+            return;
+        }
+        let font_len = font_bytes.len();
+        let mut font_system = FontSystem::new();
+        font_system.db_mut().load_font_data(font_bytes);
+        let swash_cache = SwashCache::new();
+        let cache = Cache::new(&self.device);
+        let mut atlas = TextAtlas::new(&self.device, &self.queue, &cache, self._config.format);
+        let viewport = Viewport::new(&self.device, &cache);
+        let renderer =
+            TextRenderer::new(&mut atlas, &self.device, wgpu::MultisampleState::default(), None);
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(FPS_FONT_SIZE, FPS_LINE_HEIGHT));
+        buffer.set_size(
+            &mut font_system,
+            Some(FPS_TEXT_WIDTH),
+            Some(self._config.height as f32),
+        );
+        let mut state = GlyphonState {
+            font_system,
+            swash_cache,
+            atlas,
+            renderer,
+            viewport,
+            buffer,
+            last_text: String::new(),
+        };
+        if !self.fps_text.is_empty() {
+            let attrs = Attrs::new().family(Family::Name(FPS_FONT_FAMILY));
+            state.buffer.set_text(
+                &mut state.font_system,
+                &self.fps_text,
+                &attrs,
+                Shaping::Advanced,
+                Some(Align::Right),
+            );
+            state
+                .buffer
+                .shape_until_scroll(&mut state.font_system, false);
+            state.last_text.push_str(&self.fps_text);
+        }
+        self.text_state = Some(state);
+        console::log_1(&JsValue::from_str(&format!(
+            "WGPU FPS: font loaded ({} bytes)",
+            font_len
+        )));
+    }
+
+    pub(crate) fn set_show_fps(&mut self, enabled: bool) {
+        if self.show_fps == enabled {
+            return;
+        }
+        self.show_fps = enabled;
+        self.fps_tracker.reset();
+        self.fps_logged_missing_text_state = false;
+        self.fps_logged_prepare_error = false;
+        if enabled {
+            console::log_1(&JsValue::from_str("WGPU FPS: enabled"));
+            self.fps_text = FPS_LABEL_FALLBACK.to_string();
+        } else {
+            console::log_1(&JsValue::from_str("WGPU FPS: disabled"));
+            self.fps_text.clear();
+        }
     }
 
     pub(crate) fn update_instances(&mut self, set: InstanceSet) {

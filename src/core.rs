@@ -58,6 +58,8 @@ pub(crate) const EDGE_STEP_DIV: f32 = 6.0;
 pub(crate) const EDGE_STEP_MIN: f32 = 6.0;
 pub(crate) const CORNER_RADIUS_RATIO: f32 = 0.05;
 pub(crate) const STORAGE_KEY: &str = "heddobureika.board.v2";
+pub(crate) const RENDER_SETTINGS_KEY: &str = "heddobureika.render.v1";
+pub(crate) const THEME_MODE_KEY: &str = "heddobureika.theme.v1";
 pub(crate) const STORAGE_VERSION: u32 = 2;
 pub(crate) const DIR_UP: usize = 0;
 pub(crate) const DIR_RIGHT: usize = 1;
@@ -189,7 +191,8 @@ pub(crate) enum PreviewCorner {
     TopRight,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum ThemeMode {
     System,
     Light,
@@ -209,6 +212,67 @@ pub(crate) struct SavedBoard {
     pub(crate) connections: Vec<[bool; 4]>,
     pub(crate) z_order: Vec<usize>,
     pub(crate) scramble_nonce: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RendererKind {
+    Svg,
+    Wgpu,
+}
+
+impl Default for RendererKind {
+    fn default() -> Self {
+        RendererKind::Wgpu
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SvgRenderSettings {
+    pub(crate) animations: bool,
+    pub(crate) emboss: bool,
+    pub(crate) fast_render: bool,
+    pub(crate) fast_filter: bool,
+}
+
+impl Default for SvgRenderSettings {
+    fn default() -> Self {
+        Self {
+            animations: false,
+            emboss: true,
+            fast_render: true,
+            fast_filter: true,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WgpuRenderSettings {
+    #[serde(default)]
+    pub(crate) show_fps: bool,
+}
+
+impl Default for WgpuRenderSettings {
+    fn default() -> Self {
+        Self { show_fps: false }
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RenderSettings {
+    pub(crate) renderer: RendererKind,
+    pub(crate) svg: SvgRenderSettings,
+    pub(crate) wgpu: WgpuRenderSettings,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            renderer: RendererKind::Wgpu,
+            svg: SvgRenderSettings::default(),
+            wgpu: WgpuRenderSettings::default(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]

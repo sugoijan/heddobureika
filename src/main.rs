@@ -21,7 +21,8 @@ use crate::renderer::{
 };
 
 const MAX_IMAGE_DIMENSION: u32 = 1024;
-const IMAGE_SRC: &str = "puzzles/zoe-potter.jpg";
+const IMAGE_SRC: &str = "puzzles/zoe-samurai.jpg";
+const FPS_FONT_BYTES: &[u8] = include_bytes!("../fonts/kaorigel.ttf");
 
 #[derive(Default)]
 struct DragHandlers {
@@ -50,6 +51,20 @@ fn load_saved_board() -> Option<SavedBoard> {
     Some(state)
 }
 
+fn load_render_settings() -> Option<RenderSettings> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(RENDER_SETTINGS_KEY).ok()??;
+    serde_json::from_str(&raw).ok()
+}
+
+fn load_theme_mode() -> Option<ThemeMode> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(THEME_MODE_KEY).ok()??;
+    serde_json::from_str(&raw).ok()
+}
+
 fn save_board_state(state: &SavedBoard) {
     let Ok(raw) = serde_json::to_string(state) else {
         return;
@@ -59,6 +74,38 @@ fn save_board_state(state: &SavedBoard) {
         return;
     };
     let _ = storage.set_item(STORAGE_KEY, &raw);
+}
+
+fn save_render_settings(settings: &RenderSettings) {
+    let Ok(raw) = serde_json::to_string(settings) else {
+        return;
+    };
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.set_item(RENDER_SETTINGS_KEY, &raw);
+}
+
+fn save_theme_mode(mode: ThemeMode) {
+    let Ok(raw) = serde_json::to_string(&mode) else {
+        return;
+    };
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.set_item(THEME_MODE_KEY, &raw);
+}
+
+fn sync_theme_checkbox(input: &HtmlInputElement, mode: ThemeMode) {
+    let (checked, indeterminate) = match mode {
+        ThemeMode::System => (false, true),
+        ThemeMode::Light => (false, false),
+        ThemeMode::Dark => (true, false),
+    };
+    input.set_checked(checked);
+    input.set_indeterminate(indeterminate);
 }
 
 fn now_ms() -> f32 {
@@ -718,7 +765,7 @@ fn app() -> Html {
     let rotation_queue = use_mut_ref(|| VecDeque::<QueuedRotation>::new());
     let preview_corner = use_state(|| PreviewCorner::BottomLeft);
     let preview_revealed = use_state(|| false);
-    let theme_mode = use_state(|| ThemeMode::System);
+    let theme_mode = use_state(|| load_theme_mode().unwrap_or(ThemeMode::System));
     let theme_mode_value = *theme_mode;
     let theme_toggle_ref = use_node_ref();
     let drag_handlers = use_mut_ref(DragHandlers::default);
@@ -735,16 +782,21 @@ fn app() -> Html {
     let flips = use_state(Vec::<bool>::new);
     let rotation_enabled = use_state(|| true);
     let rotation_enabled_value = *rotation_enabled;
-    let animations_enabled = use_state(|| false);
-    let animations_enabled_value = *animations_enabled;
-    let emboss_enabled = use_state(|| true);
-    let emboss_enabled_value = *emboss_enabled;
-    let fast_render = use_state(|| true);
-    let fast_render_value = *fast_render;
-    let fast_filter = use_state(|| true);
-    let fast_filter_value = *fast_filter;
-    let wgpu_enabled = use_state(|| true);
-    let wgpu_enabled_value = *wgpu_enabled;
+    let render_settings = use_state(|| load_render_settings().unwrap_or_default());
+    let render_settings_value = (*render_settings).clone();
+    let renderer_kind = render_settings_value.renderer;
+    let svg_settings_value = render_settings_value.svg.clone();
+    let wgpu_settings_value = render_settings_value.wgpu.clone();
+    let using_wgpu = renderer_kind == RendererKind::Wgpu;
+    let svg_animations_enabled = svg_settings_value.animations;
+    let svg_emboss_enabled = svg_settings_value.emboss;
+    let svg_fast_render = svg_settings_value.fast_render;
+    let svg_fast_filter = svg_settings_value.fast_filter;
+    let wgpu_show_fps = wgpu_settings_value.show_fps;
+    let animations_enabled_value = !using_wgpu && svg_animations_enabled;
+    let emboss_enabled_value = svg_emboss_enabled;
+    let fast_render_value = svg_fast_render;
+    let fast_filter_value = svg_fast_filter;
     let wgpu_renderer = use_mut_ref(|| None::<WgpuRenderer>);
     let pending_instances = use_mut_ref(|| None::<InstanceSet>);
     let mask_atlas = use_mut_ref(|| None::<Rc<MaskAtlasData>>);
@@ -787,6 +839,20 @@ fn app() -> Html {
     };
     let mask_atlas_revision_value = *mask_atlas_revision;
     let preview_revealed_value = *preview_revealed;
+    let renderer_value = if using_wgpu { "wgpu" } else { "svg" };
+    {
+        let render_settings_value = render_settings_value.clone();
+        use_effect_with(render_settings_value, move |settings| {
+            save_render_settings(settings);
+            || ()
+        });
+    }
+    {
+        use_effect_with(theme_mode_value, move |mode| {
+            save_theme_mode(*mode);
+            || ()
+        });
+    }
     let status_label = if solved_value { "Solved" } else { "In progress" };
     let status_class = if solved_value {
         "status status-solved"
@@ -1198,8 +1264,22 @@ fn app() -> Html {
             }
         })
     };
+    let on_renderer_change = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlSelectElement = event.target_unchecked_into();
+            let next_renderer = match input.value().as_str() {
+                "svg" => RendererKind::Svg,
+                "wgpu" => RendererKind::Wgpu,
+                _ => RendererKind::Wgpu,
+            };
+            let mut next = (*render_settings).clone();
+            next.renderer = next_renderer;
+            render_settings.set(next);
+        })
+    };
     let on_animations_toggle = {
-        let animations_enabled = animations_enabled.clone();
+        let render_settings = render_settings.clone();
         let animating_members = animating_members.clone();
         let rotation_anim = rotation_anim.clone();
         let rotation_anim_handle = rotation_anim_handle.clone();
@@ -1207,7 +1287,9 @@ fn app() -> Html {
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
-            animations_enabled.set(enabled);
+            let mut next = (*render_settings).clone();
+            next.svg.animations = enabled;
+            render_settings.set(next);
             if !enabled {
                 animating_members.set(Vec::new());
                 *rotation_anim.borrow_mut() = None;
@@ -1217,43 +1299,54 @@ fn app() -> Html {
         })
     };
     let on_emboss_toggle = {
-        let emboss_enabled = emboss_enabled.clone();
+        let render_settings = render_settings.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            emboss_enabled.set(input.checked());
+            let mut next = (*render_settings).clone();
+            next.svg.emboss = input.checked();
+            render_settings.set(next);
+        })
+    };
+    let on_wgpu_fps_toggle = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let mut next = (*render_settings).clone();
+            next.wgpu.show_fps = input.checked();
+            render_settings.set(next);
         })
     };
     let on_theme_toggle = {
         let theme_mode = theme_mode.clone();
-        Callback::from(move |event: MouseEvent| {
-            event.prevent_default();
+        let theme_toggle_ref = theme_toggle_ref.clone();
+        Callback::from(move |_: Event| {
             let next = match *theme_mode {
                 ThemeMode::System => ThemeMode::Light,
                 ThemeMode::Light => ThemeMode::Dark,
                 ThemeMode::Dark => ThemeMode::System,
             };
             theme_mode.set(next);
+            if let Some(input) = theme_toggle_ref.cast::<HtmlInputElement>() {
+                sync_theme_checkbox(&input, next);
+            }
         })
     };
     let on_fast_render_toggle = {
-        let fast_render = fast_render.clone();
+        let render_settings = render_settings.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            fast_render.set(input.checked());
+            let mut next = (*render_settings).clone();
+            next.svg.fast_render = input.checked();
+            render_settings.set(next);
         })
     };
     let on_fast_filter_toggle = {
-        let fast_filter = fast_filter.clone();
+        let render_settings = render_settings.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            fast_filter.set(input.checked());
-        })
-    };
-    let on_wgpu_toggle = {
-        let wgpu_enabled = wgpu_enabled.clone();
-        Callback::from(move |event: Event| {
-            let input: HtmlInputElement = event.target_unchecked_into();
-            wgpu_enabled.set(input.checked());
+            let mut next = (*render_settings).clone();
+            next.svg.fast_filter = input.checked();
+            render_settings.set(next);
         })
     };
     let on_debug_toggle = {
@@ -1266,18 +1359,15 @@ fn app() -> Html {
 
     {
         let theme_toggle_ref = theme_toggle_ref.clone();
-        use_effect_with(theme_mode_value, move |mode| {
-            if let Some(input) = theme_toggle_ref.cast::<HtmlInputElement>() {
-                let (checked, indeterminate) = match *mode {
-                    ThemeMode::System => (false, true),
-                    ThemeMode::Light => (false, false),
-                    ThemeMode::Dark => (true, false),
-                };
-                input.set_checked(checked);
-                input.set_indeterminate(indeterminate);
-            }
-            || ()
-        });
+        use_effect_with(
+            (theme_mode_value, show_controls_value),
+            move |(mode, _show_controls_value)| {
+                if let Some(input) = theme_toggle_ref.cast::<HtmlInputElement>() {
+                    sync_theme_checkbox(&input, *mode);
+                }
+                || ()
+            },
+        );
     }
 
     {
@@ -1314,10 +1404,10 @@ fn app() -> Html {
         let dragging_members = dragging_members.clone();
         let active_id = active_id.clone();
         let show_debug = show_debug.clone();
-        let emboss_enabled = emboss_enabled.clone();
+        let wgpu_show_fps = wgpu_show_fps;
         use_effect_with(
             (
-                wgpu_enabled_value,
+                using_wgpu,
                 board_ready_value,
                 image_size_value,
                 grid,
@@ -1328,7 +1418,7 @@ fn app() -> Html {
                 theme_mode_value,
             ),
             move |(
-                wgpu_enabled_value,
+                using_wgpu,
                 board_ready_value,
                 image_size_value,
                 grid,
@@ -1339,10 +1429,10 @@ fn app() -> Html {
                 theme_mode_value,
             )| {
                 let cleanup: fn() = || ();
-                if *wgpu_enabled_value {
+                if *using_wgpu {
                     hovered_id.set(None);
                 }
-                let build_inputs = if *wgpu_enabled_value && *board_ready_value {
+                let build_inputs = if *using_wgpu && *board_ready_value {
                     if let (Some((width, height)), Some(image), Some(canvas)) = (
                         *image_size_value,
                         (*image_element).clone(),
@@ -1432,7 +1522,6 @@ fn app() -> Html {
                         ThemeMode::Light => false,
                         ThemeMode::System => prefers_dark,
                     };
-                    let emboss_enabled_now = *emboss_enabled;
                     spawn_local(async move {
                         let mask_atlas_for_instances = mask_atlas_data.clone();
                         match WgpuRenderer::new(
@@ -1454,12 +1543,14 @@ fn app() -> Html {
                         .await
                         {
                             Ok(mut renderer) => {
-                                renderer.set_emboss_enabled(emboss_enabled_now);
+                                renderer.set_emboss_enabled(true);
+                                renderer.set_font_bytes(FPS_FONT_BYTES.to_vec());
                                 let total = (grid.cols as usize) * (grid.rows as usize);
                                 if let Some(instances) = pending_instances.borrow_mut().take() {
                                     if instances.instances.len() == total {
                                         renderer.update_instances(instances);
                                     }
+                                    renderer.set_show_fps(wgpu_show_fps);
                                     renderer.render();
                                 } else {
                                     let positions_snapshot = (*positions).clone();
@@ -1500,6 +1591,7 @@ fn app() -> Html {
                                         );
                                         renderer.update_instances(instances);
                                     }
+                                    renderer.set_show_fps(wgpu_show_fps);
                                     renderer.render();
                                 }
                                 *wgpu_renderer.borrow_mut() = Some(renderer);
@@ -1519,9 +1611,10 @@ fn app() -> Html {
         let wgpu_renderer = wgpu_renderer.clone();
         let pending_instances = pending_instances.clone();
         let mask_atlas = mask_atlas.clone();
+        let wgpu_show_fps = wgpu_show_fps;
         use_effect_with(
             (
-                wgpu_enabled_value,
+                using_wgpu,
                 image_size_value,
                 grid,
                 (*positions).clone(),
@@ -1530,11 +1623,11 @@ fn app() -> Html {
                 (*z_order).clone(),
                 (*connections).clone(),
                 hover_deps.clone(),
-                emboss_enabled_value,
                 mask_atlas_revision_value,
+                wgpu_show_fps,
             ),
             move |(
-                wgpu_enabled_value,
+                using_wgpu,
                 image_size_value,
                 grid,
                 positions_value,
@@ -1543,11 +1636,11 @@ fn app() -> Html {
                 z_order_value,
                 connections_value,
                 hover_deps,
-                emboss_enabled_value,
                 _mask_atlas_revision_value,
+                wgpu_show_fps,
             )| {
                 let cleanup: fn() = || ();
-                if !*wgpu_enabled_value {
+                if !*using_wgpu {
                     return cleanup;
                 }
                 let Some((width, height)) = *image_size_value else {
@@ -1600,7 +1693,8 @@ fn app() -> Html {
                 );
                 let mut renderer_ref = wgpu_renderer.borrow_mut();
                 if let Some(renderer) = renderer_ref.as_mut() {
-                    renderer.set_emboss_enabled(*emboss_enabled_value);
+                    renderer.set_emboss_enabled(true);
+                    renderer.set_show_fps(*wgpu_show_fps);
                     renderer.update_instances(instances);
                     renderer.render();
                     pending_instances.borrow_mut().take();
@@ -2214,10 +2308,10 @@ fn app() -> Html {
         let drag_move = {
             let svg_ref = svg_ref.clone();
             let canvas_ref = canvas_ref.clone();
-            let wgpu_enabled_value = wgpu_enabled_value;
+            let using_wgpu = using_wgpu;
             let schedule_drag_move = schedule_drag_move.clone();
             move |event: &MouseEvent| {
-                let target_ref = if wgpu_enabled_value {
+                let target_ref = if using_wgpu {
                     &canvas_ref
                 } else {
                     &svg_ref
@@ -2239,7 +2333,7 @@ fn app() -> Html {
         let drag_move_touch = {
             let svg_ref = svg_ref.clone();
             let canvas_ref = canvas_ref.clone();
-            let wgpu_enabled_value = wgpu_enabled_value;
+            let using_wgpu = using_wgpu;
             let drag_state = drag_state.clone();
             let active_id = active_id.clone();
             let dragging_members = dragging_members.clone();
@@ -2261,7 +2355,7 @@ fn app() -> Html {
                     .borrow()
                     .as_ref()
                     .and_then(|drag| drag.touch_id);
-                let target_ref = if wgpu_enabled_value {
+                let target_ref = if using_wgpu {
                     &canvas_ref
                 } else {
                     &svg_ref
@@ -3157,10 +3251,10 @@ fn app() -> Html {
         let drag_release = {
             let svg_ref = svg_ref.clone();
             let canvas_ref = canvas_ref.clone();
-            let wgpu_enabled_value = wgpu_enabled_value;
+            let using_wgpu = using_wgpu;
             let drag_release_common = drag_release_common.clone();
             move |event: &MouseEvent| {
-                let target_ref = if wgpu_enabled_value {
+                let target_ref = if using_wgpu {
                     &canvas_ref
                 } else {
                     &svg_ref
@@ -3181,7 +3275,7 @@ fn app() -> Html {
         let drag_release_touch = {
             let svg_ref = svg_ref.clone();
             let canvas_ref = canvas_ref.clone();
-            let wgpu_enabled_value = wgpu_enabled_value;
+            let using_wgpu = using_wgpu;
             let drag_state = drag_state.clone();
             let drag_release_common = drag_release_common.clone();
             move |event: &TouchEvent| {
@@ -3189,7 +3283,7 @@ fn app() -> Html {
                     .borrow()
                     .as_ref()
                     .and_then(|drag| drag.touch_id);
-                let target_ref = if wgpu_enabled_value {
+                let target_ref = if using_wgpu {
                     &canvas_ref
                 } else {
                     &svg_ref
@@ -4207,7 +4301,7 @@ fn app() -> Html {
         } else if hovered_id_value.is_some() {
             canvas_class.push_str(" hover");
         }
-        let canvas_node = if wgpu_enabled_value && board_ready_value {
+        let canvas_node = if using_wgpu && board_ready_value {
             html! {
                 <canvas
                     class={canvas_class}
@@ -4224,7 +4318,7 @@ fn app() -> Html {
         } else {
             html! {}
         };
-        let svg_node = if wgpu_enabled_value {
+        let svg_node = if using_wgpu {
             html! {}
         } else {
             html! {
@@ -4491,27 +4585,92 @@ fn app() -> Html {
                     />
                 </div>
                 <div class="control">
-                    <label for="animations-enabled">
-                        { "Animations: " } { if animations_enabled_value { "On" } else { "Off" } }
-                        <input
-                            id="animations-enabled"
-                            type="checkbox"
-                            checked={animations_enabled_value}
-                            onchange={on_animations_toggle}
-                        />
-                    </label>
+                    <label for="renderer-select">{ "Renderer" }</label>
+                    <select
+                        id="renderer-select"
+                        value={renderer_value}
+                        onchange={on_renderer_change}
+                    >
+                        <option value="wgpu" selected={renderer_kind == RendererKind::Wgpu}>
+                            { "WGPU" }
+                        </option>
+                        <option value="svg" selected={renderer_kind == RendererKind::Svg}>
+                            { "SVG" }
+                        </option>
+                    </select>
                 </div>
-                <div class="control">
-                    <label for="emboss-enabled">
-                        { "Emboss: " } { if emboss_enabled_value { "On" } else { "Off" } }
-                        <input
-                            id="emboss-enabled"
-                            type="checkbox"
-                            checked={emboss_enabled_value}
-                            onchange={on_emboss_toggle}
-                        />
-                    </label>
-                </div>
+                { if renderer_kind == RendererKind::Svg {
+                    html! {
+                        <>
+                            <div class="control">
+                                <label for="animations-enabled">
+                                    { "Animations: " }
+                                    { if svg_animations_enabled { "On" } else { "Off" } }
+                                    <input
+                                        id="animations-enabled"
+                                        type="checkbox"
+                                        checked={svg_animations_enabled}
+                                        onchange={on_animations_toggle}
+                                    />
+                                </label>
+                            </div>
+                            <div class="control">
+                                <label for="emboss-enabled">
+                                    { "Emboss: " }
+                                    { if svg_emboss_enabled { "On" } else { "Off" } }
+                                    <input
+                                        id="emboss-enabled"
+                                        type="checkbox"
+                                        checked={svg_emboss_enabled}
+                                        onchange={on_emboss_toggle}
+                                    />
+                                </label>
+                            </div>
+                            <div class="control">
+                                <label for="fast-render">
+                                    { "Fast render: " }
+                                    { if svg_fast_render { "On" } else { "Off" } }
+                                    <input
+                                        id="fast-render"
+                                        type="checkbox"
+                                        checked={svg_fast_render}
+                                        onchange={on_fast_render_toggle}
+                                    />
+                                </label>
+                            </div>
+                            <div class="control">
+                                <label for="fast-filter">
+                                    { "Fast filter: " }
+                                    { if svg_fast_filter { "On" } else { "Off" } }
+                                    <input
+                                        id="fast-filter"
+                                        type="checkbox"
+                                        checked={svg_fast_filter}
+                                        onchange={on_fast_filter_toggle}
+                                    />
+                                </label>
+                            </div>
+                        </>
+                    }
+                } else {
+                    html! {
+                        <>
+                            <div class="control">
+                                <label for="wgpu-show-fps">
+                                    { "Show FPS: " }
+                                    { if wgpu_show_fps { "On" } else { "Off" } }
+                                    <input
+                                        id="wgpu-show-fps"
+                                        type="checkbox"
+                                        checked={wgpu_show_fps}
+                                        onchange={on_wgpu_fps_toggle}
+                                    />
+                                </label>
+                            </div>
+                        </>
+                    }
+                } }
+                <hr class="control-separator" />
                 <div class="control">
                     <label for="theme-mode">
                         { "Theme: " }
@@ -4523,41 +4682,9 @@ fn app() -> Html {
                         <input
                             id="theme-mode"
                             type="checkbox"
+                            checked={theme_mode_value == ThemeMode::Dark}
                             ref={theme_toggle_ref}
-                            onclick={on_theme_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="fast-render">
-                        { "Fast render: " } { if fast_render_value { "On" } else { "Off" } }
-                        <input
-                            id="fast-render"
-                            type="checkbox"
-                            checked={fast_render_value}
-                            onchange={on_fast_render_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="fast-filter">
-                        { "Fast filter: " } { if fast_filter_value { "On" } else { "Off" } }
-                        <input
-                            id="fast-filter"
-                            type="checkbox"
-                            checked={fast_filter_value}
-                            onchange={on_fast_filter_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="wgpu-enabled">
-                        { "WGPU preview: " } { if wgpu_enabled_value { "On" } else { "Off" } }
-                        <input
-                            id="wgpu-enabled"
-                            type="checkbox"
-                            checked={wgpu_enabled_value}
-                            onchange={on_wgpu_toggle}
+                            onchange={on_theme_toggle}
                         />
                     </label>
                 </div>
