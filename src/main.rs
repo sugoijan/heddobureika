@@ -4175,14 +4175,30 @@ fn app() -> Html {
                     external_path.push_str(edge_path);
                 }
             }
-            let external_outline = if external_path.is_empty() {
-                html! {}
+            let (external_outline, internal_outline) = if external_path.is_empty() {
+                (html! {}, html! {})
+            } else if flipped {
+                (
+                    html! {},
+                    html! {
+                        <g class="piece-outline-group edge-internal">
+                            <path
+                                class="piece-outline edge-internal"
+                                d={external_path}
+                                mask={mask_ref.clone()}
+                            />
+                        </g>
+                    },
+                )
             } else {
-                html! {
-                    <g class="piece-outline-group edge-external">
-                        <path class="piece-outline edge-external" d={external_path} />
-                    </g>
-                }
+                (
+                    html! {
+                        <g class="piece-outline-group edge-external">
+                            <path class="piece-outline edge-external" d={external_path} />
+                        </g>
+                    },
+                    html! {},
+                )
             };
             let simple_outline = if emboss_enabled_value {
                 html! {}
@@ -4286,7 +4302,7 @@ fn app() -> Html {
             } else {
                 html! {}
             };
-            let emboss_target = if emboss_enabled_value {
+            let emboss_target = if emboss_enabled_value && !flipped {
                 "url(#emboss)"
             } else {
                 "none"
@@ -4329,6 +4345,7 @@ fn app() -> Html {
                         </g>
                     </g>
                     <g transform={inner_transform}>
+                        {internal_outline}
                         {simple_outline}
                         {debug_overlay}
                     </g>

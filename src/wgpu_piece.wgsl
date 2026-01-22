@@ -120,6 +120,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         if (input.hover < 0.5) {
             return vec4<f32>(0.0);
         }
+        if (input.flip > 0.5) {
+            return vec4<f32>(0.0);
+        }
         let outline_stroke_width_px = max(globals.outline_width_px, 0.5);
         let texel = vec2<f32>(outline_stroke_width_px, outline_stroke_width_px) / globals.atlas_size;
         let left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, 0.0)).r;
@@ -162,7 +165,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let dot_color = srgb_to_linear(vec3<f32>(0.0, 1.0, 0.0));
         rgb = rgb * (1.0 - dot) + dot_color * dot;
     }
-    if (globals.emboss_strength > 0.0) {
+    if (globals.emboss_strength > 0.0 && input.flip < 0.5) {
         let texel = vec2<f32>(1.0, 1.0) / globals.atlas_size;
         let left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, 0.0)).r;
         let right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, 0.0)).r;
@@ -192,6 +195,28 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
             rgb = mix(rgb, vec3<f32>(1.0), emboss * highlight * 1.1);
             rgb = mix(rgb, vec3<f32>(0.0), emboss * shadow * 1.5);
         }
+    }
+    if (input.flip > 0.5 && input.hover > 0.5) {
+        let outline_stroke_width_px = max(globals.outline_width_px, 0.5);
+        let texel = vec2<f32>(outline_stroke_width_px, outline_stroke_width_px) / globals.atlas_size;
+        let left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, 0.0)).r;
+        let right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, 0.0)).r;
+        let up = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, -texel.y)).r;
+        let down = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(0.0, texel.y)).r;
+        let up_left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, -texel.y)).r;
+        let up_right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, -texel.y)).r;
+        let down_left = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(-texel.x, texel.y)).r;
+        let down_right = textureSample(mask_tex, tex_sampler, input.mask_uv + vec2<f32>(texel.x, texel.y)).r;
+        let min_cardinal = min(min(left, right), min(up, down));
+        let min_diagonal = min(min(up_left, up_right), min(down_left, down_right));
+        let min_neighbor = min(min_cardinal, min_diagonal);
+        let neighbor_fwidth = abs(dpdx(min_neighbor)) + abs(dpdy(min_neighbor));
+        let outline_aa = max(max(mask_fwidth, neighbor_fwidth) * globals.edge_aa, 1e-4);
+        let inside = smoothstep(outline_threshold, outline_threshold + outline_aa, mask);
+        let outside = 1.0 - smoothstep(outline_threshold, outline_threshold + outline_aa, min_neighbor);
+        let edge = inside * outside;
+        let outline = srgb_to_linear(vec3<f32>(1.0, 0.0, 0.0));
+        rgb = mix(rgb, outline, edge);
     }
     return vec4<f32>(apply_output_gamma(rgb), alpha);
 }

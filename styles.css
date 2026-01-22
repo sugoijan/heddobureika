@@ -132,6 +132,10 @@ body {
   opacity: 0;
 }
 
+.piece-outline-group.edge-internal {
+  opacity: 0;
+}
+
 .piece.hovered .piece-image {
   opacity: 1;
 }
@@ -140,7 +144,16 @@ body {
   opacity: 1;
 }
 
+.piece.hovered .piece-outline-group.edge-internal {
+  opacity: 1;
+}
+
 .piece-outline.edge-external {
+  stroke: #f00;
+  stroke-width: 3;
+}
+
+.piece-outline.edge-internal {
   stroke: #f00;
   stroke-width: 3;
 }
