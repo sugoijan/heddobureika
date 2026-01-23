@@ -1,3 +1,11 @@
+@font-face {
+  font-family: "Iosevka";
+  src: url("fonts/iosevka.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 html,
 body {
   margin: 0;
@@ -192,7 +200,7 @@ body {
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 12px;
   box-shadow: 0 16px 32px rgba(0, 0, 0, 0.18);
-  font-family: monospace;
+  font-family: "Iosevka", monospace;
   overflow-y: auto;
 }
 
@@ -484,6 +492,7 @@ body {
 .control select {
   width: 100%;
   padding: 4px 6px;
+  font-family: inherit;
   font-size: 12px;
   border-radius: 6px;
   border: 1px solid rgba(0, 0, 0, 0.2);
@@ -499,6 +508,7 @@ body {
 .control-button {
   width: 100%;
   padding: 6px 10px;
+  font-family: inherit;
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
