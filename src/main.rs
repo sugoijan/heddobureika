@@ -1,6 +1,8 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use gloo::render::{request_animation_frame, AnimationFrame};
 use gloo::timers::callback::Interval;
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use glyphon::cosmic_text::Align;
 use js_sys::{Date, Function, Reflect};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -12,16 +14,61 @@ use web_sys::{
     HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent,
 };
 use yew::prelude::*;
+use taffy::prelude::*;
 
 mod core;
 use crate::core::*;
 mod renderer;
 use crate::renderer::{
-    build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, WgpuRenderer,
+    build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
+    UiTextId, UiTextSpec, WgpuRenderer,
 };
 
-const IMAGE_SRC: &str = "puzzles/zoe-samurai.jpg";
-const FPS_FONT_BYTES: &[u8] = include_bytes!("../fonts/kaorigel.ttf");
+const DEFAULT_PUZZLE_SRC: &str = "puzzles/zoe-samurai.jpg";
+const CREDIT_TEXT: &str = "coded by すごいジャン";
+const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
+const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
+const FPS_FONT_BYTES: &[u8] = include_bytes!("../fonts/chirufont.ttf");
+const UI_FONT_FAMILY: &str = "KaoriGel";
+const WORKSPACE_ASPECT_RATIO: f32 = 1.618034;
+const WORKSPACE_SLOT_WIDTH_FRAC: f32 = 0.76;
+const WORKSPACE_SLOT_HEIGHT_FRAC: f32 = 0.82;
+const WORKSPACE_SLOT_LEFT_FRAC: f32 = (1.0 - WORKSPACE_SLOT_WIDTH_FRAC) * 0.5;
+const WORKSPACE_SLOT_TOP_FRAC: f32 = (1.0 - WORKSPACE_SLOT_HEIGHT_FRAC) * 0.5;
+const UI_CREDIT_FONT_RATIO: f32 = 0.026;
+const UI_CREDIT_ROTATION_DEG: f32 = -1.1;
+const UI_MENU_SUB_FONT_RATIO: f32 = 0.028;
+const UI_MENU_SUB_ROTATION_DEG: f32 = 1.1;
+const UI_MENU_TITLE_FONT_RATIO: f32 = 0.05;
+const UI_MENU_TITLE_ROTATION_DEG: f32 = -0.8;
+const UI_PROGRESS_FONT_RATIO: f32 = 0.032;
+const UI_PROGRESS_ROTATION_DEG: f32 = -89.6;
+const UI_SUCCESS_FONT_RATIO: f32 = 0.082;
+const UI_SUCCESS_OFFSET_RATIO: f32 = 0.03;
+const UI_SUCCESS_ROTATION_DEG: f32 = -1.3;
+const UI_TEXT_ALPHA_SCALE: f32 = 0.8;
+const UI_TEXT_LAYOUT_SCALE: f32 = 1.08;
+const UI_TEXT_LAYOUT_PAD: f32 = 6.0;
+const UI_TEXT_HITBOX_PAD: f32 = 8.0;
+const UI_TITLE_FONT_RATIO: f32 = 0.058;
+const UI_TITLE_ROTATION_DEG: f32 = 0.5;
+
+#[derive(Clone, Copy)]
+struct PuzzleArt {
+    label: &'static str,
+    src: &'static str,
+}
+
+const PUZZLE_ARTS: &[PuzzleArt] = &[
+    PuzzleArt {
+        label: "Zoe Samurai",
+        src: DEFAULT_PUZZLE_SRC,
+    },
+    PuzzleArt {
+        label: "Zoe Potter",
+        src: "puzzles/zoe-potter.jpg",
+    },
+];
 
 #[derive(Default)]
 struct DragHandlers {
@@ -37,6 +84,484 @@ struct HoverDeps {
     active_id: Option<usize>,
     dragging_members: Vec<usize>,
     show_debug: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceLayout {
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+}
+
+#[derive(Clone, Copy)]
+struct UiHitbox {
+    center: [f32; 2],
+    half_size: [f32; 2],
+    rotation_deg: f32,
+}
+
+struct GlyphonMeasureState {
+    font_system: FontSystem,
+}
+
+impl GlyphonMeasureState {
+    fn new() -> Self {
+        let mut font_system = FontSystem::new();
+        font_system.db_mut().load_font_data(FPS_FONT_BYTES.to_vec());
+        Self { font_system }
+    }
+}
+
+fn compute_workspace_layout(
+    width: f32,
+    height: f32,
+    scale: f32,
+    max_dim: f32,
+) -> WorkspaceLayout {
+    let max_dim = max_dim.max(1.0);
+    let min_height_for_slot = max_dim / WORKSPACE_SLOT_HEIGHT_FRAC;
+    let min_height_for_width = max_dim / (WORKSPACE_SLOT_WIDTH_FRAC * WORKSPACE_ASPECT_RATIO);
+    let base_height = min_height_for_slot.max(min_height_for_width);
+    let base_width = base_height * WORKSPACE_ASPECT_RATIO;
+    let workspace_width = base_width * scale;
+    let workspace_height = base_height * scale;
+    let slot_width = workspace_width * WORKSPACE_SLOT_WIDTH_FRAC;
+    let slot_height = workspace_height * WORKSPACE_SLOT_HEIGHT_FRAC;
+    let slot_origin_x = workspace_width * WORKSPACE_SLOT_LEFT_FRAC;
+    let slot_origin_y = workspace_height * WORKSPACE_SLOT_TOP_FRAC;
+    let puzzle_offset_x = slot_origin_x + (slot_width - width) * 0.5;
+    let puzzle_offset_y = slot_origin_y + (slot_height - height) * 0.5;
+    WorkspaceLayout {
+        view_min_x: -puzzle_offset_x,
+        view_min_y: -puzzle_offset_y,
+        view_width: workspace_width,
+        view_height: workspace_height,
+    }
+}
+
+fn estimate_text_width(text: &str, font_size: f32) -> f32 {
+    let mut units = 0.0;
+    for ch in text.chars() {
+        if ch.is_ascii_whitespace() {
+            units += 0.35;
+        } else if ch.is_ascii() {
+            units += 0.6;
+        } else {
+            units += 1.0;
+        }
+    }
+    units * font_size
+}
+
+fn estimate_text_block(spec: &UiTextSpec) -> (f32, f32) {
+    let mut max_width = 0.0;
+    let lines: Vec<&str> = spec.text.lines().collect();
+    for line in &lines {
+        let width = estimate_text_width(line, spec.font_size);
+        if width > max_width {
+            max_width = width;
+        }
+    }
+    let line_count = lines.len().max(1) as f32;
+    let height = spec.line_height * line_count;
+    (max_width, height)
+}
+
+fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
+    let mut max_width = 0.0;
+    let mut max_height = 0.0;
+    for run in buffer.layout_runs() {
+        if run.line_w > max_width {
+            max_width = run.line_w;
+        }
+        let bottom = run.line_top + run.line_height;
+        if bottom > max_height {
+            max_height = bottom;
+        }
+    }
+    (max_width, max_height)
+}
+
+fn measure_text_block(
+    measure: &mut GlyphonMeasureState,
+    spec: &UiTextSpec,
+) -> (f32, f32) {
+    let metrics = Metrics::new(spec.font_size, spec.line_height);
+    let mut buffer = Buffer::new(&mut measure.font_system, metrics);
+    buffer.set_size(&mut measure.font_system, None, None);
+    let attrs = Attrs::new().family(Family::Name(UI_FONT_FAMILY));
+    buffer.set_text(
+        &mut measure.font_system,
+        &spec.text,
+        &attrs,
+        Shaping::Advanced,
+        Some(Align::Left),
+    );
+    buffer.shape_until_scroll(&mut measure.font_system, false);
+    let (width, height) = measure_text_bounds(&buffer);
+    if width <= 0.0 || height <= 0.0 {
+        estimate_text_block(spec)
+    } else {
+        (width, height)
+    }
+}
+
+fn layout_text_bounds(measure: &mut GlyphonMeasureState, spec: &UiTextSpec) -> (f32, f32) {
+    let (text_width, text_height) = measure_text_block(measure, spec);
+    let scaled_width = text_width * UI_TEXT_LAYOUT_SCALE;
+    let scaled_height = text_height * UI_TEXT_LAYOUT_SCALE;
+    (
+        (scaled_width + UI_TEXT_LAYOUT_PAD * 2.0).max(1.0),
+        (scaled_height + UI_TEXT_LAYOUT_PAD * 2.0).max(1.0),
+    )
+}
+
+fn rotation_offset_for(origin: UiRotationOrigin, width: f32, height: f32) -> [f32; 2] {
+    let half_w = width * 0.5;
+    let half_h = height * 0.5;
+    match origin {
+        UiRotationOrigin::Center => [0.0, 0.0],
+        UiRotationOrigin::BottomLeft => [-half_w, half_h],
+        UiRotationOrigin::BottomRight => [half_w, half_h],
+        UiRotationOrigin::TopLeft => [-half_w, -half_h],
+        UiRotationOrigin::TopRight => [half_w, -half_h],
+    }
+}
+
+fn apply_taffy_layout(
+    measure: &mut GlyphonMeasureState,
+    layout: WorkspaceLayout,
+    width: f32,
+    height: f32,
+    menu_visible: bool,
+    specs: &mut [UiTextSpec],
+) {
+    let left_gutter = (-layout.view_min_x).max(0.0);
+    let right_gutter = (layout.view_min_x + layout.view_width - width).max(0.0);
+    let top_gutter = (-layout.view_min_y).max(0.0);
+    let bottom_gutter = (layout.view_min_y + layout.view_height - height).max(0.0);
+    let mut taffy: TaffyTree<()> = TaffyTree::new();
+    let root_style = Style {
+        display: Display::Grid,
+        size: Size {
+            width: length(layout.view_width),
+            height: length(layout.view_height),
+        },
+        grid_template_columns: vec![length(left_gutter), length(width), length(right_gutter)],
+        grid_template_rows: vec![length(top_gutter), length(height), length(bottom_gutter)],
+        justify_items: Some(JustifyItems::Center),
+        align_items: Some(AlignItems::Center),
+        ..Default::default()
+    };
+    let mut nodes: Vec<(UiTextId, NodeId)> = Vec::new();
+    let root = if menu_visible {
+        let mut menu_children = Vec::new();
+        let mut menu_ids = Vec::new();
+        let mut title_size = None;
+        for spec in specs.iter_mut() {
+            if !matches!(spec.id, UiTextId::MenuTitle | UiTextId::MenuSubtitle) {
+                continue;
+            }
+            if matches!(spec.id, UiTextId::MenuTitle) {
+                title_size = Some(spec.font_size);
+            }
+            let (text_width, text_height) = layout_text_bounds(measure, spec);
+            spec.rotation_offset =
+                rotation_offset_for(spec.rotation_origin, text_width, text_height);
+            let child_style = Style {
+                size: Size {
+                    width: length(text_width),
+                    height: length(text_height),
+                },
+                ..Default::default()
+            };
+            let Ok(node) = taffy.new_leaf(child_style) else {
+                return;
+            };
+            menu_ids.push(node);
+            menu_children.push((spec.id, node));
+        }
+        let gap = title_size.unwrap_or(0.0) * 0.4;
+        let menu_style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            align_items: Some(AlignItems::Center),
+            justify_content: Some(JustifyContent::Center),
+            gap: Size {
+                width: zero(),
+                height: length(gap),
+            },
+            grid_row: line(2),
+            grid_column: line(2),
+            ..Default::default()
+        };
+        let Ok(menu_node) = taffy.new_with_children(menu_style, &menu_ids) else {
+            return;
+        };
+        nodes.extend(menu_children);
+        let Ok(root) = taffy.new_with_children(root_style, &[menu_node]) else {
+            return;
+        };
+        root
+    } else {
+        let mut children = Vec::new();
+        for spec in specs.iter_mut() {
+            let (row, col, span_cols, justify, align) = match spec.id {
+                UiTextId::Title => (1, 1, false, JustifySelf::Start, AlignSelf::Start),
+                UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
+                UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
+                UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
+                UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
+                    (2, 2, false, JustifySelf::Center, AlignSelf::Center)
+                }
+            };
+            let (text_width, text_height) = layout_text_bounds(measure, spec);
+            spec.rotation_offset =
+                rotation_offset_for(spec.rotation_origin, text_width, text_height);
+            let mut child_style = Style {
+                size: Size {
+                    width: length(text_width),
+                    height: length(text_height),
+                },
+                justify_self: Some(justify),
+                align_self: Some(align),
+                ..Default::default()
+            };
+            child_style.grid_row = line(row);
+            child_style.grid_column = if span_cols { span(3) } else { line(col) };
+            let Ok(node) = taffy.new_leaf(child_style) else {
+                return;
+            };
+            children.push(node);
+            nodes.push((spec.id, node));
+        }
+        let Ok(root) = taffy.new_with_children(root_style, &children) else {
+            return;
+        };
+        root
+    };
+    if taffy
+        .compute_layout(
+            root,
+            Size {
+                width: length(layout.view_width),
+                height: length(layout.view_height),
+            },
+        )
+        .is_err()
+    {
+        return;
+    }
+    let success_offset = width.min(height) * UI_SUCCESS_OFFSET_RATIO;
+    for spec in specs.iter_mut() {
+        let node = nodes
+            .iter()
+            .find(|(id, _)| *id == spec.id)
+            .map(|(_, node)| *node);
+        let Some(node) = node else {
+            continue;
+        };
+        let Ok(node_layout) = taffy.layout(node) else {
+            continue;
+        };
+        spec.pos = [
+            layout.view_min_x + node_layout.location.x + node_layout.size.width * 0.5,
+            layout.view_min_y + node_layout.location.y + node_layout.size.height * 0.5,
+        ];
+        if matches!(spec.id, UiTextId::Success) {
+            spec.pos[0] += success_offset;
+        }
+    }
+}
+
+fn ui_hitbox_for_spec(measure: &mut GlyphonMeasureState, spec: &UiTextSpec) -> UiHitbox {
+    let (text_width, text_height) = measure_text_block(measure, spec);
+    let pad = UI_TEXT_HITBOX_PAD;
+    let offset = spec.rotation_offset;
+    let angle = spec.rotation_deg.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let pivot = [spec.pos[0] + offset[0], spec.pos[1] + offset[1]];
+    let rel_center = [-offset[0], -offset[1]];
+    let center = [
+        pivot[0] + rel_center[0] * cos - rel_center[1] * sin,
+        pivot[1] + rel_center[0] * sin + rel_center[1] * cos,
+    ];
+    UiHitbox {
+        center,
+        half_size: [
+            (text_width + pad * 2.0) * 0.5,
+            (text_height + pad * 2.0) * 0.5,
+        ],
+        rotation_deg: spec.rotation_deg,
+    }
+}
+
+fn point_in_ui_hitbox(x: f32, y: f32, hitbox: UiHitbox) -> bool {
+    let dx = x - hitbox.center[0];
+    let dy = y - hitbox.center[1];
+    let angle = -hitbox.rotation_deg.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let local_x = dx * cos - dy * sin;
+    let local_y = dx * sin + dy * cos;
+    local_x.abs() <= hitbox.half_size[0] && local_y.abs() <= hitbox.half_size[1]
+}
+
+fn open_credit_url() {
+    if let Some(window) = web_sys::window() {
+        let _ = window.open_with_url_and_target(CREDIT_URL, "_blank");
+    }
+}
+
+fn ui_scale_alpha(color: [u8; 4], scale: f32) -> [u8; 4] {
+    let scaled = (color[3] as f32 * scale).round().clamp(0.0, 255.0) as u8;
+    [color[0], color[1], color[2], scaled]
+}
+
+fn ui_scaled_alpha(alpha: u8) -> u8 {
+    (alpha as f32 * UI_TEXT_ALPHA_SCALE)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn ui_text_color(is_dark: bool) -> [u8; 4] {
+    let base = if is_dark {
+        [235, 234, 230, 230]
+    } else {
+        [20, 20, 20, 220]
+    };
+    ui_scale_alpha(base, UI_TEXT_ALPHA_SCALE)
+}
+
+fn ui_accent_color(is_dark: bool) -> [u8; 4] {
+    let base = if is_dark {
+        [168, 255, 208, 240]
+    } else {
+        [24, 120, 62, 230]
+    };
+    ui_scale_alpha(base, UI_TEXT_ALPHA_SCALE)
+}
+
+fn ui_with_alpha(color: [u8; 4], alpha: u8) -> [u8; 4] {
+    [color[0], color[1], color[2], alpha]
+}
+
+fn ui_color_to_css(color: [u8; 4]) -> String {
+    let alpha = (color[3] as f32) / 255.0;
+    format!(
+        "rgba({}, {}, {}, {:.3})",
+        color[0], color[1], color[2], alpha
+    )
+}
+
+fn build_ui_specs(
+    measure: &mut GlyphonMeasureState,
+    layout: WorkspaceLayout,
+    width: f32,
+    height: f32,
+    title_text: &str,
+    solved: bool,
+    connections_label: &str,
+    border_connections_label: &str,
+    menu_visible: bool,
+    is_dark: bool,
+) -> Vec<UiTextSpec> {
+    let min_dim = width.min(height).max(1.0);
+    let base_color = ui_text_color(is_dark);
+    let muted_color = ui_with_alpha(base_color, ui_scaled_alpha(170));
+    let accent_color = ui_accent_color(is_dark);
+    let mut specs = Vec::new();
+    if menu_visible {
+        let title_size = min_dim * UI_MENU_TITLE_FONT_RATIO;
+        let sub_size = min_dim * UI_MENU_SUB_FONT_RATIO;
+        specs.push(UiTextSpec {
+            id: UiTextId::MenuTitle,
+            text: "Pick a puzzle".to_string(),
+            pos: [0.0, 0.0],
+            rotation_deg: UI_MENU_TITLE_ROTATION_DEG,
+            rotation_origin: UiRotationOrigin::Center,
+            rotation_offset: [0.0, 0.0],
+            font_size: title_size,
+            line_height: title_size * 1.08,
+            color: base_color,
+        });
+        specs.push(UiTextSpec {
+            id: UiTextId::MenuSubtitle,
+            text: "Scramble / Puzzle / Pieces".to_string(),
+            pos: [0.0, 0.0],
+            rotation_deg: UI_MENU_SUB_ROTATION_DEG,
+            rotation_origin: UiRotationOrigin::Center,
+            rotation_offset: [0.0, 0.0],
+            font_size: sub_size,
+            line_height: sub_size * 1.08,
+            color: muted_color,
+        });
+    } else {
+        if !title_text.is_empty() {
+            let title_size = min_dim * UI_TITLE_FONT_RATIO;
+            specs.push(UiTextSpec {
+                id: UiTextId::Title,
+                text: title_text.to_string(),
+                pos: [0.0, 0.0],
+                rotation_deg: UI_TITLE_ROTATION_DEG,
+                rotation_origin: UiRotationOrigin::BottomLeft,
+                rotation_offset: [0.0, 0.0],
+                font_size: title_size,
+                line_height: title_size * 1.08,
+                color: base_color,
+            });
+        }
+        let progress_text = format!(
+            "{} of borders and {} of everything complete",
+            border_connections_label, connections_label
+        );
+        let progress_size = min_dim * UI_PROGRESS_FONT_RATIO;
+        specs.push(UiTextSpec {
+            id: UiTextId::Progress,
+            text: progress_text,
+            pos: [0.0, 0.0],
+            rotation_deg: UI_PROGRESS_ROTATION_DEG,
+            rotation_origin: UiRotationOrigin::TopLeft,
+            rotation_offset: [0.0, 0.0],
+            font_size: progress_size,
+            line_height: progress_size * 1.08,
+            color: base_color,
+        });
+
+        let credit_text = CREDIT_TEXT.to_string();
+        let credit_size = min_dim * UI_CREDIT_FONT_RATIO;
+        specs.push(UiTextSpec {
+            id: UiTextId::Credit,
+            text: credit_text,
+            pos: [0.0, 0.0],
+            rotation_deg: UI_CREDIT_ROTATION_DEG,
+            rotation_origin: UiRotationOrigin::BottomLeft,
+            rotation_offset: [0.0, 0.0],
+            font_size: credit_size,
+            line_height: credit_size * 1.08,
+            color: base_color,
+        });
+
+        if solved {
+            let success_size = min_dim * UI_SUCCESS_FONT_RATIO;
+            specs.push(UiTextSpec {
+                id: UiTextId::Success,
+                text: "Well done!".to_string(),
+                pos: [0.0, 0.0],
+                rotation_deg: UI_SUCCESS_ROTATION_DEG,
+                rotation_origin: UiRotationOrigin::Center,
+                rotation_offset: [0.0, 0.0],
+                font_size: success_size,
+                line_height: success_size * 1.1,
+                color: accent_color,
+            });
+        }
+    }
+
+    apply_taffy_layout(measure, layout, width, height, menu_visible, &mut specs);
+    specs
 }
 
 fn load_saved_board() -> Option<SavedBoard> {
@@ -733,6 +1258,24 @@ fn app() -> Html {
             }
         })
         .collect();
+    let puzzle_art_index = use_state(|| 0usize);
+    let puzzle_art_index_value = *puzzle_art_index;
+    let puzzle_art = PUZZLE_ARTS
+        .get(puzzle_art_index_value)
+        .copied()
+        .unwrap_or(PUZZLE_ARTS[0]);
+    let puzzle_src = puzzle_art.src;
+    let puzzle_art_options: Html = PUZZLE_ARTS
+        .iter()
+        .enumerate()
+        .map(|(index, art)| {
+            html! {
+                <option value={index.to_string()} selected={index == puzzle_art_index_value}>
+                    {art.label}
+                </option>
+            }
+        })
+        .collect();
 
     let tab_width_input = on_setting_change(settings.clone(), |settings, value| {
         settings.tab_width = value.clamp(TAB_WIDTH_MIN, TAB_WIDTH_MAX);
@@ -837,6 +1380,9 @@ fn app() -> Html {
     let fast_filter_value = svg_fast_filter;
     let wgpu_renderer = use_mut_ref(|| None::<WgpuRenderer>);
     let pending_instances = use_mut_ref(|| None::<InstanceSet>);
+    let pending_ui = use_mut_ref(|| None::<Vec<UiTextSpec>>);
+    let ui_credit_hitbox = use_mut_ref(|| None::<UiHitbox>);
+    let ui_measure_state = use_mut_ref(GlyphonMeasureState::new);
     let mask_atlas = use_mut_ref(|| None::<Rc<MaskAtlasData>>);
     let mask_atlas_revision = use_state(|| 0u32);
     let hovered_id = use_state(|| None::<usize>);
@@ -858,6 +1404,10 @@ fn app() -> Html {
     let solved_value = *solved;
     let show_controls = use_state(|| false);
     let show_controls_value = *show_controls;
+    let menu_visible = use_state(|| false);
+    let menu_visible_value = *menu_visible;
+    let ui_credit_hovered = use_state(|| false);
+    let ui_credit_hovered_value = *ui_credit_hovered;
     let show_debug = use_state(|| false);
     let show_debug_value = *show_debug;
     let dragging_members_value = (*dragging_members).clone();
@@ -891,17 +1441,19 @@ fn app() -> Html {
             || ()
         });
     }
+    let prefers_dark = prefers_dark_mode();
+    let is_dark_theme = match theme_mode_value {
+        ThemeMode::Dark => true,
+        ThemeMode::Light => false,
+        ThemeMode::System => prefers_dark,
+    };
     let status_label = if solved_value { "Solved" } else { "In progress" };
     let status_class = if solved_value {
         "status status-solved"
     } else {
         "status"
     };
-    let solved_banner = if solved_value {
-        html! { <div class="solved-banner">{ "Solved!" }</div> }
-    } else {
-        html! {}
-    };
+    let solved_banner = html! {};
     let seed_label = if image_size_value.is_some() {
         let cols = grid.cols as usize;
         let rows = grid.rows as usize;
@@ -1072,10 +1624,16 @@ fn app() -> Html {
                         let rows = grid.rows as usize;
                         let piece_width = width as f32 / grid.cols as f32;
                         let piece_height = height as f32 / grid.rows as f32;
-                        let view_width = width as f32 * workspace_scale_value;
-                        let view_height = height as f32 * workspace_scale_value;
-                        let view_min_x = (width as f32 - view_width) * 0.5;
-                        let view_min_y = (height as f32 - view_height) * 0.5;
+                        let layout = compute_workspace_layout(
+                            width as f32,
+                            height as f32,
+                            workspace_scale_value,
+                            image_max_dim as f32,
+                        );
+                        let view_width = layout.view_width;
+                        let view_height = layout.view_height;
+                        let view_min_x = layout.view_min_x;
+                        let view_min_y = layout.view_min_y;
                         let margin =
                             piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
                         let nonce = time_nonce(*scramble_nonce);
@@ -1146,6 +1704,18 @@ fn app() -> Html {
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < grid_choices_len {
                     grid_index.set(value);
+                }
+            }
+        })
+    };
+    let on_puzzle_art_change = {
+        let puzzle_art_index = puzzle_art_index.clone();
+        let puzzle_art_len = PUZZLE_ARTS.len();
+        Callback::from(move |event: Event| {
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            if let Ok(value) = select.value().parse::<usize>() {
+                if value < puzzle_art_len {
+                    puzzle_art_index.set(value);
                 }
             }
         })
@@ -1429,6 +1999,13 @@ fn app() -> Html {
             show_debug.set(input.checked());
         })
     };
+    let on_menu_toggle = {
+        let menu_visible = menu_visible.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            menu_visible.set(input.checked());
+        })
+    };
 
     {
         let theme_toggle_ref = theme_toggle_ref.clone();
@@ -1466,6 +2043,7 @@ fn app() -> Html {
         let image_element = image_element.clone();
         let wgpu_renderer = wgpu_renderer.clone();
         let pending_instances = pending_instances.clone();
+        let pending_ui = pending_ui.clone();
         let mask_atlas = mask_atlas.clone();
         let mask_atlas_revision = mask_atlas_revision.clone();
         let hovered_id = hovered_id.clone();
@@ -1489,6 +2067,7 @@ fn app() -> Html {
                 grid,
                 settings_value.clone(),
                 workspace_scale_value,
+                image_max_dim,
                 depth_cap,
                 curve_detail,
                 theme_mode_value,
@@ -1502,6 +2081,7 @@ fn app() -> Html {
                 grid,
                 settings_value,
                 workspace_scale_value,
+                image_max_dim,
                 depth_cap,
                 curve_detail,
                 theme_mode_value,
@@ -1533,10 +2113,16 @@ fn app() -> Html {
                     let settings_value = settings_value.clone();
                     let width_f = width as f32;
                     let height_f = height as f32;
-                    let view_width = width_f * *workspace_scale_value;
-                    let view_height = height_f * *workspace_scale_value;
-                    let view_min_x = (width_f - view_width) * 0.5;
-                    let view_min_y = (height_f - view_height) * 0.5;
+                    let layout = compute_workspace_layout(
+                        width_f,
+                        height_f,
+                        *workspace_scale_value,
+                        *image_max_dim as f32,
+                    );
+                    let view_width = layout.view_width;
+                    let view_height = layout.view_height;
+                    let view_min_x = layout.view_min_x;
+                    let view_min_y = layout.view_min_y;
                     let piece_width = width_f / grid.cols as f32;
                     let piece_height = height_f / grid.rows as f32;
 
@@ -1626,6 +2212,7 @@ fn app() -> Html {
                             Ok(mut renderer) => {
                                 renderer.set_emboss_enabled(true);
                                 renderer.set_font_bytes(FPS_FONT_BYTES.to_vec());
+                                renderer.set_ui_font_bytes(FPS_FONT_BYTES.to_vec());
                                 renderer.set_edge_aa(wgpu_edge_aa);
                                 let total = (grid.cols as usize) * (grid.rows as usize);
                                 if let Some(instances) = pending_instances.borrow_mut().take() {
@@ -1633,6 +2220,9 @@ fn app() -> Html {
                                         renderer.update_instances(instances);
                                     }
                                     renderer.set_show_fps(wgpu_show_fps);
+                                    if let Some(specs) = pending_ui.borrow_mut().take() {
+                                        renderer.set_ui_texts(&specs);
+                                    }
                                     renderer.render();
                                 } else {
                                     let positions_snapshot = (*positions).clone();
@@ -1674,6 +2264,9 @@ fn app() -> Html {
                                         renderer.update_instances(instances);
                                     }
                                     renderer.set_show_fps(wgpu_show_fps);
+                                    if let Some(specs) = pending_ui.borrow_mut().take() {
+                                        renderer.set_ui_texts(&specs);
+                                    }
                                     renderer.render();
                                 }
                                 *wgpu_renderer.borrow_mut() = Some(renderer);
@@ -1692,6 +2285,10 @@ fn app() -> Html {
     {
         let wgpu_renderer = wgpu_renderer.clone();
         let pending_instances = pending_instances.clone();
+        let pending_ui = pending_ui.clone();
+        let ui_credit_hitbox = ui_credit_hitbox.clone();
+        let ui_measure_state = ui_measure_state.clone();
+        let ui_credit_hovered = ui_credit_hovered.clone();
         let mask_atlas = mask_atlas.clone();
         let wgpu_settings_value = wgpu_settings_value.clone();
         use_effect_with(
@@ -1699,12 +2296,19 @@ fn app() -> Html {
                 using_wgpu,
                 image_size_value,
                 grid,
-                (*positions).clone(),
-                (*rotations).clone(),
-                (*flips).clone(),
-                (*z_order).clone(),
-                (*connections).clone(),
-                hover_deps.clone(),
+                workspace_scale_value,
+                image_max_dim,
+                theme_mode_value,
+                solved_value,
+                menu_visible_value,
+                (
+                    (*positions).clone(),
+                    (*rotations).clone(),
+                    (*flips).clone(),
+                    (*z_order).clone(),
+                    (*connections).clone(),
+                    hover_deps.clone(),
+                ),
                 mask_atlas_revision_value,
                 wgpu_settings_value,
             ),
@@ -1712,23 +2316,48 @@ fn app() -> Html {
                 using_wgpu,
                 image_size_value,
                 grid,
-                positions_value,
-                rotations_value,
-                flips_value,
-                z_order_value,
-                connections_value,
-                hover_deps,
+                workspace_scale_value,
+                image_max_dim,
+                theme_mode_value,
+                solved_value,
+                menu_visible_value,
+                (
+                    positions_value,
+                    rotations_value,
+                    flips_value,
+                    z_order_value,
+                    connections_value,
+                    hover_deps,
+                ),
                 _mask_atlas_revision_value,
                 wgpu_settings_value,
             )| {
                 let cleanup: fn() = || ();
                 if !*using_wgpu {
+                    *ui_credit_hitbox.borrow_mut() = None;
+                    if *ui_credit_hovered {
+                        ui_credit_hovered.set(false);
+                    }
                     return cleanup;
                 }
                 let Some((width, height)) = *image_size_value else {
                     return cleanup;
                 };
 
+                let prefers_dark = prefers_dark_mode();
+                let is_dark_theme = match theme_mode_value {
+                    ThemeMode::Dark => true,
+                    ThemeMode::Light => false,
+                    ThemeMode::System => prefers_dark,
+                };
+                let width_f = width as f32;
+                let height_f = height as f32;
+                let layout = compute_workspace_layout(
+                    width_f,
+                    height_f,
+                    *workspace_scale_value,
+                    *image_max_dim as f32,
+                );
                 let cols = grid.cols as usize;
                 let rows = grid.rows as usize;
                 let piece_width = width as f32 / grid.cols as f32;
@@ -1758,31 +2387,73 @@ fn app() -> Html {
                 } else {
                     None
                 };
-                let instances = build_wgpu_instances(
-                    &positions_value,
-                    &rotations_value,
-                    &flips_value,
-                    &z_order_value,
-                    &connections_value,
-                    hovered_id,
-                    show_debug,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    &mask_atlas,
-                    highlight_members,
+                let show_menu = *menu_visible_value;
+                let instances = if show_menu {
+                    InstanceSet {
+                        instances: Vec::new(),
+                        batches: Vec::new(),
+                    }
+                } else {
+                    build_wgpu_instances(
+                        &positions_value,
+                        &rotations_value,
+                        &flips_value,
+                        &z_order_value,
+                        &connections_value,
+                        hovered_id,
+                        show_debug,
+                        cols,
+                        rows,
+                        piece_width,
+                        piece_height,
+                        &mask_atlas,
+                        highlight_members,
+                    )
+                };
+                let (connections_label, border_connections_label) = if connections_value.len() == total {
+                    let (connected, border_connected, total_expected, border_expected) =
+                        count_connections(&connections_value, cols, rows);
+                    (
+                        format_progress(connected, total_expected),
+                        format_progress(border_connected, border_expected),
+                    )
+                } else {
+                    ("--".to_string(), "--".to_string())
+                };
+                let mut measure_state = ui_measure_state.borrow_mut();
+                let ui_specs = build_ui_specs(
+                    &mut measure_state,
+                    layout,
+                    width_f,
+                    height_f,
+                    UI_TITLE_TEXT,
+                    *solved_value,
+                    &connections_label,
+                    &border_connections_label,
+                    show_menu,
+                    is_dark_theme,
                 );
+                let credit_hitbox = ui_specs
+                    .iter()
+                    .find(|spec| matches!(spec.id, UiTextId::Credit))
+                    .map(|spec| ui_hitbox_for_spec(&mut measure_state, spec));
+                *ui_credit_hitbox.borrow_mut() = credit_hitbox;
+                if ui_credit_hitbox.borrow().is_none() && *ui_credit_hovered {
+                    ui_credit_hovered.set(false);
+                }
                 let mut renderer_ref = wgpu_renderer.borrow_mut();
                 if let Some(renderer) = renderer_ref.as_mut() {
                     renderer.set_emboss_enabled(true);
                     renderer.set_edge_aa(wgpu_settings_value.edge_aa);
                     renderer.set_show_fps(wgpu_settings_value.show_fps);
+                    renderer.set_show_frame(!show_menu);
+                    renderer.set_ui_texts(&ui_specs);
                     renderer.update_instances(instances);
                     renderer.render();
                     pending_instances.borrow_mut().take();
                 } else {
                     *pending_instances.borrow_mut() = Some(instances);
+                    *pending_ui.borrow_mut() = Some(ui_specs);
                 }
                 cleanup
             },
@@ -1994,8 +2665,8 @@ fn app() -> Html {
         let image_element = image_element.clone();
         let image_revision = image_revision.clone();
         use_effect_with(
-            (image_max_dim, image_render_scale),
-            move |(image_max_dim, image_render_scale)| {
+            (image_max_dim, image_render_scale, puzzle_src),
+            move |(image_max_dim, image_render_scale, puzzle_src)| {
                 let img = HtmlImageElement::new().expect("create image element");
                 let img_clone = img.clone();
                 let logical_max_dim = *image_max_dim;
@@ -2128,7 +2799,7 @@ fn app() -> Html {
                     onload_scaled.forget();
                 }));
                 img.set_onload(Some(onload.as_ref().unchecked_ref()));
-                img.set_src(IMAGE_SRC);
+                img.set_src(puzzle_src);
                 onload.forget();
                 || ()
             },
@@ -2139,16 +2810,35 @@ fn app() -> Html {
         if let Some((width, height)) = *image_size {
         let width_f = width as f32;
         let height_f = height as f32;
-        let view_width = width_f * workspace_scale_value;
-        let view_height = height_f * workspace_scale_value;
-        let view_min_x = (width_f - view_width) * 0.5;
-        let view_min_y = (height_f - view_height) * 0.5;
+        let layout = compute_workspace_layout(
+            width_f,
+            height_f,
+            workspace_scale_value,
+            image_max_dim as f32,
+        );
+        let view_width = layout.view_width;
+        let view_height = layout.view_height;
+        let view_min_x = layout.view_min_x;
+        let view_min_y = layout.view_min_y;
         let view_box = format!(
             "{} {} {} {}",
             fmt_f32(view_min_x),
             fmt_f32(view_min_y),
             fmt_f32(view_width),
             fmt_f32(view_height)
+        );
+        let mut measure_state = ui_measure_state.borrow_mut();
+        let ui_specs = build_ui_specs(
+            &mut measure_state,
+            layout,
+            width_f,
+            height_f,
+            UI_TITLE_TEXT,
+            solved_value,
+            connections_label.as_str(),
+            border_connections_label.as_str(),
+            menu_visible_value,
+            is_dark_theme,
         );
         let piece_width = width_f / grid.cols as f32;
         let piece_height = height_f / grid.rows as f32;
@@ -4334,7 +5024,7 @@ fn app() -> Html {
                             />
                             <image
                                 class="piece-image"
-                                href={IMAGE_SRC}
+                                href={puzzle_src}
                                 x={img_x}
                                 y={img_y}
                                 width={width.to_string()}
@@ -4353,7 +5043,9 @@ fn app() -> Html {
             };
             nodes.push(node);
         }
-        let piece_nodes: Html = if z_order_value.len() == nodes.len() {
+        let piece_nodes: Html = if menu_visible_value {
+            html! {}
+        } else if z_order_value.len() == nodes.len() {
             z_order_value
                 .iter()
                 .filter_map(|id| nodes.get(*id))
@@ -4364,6 +5056,8 @@ fn app() -> Html {
         };
         let on_canvas_down = {
             let canvas_ref = canvas_ref.clone();
+            let ui_credit_hitbox = ui_credit_hitbox.clone();
+            let ui_credit_hovered = ui_credit_hovered.clone();
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
@@ -4383,8 +5077,16 @@ fn app() -> Html {
                 ) else {
                     return;
                 };
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
                 let mask_atlas_ref = mask_atlas.borrow();
                 let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
+                    if credit_hit {
+                        open_credit_url();
+                        event.prevent_default();
+                    }
                     return;
                 };
                 let positions_snapshot = (*positions).clone();
@@ -4408,13 +5110,25 @@ fn app() -> Html {
                     piece_height,
                     mask_pad,
                 ) {
+                    if *ui_credit_hovered {
+                        ui_credit_hovered.set(false);
+                    }
                     begin_drag(piece_id, x, y, event.shift_key(), event.ctrl_key(), None);
+                    event.prevent_default();
+                    return;
+                }
+                if credit_hit {
+                    open_credit_url();
+                    event.prevent_default();
+                    return;
                 }
                 event.prevent_default();
             })
         };
         let on_canvas_touch = {
             let canvas_ref = canvas_ref.clone();
+            let ui_credit_hitbox = ui_credit_hitbox.clone();
+            let ui_credit_hovered = ui_credit_hovered.clone();
             let positions = positions.clone();
             let rotations = rotations.clone();
             let flips = flips.clone();
@@ -4443,8 +5157,16 @@ fn app() -> Html {
                 ) else {
                     return;
                 };
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
                 let mask_atlas_ref = mask_atlas.borrow();
                 let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
+                    if credit_hit {
+                        open_credit_url();
+                        event.prevent_default();
+                    }
                     return;
                 };
                 let positions_snapshot = (*positions).clone();
@@ -4468,7 +5190,17 @@ fn app() -> Html {
                     piece_height,
                     mask_pad,
                 ) {
+                    if *ui_credit_hovered {
+                        ui_credit_hovered.set(false);
+                    }
                     begin_drag(piece_id, x, y, false, false, touch_id);
+                    event.prevent_default();
+                    return;
+                }
+                if credit_hit {
+                    open_credit_url();
+                    event.prevent_default();
+                    return;
                 }
                 event.prevent_default();
             })
@@ -4481,6 +5213,8 @@ fn app() -> Html {
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let hovered_id = hovered_id.clone();
+            let ui_credit_hitbox = ui_credit_hitbox.clone();
+            let ui_credit_hovered = ui_credit_hovered.clone();
             let active_id = active_id.clone();
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
@@ -4498,62 +5232,80 @@ fn app() -> Html {
                     view_height,
                 ) else {
                     hovered_id.set(None);
+                    if *ui_credit_hovered {
+                        ui_credit_hovered.set(false);
+                    }
                     return;
                 };
-                let mask_atlas_ref = mask_atlas.borrow();
-                let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
+                let mut piece_hit = None;
+                if let Some(mask_atlas) = mask_atlas.borrow().as_ref() {
+                    let positions_snapshot = &*positions;
+                    let rotations_snapshot = &*rotations;
+                    let flips_snapshot = &*flips;
+                    let order_snapshot = &*z_order;
+                    let total = cols * rows;
+                    let fallback_order = if order_snapshot.len() == total {
+                        None
+                    } else {
+                        Some((0..total).collect::<Vec<_>>())
+                    };
+                    let order = match fallback_order.as_deref() {
+                        Some(slice) => slice,
+                        None => order_snapshot.as_slice(),
+                    };
+                    piece_hit = pick_piece_at(
+                        x,
+                        y,
+                        positions_snapshot,
+                        rotations_snapshot,
+                        flips_snapshot,
+                        order,
+                        mask_atlas,
+                        cols,
+                        piece_width,
+                        piece_height,
+                        mask_pad,
+                    );
+                }
+                if piece_hit.is_some() {
+                    if *ui_credit_hovered {
+                        ui_credit_hovered.set(false);
+                    }
+                    hovered_id.set(piece_hit);
+                    return;
+                }
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
+                if *ui_credit_hovered != credit_hit {
+                    ui_credit_hovered.set(credit_hit);
+                }
+                if credit_hit {
                     hovered_id.set(None);
                     return;
-                };
-                let positions_snapshot = &*positions;
-                let rotations_snapshot = &*rotations;
-                let flips_snapshot = &*flips;
-                let order_snapshot = &*z_order;
-                let total = cols * rows;
-                let fallback_order = if order_snapshot.len() == total {
-                    None
-                } else {
-                    Some((0..total).collect::<Vec<_>>())
-                };
-                let order = match fallback_order.as_deref() {
-                    Some(slice) => slice,
-                    None => order_snapshot.as_slice(),
-                };
-                let hit = pick_piece_at(
-                    x,
-                    y,
-                    positions_snapshot,
-                    rotations_snapshot,
-                    flips_snapshot,
-                    order,
-                    mask_atlas,
-                    cols,
-                    piece_width,
-                    piece_height,
-                    mask_pad,
-                );
-                hovered_id.set(hit);
+                }
+                hovered_id.set(None);
             })
         };
         let on_canvas_leave = {
             let hovered_id = hovered_id.clone();
+            let ui_credit_hovered = ui_credit_hovered.clone();
             Callback::from(move |_: MouseEvent| {
                 hovered_id.set(None);
+                if *ui_credit_hovered {
+                    ui_credit_hovered.set(false);
+                }
             })
         };
         let on_context_menu = Callback::from(|event: MouseEvent| {
             event.prevent_default();
         });
         let bounds_inset = 1.0;
-        let bounds = html! {
-            <>
-                <rect
-                    class="workspace-bounds"
-                    x={fmt_f32(view_min_x)}
-                    y={fmt_f32(view_min_y)}
-                    width={fmt_f32(view_width)}
-                    height={fmt_f32(view_height)}
-                />
+        let puzzle_bounds = if menu_visible_value {
+            html! {}
+        } else {
+            html! {
                 <rect
                     class="puzzle-bounds"
                     x={fmt_f32(bounds_inset)}
@@ -4563,7 +5315,16 @@ fn app() -> Html {
                     rx={frame_corner_radius.clone()}
                     ry={frame_corner_radius.clone()}
                 />
-            </>
+            }
+        };
+        let workspace_bounds = html! {
+            <rect
+                class="workspace-bounds"
+                x={fmt_f32(view_min_x)}
+                y={fmt_f32(view_min_y)}
+                width={fmt_f32(view_width)}
+                height={fmt_f32(view_height)}
+            />
         };
 
         let mut svg_class = if show_debug_value {
@@ -4583,23 +5344,118 @@ fn app() -> Html {
         } else if hovered_id_value.is_some() {
             canvas_class.push_str(" hover");
         }
+        if ui_credit_hovered_value {
+            canvas_class.push_str(" ui-link-hover");
+        }
         let canvas_node = if using_wgpu && board_ready_value {
+            let noop_mouse = Callback::from(|_: MouseEvent| {});
+            let noop_touch = Callback::from(|_: TouchEvent| {});
+            let (canvas_on_down, canvas_on_move, canvas_on_leave, canvas_on_touch) =
+                if menu_visible_value {
+                    (
+                        noop_mouse.clone(),
+                        noop_mouse.clone(),
+                        noop_mouse.clone(),
+                        noop_touch.clone(),
+                    )
+                } else {
+                    (
+                        on_canvas_down.clone(),
+                        on_canvas_move.clone(),
+                        on_canvas_leave.clone(),
+                        on_canvas_touch.clone(),
+                    )
+                };
             html! {
                 <canvas
                     class={canvas_class}
                     ref={canvas_ref}
                     width={view_width.round().to_string()}
                     height={view_height.round().to_string()}
-                    onmousedown={on_canvas_down}
-                    onmousemove={on_canvas_move}
-                    onmouseleave={on_canvas_leave}
-                    ontouchstart={on_canvas_touch}
+                    onmousedown={canvas_on_down}
+                    onmousemove={canvas_on_move}
+                    onmouseleave={canvas_on_leave}
+                    ontouchstart={canvas_on_touch}
                     oncontextmenu={on_context_menu.clone()}
                 />
             }
         } else {
             html! {}
         };
+        let ui_nodes: Html = if using_wgpu {
+            html! {}
+        } else {
+            ui_specs
+                .iter()
+                .map(|spec| {
+                    let x = fmt_f32(spec.pos[0]);
+                    let y = fmt_f32(spec.pos[1]);
+                    let rotation = fmt_f32(spec.rotation_deg);
+                    let pivot_x = fmt_f32(spec.pos[0] + spec.rotation_offset[0]);
+                    let pivot_y = fmt_f32(spec.pos[1] + spec.rotation_offset[1]);
+                    let transform = format!("rotate({} {} {})", rotation, pivot_x, pivot_y);
+                    let style = format!(
+                        "font-size: {}px; fill: {};",
+                        fmt_f32(spec.font_size),
+                        ui_color_to_css(spec.color)
+                    );
+                    let class = match spec.id {
+                        UiTextId::Title => "ui-text ui-title",
+                        UiTextId::Progress => "ui-text ui-progress",
+                        UiTextId::Credit => "ui-text ui-credit",
+                        UiTextId::Success => "ui-text ui-success",
+                        UiTextId::MenuTitle => "ui-text ui-menu-title",
+                        UiTextId::MenuSubtitle => "ui-text ui-menu-sub",
+                    };
+                    let lines: Vec<&str> = spec.text.lines().collect();
+                    let line_count = lines.len().max(1) as f32;
+                    let total_height = spec.line_height * (line_count - 1.0).max(0.0);
+                    let start_dy = -total_height * 0.5;
+                    let line_nodes: Html = lines
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, line)| {
+                            let dy = if idx == 0 {
+                                start_dy
+                            } else {
+                                spec.line_height
+                            };
+                            html! {
+                                <tspan x={x.clone()} dy={fmt_f32(dy)}>
+                                    {(*line).to_string()}
+                                </tspan>
+                            }
+                        })
+                        .collect();
+                    let text_node = html! {
+                        <text
+                            class={class}
+                            x={x.clone()}
+                            y={y.clone()}
+                            transform={transform}
+                            style={style}
+                        >
+                            {line_nodes}
+                        </text>
+                    };
+                    if matches!(spec.id, UiTextId::Credit) {
+                        html! {
+                            <a
+                                class="ui-link"
+                                href={CREDIT_URL}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                            >
+                                {text_node}
+                            </a>
+                        }
+                    } else {
+                        text_node
+                    }
+                })
+                .collect()
+        };
+
         let svg_node = if using_wgpu {
             html! {}
         } else {
@@ -4619,7 +5475,9 @@ fn app() -> Html {
                         {emboss_filter}
                         {mask_defs}
                     </defs>
-                    {bounds}
+                    {workspace_bounds}
+                    {ui_nodes}
+                    {puzzle_bounds}
                     {piece_nodes}
                 </svg>
             }
@@ -4648,16 +5506,7 @@ fn app() -> Html {
         )
     };
 
-    let controls_hint = html! {
-        <a
-            class="controls-hint"
-            href="https://github.com/sugoijan/heddobureika"
-            target="_blank"
-            rel="noopener noreferrer"
-        >
-            { "source" }
-        </a>
-    };
+    let controls_hint = html! {};
     let preview_corner_class = match *preview_corner {
         PreviewCorner::BottomLeft => "corner-bl",
         PreviewCorner::BottomRight => "corner-br",
@@ -4731,43 +5580,43 @@ fn app() -> Html {
     };
     let preview_box = html! {
         <aside class={preview_class}>
-            <button
-                class="preview-toggle"
-                type="button"
-                aria-label={preview_toggle_label}
-                aria-pressed={if preview_revealed_value { "true" } else { "false" }}
-                onclick={on_preview_toggle}
-            >
-                <svg class="preview-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <path
-                        class="preview-toggle-eye"
-                        d="M2 12c2.4-4.2 5.8-6.4 10-6.4s7.6 2.2 10 6.4c-2.4 4.2-5.8 6.4-10 6.4S4.4 16.2 2 12z"
-                    />
-                    <circle class="preview-toggle-pupil" cx="12" cy="12" r="3.2" />
-                    {preview_toggle_slash}
-                </svg>
-            </button>
-            <button
-                class={preview_arrow_horizontal}
-                type="button"
-                aria-label="Move preview horizontally"
-                onclick={on_preview_horizontal}
-            >
-                <svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
-                    <polyline points="4,2 8,6 4,10" />
-                </svg>
-            </button>
-            <button
-                class={preview_arrow_vertical}
-                type="button"
-                aria-label="Move preview vertically"
-                onclick={on_preview_vertical}
-            >
-                <svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
-                    <polyline points="4,2 8,6 4,10" />
-                </svg>
-            </button>
-            <img src={IMAGE_SRC} alt="preview" onclick={on_preview_hide} />
+        <button
+            class="preview-toggle"
+            type="button"
+            aria-label={preview_toggle_label}
+            aria-pressed={if preview_revealed_value { "true" } else { "false" }}
+            onclick={on_preview_toggle}
+        >
+            <svg class="preview-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                    class="preview-toggle-eye"
+                    d="M2 12c2.4-4.2 5.8-6.4 10-6.4s7.6 2.2 10 6.4c-2.4 4.2-5.8 6.4-10 6.4S4.4 16.2 2 12z"
+                />
+                <circle class="preview-toggle-pupil" cx="12" cy="12" r="3.2" />
+                {preview_toggle_slash}
+            </svg>
+        </button>
+        <button
+            class={preview_arrow_horizontal}
+            type="button"
+            aria-label="Move preview horizontally"
+            onclick={on_preview_horizontal}
+        >
+            <svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
+                <polyline points="4,2 8,6 4,10" />
+            </svg>
+        </button>
+        <button
+            class={preview_arrow_vertical}
+            type="button"
+            aria-label="Move preview vertically"
+            onclick={on_preview_vertical}
+        >
+            <svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
+                <polyline points="4,2 8,6 4,10" />
+            </svg>
+        </button>
+        <img src={puzzle_src} alt="preview" onclick={on_preview_hide} />
         </aside>
     };
     let controls_panel = if show_controls_value {
@@ -4775,6 +5624,17 @@ fn app() -> Html {
             <aside class="controls">
                 <h2>{ "Dev Panel" }</h2>
                 <p class={status_class}>{ status_label }</p>
+                <div class="control">
+                    <label for="menu-visible">
+                        { "Menu overlay" }
+                        <input
+                            id="menu-visible"
+                            type="checkbox"
+                            checked={menu_visible_value}
+                            onchange={on_menu_toggle}
+                        />
+                    </label>
+                </div>
                 <div class="control">
                     <label>
                         { "Seed" }
@@ -4798,6 +5658,18 @@ fn app() -> Html {
                         { "Border connections" }
                         <span class="control-value">{ border_connections_label }</span>
                     </label>
+                </div>
+                <div class="control">
+                    <label for="puzzle-art-select">
+                        { "Puzzle art" }
+                        <span class="control-value">{ puzzle_art.label }</span>
+                    </label>
+                    <select
+                        id="puzzle-art-select"
+                        onchange={on_puzzle_art_change}
+                    >
+                        {puzzle_art_options}
+                    </select>
                 </div>
                 <div class="control">
                     <label for="grid-select">

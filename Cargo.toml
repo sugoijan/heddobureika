@@ -5,12 +5,13 @@ edition = "2021"
 license = "CC-BY-NC-SA-4.0"
 
 [dependencies]
-yew = { version = "0.21", features = ["csr"] }
+yew = { version = "0.22", features = ["csr"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-gloo = "0.10"
+gloo = "0.11"
 js-sys = "0.3"
-glyphon = "0.10.0"
+glyphon = "0.10"
+taffy = "0.9"
 wgpu = { version = "28", default-features = false, features = ["std", "webgpu", "webgl", "wgsl"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

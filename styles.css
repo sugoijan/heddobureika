@@ -12,6 +12,14 @@ body {
   padding: 0;
 }
 
+@font-face {
+  font-family: "Chirufont";
+  src: url("fonts/chirufont.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 .hidden {
   display: none;
 }
@@ -32,6 +40,53 @@ body {
   isolation: isolate;
 }
 
+.ui-text {
+  font-family: "Chirufont", sans-serif;
+  font-weight: 400;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+.ui-link {
+  pointer-events: auto;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.ui-link .ui-credit {
+  text-decoration: none;
+}
+
+.ui-link .ui-text {
+  pointer-events: auto;
+}
+
+.ui-link:hover .ui-credit {
+  text-decoration: underline;
+}
+
+.ui-progress {
+  letter-spacing: 0.04em;
+}
+
+.ui-title {
+  letter-spacing: 0.05em;
+}
+
+.ui-success {
+  letter-spacing: 0.06em;
+}
+
+.ui-menu-title {
+  letter-spacing: 0.05em;
+}
+
+.ui-menu-sub {
+  letter-spacing: 0.06em;
+}
+
 .puzzle-canvas {
   max-width: 100%;
   height: auto;
@@ -46,6 +101,10 @@ body {
 
 .puzzle-canvas.dragging {
   cursor: grabbing;
+}
+
+.puzzle-canvas.ui-link-hover {
+  cursor: pointer;
 }
 
 .workspace-bounds {

@@ -35,9 +35,9 @@ pub(crate) const CLICK_QUICK_TAP_MS: f32 = 120.0;
 pub(crate) const SNAP_ANIMATION_MS: f32 = 160.0;
 pub(crate) const FLIP_CHANCE: f32 = 0.2;
 pub(crate) const RUBBER_BAND_RATIO: f32 = 0.35;
-pub(crate) const WORKSPACE_SCALE_MIN: f32 = 0.4;
-pub(crate) const WORKSPACE_SCALE_MAX: f32 = 2.5;
-pub(crate) const WORKSPACE_SCALE_DEFAULT: f32 = 1.7;
+pub(crate) const WORKSPACE_SCALE_MIN: f32 = 0.5;
+pub(crate) const WORKSPACE_SCALE_MAX: f32 = 2.0;
+pub(crate) const WORKSPACE_SCALE_DEFAULT: f32 = 0.8;
 pub(crate) const FRAME_SNAP_MIN: f32 = 0.4;
 pub(crate) const FRAME_SNAP_MAX: f32 = 3.0;
 pub(crate) const FRAME_SNAP_DEFAULT: f32 = 1.0;
@@ -584,7 +584,8 @@ pub(crate) fn format_progress(count: usize, total: usize) -> String {
         return "--".to_string();
     }
     let pct = (count as f32 / total as f32) * 100.0;
-    format!("{}/{} ({:.0}%)", count, total, pct)
+    //format!("{}/{} ({:.0}%)", count, total, pct)
+    format!("{:.0}%", pct)
 }
 
 pub(crate) fn format_time_unit(value: u32, unit: &str) -> String {
@@ -1076,10 +1077,10 @@ pub(crate) fn apply_snaps_for_group(
     center_max_x: f32,
     center_min_y: f32,
     center_max_y: f32,
-    view_min_x: f32,
-    view_min_y: f32,
-    view_width: f32,
-    view_height: f32,
+    _view_min_x: f32,
+    _view_min_y: f32,
+    _view_width: f32,
+    _view_height: f32,
     rotation_snap_tolerance: f32,
     rotation_enabled: bool,
 ) -> Vec<usize> {
@@ -1634,12 +1635,7 @@ pub(crate) fn apply_snaps_for_group(
         }
 
         if group_after.len() == total {
-            let stage_center_x = view_min_x + view_width * 0.5;
-            let stage_center_y = view_min_y + view_height * 0.5;
-            let target_center = (
-                stage_center_x - frame_width * 0.5 + piece_width * 0.5,
-                stage_center_y - frame_height * 0.5 + piece_height * 0.5,
-            );
+            let target_center = (piece_width * 0.5, piece_height * 0.5);
             align_group_to_anchor(
                 positions,
                 rotations,

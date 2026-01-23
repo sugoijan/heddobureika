@@ -68,6 +68,39 @@ pub(crate) struct InstanceSet {
     pub(crate) batches: Vec<InstanceBatch>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UiTextId {
+    Title,
+    Progress,
+    Credit,
+    Success,
+    MenuTitle,
+    MenuSubtitle,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UiRotationOrigin {
+    Center,
+    BottomLeft,
+    BottomRight,
+    TopLeft,
+    TopRight,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UiTextSpec {
+    pub(crate) id: UiTextId,
+    pub(crate) text: String,
+    pub(crate) pos: [f32; 2],
+    pub(crate) rotation_deg: f32,
+    pub(crate) rotation_origin: UiRotationOrigin,
+    pub(crate) rotation_offset: [f32; 2],
+    pub(crate) font_size: f32,
+    pub(crate) line_height: f32,
+    pub(crate) color: [u8; 4],
+}
+
 impl Instance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -149,6 +182,52 @@ impl FrameInstance {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct UiInstance {
+    pos: [f32; 2],
+    size: [f32; 2],
+    pivot: [f32; 2],
+    rotation: f32,
+    opacity: f32,
+}
+
+impl UiInstance {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<UiInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 1,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 8,
+                    shader_location: 2,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 16,
+                    shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 24,
+                    shader_location: 4,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 28,
+                    shader_location: 5,
+                },
+            ],
+        }
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Globals {
@@ -175,6 +254,14 @@ struct FrameGlobals {
     color: [f32; 4],
     output_gamma: f32,
     _pad: [f32; 7],
+}
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct UiGlobals {
+    view_min: [f32; 2],
+    view_size: [f32; 2],
+    _pad: [f32; 4],
 }
 
 struct FrameSegment {
@@ -366,6 +453,8 @@ const FPS_LINE_HEIGHT: f32 = 14.0;
 const FPS_TEXT_PADDING_X: f32 = 12.0;
 const FPS_TEXT_PADDING_Y: f32 = 12.0;
 const FPS_TEXT_WIDTH: f32 = 80.0;
+const UI_FONT_FAMILY: &str = "KaoriGel";
+const UI_TEXT_PADDING: f32 = 8.0;
 
 struct FpsTracker {
     last_ms: f32,
@@ -409,6 +498,29 @@ struct GlyphonState {
     last_text: String,
 }
 
+struct UiTextState {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    atlas: TextAtlas,
+    renderer: TextRenderer,
+    viewport: Viewport,
+}
+
+struct UiSprite {
+    id: UiTextId,
+    text: String,
+    font_size: f32,
+    line_height: f32,
+    color: [u8; 4],
+    size_px: [u32; 2],
+    buffer: Buffer,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    instance: UiInstance,
+    instance_buffer: wgpu::Buffer,
+}
+
 fn now_ms() -> f32 {
     (Date::now() % 1_000_000.0) as f32
 }
@@ -446,6 +558,14 @@ pub(crate) struct WgpuRenderer {
     frame_bg_instance_count: u32,
     frame_stroke_instance_buffer: wgpu::Buffer,
     frame_stroke_instance_count: u32,
+    ui_pipeline: wgpu::RenderPipeline,
+    _ui_globals_buffer: wgpu::Buffer,
+    ui_globals_bind_group: wgpu::BindGroup,
+    ui_texture_bind_group_layout: wgpu::BindGroupLayout,
+    ui_sampler: wgpu::Sampler,
+    ui_sprites: Vec<UiSprite>,
+    ui_text_state: Option<UiTextState>,
+    show_frame: bool,
     frame_clear_color: wgpu::Color,
     text_state: Option<GlyphonState>,
     show_fps: bool,
@@ -885,6 +1005,111 @@ impl WgpuRenderer {
             cache: None,
         });
 
+        let ui_globals = UiGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            _pad: [0.0; 4],
+        };
+        let ui_globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ui-globals-buffer"),
+            contents: bytemuck::bytes_of(&ui_globals),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let ui_globals_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ui-globals-bind-group-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let ui_globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui-globals-bind-group"),
+            layout: &ui_globals_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ui_globals_buffer.as_entire_binding(),
+            }],
+        });
+        let ui_texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ui-texture-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let ui_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ui-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ui-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("wgpu_ui.wgsl").into()),
+        });
+        let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ui-pipeline-layout"),
+            bind_group_layouts: &[&ui_globals_bind_group_layout, &ui_texture_bind_group_layout],
+            immediate_size: 0,
+        });
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui-pipeline"),
+            layout: Some(&ui_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ui_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::layout(), UiInstance::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad-vertex-buffer"),
             contents: bytemuck::cast_slice(&QUAD_VERTICES),
@@ -1031,6 +1256,14 @@ impl WgpuRenderer {
             frame_bg_instance_count: frame_bg_instances.len() as u32,
             frame_stroke_instance_buffer,
             frame_stroke_instance_count: frame_stroke_instances.len() as u32,
+            ui_pipeline,
+            _ui_globals_buffer: ui_globals_buffer,
+            ui_globals_bind_group,
+            ui_texture_bind_group_layout,
+            ui_sampler,
+            ui_sprites: Vec::new(),
+            ui_text_state: None,
+            show_frame: true,
             frame_clear_color,
             text_state: None,
             show_fps: false,
@@ -1056,7 +1289,7 @@ impl WgpuRenderer {
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frame-pass"),
+                label: Some("frame-bg-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -1080,18 +1313,6 @@ impl WgpuRenderer {
                 render_pass.set_vertex_buffer(1, self.frame_bg_instance_buffer.slice(..));
                 render_pass.draw_indexed(0..self.index_count, 0, 0..self.frame_bg_instance_count);
             }
-            if self.frame_stroke_instance_count > 0 {
-                render_pass.set_bind_group(0, &self.frame_stroke_bind_group, &[]);
-                render_pass
-                    .set_vertex_buffer(1, self.frame_stroke_instance_buffer.slice(..));
-                render_pass
-                    .draw_indexed(0..self.index_count, 0, 0..self.frame_stroke_instance_count);
-            }
-            if self.frame_instance_count > 0 {
-                render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
-                render_pass.set_vertex_buffer(1, self.frame_instance_buffer.slice(..));
-                render_pass.draw_indexed(0..self.index_count, 0, 0..self.frame_instance_count);
-            }
         }
 
         let mut globals_outline = self.globals;
@@ -1108,6 +1329,73 @@ impl WgpuRenderer {
             0,
             bytemuck::bytes_of(&globals_fill),
         );
+        if !self.ui_sprites.is_empty() {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_pipeline(&self.ui_pipeline);
+            render_pass.set_bind_group(0, &self.ui_globals_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass
+                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            for sprite in &self.ui_sprites {
+                if sprite.instance.opacity <= f32::EPSILON {
+                    continue;
+                }
+                render_pass.set_bind_group(1, &sprite.bind_group, &[]);
+                render_pass.set_vertex_buffer(1, sprite.instance_buffer.slice(..));
+                render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+        }
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frame-lines-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_pipeline(&self.frame_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass
+                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            if self.frame_stroke_instance_count > 0 {
+                render_pass.set_bind_group(0, &self.frame_stroke_bind_group, &[]);
+                render_pass
+                    .set_vertex_buffer(1, self.frame_stroke_instance_buffer.slice(..));
+                render_pass
+                    .draw_indexed(0..self.index_count, 0, 0..self.frame_stroke_instance_count);
+            }
+            if self.show_frame && self.frame_instance_count > 0 {
+                render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                render_pass.set_vertex_buffer(1, self.frame_instance_buffer.slice(..));
+                render_pass.draw_indexed(0..self.index_count, 0, 0..self.frame_instance_count);
+            }
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("piece-pass"),
@@ -1312,6 +1600,275 @@ impl WgpuRenderer {
         )));
     }
 
+    pub(crate) fn set_ui_font_bytes(&mut self, font_bytes: Vec<u8>) {
+        if self.ui_text_state.is_some() {
+            return;
+        }
+        let mut font_system = FontSystem::new();
+        font_system.db_mut().load_font_data(font_bytes);
+        let swash_cache = SwashCache::new();
+        let cache = Cache::new(&self.device);
+        let mut atlas = TextAtlas::new(&self.device, &self.queue, &cache, self._config.format);
+        let viewport = Viewport::new(&self.device, &cache);
+        let renderer =
+            TextRenderer::new(&mut atlas, &self.device, wgpu::MultisampleState::default(), None);
+        self.ui_text_state = Some(UiTextState {
+            font_system,
+            swash_cache,
+            atlas,
+            renderer,
+            viewport,
+        });
+    }
+
+    pub(crate) fn set_ui_texts(&mut self, specs: &[UiTextSpec]) {
+        let Some(ui_state) = self.ui_text_state.as_mut() else {
+            return;
+        };
+        let mut keep_ids = Vec::with_capacity(specs.len());
+        for spec in specs {
+            keep_ids.push(spec.id);
+        }
+        self.ui_sprites.retain(|sprite| keep_ids.contains(&sprite.id));
+        for spec in specs {
+            let needs_new = self.ui_sprites.iter().all(|sprite| sprite.id != spec.id);
+            if needs_new {
+                let font_px = spec.font_size * self.render_scale;
+                let line_px = spec.line_height * self.render_scale;
+                let buffer = Buffer::new(&mut ui_state.font_system, Metrics::new(font_px, line_px));
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("ui-texture"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self._config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ui-texture-bind-group"),
+                    layout: &self.ui_texture_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                        },
+                    ],
+                });
+                let instance = UiInstance {
+                    pos: spec.pos,
+                    size: [1.0, 1.0],
+                    pivot: spec.rotation_offset,
+                    rotation: spec.rotation_deg,
+                    opacity: 1.0,
+                };
+                let instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui-instance-buffer"),
+                    contents: bytemuck::cast_slice(&[instance]),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                });
+                self.ui_sprites.push(UiSprite {
+                    id: spec.id,
+                    text: String::new(),
+                    font_size: 0.0,
+                    line_height: 0.0,
+                    color: [0, 0, 0, 0],
+                    size_px: [1, 1],
+                    buffer,
+                    texture,
+                    view,
+                    bind_group,
+                    instance,
+                    instance_buffer,
+                });
+            }
+            let index = self
+                .ui_sprites
+                .iter()
+                .position(|sprite| sprite.id == spec.id);
+            let Some(index) = index else {
+                continue;
+            };
+            let sprite = &mut self.ui_sprites[index];
+            let needs_texture = sprite.text != spec.text
+                || (sprite.font_size - spec.font_size).abs() > f32::EPSILON
+                || (sprite.line_height - spec.line_height).abs() > f32::EPSILON
+                || sprite.color != spec.color;
+            if needs_texture {
+                let font_px = spec.font_size * self.render_scale;
+                let line_px = spec.line_height * self.render_scale;
+                let metrics = Metrics::new(font_px, line_px);
+                let pad_px = UI_TEXT_PADDING * self.render_scale;
+                sprite.buffer = Buffer::new(&mut ui_state.font_system, metrics);
+                sprite
+                    .buffer
+                    .set_size(&mut ui_state.font_system, None, None);
+                let attrs = Attrs::new().family(Family::Name(UI_FONT_FAMILY));
+                sprite.buffer.set_text(
+                    &mut ui_state.font_system,
+                    &spec.text,
+                    &attrs,
+                    Shaping::Advanced,
+                    Some(Align::Left),
+                );
+                sprite
+                    .buffer
+                    .shape_until_scroll(&mut ui_state.font_system, false);
+                let (text_w, text_h) = measure_text_bounds(&sprite.buffer);
+                let tex_w = (text_w + pad_px * 2.0).ceil().max(1.0) as u32;
+                let tex_h = (text_h + pad_px * 2.0).ceil().max(1.0) as u32;
+                sprite
+                    .buffer
+                    .set_size(&mut ui_state.font_system, Some(tex_w as f32), None);
+                sprite.buffer.set_text(
+                    &mut ui_state.font_system,
+                    &spec.text,
+                    &attrs,
+                    Shaping::Advanced,
+                    Some(Align::Center),
+                );
+                sprite
+                    .buffer
+                    .shape_until_scroll(&mut ui_state.font_system, false);
+                if tex_w != sprite.size_px[0] || tex_h != sprite.size_px[1] {
+                    sprite.texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("ui-texture"),
+                        size: wgpu::Extent3d {
+                            width: tex_w,
+                            height: tex_h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self._config.format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    });
+                    sprite.view = sprite.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    sprite.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("ui-texture-bind-group"),
+                        layout: &self.ui_texture_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&sprite.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                            },
+                        ],
+                    });
+                    sprite.size_px = [tex_w, tex_h];
+                }
+                sprite.instance.size = [
+                    tex_w as f32 / self.render_scale,
+                    tex_h as f32 / self.render_scale,
+                ];
+                let color = Color::rgba(spec.color[0], spec.color[1], spec.color[2], spec.color[3]);
+                ui_state.viewport.update(
+                    &self.queue,
+                    Resolution {
+                        width: tex_w,
+                        height: tex_h,
+                    },
+                );
+                let bounds = TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: tex_w as i32,
+                    bottom: tex_h as i32,
+                };
+                let text_area = TextArea {
+                    buffer: &sprite.buffer,
+                    left: 0.0,
+                    top: pad_px,
+                    scale: 1.0,
+                    bounds,
+                    default_color: color,
+                    custom_glyphs: &[],
+                };
+                if ui_state
+                    .renderer
+                    .prepare(
+                        &self.device,
+                        &self.queue,
+                        &mut ui_state.font_system,
+                        &mut ui_state.atlas,
+                        &ui_state.viewport,
+                        [text_area],
+                        &mut ui_state.swash_cache,
+                    )
+                    .is_ok()
+                {
+                    let mut encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("ui-text-encoder"),
+                        });
+                    {
+                        let mut render_pass =
+                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("ui-text-pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &sprite.view,
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                                            r: 0.0,
+                                            g: 0.0,
+                                            b: 0.0,
+                                            a: 0.0,
+                                        }),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
+                        let _ = ui_state
+                            .renderer
+                            .render(&ui_state.atlas, &ui_state.viewport, &mut render_pass);
+                    }
+                    self.queue.submit(Some(encoder.finish()));
+                    sprite.text = spec.text.clone();
+                    sprite.font_size = spec.font_size;
+                    sprite.line_height = spec.line_height;
+                    sprite.color = spec.color;
+                }
+            }
+            sprite.instance.pos = spec.pos;
+            sprite.instance.pivot = spec.rotation_offset;
+            sprite.instance.rotation = spec.rotation_deg;
+            sprite.instance.opacity = 1.0;
+            self.queue.write_buffer(
+                &sprite.instance_buffer,
+                0,
+                bytemuck::cast_slice(&[sprite.instance]),
+            );
+        }
+    }
+
+    pub(crate) fn set_show_frame(&mut self, enabled: bool) {
+        self.show_frame = enabled;
+    }
+
     pub(crate) fn set_edge_aa(&mut self, edge_aa: f32) {
         self.globals.edge_aa = edge_aa.max(0.0);
     }
@@ -1356,6 +1913,21 @@ impl WgpuRenderer {
     pub(crate) fn set_emboss_enabled(&mut self, enabled: bool) {
         self.globals.emboss_strength = if enabled { EMBOSS_OPACITY } else { 0.0 };
     }
+}
+
+fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
+    let mut max_width = 0.0;
+    let mut max_height = 0.0;
+    for run in buffer.layout_runs() {
+        if run.line_w > max_width {
+            max_width = run.line_w;
+        }
+        let bottom = run.line_top + run.line_height;
+        if bottom > max_height {
+            max_height = bottom;
+        }
+    }
+    (max_width, max_height)
 }
 
 fn image_to_rgba(
