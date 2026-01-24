@@ -11,7 +11,8 @@ struct Globals {
     emboss_rim: f32,
     outline_width_px: f32,
     edge_aa: f32,
-    _pad: vec2<f32>,
+    puzzle_scale: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0)
@@ -67,8 +68,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let angle = (select(input.inst_rot, -input.inst_rot, is_flipped)) * 0.017453292;
     let rotated = rotate_point(local_geom - center, angle) + center;
     let world = (input.inst_pos - globals.mask_pad) + rotated;
-    let ndc_x = (world.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
-    let ndc_y = 1.0 - (world.y - globals.view_min.y) / globals.view_size.y * 2.0;
+    let world_scaled = world * globals.puzzle_scale;
+    let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
     out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     let piece_local = local - globals.mask_pad;
     out.art_uv = (input.inst_piece_origin + piece_local) / globals.image_size;

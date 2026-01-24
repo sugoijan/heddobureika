@@ -3,7 +3,8 @@ struct FrameGlobals {
     view_size: vec2<f32>,
     color: vec4<f32>,
     output_gamma: f32,
-    _pad: vec3<f32>,
+    puzzle_scale: f32,
+    _pad: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -41,8 +42,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let local = input.pos * input.inst_size;
     let rotated = rotate_point(local, input.inst_rot);
     let world = input.inst_pos + rotated;
-    let ndc_x = (world.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
-    let ndc_y = 1.0 - (world.y - globals.view_min.y) / globals.view_size.y * 2.0;
+    let world_scaled = world * globals.puzzle_scale;
+    let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
     out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.color = globals.color;
     return out;

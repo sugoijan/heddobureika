@@ -4,6 +4,7 @@ use gloo::timers::callback::Interval;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
 use js_sys::{Date, Function, Reflect};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
@@ -35,6 +36,8 @@ const WORKSPACE_SLOT_WIDTH_FRAC: f32 = 0.76;
 const WORKSPACE_SLOT_HEIGHT_FRAC: f32 = 0.82;
 const WORKSPACE_SLOT_LEFT_FRAC: f32 = (1.0 - WORKSPACE_SLOT_WIDTH_FRAC) * 0.5;
 const WORKSPACE_SLOT_TOP_FRAC: f32 = (1.0 - WORKSPACE_SLOT_HEIGHT_FRAC) * 0.5;
+const WORKSPACE_SLOT_MARGIN_FRAC: f32 = 0.03;
+const WORKSPACE_SLOT_MARGIN_MIN: f32 = 6.0;
 const UI_CREDIT_FONT_RATIO: f32 = 0.026;
 const UI_CREDIT_ROTATION_DEG: f32 = -1.1;
 const UI_MENU_SUB_FONT_RATIO: f32 = 0.028;
@@ -68,7 +71,23 @@ const PUZZLE_ARTS: &[PuzzleArt] = &[
         label: "Zoe Potter",
         src: "puzzles/zoe-potter.jpg",
     },
+    PuzzleArt {
+        label: "Raora by Noy",
+        src: "puzzles/raora-by-noy.avif",
+    },
 ];
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedPuzzleSelection {
+    version: u32,
+    puzzle_src: String,
+    cols: u32,
+    rows: u32,
+}
+
+fn puzzle_art_index_by_src(src: &str) -> Option<usize> {
+    PUZZLE_ARTS.iter().position(|art| art.src == src)
+}
 
 #[derive(Default)]
 struct DragHandlers {
@@ -92,6 +111,7 @@ struct WorkspaceLayout {
     view_min_y: f32,
     view_width: f32,
     view_height: f32,
+    puzzle_scale: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +140,8 @@ fn compute_workspace_layout(
     max_dim: f32,
 ) -> WorkspaceLayout {
     let max_dim = max_dim.max(1.0);
+    let safe_width = width.max(1.0);
+    let safe_height = height.max(1.0);
     let min_height_for_slot = max_dim / WORKSPACE_SLOT_HEIGHT_FRAC;
     let min_height_for_width = max_dim / (WORKSPACE_SLOT_WIDTH_FRAC * WORKSPACE_ASPECT_RATIO);
     let base_height = min_height_for_slot.max(min_height_for_width);
@@ -130,13 +152,23 @@ fn compute_workspace_layout(
     let slot_height = workspace_height * WORKSPACE_SLOT_HEIGHT_FRAC;
     let slot_origin_x = workspace_width * WORKSPACE_SLOT_LEFT_FRAC;
     let slot_origin_y = workspace_height * WORKSPACE_SLOT_TOP_FRAC;
-    let puzzle_offset_x = slot_origin_x + (slot_width - width) * 0.5;
-    let puzzle_offset_y = slot_origin_y + (slot_height - height) * 0.5;
+    let slot_min = slot_width.min(slot_height).max(1.0);
+    let margin = (slot_min * WORKSPACE_SLOT_MARGIN_FRAC).max(WORKSPACE_SLOT_MARGIN_MIN);
+    let fit_width = (slot_width - margin * 2.0).max(1.0);
+    let fit_height = (slot_height - margin * 2.0).max(1.0);
+    let puzzle_scale = (fit_width / safe_width)
+        .min(fit_height / safe_height)
+        .min(1.0);
+    let scaled_width = safe_width * puzzle_scale;
+    let scaled_height = safe_height * puzzle_scale;
+    let puzzle_offset_x = slot_origin_x + (slot_width - scaled_width) * 0.5;
+    let puzzle_offset_y = slot_origin_y + (slot_height - scaled_height) * 0.5;
     WorkspaceLayout {
         view_min_x: -puzzle_offset_x,
         view_min_y: -puzzle_offset_y,
         view_width: workspace_width,
         view_height: workspace_height,
+        puzzle_scale,
     }
 }
 
@@ -237,10 +269,12 @@ fn apply_taffy_layout(
     menu_visible: bool,
     specs: &mut [UiTextSpec],
 ) {
+    let puzzle_width = width * layout.puzzle_scale;
+    let puzzle_height = height * layout.puzzle_scale;
     let left_gutter = (-layout.view_min_x).max(0.0);
-    let right_gutter = (layout.view_min_x + layout.view_width - width).max(0.0);
+    let right_gutter = (layout.view_min_x + layout.view_width - puzzle_width).max(0.0);
     let top_gutter = (-layout.view_min_y).max(0.0);
-    let bottom_gutter = (layout.view_min_y + layout.view_height - height).max(0.0);
+    let bottom_gutter = (layout.view_min_y + layout.view_height - puzzle_height).max(0.0);
     let mut taffy: TaffyTree<()> = TaffyTree::new();
     let root_style = Style {
         display: Display::Grid,
@@ -248,8 +282,12 @@ fn apply_taffy_layout(
             width: length(layout.view_width),
             height: length(layout.view_height),
         },
-        grid_template_columns: vec![length(left_gutter), length(width), length(right_gutter)],
-        grid_template_rows: vec![length(top_gutter), length(height), length(bottom_gutter)],
+        grid_template_columns: vec![
+            length(left_gutter),
+            length(puzzle_width),
+            length(right_gutter),
+        ],
+        grid_template_rows: vec![length(top_gutter), length(puzzle_height), length(bottom_gutter)],
         justify_items: Some(JustifyItems::Center),
         align_items: Some(AlignItems::Center),
         ..Default::default()
@@ -514,7 +552,7 @@ fn build_ui_specs(
             });
         }
         let progress_text = format!(
-            "{} of borders and {} of everything complete",
+            "{} of borders and {} in total complete",
             border_connections_label, connections_label
         );
         let progress_size = min_dim * UI_PROGRESS_FONT_RATIO;
@@ -575,6 +613,20 @@ fn load_saved_board() -> Option<SavedBoard> {
     Some(state)
 }
 
+fn load_puzzle_selection() -> Option<SavedPuzzleSelection> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(PUZZLE_SELECTION_KEY).ok()??;
+    let selection: SavedPuzzleSelection = serde_json::from_str(&raw).ok()?;
+    if selection.version != PUZZLE_SELECTION_VERSION {
+        return None;
+    }
+    if selection.puzzle_src.is_empty() || selection.cols == 0 || selection.rows == 0 {
+        return None;
+    }
+    Some(selection)
+}
+
 fn load_render_settings() -> Option<RenderSettings> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
@@ -598,6 +650,33 @@ fn save_board_state(state: &SavedBoard) {
         return;
     };
     let _ = storage.set_item(STORAGE_KEY, &raw);
+}
+
+fn save_puzzle_selection(selection: &SavedPuzzleSelection) {
+    let Ok(raw) = serde_json::to_string(selection) else {
+        return;
+    };
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.set_item(PUZZLE_SELECTION_KEY, &raw);
+}
+
+fn clear_saved_board() {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.remove_item(STORAGE_KEY);
+}
+
+fn clear_puzzle_selection() {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.remove_item(PUZZLE_SELECTION_KEY);
 }
 
 fn save_render_settings(settings: &RenderSettings) {
@@ -943,6 +1022,15 @@ fn touch_event_to_svg_coords(
     Some((x, y))
 }
 
+fn workspace_to_puzzle_coords(scale: f32, x: f32, y: f32) -> (f32, f32) {
+    let scale = scale.max(1.0e-4);
+    (x / scale, y / scale)
+}
+
+fn workspace_to_puzzle_opt(scale: f32, coords: Option<(f32, f32)>) -> Option<(f32, f32)> {
+    coords.map(|(x, y)| workspace_to_puzzle_coords(scale, x, y))
+}
+
 fn build_wgpu_instances(
     positions: &[(f32, f32)],
     rotations: &[f32],
@@ -1258,7 +1346,14 @@ fn app() -> Html {
             }
         })
         .collect();
-    let puzzle_art_index = use_state(|| 0usize);
+    let saved_puzzle_selection = use_mut_ref(load_puzzle_selection);
+    let saved_puzzle_art_index = {
+        let selection = saved_puzzle_selection.borrow();
+        selection
+            .as_ref()
+            .and_then(|selection| puzzle_art_index_by_src(&selection.puzzle_src))
+    };
+    let puzzle_art_index = use_state(|| saved_puzzle_art_index.unwrap_or(0));
     let puzzle_art_index_value = *puzzle_art_index;
     let puzzle_art = PUZZLE_ARTS
         .get(puzzle_art_index_value)
@@ -1441,6 +1536,26 @@ fn app() -> Html {
             || ()
         });
     }
+    {
+        let grid_choices = grid_choices.clone();
+        use_effect_with(
+            (grid_index_value, image_revision_value, image_size_value),
+            move |(grid_index_value, _image_revision_value, image_size_value)| {
+                if image_size_value.is_some() {
+                    if let Some(grid) = grid_choices.get(*grid_index_value).copied() {
+                        let selection = SavedPuzzleSelection {
+                            version: PUZZLE_SELECTION_VERSION,
+                            puzzle_src: puzzle_src.to_string(),
+                            cols: grid.cols,
+                            rows: grid.rows,
+                        };
+                        save_puzzle_selection(&selection);
+                    }
+                }
+                || ()
+            },
+        );
+    }
     let prefers_dark = prefers_dark_mode();
     let is_dark_theme = match theme_mode_value {
         ThemeMode::Dark => true,
@@ -1507,12 +1622,15 @@ fn app() -> Html {
         let restore_state = restore_state.clone();
         let restore_attempted = restore_attempted.clone();
         let grid_initialized = grid_initialized.clone();
+        let saved_puzzle_selection = saved_puzzle_selection.clone();
+        let puzzle_src = puzzle_src;
         use_effect_with(
             (grid_index_value, image_size_value),
             move |(grid_index_value, image_size_value)| {
                 if let Some((width, height)) = *image_size_value {
                     let mut allow_scramble = true;
                     let mut skip_scramble = false;
+                    let mut skip_restore = false;
                     if grid_choices.is_empty() {
                         allow_scramble = false;
                     } else if *grid_index_value >= grid_choices.len() {
@@ -1521,6 +1639,28 @@ fn app() -> Html {
                         allow_scramble = false;
                     }
                     if allow_scramble {
+                        if let Some(selection) = saved_puzzle_selection.borrow_mut().take() {
+                            if selection.puzzle_src == puzzle_src {
+                                if let Some(saved_index) =
+                                    grid_choice_index(&grid_choices, selection.cols, selection.rows)
+                                {
+                                    if saved_index != *grid_index_value {
+                                        grid_index.set(saved_index);
+                                        *grid_initialized.borrow_mut() = true;
+                                        skip_scramble = true;
+                                        skip_restore = true;
+                                    }
+                                } else {
+                                    clear_puzzle_selection();
+                                    clear_saved_board();
+                                }
+                            } else {
+                                clear_puzzle_selection();
+                                clear_saved_board();
+                            }
+                        }
+                    }
+                    if allow_scramble && !skip_restore {
                         let saved_state = {
                             let mut attempted = restore_attempted.borrow_mut();
                             if !*attempted {
@@ -1634,6 +1774,11 @@ fn app() -> Html {
                         let view_height = layout.view_height;
                         let view_min_x = layout.view_min_x;
                         let view_min_y = layout.view_min_y;
+                        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
+                        let puzzle_view_min_x = view_min_x / puzzle_scale;
+                        let puzzle_view_min_y = view_min_y / puzzle_scale;
+                        let puzzle_view_width = view_width / puzzle_scale;
+                        let puzzle_view_height = view_height / puzzle_scale;
                         let margin =
                             piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
                         let nonce = time_nonce(*scramble_nonce);
@@ -1646,10 +1791,10 @@ fn app() -> Html {
                             rows,
                             piece_width,
                             piece_height,
-                            view_min_x,
-                            view_min_y,
-                            view_width,
-                            view_height,
+                            puzzle_view_min_x,
+                            puzzle_view_min_y,
+                            puzzle_view_width,
+                            puzzle_view_height,
                             margin,
                         );
                         let rotations_scrambled = scramble_rotations(
@@ -1704,6 +1849,7 @@ fn app() -> Html {
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < grid_choices_len {
                     grid_index.set(value);
+                    clear_saved_board();
                 }
             }
         })
@@ -1716,6 +1862,7 @@ fn app() -> Html {
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < puzzle_art_len {
                     puzzle_art_index.set(value);
+                    clear_saved_board();
                 }
             }
         })
@@ -2202,6 +2349,7 @@ fn app() -> Html {
                             view_min_y,
                             view_width,
                             view_height,
+                            layout.puzzle_scale,
                             mask_atlas_data,
                             mask_pad,
                             render_scale_value,
@@ -2820,6 +2968,11 @@ fn app() -> Html {
         let view_height = layout.view_height;
         let view_min_x = layout.view_min_x;
         let view_min_y = layout.view_min_y;
+        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
+        let puzzle_view_min_x = view_min_x / puzzle_scale;
+        let puzzle_view_min_y = view_min_y / puzzle_scale;
+        let puzzle_view_width = view_width / puzzle_scale;
+        let puzzle_view_height = view_height / puzzle_scale;
         let view_box = format!(
             "{} {} {} {}",
             fmt_f32(view_min_x),
@@ -2887,10 +3040,10 @@ fn app() -> Html {
         let emboss_height = fmt_f32(piece_height + (mask_pad + emboss_pad) * 2.0);
         let emboss_offset_neg = fmt_f32(-EMBOSS_OFFSET);
         let emboss_rim_radius = fmt_f32(EMBOSS_RIM);
-        let center_min_x = view_min_x + piece_width * 0.5;
-        let center_min_y = view_min_y + piece_height * 0.5;
-        let mut center_max_x = view_min_x + view_width - piece_width * 0.5;
-        let mut center_max_y = view_min_y + view_height - piece_height * 0.5;
+        let center_min_x = puzzle_view_min_x + piece_width * 0.5;
+        let center_min_y = puzzle_view_min_y + piece_height * 0.5;
+        let mut center_max_x = puzzle_view_min_x + puzzle_view_width - piece_width * 0.5;
+        let mut center_max_y = puzzle_view_min_y + puzzle_view_height - piece_height * 0.5;
         if center_max_x < center_min_x {
             center_max_x = center_min_x;
         }
@@ -3240,6 +3393,7 @@ fn app() -> Html {
             let canvas_ref = canvas_ref.clone();
             let using_wgpu = using_wgpu;
             let schedule_drag_move = schedule_drag_move.clone();
+            let puzzle_scale = puzzle_scale;
             move |event: &MouseEvent| {
                 let target_ref = if using_wgpu {
                     &canvas_ref
@@ -3254,6 +3408,7 @@ fn app() -> Html {
                     view_width,
                     view_height,
                 ) {
+                    let (x, y) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                     if schedule_drag_move(x, y) {
                         event.prevent_default();
                     }
@@ -3270,6 +3425,7 @@ fn app() -> Html {
             let drag_pending = drag_pending.clone();
             let drag_frame = drag_frame.clone();
             let schedule_drag_move = schedule_drag_move.clone();
+            let puzzle_scale = puzzle_scale;
             move |event: &TouchEvent| {
                 if event.touches().length() > 1 {
                     if drag_state.borrow().is_some() {
@@ -3300,6 +3456,7 @@ fn app() -> Html {
                     touch_id,
                     false,
                 ) {
+                    let (x, y) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                     if schedule_drag_move(x, y) {
                         event.prevent_default();
                     }
@@ -4192,19 +4349,23 @@ fn app() -> Html {
             let canvas_ref = canvas_ref.clone();
             let using_wgpu = using_wgpu;
             let drag_release_common = drag_release_common.clone();
+            let puzzle_scale = puzzle_scale;
             move |event: &MouseEvent| {
                 let target_ref = if using_wgpu {
                     &canvas_ref
                 } else {
                     &svg_ref
                 };
-                let coords = event_to_svg_coords(
-                    event,
-                    target_ref,
-                    view_min_x,
-                    view_min_y,
-                    view_width,
-                    view_height,
+                let coords = workspace_to_puzzle_opt(
+                    puzzle_scale,
+                    event_to_svg_coords(
+                        event,
+                        target_ref,
+                        view_min_x,
+                        view_min_y,
+                        view_width,
+                        view_height,
+                    ),
                 );
                 if drag_release_common(coords) {
                     event.prevent_default();
@@ -4217,6 +4378,7 @@ fn app() -> Html {
             let using_wgpu = using_wgpu;
             let drag_state = drag_state.clone();
             let drag_release_common = drag_release_common.clone();
+            let puzzle_scale = puzzle_scale;
             move |event: &TouchEvent| {
                 let touch_id = drag_state
                     .borrow()
@@ -4227,15 +4389,18 @@ fn app() -> Html {
                 } else {
                     &svg_ref
                 };
-                let coords = touch_event_to_svg_coords(
-                    event,
-                    target_ref,
-                    view_min_x,
-                    view_min_y,
-                    view_width,
-                    view_height,
-                    touch_id,
-                    true,
+                let coords = workspace_to_puzzle_opt(
+                    puzzle_scale,
+                    touch_event_to_svg_coords(
+                        event,
+                        target_ref,
+                        view_min_x,
+                        view_min_y,
+                        view_width,
+                        view_height,
+                        touch_id,
+                        true,
+                    ),
                 );
                 if drag_release_common(coords) {
                     event.prevent_default();
@@ -4292,10 +4457,10 @@ fn app() -> Html {
                     rows,
                     piece_width,
                     piece_height,
-                    view_min_x,
-                    view_min_y,
-                    view_width,
-                    view_height,
+                    puzzle_view_min_x,
+                    puzzle_view_min_y,
+                    puzzle_view_width,
+                    puzzle_view_height,
                     mask_pad,
                 );
                 let next_rotations =
@@ -4900,6 +5065,7 @@ fn app() -> Html {
             let on_piece_down = {
                 let svg_ref = svg_ref.clone();
                 let begin_drag = begin_drag.clone();
+                let puzzle_scale = puzzle_scale;
                 Callback::from(move |event: MouseEvent| {
                     if let Some((x, y)) = event_to_svg_coords(
                         &event,
@@ -4909,6 +5075,7 @@ fn app() -> Html {
                         view_width,
                         view_height,
                     ) {
+                        let (x, y) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                         begin_drag(piece_id, x, y, event.shift_key(), event.ctrl_key(), None);
                     }
                     event.prevent_default();
@@ -4917,6 +5084,7 @@ fn app() -> Html {
             let on_piece_touch = {
                 let svg_ref = svg_ref.clone();
                 let begin_drag = begin_drag.clone();
+                let puzzle_scale = puzzle_scale;
                 Callback::from(move |event: TouchEvent| {
                     if event.touches().length() > 1 {
                         return;
@@ -4933,6 +5101,7 @@ fn app() -> Html {
                             touch_id,
                             true,
                         ) {
+                            let (x, y) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                             begin_drag(piece_id, x, y, false, false, touch_id);
                         }
                     }
@@ -5066,6 +5235,7 @@ fn app() -> Html {
             let begin_drag = begin_drag.clone();
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
+            let puzzle_scale = puzzle_scale;
             Callback::from(move |event: MouseEvent| {
                 let Some((x, y)) = event_to_svg_coords(
                     &event,
@@ -5077,6 +5247,7 @@ fn app() -> Html {
                 ) else {
                     return;
                 };
+                let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                 let credit_hit = ui_credit_hitbox
                     .borrow()
                     .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
@@ -5098,8 +5269,8 @@ fn app() -> Html {
                     order = (0..total).collect();
                 }
                 if let Some(piece_id) = pick_piece_at(
-                    x,
-                    y,
+                    px,
+                    py,
                     &positions_snapshot,
                     &rotations_snapshot,
                     &flips_snapshot,
@@ -5113,7 +5284,7 @@ fn app() -> Html {
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
-                    begin_drag(piece_id, x, y, event.shift_key(), event.ctrl_key(), None);
+                    begin_drag(piece_id, px, py, event.shift_key(), event.ctrl_key(), None);
                     event.prevent_default();
                     return;
                 }
@@ -5137,6 +5308,7 @@ fn app() -> Html {
             let begin_drag = begin_drag.clone();
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
+            let puzzle_scale = puzzle_scale;
             Callback::from(move |event: TouchEvent| {
                 if event.touches().length() > 1 {
                     return;
@@ -5157,6 +5329,7 @@ fn app() -> Html {
                 ) else {
                     return;
                 };
+                let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                 let credit_hit = ui_credit_hitbox
                     .borrow()
                     .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
@@ -5178,8 +5351,8 @@ fn app() -> Html {
                     order = (0..total).collect();
                 }
                 if let Some(piece_id) = pick_piece_at(
-                    x,
-                    y,
+                    px,
+                    py,
                     &positions_snapshot,
                     &rotations_snapshot,
                     &flips_snapshot,
@@ -5193,7 +5366,7 @@ fn app() -> Html {
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
-                    begin_drag(piece_id, x, y, false, false, touch_id);
+                    begin_drag(piece_id, px, py, false, false, touch_id);
                     event.prevent_default();
                     return;
                 }
@@ -5219,6 +5392,7 @@ fn app() -> Html {
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
             let using_wgpu = using_wgpu;
+            let puzzle_scale = puzzle_scale;
             Callback::from(move |event: MouseEvent| {
                 if using_wgpu && active_id.is_some() {
                     return;
@@ -5237,6 +5411,7 @@ fn app() -> Html {
                     }
                     return;
                 };
+                let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                 let mut piece_hit = None;
                 if let Some(mask_atlas) = mask_atlas.borrow().as_ref() {
                     let positions_snapshot = &*positions;
@@ -5254,8 +5429,8 @@ fn app() -> Html {
                         None => order_snapshot.as_slice(),
                     };
                     piece_hit = pick_piece_at(
-                        x,
-                        y,
+                        px,
+                        py,
                         positions_snapshot,
                         rotations_snapshot,
                         flips_snapshot,
@@ -5316,6 +5491,13 @@ fn app() -> Html {
                     ry={frame_corner_radius.clone()}
                 />
             }
+        };
+        let puzzle_transform = format!("scale({})", fmt_f32(puzzle_scale));
+        let puzzle_group = html! {
+            <g transform={puzzle_transform}>
+                {puzzle_bounds}
+                {piece_nodes}
+            </g>
         };
         let workspace_bounds = html! {
             <rect
@@ -5396,7 +5578,7 @@ fn app() -> Html {
                     let transform = format!("rotate({} {} {})", rotation, pivot_x, pivot_y);
                     let style = format!(
                         "font-size: {}px; fill: {};",
-                        fmt_f32(spec.font_size),
+                        fmt_f32(spec.font_size * 0.925),
                         ui_color_to_css(spec.color)
                     );
                     let class = match spec.id {
@@ -5477,8 +5659,7 @@ fn app() -> Html {
                     </defs>
                     {workspace_bounds}
                     {ui_nodes}
-                    {puzzle_bounds}
-                    {piece_nodes}
+                    {puzzle_group}
                 </svg>
             }
         };

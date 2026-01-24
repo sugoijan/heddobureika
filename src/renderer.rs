@@ -243,7 +243,8 @@ struct Globals {
     emboss_rim: f32,
     outline_width_px: f32,
     edge_aa: f32,
-    _pad: [f32; 2],
+    puzzle_scale: f32,
+    _pad: [f32; 1],
 }
 
 #[repr(C, align(16))]
@@ -253,7 +254,8 @@ struct FrameGlobals {
     view_size: [f32; 2],
     color: [f32; 4],
     output_gamma: f32,
-    _pad: [f32; 7],
+    puzzle_scale: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C, align(16))]
@@ -590,6 +592,7 @@ impl WgpuRenderer {
         view_min_y: f32,
         view_width: f32,
         view_height: f32,
+        puzzle_scale: f32,
         mask_atlas: Rc<MaskAtlasData>,
         mask_pad: f32,
         render_scale: f32,
@@ -598,6 +601,7 @@ impl WgpuRenderer {
         let (art_pixels, art_width, art_height) = image_to_rgba(&image)?;
         let logical_width = piece_width * grid.cols as f32;
         let logical_height = piece_height * grid.rows as f32;
+        let puzzle_scale = puzzle_scale.max(1.0e-4);
 
         let css_width = view_width.max(1.0);
         let css_height = view_height.max(1.0);
@@ -721,7 +725,8 @@ impl WgpuRenderer {
             emboss_rim: EMBOSS_RIM,
             outline_width_px: 2.0,
             edge_aa: WGPU_EDGE_AA_DEFAULT,
-            _pad: [0.0; 2],
+            puzzle_scale,
+            _pad: [0.0; 1],
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals-buffer-fill"),
@@ -892,7 +897,8 @@ impl WgpuRenderer {
             view_size: [view_width, view_height],
             color: dash_color,
             output_gamma,
-            _pad: [0.0; 7],
+            puzzle_scale,
+            _pad: [0.0; 2],
         };
         let frame_globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("frame-globals-buffer"),
@@ -904,7 +910,8 @@ impl WgpuRenderer {
             view_size: [view_width, view_height],
             color: workspace_fill,
             output_gamma,
-            _pad: [0.0; 7],
+            puzzle_scale: 1.0,
+            _pad: [0.0; 2],
         };
         let frame_bg_globals_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -917,7 +924,8 @@ impl WgpuRenderer {
             view_size: [view_width, view_height],
             color: workspace_stroke,
             output_gamma,
-            _pad: [0.0; 7],
+            puzzle_scale: 1.0,
+            _pad: [0.0; 2],
         };
         let frame_stroke_globals_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

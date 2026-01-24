@@ -119,7 +119,6 @@ body {
   stroke: rgba(0, 0, 0, 0.25);
   stroke-width: 1.5;
   stroke-dasharray: 6 4;
-  vector-effect: non-scaling-stroke;
   pointer-events: none;
 }
 
