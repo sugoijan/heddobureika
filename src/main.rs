@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, Element, Event, HtmlCanvasElement, HtmlImageElement, HtmlInputElement,
@@ -19,6 +20,12 @@ use taffy::prelude::*;
 
 mod core;
 use crate::core::*;
+mod model;
+use crate::model::*;
+#[cfg(target_arch = "wasm32")]
+mod renderer;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "renderer_stub.rs"]
 mod renderer;
 use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
@@ -66,20 +73,24 @@ fn drag_angle_for_group(count: usize) -> f32 {
 #[derive(Clone, Copy)]
 struct PuzzleArt {
     label: &'static str,
+    slug: &'static str,
     src: &'static str,
 }
 
 const PUZZLE_ARTS: &[PuzzleArt] = &[
     PuzzleArt {
         label: "Zoe Samurai",
+        slug: "zoe-samurai",
         src: DEFAULT_PUZZLE_SRC,
     },
     PuzzleArt {
         label: "Zoe Potter",
+        slug: "zoe-potter",
         src: "puzzles/zoe-potter.jpg",
     },
     PuzzleArt {
         label: "Raora by Noy",
+        slug: "raora-by-noy",
         src: "puzzles/raora-by-noy.avif",
     },
 ];
@@ -92,8 +103,168 @@ struct SavedPuzzleSelection {
     rows: u32,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedGame {
+    version: u32,
+    image_width: u32,
+    image_height: u32,
+    instance: PuzzleInstance,
+    state: PuzzleState,
+}
+
 fn puzzle_art_index_by_src(src: &str) -> Option<usize> {
     PUZZLE_ARTS.iter().position(|art| art.src == src)
+}
+
+fn puzzle_art_index_by_slug(slug: &str) -> Option<usize> {
+    let trimmed = slug.trim();
+    PUZZLE_ARTS
+        .iter()
+        .position(|art| art.slug.eq_ignore_ascii_case(trimmed))
+}
+
+fn puzzle_art_index_by_label(label: &str) -> Option<usize> {
+    let trimmed = label.trim();
+    PUZZLE_ARTS
+        .iter()
+        .position(|art| art.label.eq_ignore_ascii_case(trimmed))
+}
+
+#[derive(Clone)]
+enum HashRouteMode {
+    Resume,
+    Puzzle {
+        puzzle_index: usize,
+        pieces: Option<u32>,
+        seed: Option<u32>,
+    },
+}
+
+#[derive(Clone)]
+struct HashRoute {
+    mode: HashRouteMode,
+    clear_hash: bool,
+}
+
+fn decode_hash_value(value: &str) -> String {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    js_sys::decode_uri_component(raw)
+        .ok()
+        .and_then(|decoded| decoded.as_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn encode_hash_value(value: &str) -> String {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    js_sys::encode_uri_component(raw)
+        .as_string()
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn base_url_without_hash() -> Option<String> {
+    let window = web_sys::window()?;
+    let href = window.location().href().ok()?;
+    let base = href.split('#').next().unwrap_or(&href).to_string();
+    Some(base)
+}
+
+fn parse_seed_value(value: &str) -> Option<u32> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let normalized = raw.replace('_', "");
+    let trimmed = normalized.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+fn parse_hash_route() -> Option<HashRoute> {
+    let window = web_sys::window()?;
+    let hash = window.location().hash().ok()?;
+    let raw = hash.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.trim_start_matches('#').trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.eq_ignore_ascii_case("resume") {
+        return Some(HashRoute {
+            mode: HashRouteMode::Resume,
+            clear_hash: true,
+        });
+    }
+    let mut puzzle_index = None;
+    let mut pieces = None;
+    let mut seed = None;
+    let mut saw_param = false;
+    for chunk in raw.split(';') {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        saw_param = true;
+        let mut iter = chunk.splitn(2, '=');
+        let key = iter.next().unwrap_or("").trim();
+        let value = iter.next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("puzzle") {
+            let decoded = decode_hash_value(value);
+            puzzle_index = puzzle_art_index_by_slug(&decoded)
+                .or_else(|| puzzle_art_index_by_label(&decoded))
+                .or_else(|| puzzle_art_index_by_src(&decoded));
+        } else if key.eq_ignore_ascii_case("pieces") {
+            if let Ok(parsed) = value.parse::<u32>() {
+                if parsed > 0 {
+                    pieces = Some(parsed);
+                }
+            }
+        } else if key.eq_ignore_ascii_case("seed") {
+            seed = parse_seed_value(value);
+        }
+    }
+    if let Some(index) = puzzle_index {
+        return Some(HashRoute {
+            mode: HashRouteMode::Puzzle {
+                puzzle_index: index,
+                pieces,
+                seed,
+            },
+            clear_hash: true,
+        });
+    }
+    if saw_param {
+        return Some(HashRoute {
+            mode: HashRouteMode::Resume,
+            clear_hash: true,
+        });
+    }
+    None
+}
+
+fn clear_location_hash() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let location = window.location();
+    let path = location.pathname().unwrap_or_default();
+    let search = location.search().unwrap_or_default();
+    let new_url = format!("{path}{search}");
+    if let Ok(history) = window.history() {
+        let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&new_url));
+    } else {
+        let _ = location.set_hash("");
+    }
 }
 
 #[derive(Default)]
@@ -609,15 +780,60 @@ fn build_ui_specs(
     specs
 }
 
-fn load_saved_board() -> Option<SavedBoard> {
+fn load_saved_game() -> Option<SavedGame> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
     let raw = storage.get_item(STORAGE_KEY).ok()??;
-    let state: SavedBoard = serde_json::from_str(&raw).ok()?;
+    let state: SavedGame = serde_json::from_str(&raw).ok()?;
     if state.version != STORAGE_VERSION {
         return None;
     }
     Some(state)
+}
+
+fn validate_saved_game(state: &SavedGame, total: usize) -> bool {
+    if state.state.pieces.len() != total
+        || state.state.groups.len() != total
+        || state.state.connections.len() != total
+        || state.state.flips.len() != total
+    {
+        return false;
+    }
+    if state.state.group_order.iter().any(|id| *id >= total) {
+        return false;
+    }
+    for (id, piece) in state.state.pieces.iter().enumerate() {
+        let group = piece.group();
+        if group >= total {
+            return false;
+        }
+        if id >= total {
+            return false;
+        }
+    }
+    for (gid, group) in state.state.groups.iter().enumerate() {
+        let Some(group) = group else {
+            continue;
+        };
+        if group.id != gid || group.anchor != gid || group.members.is_empty() {
+            return false;
+        }
+        for member in &group.members {
+            if *member >= total {
+                return false;
+            }
+            if state
+                .state
+                .pieces
+                .get(*member)
+                .map(|piece| piece.group() != gid)
+                .unwrap_or(true)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn load_puzzle_selection() -> Option<SavedPuzzleSelection> {
@@ -648,7 +864,7 @@ fn load_theme_mode() -> Option<ThemeMode> {
     serde_json::from_str(&raw).ok()
 }
 
-fn save_board_state(state: &SavedBoard) {
+fn save_game_state(state: &SavedGame) {
     let Ok(raw) = serde_json::to_string(state) else {
         return;
     };
@@ -670,7 +886,7 @@ fn save_puzzle_selection(selection: &SavedPuzzleSelection) {
     let _ = storage.set_item(PUZZLE_SELECTION_KEY, &raw);
 }
 
-fn clear_saved_board() {
+fn clear_saved_game() {
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
         return;
@@ -916,6 +1132,46 @@ fn rebuild_groups_from_piece_state(
     (anchor_of, group_pos, group_rot, group_order)
 }
 
+fn grid_index_for_piece_count(
+    choices: &[GridChoice],
+    width: u32,
+    height: u32,
+    target: u32,
+) -> Option<usize> {
+    if target == 0 {
+        return None;
+    }
+    choices
+        .iter()
+        .position(|choice| choice.target_count == target)
+        .or_else(|| choices.iter().position(|choice| choice.actual_count == target))
+        .or_else(|| {
+            best_grid_for_count(width, height, target)
+                .and_then(|grid| grid_choice_index(choices, grid.cols, grid.rows))
+        })
+}
+
+fn group_transforms_from_anchor(
+    anchor_of: &[usize],
+    positions: &[(f32, f32)],
+    rotations: &[f32],
+) -> (Vec<(f32, f32)>, Vec<f32>) {
+    let total = anchor_of.len();
+    let mut group_pos = vec![(0.0, 0.0); total];
+    let mut group_rot = vec![0.0; total];
+    for (id, anchor) in anchor_of.iter().copied().enumerate() {
+        if anchor == id {
+            if let Some(pos) = positions.get(id) {
+                group_pos[id] = *pos;
+            }
+            if let Some(rot) = rotations.get(id) {
+                group_rot[id] = *rot;
+            }
+        }
+    }
+    (group_pos, group_rot)
+}
+
 fn rebuild_group_state(
     positions: &[(f32, f32)],
     rotations: &[f32],
@@ -960,6 +1216,60 @@ fn rebuild_group_state(
         derived_rotations,
         piece_order,
     )
+}
+
+fn anchor_of_from_state(state: &PuzzleState) -> Vec<usize> {
+    state.pieces.iter().map(|piece| piece.group()).collect()
+}
+
+fn group_transforms_from_state(
+    state: &PuzzleState,
+    total: usize,
+) -> (Vec<(f32, f32)>, Vec<f32>) {
+    let mut group_pos = vec![(0.0, 0.0); total];
+    let mut group_rot = vec![0.0; total];
+    for (id, group) in state.groups.iter().enumerate() {
+        if let Some(group) = group {
+            if id < total {
+                group_pos[id] = (group.transform.pos[0], group.transform.pos[1]);
+                group_rot[id] = group.transform.rot_deg;
+            }
+        }
+    }
+    (group_pos, group_rot)
+}
+
+struct UiDerived {
+    positions: Vec<(f32, f32)>,
+    rotations: Vec<f32>,
+    z_order: Vec<usize>,
+    anchor_of: Vec<usize>,
+    group_pos: Vec<(f32, f32)>,
+    group_rot: Vec<f32>,
+    group_order: Vec<usize>,
+}
+
+fn derive_ui_state_from_puzzle(
+    state: &PuzzleState,
+    cols: usize,
+    piece_width: f32,
+    piece_height: f32,
+) -> UiDerived {
+    let total = state.groups.len();
+    let (positions, rotations) = state.derive_piece_transforms(cols, piece_width, piece_height);
+    let z_order = state.build_piece_order();
+    let anchor_of = anchor_of_from_state(state);
+    let (group_pos, group_rot) = group_transforms_from_state(state, total);
+    let group_order = state.group_order.clone();
+    UiDerived {
+        positions,
+        rotations,
+        z_order,
+        anchor_of,
+        group_pos,
+        group_rot,
+        group_order,
+    }
 }
 
 fn event_to_svg_coords(
@@ -1439,14 +1749,25 @@ fn app() -> Html {
             }
         })
         .collect();
+    let route_state = use_mut_ref(parse_hash_route);
+    let pending_hash_clear = use_mut_ref(|| false);
+    let route_snapshot = route_state.borrow().clone();
+    let route_puzzle_index = route_snapshot.as_ref().and_then(|route| match route.mode {
+        HashRouteMode::Puzzle { puzzle_index, .. } => Some(puzzle_index),
+        HashRouteMode::Resume => None,
+    });
     let saved_puzzle_selection = use_mut_ref(load_puzzle_selection);
     let saved_puzzle_art_index = {
-        let selection = saved_puzzle_selection.borrow();
-        selection
-            .as_ref()
-            .and_then(|selection| puzzle_art_index_by_src(&selection.puzzle_src))
+        if route_puzzle_index.is_none() {
+            let selection = saved_puzzle_selection.borrow();
+            selection
+                .as_ref()
+                .and_then(|selection| puzzle_art_index_by_src(&selection.puzzle_src))
+        } else {
+            None
+        }
     };
-    let puzzle_art_index = use_state(|| saved_puzzle_art_index.unwrap_or(0));
+    let puzzle_art_index = use_state(|| route_puzzle_index.or(saved_puzzle_art_index).unwrap_or(0));
     let puzzle_art_index_value = *puzzle_art_index;
     let puzzle_art = PUZZLE_ARTS
         .get(puzzle_art_index_value)
@@ -1507,6 +1828,7 @@ fn app() -> Html {
     let line_bend_input = on_setting_change(settings.clone(), |settings, value| {
         settings.line_bend_ratio = value.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
     });
+    let puzzle_state = use_state(PuzzleState::empty);
     let positions = use_state(Vec::<(f32, f32)>::new);
     let group_anchor = use_state(Vec::<usize>::new);
     let group_pos = use_state(Vec::<(f32, f32)>::new);
@@ -1532,7 +1854,7 @@ fn app() -> Html {
     let theme_mode_value = *theme_mode;
     let theme_toggle_ref = use_node_ref();
     let drag_handlers = use_mut_ref(DragHandlers::default);
-    let restore_state = use_mut_ref(|| None::<SavedBoard>);
+    let restore_state = use_mut_ref(|| None::<SavedGame>);
     let restore_attempted = use_mut_ref(|| false);
     let grid_initialized = use_mut_ref(|| false);
     let svg_ref = use_node_ref();
@@ -1584,6 +1906,39 @@ fn app() -> Html {
     let snap_distance_ratio_value = *snap_distance_ratio;
     let scramble_nonce = use_state(|| 0u32);
     let scramble_nonce_value = *scramble_nonce;
+    let include_share_seed = use_state(|| false);
+    let include_share_seed_value = *include_share_seed;
+    let on_share_seed_toggle = {
+        let include_share_seed = include_share_seed.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            include_share_seed.set(input.checked());
+        })
+    };
+    let share_seed_value = if include_share_seed_value {
+        if image_size_value.is_some() {
+            Some(scramble_seed(
+                PUZZLE_SEED,
+                scramble_nonce_value,
+                grid.cols as usize,
+                grid.rows as usize,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let share_link = base_url_without_hash()
+        .map(|base| {
+            let slug = encode_hash_value(puzzle_art.slug);
+            let mut fragment = format!("puzzle={slug};pieces={}", grid.actual_count);
+            if let Some(seed) = share_seed_value {
+                fragment.push_str(&format!(";seed={:#x}", seed));
+            }
+            format!("{base}#{fragment}")
+        })
+        .unwrap_or_default();
     let save_revision = use_state(|| 0u32);
     let save_revision_value = *save_revision;
     let frame_snap_ratio = use_state(|| FRAME_SNAP_DEFAULT);
@@ -1612,6 +1967,33 @@ fn app() -> Html {
         active_id: active_id_value,
         dragging_members: dragging_members_value.clone(),
         show_debug: show_debug_value,
+    };
+    let apply_puzzle_state: Rc<dyn Fn(PuzzleState, usize, f32, f32)> = {
+        let positions = positions.clone();
+        let rotations = rotations.clone();
+        let flips = flips.clone();
+        let connections = connections.clone();
+        let z_order = z_order.clone();
+        let group_anchor = group_anchor.clone();
+        let group_pos = group_pos.clone();
+        let group_rot = group_rot.clone();
+        let group_order = group_order.clone();
+        let scramble_nonce = scramble_nonce.clone();
+        let puzzle_state = puzzle_state.clone();
+        Rc::new(move |next_state: PuzzleState, cols: usize, piece_width: f32, piece_height: f32| {
+            let derived = derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
+            positions.set(derived.positions);
+            rotations.set(derived.rotations);
+            flips.set(next_state.flips.clone());
+            connections.set(next_state.connections.clone());
+            group_anchor.set(derived.anchor_of);
+            group_pos.set(derived.group_pos);
+            group_rot.set(derived.group_rot);
+            group_order.set(derived.group_order);
+            z_order.set(derived.z_order);
+            scramble_nonce.set(next_state.scramble_nonce);
+            puzzle_state.set(next_state);
+        })
     };
     let mask_atlas_revision_value = *mask_atlas_revision;
     let preview_revealed_value = *preview_revealed;
@@ -1691,7 +2073,8 @@ fn app() -> Html {
         ("--".to_string(), "--".to_string())
     };
     {
-        let positions = positions.clone();
+        let apply_puzzle_state = apply_puzzle_state.clone();
+        let scramble_nonce = scramble_nonce.clone();
         let active_id = active_id.clone();
         let drag_state = drag_state.clone();
         let dragging_members = dragging_members.clone();
@@ -1699,19 +2082,13 @@ fn app() -> Html {
         let rotation_anim = rotation_anim.clone();
         let rotation_anim_handle = rotation_anim_handle.clone();
         let rotation_queue = rotation_queue.clone();
-        let z_order = z_order.clone();
-        let connections = connections.clone();
-        let group_anchor = group_anchor.clone();
-        let group_pos = group_pos.clone();
-        let group_rot = group_rot.clone();
-        let group_order = group_order.clone();
-        let rotations = rotations.clone();
-        let flips = flips.clone();
         let solved = solved.clone();
-        let scramble_nonce = scramble_nonce.clone();
         let grid_index = grid_index.clone();
         let grid_choices = grid_choices.clone();
         let grid_default_index = grid_default_index;
+        let route_state = route_state.clone();
+        let pending_hash_clear = pending_hash_clear.clone();
+        let save_revision = save_revision.clone();
         let restore_state = restore_state.clone();
         let restore_attempted = restore_attempted.clone();
         let grid_initialized = grid_initialized.clone();
@@ -1724,12 +2101,43 @@ fn app() -> Html {
                     let mut allow_scramble = true;
                     let mut skip_scramble = false;
                     let mut skip_restore = false;
+                    let route_snapshot = route_state.borrow().clone();
+                    let mut route_force_new = false;
+                    let mut route_piece_target = None;
+                    let mut route_seed = None;
+                    let mut route_clear_hash = false;
+                    if let Some(route) = route_snapshot.as_ref() {
+                        route_clear_hash = route.clear_hash;
+                        if let HashRouteMode::Puzzle { pieces, seed, .. } = route.mode {
+                            route_force_new = true;
+                            route_piece_target = pieces;
+                            route_seed = seed;
+                        }
+                    }
                     if grid_choices.is_empty() {
                         allow_scramble = false;
                     } else if *grid_index_value >= grid_choices.len() {
                         grid_index.set(grid_default_index.min(grid_choices.len() - 1));
                         *grid_initialized.borrow_mut() = true;
                         allow_scramble = false;
+                    }
+                    if route_force_new {
+                        saved_puzzle_selection.borrow_mut().take();
+                        clear_puzzle_selection();
+                        clear_saved_game();
+                        skip_restore = true;
+                        if let Some(target) = route_piece_target {
+                            if let Some(target_index) =
+                                grid_index_for_piece_count(&grid_choices, width, height, target)
+                            {
+                                if target_index != *grid_index_value {
+                                    grid_index.set(target_index);
+                                    *grid_initialized.borrow_mut() = true;
+                                    skip_scramble = true;
+                                    skip_restore = true;
+                                }
+                            }
+                        }
                     }
                     if allow_scramble {
                         if let Some(selection) = saved_puzzle_selection.borrow_mut().take() {
@@ -1745,11 +2153,11 @@ fn app() -> Html {
                                     }
                                 } else {
                                     clear_puzzle_selection();
-                                    clear_saved_board();
+                                    clear_saved_game();
                                 }
                             } else {
                                 clear_puzzle_selection();
-                                clear_saved_board();
+                                clear_saved_game();
                             }
                         }
                     }
@@ -1758,68 +2166,53 @@ fn app() -> Html {
                             let mut attempted = restore_attempted.borrow_mut();
                             if !*attempted {
                                 *attempted = true;
-                                *restore_state.borrow_mut() = load_saved_board();
+                                *restore_state.borrow_mut() = load_saved_game();
                             }
                             restore_state.borrow_mut().take()
                         };
                         if let Some(state) = saved_state {
                             if state.image_width == width && state.image_height == height {
-                                if let Some(saved_index) =
-                                    grid_choice_index(&grid_choices, state.cols, state.rows)
-                                {
+                                if let Some(saved_index) = grid_choice_index(
+                                    &grid_choices,
+                                    state.instance.cols,
+                                    state.instance.rows,
+                                ) {
                                     if saved_index != *grid_index_value {
                                         *restore_state.borrow_mut() = Some(state);
                                         grid_index.set(saved_index);
                                         *grid_initialized.borrow_mut() = true;
                                         skip_scramble = true;
                                     } else {
-                                        let cols = state.cols as usize;
-                                        let rows = state.rows as usize;
+                                        let cols = state.instance.cols as usize;
+                                        let rows = state.instance.rows as usize;
                                         let total = cols * rows;
-                                        if validate_saved_board(&state, total) {
-                                            let piece_width = width as f32 / state.cols as f32;
-                                            let piece_height = height as f32 / state.rows as f32;
-                                            let (anchor_of, group_positions, group_rotations, order) =
-                                                rebuild_groups_from_piece_state(
-                                                    &state.positions,
-                                                    &state.rotations,
-                                                    &state.connections,
-                                                    cols,
-                                                    rows,
-                                                    Some(&state.z_order),
-                                                );
-                                            let (derived_positions, derived_rotations) =
-                                                derive_piece_state(
-                                                    &anchor_of,
-                                                    &group_positions,
-                                                    &group_rotations,
-                                                    cols,
-                                                    piece_width,
-                                                    piece_height,
-                                                );
-                                            let piece_order =
-                                                build_piece_order_from_groups(&order, &anchor_of);
+                                        if validate_saved_game(&state, total) {
+                                            let piece_width = width as f32 / state.instance.cols as f32;
+                                            let piece_height = height as f32 / state.instance.rows as f32;
+                                            let next_state = state.state.clone();
+                                            let derived = derive_ui_state_from_puzzle(
+                                                &next_state,
+                                                cols,
+                                                piece_width,
+                                                piece_height,
+                                            );
                                             let solved_now = is_solved(
-                                                &derived_positions,
-                                                &derived_rotations,
-                                                &state.flips,
-                                                &state.connections,
+                                                &derived.positions,
+                                                &derived.rotations,
+                                                &next_state.flips,
+                                                &next_state.connections,
                                                 cols,
                                                 rows,
                                                 piece_width,
                                                 piece_height,
                                                 rotation_enabled_value,
                                             );
-                                            positions.set(derived_positions);
-                                            rotations.set(derived_rotations);
-                                            flips.set(state.flips.clone());
-                                            connections.set(state.connections.clone());
-                                            z_order.set(piece_order);
-                                            group_anchor.set(anchor_of);
-                                            group_pos.set(group_positions);
-                                            group_rot.set(group_rotations);
-                                            group_order.set(order);
-                                            scramble_nonce.set(state.scramble_nonce);
+                                            apply_puzzle_state(
+                                                next_state,
+                                                cols,
+                                                piece_width,
+                                                piece_height,
+                                            );
                                             active_id.set(None);
                                             dragging_members.set(Vec::new());
                                             animating_members.set(Vec::new());
@@ -1830,6 +2223,14 @@ fn app() -> Html {
                                             solved.set(solved_now);
                                             *grid_initialized.borrow_mut() = true;
                                             skip_scramble = true;
+                                            if route_snapshot.is_some() {
+                                                if route_clear_hash {
+                                                    *pending_hash_clear.borrow_mut() = true;
+                                                }
+                                                route_state.borrow_mut().take();
+                                                save_revision
+                                                    .set(save_revision.wrapping_add(1));
+                                            }
                                         }
                                     }
                                 }
@@ -1874,7 +2275,11 @@ fn app() -> Html {
                         let puzzle_view_height = view_height / puzzle_scale;
                         let margin =
                             piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
-                        let nonce = time_nonce(*scramble_nonce);
+                        let nonce = if let Some(seed) = route_seed {
+                            scramble_nonce_from_seed(PUZZLE_SEED, seed, cols, rows)
+                        } else {
+                            time_nonce(*scramble_nonce)
+                        };
                         let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
                         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
                         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
@@ -1895,21 +2300,19 @@ fn app() -> Html {
                             cols * rows,
                             rotation_enabled_value,
                         );
-                        let anchor_of = (0..cols * rows).collect::<Vec<_>>();
-                        let group_positions = next_positions.clone();
-                        let group_rotations = rotations_scrambled.clone();
-                        let group_order_value = order.clone();
-                        let (derived_positions, derived_rotations) = derive_piece_state(
-                            &anchor_of,
-                            &group_positions,
-                            &group_rotations,
+                        let next_flips = scramble_flips(flip_seed, cols * rows, FLIP_CHANCE);
+                        let next_connections = vec![[false; 4]; cols * rows];
+                        let next_state = PuzzleState::rebuild_from_piece_state(
+                            &next_positions,
+                            &rotations_scrambled,
+                            &next_flips,
+                            &next_connections,
                             cols,
-                            piece_width,
-                            piece_height,
+                            rows,
+                            Some(&order),
+                            nonce,
                         );
-                        let piece_order =
-                            build_piece_order_from_groups(&group_order_value, &anchor_of);
-                        positions.set(derived_positions);
+                        apply_puzzle_state(next_state, cols, piece_width, piece_height);
                         active_id.set(None);
                         dragging_members.set(Vec::new());
                         animating_members.set(Vec::new());
@@ -1917,16 +2320,14 @@ fn app() -> Html {
                         rotation_anim_handle.borrow_mut().take();
                         rotation_queue.borrow_mut().clear();
                         *drag_state.borrow_mut() = None;
-                        z_order.set(piece_order);
-                        connections.set(vec![[false; 4]; cols * rows]);
-                        rotations.set(derived_rotations);
-                        group_anchor.set(anchor_of);
-                        group_pos.set(group_positions);
-                        group_rot.set(group_rotations);
-                        group_order.set(group_order_value);
-                        flips.set(scramble_flips(flip_seed, cols * rows, FLIP_CHANCE));
                         solved.set(false);
-                        scramble_nonce.set(nonce);
+                        if route_snapshot.is_some() {
+                            if route_clear_hash {
+                                *pending_hash_clear.borrow_mut() = true;
+                            }
+                            route_state.borrow_mut().take();
+                            save_revision.set(save_revision.wrapping_add(1));
+                        }
                     }
                 }
                 || ()
@@ -1942,7 +2343,7 @@ fn app() -> Html {
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < grid_choices_len {
                     grid_index.set(value);
-                    clear_saved_board();
+                    clear_saved_game();
                 }
             }
         })
@@ -1955,7 +2356,7 @@ fn app() -> Html {
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < puzzle_art_len {
                     puzzle_art_index.set(value);
-                    clear_saved_board();
+                    clear_saved_game();
                 }
             }
         })
@@ -1992,15 +2393,13 @@ fn app() -> Html {
     };
     let on_rotation_toggle = {
         let rotation_enabled = rotation_enabled.clone();
+        let positions = positions.clone();
         let rotations = rotations.clone();
         let flips = flips.clone();
-        let positions = positions.clone();
         let connections = connections.clone();
-        let group_anchor = group_anchor.clone();
-        let group_pos = group_pos.clone();
-        let group_rot = group_rot.clone();
-        let group_order = group_order.clone();
         let z_order = z_order.clone();
+        let apply_puzzle_state = apply_puzzle_state.clone();
+        let scramble_nonce = scramble_nonce.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
         let grid_choices = grid_choices.clone();
@@ -2036,10 +2435,10 @@ fn app() -> Html {
                     None
                 };
                 let (
-                    anchor_of,
-                    group_positions,
-                    group_rotations,
-                    group_order_value,
+                    _anchor_of,
+                    _group_positions,
+                    _group_rotations,
+                    _group_order_value,
                     derived_positions,
                     derived_rotations,
                     piece_order,
@@ -2064,13 +2463,17 @@ fn app() -> Html {
                     piece_height,
                     enabled,
                 );
-                positions.set(derived_positions);
-                rotations.set(derived_rotations);
-                group_anchor.set(anchor_of);
-                group_pos.set(group_positions);
-                group_rot.set(group_rotations);
-                group_order.set(group_order_value);
-                z_order.set(piece_order);
+                let next_state = PuzzleState::rebuild_from_piece_state(
+                    &derived_positions,
+                    &derived_rotations,
+                    &flips_snapshot,
+                    &connections_snapshot,
+                    cols,
+                    rows,
+                    Some(piece_order.as_slice()),
+                    *scramble_nonce,
+                );
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                 solved.set(solved_now);
             }
             save_revision.set(save_revision.wrapping_add(1));
@@ -2747,17 +3150,14 @@ fn app() -> Html {
     }
 
     {
-        let positions = positions.clone();
-        let rotations = rotations.clone();
-        let flips = flips.clone();
-        let connections = connections.clone();
-        let z_order = z_order.clone();
         let image_size = image_size.clone();
         let grid_index = grid_index.clone();
         let grid_choices = grid_choices.clone();
-        let scramble_nonce = scramble_nonce.clone();
+        let puzzle_art = puzzle_art;
+        let puzzle_state = puzzle_state.clone();
         let active_id = active_id.clone();
         let animating_members = animating_members.clone();
+        let pending_hash_clear = pending_hash_clear.clone();
         use_effect_with(save_revision_value, move |save_revision_value| {
             let should_save =
                 *save_revision_value > 0 && active_id.is_none() && animating_members.is_empty();
@@ -2768,32 +3168,31 @@ fn app() -> Html {
                         .copied()
                         .unwrap_or(FALLBACK_GRID);
                     let total = (grid.cols * grid.rows) as usize;
-                    let positions_value = (*positions).clone();
-                    let rotations_value = (*rotations).clone();
-                    let flips_value = (*flips).clone();
-                    let connections_value = (*connections).clone();
-                    let z_order_value = (*z_order).clone();
-                    if positions_value.len() == total
-                        && rotations_value.len() == total
-                        && flips_value.len() == total
-                        && connections_value.len() == total
-                        && z_order_value.len() == total
-                        && z_order_value.iter().all(|id| *id < total)
-                    {
-                        let state = SavedBoard {
-                            version: STORAGE_VERSION,
-                            cols: grid.cols,
+                    let puzzle_snapshot = (*puzzle_state).clone();
+                    let state_ok = puzzle_snapshot.pieces.len() == total
+                        && puzzle_snapshot.groups.len() == total
+                        && puzzle_snapshot.connections.len() == total
+                        && puzzle_snapshot.flips.len() == total;
+                    if state_ok {
+                        let instance = PuzzleInstance {
+                            label: puzzle_art.label.to_string(),
+                            image_src: puzzle_art.src.to_string(),
                             rows: grid.rows,
+                            cols: grid.cols,
+                            shape_seed: PUZZLE_SEED,
+                        };
+                        let state = SavedGame {
+                            version: STORAGE_VERSION,
                             image_width: width,
                             image_height: height,
-                            positions: positions_value,
-                            rotations: rotations_value,
-                            flips: flips_value,
-                            connections: connections_value,
-                            z_order: z_order_value,
-                            scramble_nonce: *scramble_nonce,
+                            instance,
+                            state: puzzle_snapshot,
                         };
-                        save_board_state(&state);
+                        save_game_state(&state);
+                        if *pending_hash_clear.borrow() {
+                            clear_location_hash();
+                            *pending_hash_clear.borrow_mut() = false;
+                        }
                     }
                 }
             }
@@ -3276,6 +3675,7 @@ fn app() -> Html {
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
             let flips = flips.clone();
+            let connections = connections.clone();
             let group_anchor = group_anchor.clone();
             let group_pos = group_pos.clone();
             let group_rot = group_rot.clone();
@@ -3285,7 +3685,6 @@ fn app() -> Html {
             let wgpu_renderer = wgpu_renderer.clone();
             let mask_atlas = mask_atlas.clone();
             let z_order = z_order.clone();
-            let connections = connections.clone();
             let show_debug = show_debug.clone();
             let using_wgpu = using_wgpu;
             let wgpu_edge_aa = wgpu_edge_aa;
@@ -3650,6 +4049,8 @@ fn app() -> Html {
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
             let flips = flips.clone();
+            let apply_puzzle_state = apply_puzzle_state.clone();
+            let puzzle_state = puzzle_state.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let drag_pending = drag_pending.clone();
@@ -3665,6 +4066,7 @@ fn app() -> Html {
             let group_rot = group_rot.clone();
             let group_order = group_order.clone();
             let z_order = z_order.clone();
+            let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             let using_wgpu = using_wgpu;
@@ -3690,6 +4092,8 @@ fn app() -> Html {
                     let snap_distance = piece_width.min(piece_height) * snap_distance_ratio_value;
                     let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
                     let start_group_animation = {
+                        let apply_puzzle_state = apply_puzzle_state.clone();
+                        let scramble_nonce = scramble_nonce.clone();
                         let positions = positions.clone();
                         let rotations = rotations.clone();
                         let flips = flips.clone();
@@ -3697,7 +4101,6 @@ fn app() -> Html {
                         let group_anchor = group_anchor.clone();
                         let group_pos = group_pos.clone();
                         let group_rot = group_rot.clone();
-                        let group_order = group_order.clone();
                         let z_order = z_order.clone();
                         let solved = solved.clone();
                         let save_revision = save_revision.clone();
@@ -3846,10 +4249,10 @@ fn app() -> Html {
                                     None
                                 };
                                 let (
-                                    anchor_of,
-                                    group_positions,
-                                    group_rotations,
-                                    group_order_value,
+                                    _anchor_of,
+                                    _group_positions,
+                                    _group_rotations,
+                                    _group_order_value,
                                     derived_positions,
                                     derived_rotations,
                                     piece_order,
@@ -3874,14 +4277,17 @@ fn app() -> Html {
                                     piece_height,
                                     rotation_enabled_value,
                                 );
-                                positions.set(derived_positions);
-                                rotations.set(derived_rotations);
-                                connections.set(connections_snapshot);
-                                group_anchor.set(anchor_of);
-                                group_pos.set(group_positions);
-                                group_rot.set(group_rotations);
-                                group_order.set(group_order_value);
-                                z_order.set(piece_order);
+                                let next_state = PuzzleState::rebuild_from_piece_state(
+                                    &derived_positions,
+                                    &derived_rotations,
+                                    &flips_snapshot,
+                                    &connections_snapshot,
+                                    cols,
+                                    rows,
+                                    Some(piece_order.as_slice()),
+                                    *scramble_nonce,
+                                );
+                                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                                 animating_members.set(Vec::new());
                                 *rotation_anim.borrow_mut() = None;
                                 rotation_anim_handle.borrow_mut().take();
@@ -4006,6 +4412,17 @@ fn app() -> Html {
                                 }
                                 positions.set(next_positions.clone());
                                 rotations.set(next_rotations.clone());
+                                let anchor_of_snapshot = (*group_anchor).clone();
+                                if !anchor_of_snapshot.is_empty() {
+                                    let (next_group_pos, next_group_rot) =
+                                        group_transforms_from_anchor(
+                                            &anchor_of_snapshot,
+                                            &next_positions,
+                                            &next_rotations,
+                                        );
+                                    group_pos.set(next_group_pos);
+                                    group_rot.set(next_group_rot);
+                                }
                                 if t >= 1.0 {
                                     let queued = rotation_queue.borrow_mut().pop_front();
                                     if let Some(next_step) = queued {
@@ -4102,10 +4519,10 @@ fn app() -> Html {
                                         None
                                     };
                                     let (
-                                        anchor_of,
-                                        group_positions,
-                                        group_rotations,
-                                        group_order_value,
+                                        _anchor_of,
+                                        _group_positions,
+                                        _group_rotations,
+                                        _group_order_value,
                                         derived_positions,
                                         derived_rotations,
                                         piece_order,
@@ -4130,14 +4547,17 @@ fn app() -> Html {
                                         piece_height,
                                         rotation_enabled_value,
                                     );
-                                    positions.set(derived_positions);
-                                    rotations.set(derived_rotations);
-                                    connections.set(connections_snapshot);
-                                    group_anchor.set(anchor_of);
-                                    group_pos.set(group_positions);
-                                    group_rot.set(group_rotations);
-                                    group_order.set(group_order_value);
-                                    z_order.set(piece_order);
+                                    let next_state = PuzzleState::rebuild_from_piece_state(
+                                        &derived_positions,
+                                        &derived_rotations,
+                                        &flips_snapshot,
+                                        &connections_snapshot,
+                                        cols,
+                                        rows,
+                                        Some(piece_order.as_slice()),
+                                        *scramble_nonce,
+                                    );
+                                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
                                     solved.set(solved_now);
                                     save_revision.set(save_revision.wrapping_add(1));
                                     rotation_anim_handle_for_tick.borrow_mut().take();
@@ -4169,10 +4589,10 @@ fn app() -> Html {
                                     None
                                 };
                                 let (
-                                    anchor_of,
-                                    group_positions,
-                                    group_rotations,
-                                    group_order_value,
+                                    _anchor_of,
+                                    _group_positions,
+                                    _group_rotations,
+                                    _group_order_value,
                                     derived_positions,
                                     derived_rotations,
                                     piece_order,
@@ -4197,15 +4617,17 @@ fn app() -> Html {
                                     piece_height,
                                     rotation_enabled_value,
                                 );
-                                positions.set(derived_positions);
-                                rotations.set(derived_rotations);
-                                connections.set(next_connections);
-                                flips.set(next_flips);
-                                group_anchor.set(anchor_of);
-                                group_pos.set(group_positions);
-                                group_rot.set(group_rotations);
-                                group_order.set(group_order_value);
-                                z_order.set(piece_order);
+                                let next_state = PuzzleState::rebuild_from_piece_state(
+                                    &derived_positions,
+                                    &derived_rotations,
+                                    &next_flips,
+                                    &next_connections,
+                                    cols,
+                                    rows,
+                                    Some(piece_order.as_slice()),
+                                    *scramble_nonce,
+                                );
+                                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                                 solved.set(solved_now);
                                 save_revision.set(save_revision.wrapping_add(1));
                                 active_id.set(None);
@@ -4227,10 +4649,10 @@ fn app() -> Html {
                                     None
                                 };
                                 let (
-                                    anchor_of,
-                                    group_positions,
-                                    group_rotations,
-                                    group_order_value,
+                                    _anchor_of,
+                                    _group_positions,
+                                    _group_rotations,
+                                    _group_order_value,
                                     derived_positions,
                                     derived_rotations,
                                     piece_order,
@@ -4255,15 +4677,17 @@ fn app() -> Html {
                                     piece_height,
                                     rotation_enabled_value,
                                 );
-                                positions.set(derived_positions);
-                                rotations.set(derived_rotations);
-                                connections.set(next_connections);
-                                flips.set(next_flips);
-                                group_anchor.set(anchor_of);
-                                group_pos.set(group_positions);
-                                group_rot.set(group_rotations);
-                                group_order.set(group_order_value);
-                                z_order.set(piece_order);
+                                let next_state = PuzzleState::rebuild_from_piece_state(
+                                    &derived_positions,
+                                    &derived_rotations,
+                                    &next_flips,
+                                    &next_connections,
+                                    cols,
+                                    rows,
+                                    Some(piece_order.as_slice()),
+                                    *scramble_nonce,
+                                );
+                                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                                 solved.set(solved_now);
                                 save_revision.set(save_revision.wrapping_add(1));
                                 active_id.set(None);
@@ -4466,19 +4890,6 @@ fn app() -> Html {
                             }
                         }
                     }
-                    if let Some(anim) = pending_animation {
-                        let connections_snapshot = next_connections.clone();
-                        connections.set(next_connections);
-                        flips.set(next_flips);
-                        start_group_animation(anim, Some(connections_snapshot));
-                        active_id.set(None);
-                        dragging_members.set(Vec::new());
-                        *drag_state.borrow_mut() = None;
-                        drag_pending.borrow_mut().take();
-                        drag_frame.borrow_mut().take();
-                        return true;
-                    }
-
                     let order_snapshot = (*z_order).clone();
                     let order_opt = if order_snapshot.len() == cols * rows {
                         Some(order_snapshot.as_slice())
@@ -4487,8 +4898,8 @@ fn app() -> Html {
                     };
                     let (
                         anchor_of,
-                        group_positions,
-                        group_rotations,
+                        _group_positions,
+                        _group_rotations,
                         group_order_value,
                         derived_positions,
                         derived_rotations,
@@ -4503,6 +4914,40 @@ fn app() -> Html {
                         piece_height,
                         order_opt,
                     );
+                    let next_state = PuzzleState::rebuild_from_piece_state(
+                        &derived_positions,
+                        &derived_rotations,
+                        &next_flips,
+                        &next_connections,
+                        cols,
+                        rows,
+                        Some(piece_order.as_slice()),
+                        *scramble_nonce,
+                    );
+                    if let Some(anim) = pending_animation {
+                        let connections_snapshot = next_state.connections.clone();
+                        let (group_pos_now, group_rot_now) = group_transforms_from_anchor(
+                            &anchor_of,
+                            &start_positions_all,
+                            &start_rotations_all,
+                        );
+                        puzzle_state.set(next_state);
+                        group_anchor.set(anchor_of);
+                        group_pos.set(group_pos_now);
+                        group_rot.set(group_rot_now);
+                        group_order.set(group_order_value);
+                        z_order.set(piece_order);
+                        connections.set(connections_snapshot.clone());
+                        flips.set(next_flips);
+                        start_group_animation(anim, Some(connections_snapshot));
+                        active_id.set(None);
+                        dragging_members.set(Vec::new());
+                        *drag_state.borrow_mut() = None;
+                        drag_pending.borrow_mut().take();
+                        drag_frame.borrow_mut().take();
+                        return true;
+                    }
+
                     let solved_now = is_solved(
                         &derived_positions,
                         &derived_rotations,
@@ -4514,15 +4959,7 @@ fn app() -> Html {
                         piece_height,
                         rotation_enabled_value,
                     );
-                    positions.set(derived_positions);
-                    rotations.set(derived_rotations);
-                    connections.set(next_connections);
-                    flips.set(next_flips);
-                    group_anchor.set(anchor_of);
-                    group_pos.set(group_positions);
-                    group_rot.set(group_rotations);
-                    group_order.set(group_order_value);
-                    z_order.set(piece_order);
+                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
                     solved.set(solved_now);
                     save_revision.set(save_revision.wrapping_add(1));
                     active_id.set(None);
@@ -4611,15 +5048,8 @@ fn app() -> Html {
         }
 
         let on_scramble = {
-            let positions = positions.clone();
-            let connections = connections.clone();
-            let z_order = z_order.clone();
-            let rotations = rotations.clone();
-            let flips = flips.clone();
-            let group_anchor = group_anchor.clone();
-            let group_pos = group_pos.clone();
-            let group_rot = group_rot.clone();
-            let group_order = group_order.clone();
+            let apply_puzzle_state = apply_puzzle_state.clone();
+            let scramble_nonce = scramble_nonce.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let dragging_members = dragging_members.clone();
@@ -4627,7 +5057,6 @@ fn app() -> Html {
             let rotation_anim = rotation_anim.clone();
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
-            let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
@@ -4638,7 +5067,6 @@ fn app() -> Html {
                     return;
                 }
                 let next_nonce = time_nonce(*scramble_nonce);
-                scramble_nonce.set(next_nonce);
                 let seed = scramble_seed(PUZZLE_SEED, next_nonce, cols, rows);
                 let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
                 let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
@@ -4657,33 +5085,18 @@ fn app() -> Html {
                 let next_rotations =
                     scramble_rotations(rotation_seed, total, rotation_enabled_value);
                 let next_connections = vec![[false; 4]; total];
-                let (
-                    anchor_of,
-                    group_positions,
-                    group_rotations,
-                    group_order_value,
-                    derived_positions,
-                    derived_rotations,
-                    piece_order,
-                ) = rebuild_group_state(
+                let next_flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
+                let next_state = PuzzleState::rebuild_from_piece_state(
                     &next_positions,
                     &next_rotations,
+                    &next_flips,
                     &next_connections,
                     cols,
                     rows,
-                    piece_width,
-                    piece_height,
                     Some(order.as_slice()),
+                    next_nonce,
                 );
-                positions.set(derived_positions);
-                rotations.set(derived_rotations);
-                connections.set(next_connections);
-                group_anchor.set(anchor_of);
-                group_pos.set(group_positions);
-                group_rot.set(group_rotations);
-                group_order.set(group_order_value);
-                z_order.set(piece_order);
-                flips.set(scramble_flips(flip_seed, total, FLIP_CHANCE));
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                 active_id.set(None);
                 dragging_members.set(Vec::new());
                 animating_members.set(Vec::new());
@@ -4696,15 +5109,7 @@ fn app() -> Html {
             })
         };
         let on_solve = {
-            let positions = positions.clone();
-            let connections = connections.clone();
-            let z_order = z_order.clone();
-            let rotations = rotations.clone();
-            let flips = flips.clone();
-            let group_anchor = group_anchor.clone();
-            let group_pos = group_pos.clone();
-            let group_rot = group_rot.clone();
-            let group_order = group_order.clone();
+            let apply_puzzle_state = apply_puzzle_state.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let dragging_members = dragging_members.clone();
@@ -4712,6 +5117,7 @@ fn app() -> Html {
             let rotation_anim = rotation_anim.clone();
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
+            let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
@@ -4733,33 +5139,18 @@ fn app() -> Html {
                 let order: Vec<usize> = (0..total).collect();
                 let next_rotations = vec![0.0; total];
                 let next_connections = build_full_connections(cols, rows);
-                let (
-                    anchor_of,
-                    group_positions,
-                    group_rotations,
-                    group_order_value,
-                    derived_positions,
-                    derived_rotations,
-                    piece_order,
-                ) = rebuild_group_state(
+                let next_flips = vec![false; total];
+                let next_state = PuzzleState::rebuild_from_piece_state(
                     &next_positions,
                     &next_rotations,
+                    &next_flips,
                     &next_connections,
                     cols,
                     rows,
-                    piece_width,
-                    piece_height,
                     Some(order.as_slice()),
+                    *scramble_nonce,
                 );
-                positions.set(derived_positions);
-                rotations.set(derived_rotations);
-                connections.set(next_connections);
-                group_anchor.set(anchor_of);
-                group_pos.set(group_positions);
-                group_rot.set(group_rotations);
-                group_order.set(group_order_value);
-                z_order.set(piece_order);
-                flips.set(vec![false; total]);
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                 active_id.set(None);
                 dragging_members.set(Vec::new());
                 animating_members.set(Vec::new());
@@ -4773,19 +5164,16 @@ fn app() -> Html {
         };
         let on_solve_rotation = {
             let positions = positions.clone();
-            let rotations = rotations.clone();
             let flips = flips.clone();
             let connections = connections.clone();
-            let group_anchor = group_anchor.clone();
-            let group_pos = group_pos.clone();
-            let group_rot = group_rot.clone();
-            let group_order = group_order.clone();
             let z_order = z_order.clone();
+            let apply_puzzle_state = apply_puzzle_state.clone();
             let dragging_members = dragging_members.clone();
             let animating_members = animating_members.clone();
             let rotation_anim = rotation_anim.clone();
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
+            let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
@@ -4805,42 +5193,34 @@ fn app() -> Html {
                 } else {
                     None
                 };
-                let (
-                    anchor_of,
-                    group_positions,
-                    group_rotations,
-                    group_order_value,
-                    derived_positions,
-                    derived_rotations,
-                    piece_order,
-                ) = rebuild_group_state(
+                let next_state = PuzzleState::rebuild_from_piece_state(
                     &positions_snapshot,
                     &zeroed,
+                    &flips_snapshot,
                     &connections_snapshot,
                     cols,
                     rows,
+                    order_opt,
+                    *scramble_nonce,
+                );
+                let derived = derive_ui_state_from_puzzle(
+                    &next_state,
+                    cols,
                     piece_width,
                     piece_height,
-                    order_opt,
                 );
                 let solved_now = is_solved(
-                    &derived_positions,
-                    &derived_rotations,
-                    &flips_snapshot,
-                    &connections_snapshot,
+                    &derived.positions,
+                    &derived.rotations,
+                    &next_state.flips,
+                    &next_state.connections,
                     cols,
                     rows,
                     piece_width,
                     piece_height,
                     rotation_enabled_value,
                 );
-                positions.set(derived_positions);
-                rotations.set(derived_rotations.clone());
-                group_anchor.set(anchor_of);
-                group_pos.set(group_positions);
-                group_rot.set(group_rotations);
-                group_order.set(group_order_value);
-                z_order.set(piece_order);
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                 solved.set(solved_now);
                 dragging_members.set(Vec::new());
                 animating_members.set(Vec::new());
@@ -4853,13 +5233,15 @@ fn app() -> Html {
         let on_unflip = {
             let positions = positions.clone();
             let rotations = rotations.clone();
-            let flips = flips.clone();
             let connections = connections.clone();
+            let z_order = z_order.clone();
+            let apply_puzzle_state = apply_puzzle_state.clone();
             let dragging_members = dragging_members.clone();
             let animating_members = animating_members.clone();
             let rotation_anim = rotation_anim.clone();
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
+            let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             Callback::from(move |_: MouseEvent| {
@@ -4873,18 +5255,34 @@ fn app() -> Html {
                 let rotations_snapshot = (*rotations).clone();
                 let connections_snapshot = (*connections).clone();
                 let cleared = vec![false; total];
-                flips.set(cleared.clone());
-                let solved_now = is_solved(
+                let order_snapshot = (*z_order).clone();
+                let order_opt = if order_snapshot.len() == total {
+                    Some(order_snapshot.as_slice())
+                } else {
+                    None
+                };
+                let next_state = PuzzleState::rebuild_from_piece_state(
                     &positions_snapshot,
                     &rotations_snapshot,
                     &cleared,
                     &connections_snapshot,
                     cols,
                     rows,
+                    order_opt,
+                    *scramble_nonce,
+                );
+                let solved_now = is_solved(
+                    &positions_snapshot,
+                    &rotations_snapshot,
+                    &next_state.flips,
+                    &next_state.connections,
+                    cols,
+                    rows,
                     piece_width,
                     piece_height,
                     rotation_enabled_value,
                 );
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                 solved.set(solved_now);
                 dragging_members.set(Vec::new());
                 animating_members.set(Vec::new());
@@ -5010,12 +5408,11 @@ fn app() -> Html {
             let rotations = rotations.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
-            let group_anchor = group_anchor.clone();
-            let group_pos = group_pos.clone();
-            let group_rot = group_rot.clone();
             let group_pos_live = group_pos_live.clone();
             let group_rot_live = group_rot_live.clone();
-            let group_order = group_order.clone();
+            let flips = flips.clone();
+            let apply_puzzle_state = apply_puzzle_state.clone();
+            let scramble_nonce = scramble_nonce.clone();
             let drag_state = drag_state.clone();
             let active_id = active_id.clone();
             let dragging_members = dragging_members.clone();
@@ -5032,6 +5429,7 @@ fn app() -> Html {
                 let positions_snapshot = (*positions).clone();
                 let rotations_snapshot = (*rotations).clone();
                 let mut connections_snapshot = (*connections).clone();
+                let flips_snapshot = (*flips).clone();
                 let mut members = if shift_key {
                     clear_piece_connections(&mut connections_snapshot, piece_id, cols, rows);
                     vec![piece_id]
@@ -5066,14 +5464,6 @@ fn app() -> Html {
                     piece_height,
                     order_opt,
                 );
-                if shift_key {
-                    connections.set(connections_snapshot.clone());
-                }
-                positions.set(derived_positions.clone());
-                rotations.set(derived_rotations.clone());
-                group_anchor.set(anchor_of.clone());
-                group_pos.set(group_positions.clone());
-                group_rot.set(group_rotations.clone());
                 if using_wgpu {
                     *positions_live.borrow_mut() = derived_positions.clone();
                     *rotations_live.borrow_mut() = derived_rotations.clone();
@@ -5084,8 +5474,17 @@ fn app() -> Html {
                 group_order_value.retain(|id| *id != anchor_id);
                 group_order_value.push(anchor_id);
                 let piece_order = build_piece_order_from_groups(&group_order_value, &anchor_of);
-                group_order.set(group_order_value);
-                z_order.set(piece_order);
+                let next_state = PuzzleState::rebuild_from_piece_state(
+                    &derived_positions,
+                    &derived_rotations,
+                    &flips_snapshot,
+                    &connections_snapshot,
+                    cols,
+                    rows,
+                    Some(piece_order.as_slice()),
+                    *scramble_nonce,
+                );
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
                 let anchor_pos = group_positions
                     .get(anchor_id)
                     .copied()
@@ -6067,6 +6466,28 @@ fn app() -> Html {
                     <label>
                         { "Seed" }
                         <span class="control-value">{ seed_label }</span>
+                    </label>
+                </div>
+                <div class="control">
+                    <label for="share-link">
+                        { "Share link" }
+                    </label>
+                    <input
+                        id="share-link"
+                        type="text"
+                        value={share_link}
+                        readonly=true
+                    />
+                </div>
+                <div class="control">
+                    <label for="share-seed">
+                        { "Include shuffle seed" }
+                        <input
+                            id="share-seed"
+                            type="checkbox"
+                            checked={include_share_seed_value}
+                            onchange={on_share_seed_toggle}
+                        />
                     </label>
                 </div>
                 <div class="control">

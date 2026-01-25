@@ -67,11 +67,11 @@ pub(crate) const LINE_BEND_MIN: f32 = 0.0;
 pub(crate) const EDGE_STEP_DIV: f32 = 6.0;
 pub(crate) const EDGE_STEP_MIN: f32 = 6.0;
 pub(crate) const CORNER_RADIUS_RATIO: f32 = 0.05;
-pub(crate) const STORAGE_KEY: &str = "heddobureika.board.v2";
+pub(crate) const STORAGE_KEY: &str = "heddobureika.board.v3";
 pub(crate) const PUZZLE_SELECTION_KEY: &str = "heddobureika.puzzle.v1";
 pub(crate) const RENDER_SETTINGS_KEY: &str = "heddobureika.render.v1";
 pub(crate) const THEME_MODE_KEY: &str = "heddobureika.theme.v1";
-pub(crate) const STORAGE_VERSION: u32 = 2;
+pub(crate) const STORAGE_VERSION: u32 = 3;
 pub(crate) const PUZZLE_SELECTION_VERSION: u32 = 1;
 pub(crate) const DIR_UP: usize = 0;
 pub(crate) const DIR_RIGHT: usize = 1;
@@ -213,21 +213,6 @@ pub(crate) enum ThemeMode {
     System,
     Light,
     Dark,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct SavedBoard {
-    pub(crate) version: u32,
-    pub(crate) cols: u32,
-    pub(crate) rows: u32,
-    pub(crate) image_width: u32,
-    pub(crate) image_height: u32,
-    pub(crate) positions: Vec<(f32, f32)>,
-    pub(crate) rotations: Vec<f32>,
-    pub(crate) flips: Vec<bool>,
-    pub(crate) connections: Vec<[bool; 4]>,
-    pub(crate) z_order: Vec<usize>,
-    pub(crate) scramble_nonce: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -457,31 +442,6 @@ pub(crate) fn build_grid_choices(width: u32, height: u32) -> Vec<GridChoice> {
         .iter()
         .filter_map(|target| best_grid_for_count(width, height, *target))
         .collect()
-}
-
-pub(crate) fn validate_saved_board(state: &SavedBoard, total: usize) -> bool {
-    if state.positions.len() != total
-        || state.rotations.len() != total
-        || state.flips.len() != total
-        || state.connections.len() != total
-        || state.z_order.len() != total
-    {
-        return false;
-    }
-    if state.positions.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
-        return false;
-    }
-    if state.rotations.iter().any(|rot| !rot.is_finite()) {
-        return false;
-    }
-    let mut seen = vec![false; total];
-    for id in &state.z_order {
-        if *id >= total || seen[*id] {
-            return false;
-        }
-        seen[*id] = true;
-    }
-    true
 }
 
 pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -1842,6 +1802,12 @@ pub(crate) fn build_full_connections(cols: usize, rows: usize) -> Vec<[bool; 4]>
 pub(crate) fn scramble_seed(base: u32, nonce: u32, cols: usize, rows: usize) -> u32 {
     let grid = ((cols as u32) << 16) ^ (rows as u32);
     base ^ nonce.wrapping_mul(0x9E37_79B9) ^ grid ^ 0x5CA7_7EED
+}
+
+pub(crate) fn scramble_nonce_from_seed(base: u32, seed: u32, cols: usize, rows: usize) -> u32 {
+    let grid = ((cols as u32) << 16) ^ (rows as u32);
+    let mixed = seed ^ base ^ grid ^ 0x5CA7_7EED;
+    mixed.wrapping_mul(0x144C_BC89)
 }
 
 pub(crate) fn scramble_layout(
