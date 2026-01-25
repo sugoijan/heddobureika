@@ -42,6 +42,8 @@ const QUAD_VERTICES: [Vertex; 4] = [
 ];
 
 const QUAD_INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
+const OUTLINE_COLOR_DEFAULT: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+const OUTLINE_COLOR_SOLVED: [f32; 4] = [0.165, 0.659, 0.29, 1.0];
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -51,7 +53,7 @@ pub(crate) struct Instance {
     pub(crate) rotation: f32,
     pub(crate) flip: f32,
     pub(crate) hover: f32,
-    pub(crate) _pad: f32,
+    pub(crate) drag: f32,
     pub(crate) piece_origin: [f32; 2],
     pub(crate) mask_origin: [f32; 2],
 }
@@ -133,14 +135,19 @@ impl Instance {
                     shader_location: 5,
                 },
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
-                    offset: 32,
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 28,
                     shader_location: 6,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x2,
-                    offset: 40,
+                    offset: 32,
                     shader_location: 7,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 40,
+                    shader_location: 8,
                 },
             ],
         }
@@ -245,6 +252,7 @@ struct Globals {
     edge_aa: f32,
     puzzle_scale: f32,
     _pad: [f32; 1],
+    outline_color: [f32; 4],
 }
 
 #[repr(C, align(16))]
@@ -727,6 +735,7 @@ impl WgpuRenderer {
             edge_aa: WGPU_EDGE_AA_DEFAULT,
             puzzle_scale,
             _pad: [0.0; 1],
+            outline_color: OUTLINE_COLOR_DEFAULT,
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals-buffer-fill"),
@@ -1135,7 +1144,7 @@ impl WgpuRenderer {
             rotation: 0.0,
             flip: 0.0,
             hover: 0.0,
-            _pad: 0.0,
+            drag: 0.0,
             piece_origin: [0.0, 0.0],
             mask_origin: [0.0, 0.0],
         }];
@@ -1879,6 +1888,17 @@ impl WgpuRenderer {
 
     pub(crate) fn set_edge_aa(&mut self, edge_aa: f32) {
         self.globals.edge_aa = edge_aa.max(0.0);
+    }
+
+    pub(crate) fn set_solved(&mut self, solved: bool) {
+        let target = if solved {
+            OUTLINE_COLOR_SOLVED
+        } else {
+            OUTLINE_COLOR_DEFAULT
+        };
+        if self.globals.outline_color != target {
+            self.globals.outline_color = target;
+        }
     }
 
     pub(crate) fn set_show_fps(&mut self, enabled: bool) {

@@ -13,6 +13,7 @@ struct Globals {
     edge_aa: f32,
     puzzle_scale: f32,
     _pad: f32,
+    outline_color: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -34,8 +35,9 @@ struct VertexIn {
     @location(3) inst_rot: f32,
     @location(4) inst_flip: f32,
     @location(5) inst_hover: f32,
-    @location(6) inst_piece_origin: vec2<f32>,
-    @location(7) inst_mask_origin: vec2<f32>,
+    @location(6) inst_drag: f32,
+    @location(7) inst_piece_origin: vec2<f32>,
+    @location(8) inst_mask_origin: vec2<f32>,
 };
 
 struct VertexOut {
@@ -65,9 +67,14 @@ fn vs_main(input: VertexIn) -> VertexOut {
         local_geom.x = full_size.x - local_geom.x;
     }
     let center = globals.mask_pad + input.inst_size * 0.5;
-    let angle = (select(input.inst_rot, -input.inst_rot, is_flipped)) * 0.017453292;
+    let drag = input.inst_drag;
+    let drag_active = abs(drag) > 1e-4;
+    let drag_scale = select(1.0, 1.02, drag_active);
+    let drag_rot = drag * 0.017453292;
+    let angle = (select(input.inst_rot, -input.inst_rot, is_flipped)) * 0.017453292 + drag_rot;
     let rotated = rotate_point(local_geom - center, angle) + center;
-    let world = (input.inst_pos - globals.mask_pad) + rotated;
+    let scaled = (rotated - center) * drag_scale + center;
+    let world = (input.inst_pos - globals.mask_pad) + scaled;
     let world_scaled = world * globals.puzzle_scale;
     let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
     let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
@@ -143,8 +150,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let outside = 1.0 - smoothstep(outline_threshold, outline_threshold + outline_aa, mask);
         let inside = smoothstep(outline_threshold, outline_threshold + outline_aa, max_neighbor);
         let edge = outside * inside;
-        let outline = srgb_to_linear(vec3<f32>(1.0, 0.0, 0.0));
-        return vec4<f32>(apply_output_gamma(outline), edge);
+        let outline = srgb_to_linear(globals.outline_color.rgb);
+        let outline_alpha = globals.outline_color.a * edge;
+        return vec4<f32>(apply_output_gamma(outline), outline_alpha);
     }
     if (mask < outline_threshold) {
         discard;

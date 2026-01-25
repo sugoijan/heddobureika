@@ -224,6 +224,11 @@ body {
   stroke-width: 3;
 }
 
+.puzzle-image.solved .piece-outline.edge-external,
+.puzzle-image.solved .piece-outline.edge-internal {
+  stroke: #2aa84a;
+}
+
 .piece-outline-simple {
   stroke: rgba(0, 0, 0, 0.2);
   stroke-width: 1;

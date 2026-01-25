@@ -55,6 +55,13 @@ const UI_TEXT_LAYOUT_PAD: f32 = 6.0;
 const UI_TEXT_HITBOX_PAD: f32 = 8.0;
 const UI_TITLE_FONT_RATIO: f32 = 0.058;
 const UI_TITLE_ROTATION_DEG: f32 = 0.5;
+const DRAG_SCALE: f32 = 1.01;
+const DRAG_ROTATION_DEG: f32 = 1.0;
+
+fn drag_angle_for_group(count: usize) -> f32 {
+    let denom = (count.max(1) as f32).sqrt();
+    DRAG_ROTATION_DEG / denom
+}
 
 #[derive(Clone, Copy)]
 struct PuzzleArt {
@@ -1031,6 +1038,53 @@ fn workspace_to_puzzle_opt(scale: f32, coords: Option<(f32, f32)>) -> Option<(f3
     coords.map(|(x, y)| workspace_to_puzzle_coords(scale, x, y))
 }
 
+fn drag_group_center(
+    positions: &[(f32, f32)],
+    members: &[usize],
+    piece_width: f32,
+    piece_height: f32,
+) -> Option<(f32, f32)> {
+    if members.is_empty() {
+        return None;
+    }
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut count = 0.0;
+    for id in members {
+        if let Some(pos) = positions.get(*id) {
+            sum_x += pos.0 + piece_width * 0.5;
+            sum_y += pos.1 + piece_height * 0.5;
+            count += 1.0;
+        }
+    }
+    if count > 0.0 {
+        Some((sum_x / count, sum_y / count))
+    } else {
+        None
+    }
+}
+
+fn drag_group_position(
+    pos: (f32, f32),
+    center: (f32, f32),
+    scale: f32,
+    rotation_deg: f32,
+    piece_width: f32,
+    piece_height: f32,
+) -> (f32, f32) {
+    let piece_center = (pos.0 + piece_width * 0.5, pos.1 + piece_height * 0.5);
+    let mut dx = piece_center.0 - center.0;
+    let mut dy = piece_center.1 - center.1;
+    dx *= scale;
+    dy *= scale;
+    let (rx, ry) = rotate_vec(dx, dy, rotation_deg);
+    let new_center = (center.0 + rx, center.1 + ry);
+    (
+        new_center.0 - piece_width * 0.5,
+        new_center.1 - piece_height * 0.5,
+    )
+}
+
 fn build_wgpu_instances(
     positions: &[(f32, f32)],
     rotations: &[f32],
@@ -1045,6 +1099,8 @@ fn build_wgpu_instances(
     piece_height: f32,
     mask_atlas: &MaskAtlasData,
     highlighted_members: Option<&[usize]>,
+    drag_origin: Option<(f32, f32)>,
+    drag_dir: f32,
 ) -> InstanceSet {
     let total = cols * rows;
     if total == 0 {
@@ -1080,6 +1136,30 @@ fn build_wgpu_instances(
             }
         }
     }
+    let mut drag_mask = vec![false; total];
+    if let Some(members) = highlighted_members {
+        for member in members {
+            if *member < drag_mask.len() {
+                drag_mask[*member] = true;
+            }
+        }
+    }
+    let drag_active = drag_dir.abs() > f32::EPSILON && drag_mask.iter().any(|val| *val);
+    let drag_count = highlighted_members.map(|members| members.len()).unwrap_or(0);
+    let drag_rotation = if drag_active {
+        drag_angle_for_group(drag_count) * drag_dir.signum()
+    } else {
+        0.0
+    };
+    let drag_scale = if drag_active { DRAG_SCALE } else { 1.0 };
+    let drag_center = if drag_active {
+        drag_origin.or_else(|| {
+            highlighted_members
+                .and_then(|members| drag_group_center(positions, members, piece_width, piece_height))
+        })
+    } else {
+        None
+    };
     let mut group_id = vec![usize::MAX; total];
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut queue = VecDeque::new();
@@ -1141,12 +1221,21 @@ fn build_wgpu_instances(
             let base_x = col as f32 * piece_width;
             let base_y = row as f32 * piece_height;
             let pos = positions.get(id).copied().unwrap_or((base_x, base_y));
+            let render_pos = if drag_mask.get(id).copied().unwrap_or(false) {
+                if let Some(center) = drag_center {
+                    drag_group_position(pos, center, drag_scale, drag_rotation, piece_width, piece_height)
+                } else {
+                    pos
+                }
+            } else {
+                pos
+            };
             let rotation = rotations.get(id).copied().unwrap_or(0.0);
             let flipped = flips.get(id).copied().unwrap_or(false);
             let hovered = hovered_mask.get(id).copied().unwrap_or(false);
             let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
             instances.push(Instance {
-                pos: [pos.0, pos.1],
+                pos: [render_pos.0, render_pos.1],
                 size: [piece_width, piece_height],
                 rotation,
                 flip: if flipped { 1.0 } else { 0.0 },
@@ -1157,7 +1246,11 @@ fn build_wgpu_instances(
                 } else {
                     0.0
                 },
-                _pad: 0.0,
+                drag: if drag_mask.get(id).copied().unwrap_or(false) {
+                    drag_rotation
+                } else {
+                    0.0
+                },
                 piece_origin: [base_x, base_y],
                 mask_origin,
             });
@@ -2201,10 +2294,12 @@ fn app() -> Html {
         let connections = connections.clone();
         let dragging_members = dragging_members.clone();
         let active_id = active_id.clone();
+        let drag_state = drag_state.clone();
         let show_debug = show_debug.clone();
         let wgpu_show_fps = wgpu_show_fps;
         let wgpu_edge_aa = wgpu_edge_aa;
         let wgpu_render_scale = wgpu_render_scale;
+        let solved = solved.clone();
         use_effect_with(
             (
                 using_wgpu,
@@ -2362,6 +2457,7 @@ fn app() -> Html {
                                 renderer.set_font_bytes(FPS_FONT_BYTES.to_vec());
                                 renderer.set_ui_font_bytes(FPS_FONT_BYTES.to_vec());
                                 renderer.set_edge_aa(wgpu_edge_aa);
+                                renderer.set_solved(*solved);
                                 let total = (grid.cols as usize) * (grid.rows as usize);
                                 if let Some(instances) = pending_instances.borrow_mut().take() {
                                     if instances.instances.len() == total {
@@ -2387,11 +2483,29 @@ fn app() -> Html {
                                     } else {
                                         None
                                     };
-                                    let show_debug_snapshot = *show_debug;
-                                    let has_state = positions_snapshot.len() == total
-                                        && rotations_snapshot.len() == total
-                                        && flips_snapshot.len() == total
-                                        && z_order_snapshot.len() == total
+                    let drag_dir = if highlight_members.is_some() {
+                        let right_click = drag_state
+                            .borrow()
+                            .as_ref()
+                            .map(|drag| drag.right_click)
+                            .unwrap_or(false);
+                        if right_click { -1.0 } else { 1.0 }
+                    } else {
+                        0.0
+                    };
+                    let drag_origin = if highlight_members.is_some() {
+                        drag_state
+                            .borrow()
+                            .as_ref()
+                            .map(|drag| (drag.cursor_x, drag.cursor_y))
+                    } else {
+                        None
+                    };
+                    let show_debug_snapshot = *show_debug;
+                    let has_state = positions_snapshot.len() == total
+                        && rotations_snapshot.len() == total
+                        && flips_snapshot.len() == total
+                        && z_order_snapshot.len() == total
                                         && connections_snapshot.len() == total;
                                     if has_state {
                                         let instances = build_wgpu_instances(
@@ -2408,6 +2522,8 @@ fn app() -> Html {
                                             piece_height,
                                             &mask_atlas_for_instances,
                                             highlight_members,
+                                            drag_origin,
+                                            drag_dir,
                                         );
                                         renderer.update_instances(instances);
                                     }
@@ -2438,6 +2554,7 @@ fn app() -> Html {
         let ui_measure_state = ui_measure_state.clone();
         let ui_credit_hovered = ui_credit_hovered.clone();
         let mask_atlas = mask_atlas.clone();
+        let drag_state = drag_state.clone();
         let wgpu_settings_value = wgpu_settings_value.clone();
         use_effect_with(
             (
@@ -2535,6 +2652,24 @@ fn app() -> Html {
                 } else {
                     None
                 };
+                let drag_dir = if highlight_members.is_some() {
+                    let right_click = drag_state
+                        .borrow()
+                        .as_ref()
+                        .map(|drag| drag.right_click)
+                        .unwrap_or(false);
+                    if right_click { -1.0 } else { 1.0 }
+                } else {
+                    0.0
+                };
+                let drag_origin = if highlight_members.is_some() {
+                    drag_state
+                        .borrow()
+                        .as_ref()
+                        .map(|drag| (drag.cursor_x, drag.cursor_y))
+                } else {
+                    None
+                };
                 let show_menu = *menu_visible_value;
                 let instances = if show_menu {
                     InstanceSet {
@@ -2556,6 +2691,8 @@ fn app() -> Html {
                         piece_height,
                         &mask_atlas,
                         highlight_members,
+                        drag_origin,
+                        drag_dir,
                     )
                 };
                 let (connections_label, border_connections_label) = if connections_value.len() == total {
@@ -2595,6 +2732,7 @@ fn app() -> Html {
                     renderer.set_edge_aa(wgpu_settings_value.edge_aa);
                     renderer.set_show_fps(wgpu_settings_value.show_fps);
                     renderer.set_show_frame(!show_menu);
+                    renderer.set_solved(*solved_value);
                     renderer.set_ui_texts(&ui_specs);
                     renderer.update_instances(instances);
                     renderer.render();
@@ -3102,6 +3240,35 @@ fn app() -> Html {
                 animating_mask[*id] = true;
             }
         }
+        let (drag_right_click, drag_origin) = drag_state
+            .borrow()
+            .as_ref()
+            .map(|drag| (drag.right_click, Some((drag.cursor_x, drag.cursor_y))))
+            .unwrap_or((false, None));
+        let drag_dir: f32 = if dragging_members_value.is_empty() {
+            0.0
+        } else if drag_right_click {
+            -1.0
+        } else {
+            1.0
+        };
+        let drag_rotation = if drag_dir.abs() > f32::EPSILON {
+            drag_angle_for_group(dragging_members_value.len()) * drag_dir.signum()
+        } else {
+            0.0
+        };
+        let drag_scale = if drag_dir.abs() > f32::EPSILON {
+            DRAG_SCALE
+        } else {
+            1.0
+        };
+        let drag_center = if drag_dir.abs() > f32::EPSILON {
+            drag_origin.or_else(|| {
+                drag_group_center(&positions_value, &dragging_members_value, piece_width, piece_height)
+            })
+        } else {
+            None
+        };
         let z_order_value = (*z_order).clone();
         let drag_move_common: Rc<dyn Fn(f32, f32) -> bool> = {
             let positions = positions.clone();
@@ -3123,7 +3290,16 @@ fn app() -> Html {
             let using_wgpu = using_wgpu;
             let wgpu_edge_aa = wgpu_edge_aa;
             Rc::new(move |x: f32, y: f32| {
-                let drag = drag_state.borrow().clone();
+                let drag = {
+                    let mut drag_ref = drag_state.borrow_mut();
+                    if let Some(drag) = drag_ref.as_mut() {
+                        drag.cursor_x = x;
+                        drag.cursor_y = y;
+                        Some(drag.clone())
+                    } else {
+                        None
+                    }
+                };
                 if let Some(drag) = drag {
                     let render_wgpu = |positions_snapshot: &[(f32, f32)],
                                        rotations_snapshot: &[f32],
@@ -3135,6 +3311,8 @@ fn app() -> Html {
                         let flips_snapshot = &*flips;
                         let z_order_snapshot = &*z_order;
                         let connections_snapshot = &*connections;
+                        let drag_dir = if drag.right_click { -1.0 } else { 1.0 };
+                        let drag_origin = Some((drag.cursor_x, drag.cursor_y));
                         let instances = build_wgpu_instances(
                             positions_snapshot,
                             rotations_snapshot,
@@ -3149,10 +3327,13 @@ fn app() -> Html {
                             piece_height,
                             mask_atlas,
                             Some(drag.members.as_slice()),
+                            drag_origin,
+                            drag_dir,
                         );
                         let mut renderer_ref = wgpu_renderer.borrow_mut();
                         if let Some(renderer) = renderer_ref.as_mut() {
                             renderer.set_edge_aa(wgpu_edge_aa);
+                            renderer.set_solved(solved_value);
                             renderer.update_instances(instances);
                             renderer.render();
                         }
@@ -3491,6 +3672,7 @@ fn app() -> Html {
                 let drag = drag_state.borrow().clone();
                 if let Some(drag) = drag {
                     let ctrl_flip = drag.rotate_mode;
+                    let reverse_rotation = drag.right_click;
                     let (mut next, mut next_rotations) = if using_wgpu {
                         (
                             positions_live.borrow().clone(),
@@ -3629,6 +3811,7 @@ fn app() -> Html {
                                     .unwrap_or_else(|| (*connections).clone());
                                 let flips_snapshot = (*flips).clone();
                                 if should_snap {
+                                    let complete_snap = !*solved;
                                     let snap_distance = piece_width.min(piece_height)
                                         * snap_distance_ratio_value;
                                     apply_snaps_for_group(
@@ -3643,6 +3826,7 @@ fn app() -> Html {
                                         piece_height,
                                         snap_distance,
                                         frame_snap_ratio_value,
+                                        complete_snap,
                                         center_min_x,
                                         center_max_x,
                                         center_min_y,
@@ -3855,6 +4039,7 @@ fn app() -> Html {
                                             rotation_noise_value,
                                             rotation_snap_tolerance_value,
                                         );
+                                        let delta = if next_step.reverse { -delta } else { delta };
                                         *rotation_anim.borrow_mut() = Some(RotationAnimation {
                                             start_time: now_ms(),
                                             duration: SNAP_ANIMATION_MS,
@@ -3882,6 +4067,7 @@ fn app() -> Html {
                                         .unwrap_or_else(|| (*connections).clone());
                                     let flips_snapshot = (*flips).clone();
                                     if should_snap {
+                                        let complete_snap = !*solved;
                                         let snap_distance = piece_width.min(piece_height)
                                             * snap_distance_ratio_value;
                                         apply_snaps_for_group(
@@ -3896,6 +4082,7 @@ fn app() -> Html {
                                             piece_height,
                                             snap_distance,
                                             frame_snap_ratio_value,
+                                            complete_snap,
                                             center_min_x,
                                             center_max_x,
                                             center_min_y,
@@ -4114,6 +4301,7 @@ fn app() -> Html {
                                                     pivot_x,
                                                     pivot_y,
                                                     noise,
+                                                    reverse: reverse_rotation,
                                                 });
                                             dragging_members.set(Vec::new());
                                             active_id.set(None);
@@ -4154,6 +4342,7 @@ fn app() -> Html {
                                     rotation_noise_value,
                                     rotation_snap_tolerance_value,
                                 );
+                                let delta = if reverse_rotation { -delta } else { delta };
                                 let mut start_positions = Vec::with_capacity(members.len());
                                 let mut start_rotations = Vec::with_capacity(members.len());
                                 for member in &members {
@@ -4190,6 +4379,7 @@ fn app() -> Html {
                             }
                         }
                     }
+                    let complete_snap = !*solved;
                     let group_after = apply_snaps_for_group(
                         &drag.members,
                         &mut next,
@@ -4202,6 +4392,7 @@ fn app() -> Html {
                         piece_height,
                         snap_distance,
                         frame_snap_ratio_value,
+                        complete_snap,
                         center_min_x,
                         center_max_x,
                         center_min_y,
@@ -4814,7 +5005,7 @@ fn app() -> Html {
             })
             .collect();
 
-        let begin_drag: Rc<dyn Fn(usize, f32, f32, bool, bool, Option<i32>)> = {
+        let begin_drag: Rc<dyn Fn(usize, f32, f32, bool, bool, bool, Option<i32>)> = {
             let positions = positions.clone();
             let rotations = rotations.clone();
             let positions_live = positions_live.clone();
@@ -4837,7 +5028,7 @@ fn app() -> Html {
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
             let using_wgpu = using_wgpu;
-            Rc::new(move |piece_id, x, y, shift_key, rotate_mode, touch_id| {
+            Rc::new(move |piece_id, x, y, shift_key, rotate_mode, right_click, touch_id| {
                 let positions_snapshot = (*positions).clone();
                 let rotations_snapshot = (*rotations).clone();
                 let mut connections_snapshot = (*connections).clone();
@@ -4941,6 +5132,9 @@ fn app() -> Html {
                     anchor_rot,
                     touch_id,
                     rotate_mode,
+                    right_click,
+                    cursor_x: x,
+                    cursor_y: y,
                     pivot_x,
                     pivot_y,
                     start_angle,
@@ -4962,6 +5156,23 @@ fn app() -> Html {
             let flipped = flips_value.get(piece.id).copied().unwrap_or(false);
             let center_x = piece_width * 0.5;
             let center_y = piece_height * 0.5;
+            let is_dragging = dragging_mask.get(piece.id).copied().unwrap_or(false);
+            let render_pos = if is_dragging {
+                if let Some(center) = drag_center {
+                    drag_group_position(
+                        current,
+                        center,
+                        drag_scale,
+                        drag_rotation,
+                        piece_width,
+                        piece_height,
+                    )
+                } else {
+                    current
+                }
+            } else {
+                current
+            };
             let flip_transform = if flipped {
                 format!(
                     " translate({} {}) scale(-1 1) translate(-{} -{})",
@@ -4973,22 +5184,37 @@ fn app() -> Html {
             } else {
                 String::new()
             };
+            let drag_transform = if is_dragging {
+                format!(
+                    " translate({} {}) scale({}) translate(-{} -{}) rotate({} {} {})",
+                    fmt_f32(center_x),
+                    fmt_f32(center_y),
+                    fmt_f32(drag_scale),
+                    fmt_f32(center_x),
+                    fmt_f32(center_y),
+                    fmt_f32(drag_rotation),
+                    fmt_f32(center_x),
+                    fmt_f32(center_y),
+                )
+            } else {
+                String::new()
+            };
             let outer_transform = format!(
                 "translate({} {})",
-                fmt_f32(current.0),
-                fmt_f32(current.1)
+                fmt_f32(render_pos.0),
+                fmt_f32(render_pos.1)
             );
             let inner_transform = format!(
-                "{} rotate({} {} {})",
+                "{} rotate({} {} {}){}",
                 flip_transform,
                 fmt_f32(rotation),
                 fmt_f32(center_x),
-                fmt_f32(center_y)
+                fmt_f32(center_y),
+                drag_transform
             );
             let mask_ref = format!("url(#piece-mask-{})", piece.id);
             let img_x = fmt_f32(-piece_x);
             let img_y = fmt_f32(-piece_y);
-            let is_dragging = dragging_mask.get(piece.id).copied().unwrap_or(false);
             let is_animating = animating_mask.get(piece.id).copied().unwrap_or(false);
             let is_hovered = hovered_mask.get(piece.id).copied().unwrap_or(false);
             let mut class = if is_dragging {
@@ -5067,6 +5293,7 @@ fn app() -> Html {
                 let begin_drag = begin_drag.clone();
                 let puzzle_scale = puzzle_scale;
                 Callback::from(move |event: MouseEvent| {
+                    let right_click = event.button() == 2;
                     if let Some((x, y)) = event_to_svg_coords(
                         &event,
                         &svg_ref,
@@ -5076,7 +5303,15 @@ fn app() -> Html {
                         view_height,
                     ) {
                         let (x, y) = workspace_to_puzzle_coords(puzzle_scale, x, y);
-                        begin_drag(piece_id, x, y, event.shift_key(), event.ctrl_key(), None);
+                        begin_drag(
+                            piece_id,
+                            x,
+                            y,
+                            event.shift_key(),
+                            event.ctrl_key(),
+                            right_click,
+                            None,
+                        );
                     }
                     event.prevent_default();
                 })
@@ -5102,7 +5337,7 @@ fn app() -> Html {
                             true,
                         ) {
                             let (x, y) = workspace_to_puzzle_coords(puzzle_scale, x, y);
-                            begin_drag(piece_id, x, y, false, false, touch_id);
+                            begin_drag(piece_id, x, y, false, false, false, touch_id);
                         }
                     }
                 })
@@ -5237,6 +5472,7 @@ fn app() -> Html {
             let rows = grid.rows as usize;
             let puzzle_scale = puzzle_scale;
             Callback::from(move |event: MouseEvent| {
+                let right_click = event.button() == 2;
                 let Some((x, y)) = event_to_svg_coords(
                     &event,
                     &canvas_ref,
@@ -5284,7 +5520,15 @@ fn app() -> Html {
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
-                    begin_drag(piece_id, px, py, event.shift_key(), event.ctrl_key(), None);
+                    begin_drag(
+                        piece_id,
+                        px,
+                        py,
+                        event.shift_key(),
+                        event.ctrl_key(),
+                        right_click,
+                        None,
+                    );
                     event.prevent_default();
                     return;
                 }
@@ -5366,7 +5610,7 @@ fn app() -> Html {
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
-                    begin_drag(piece_id, px, py, false, false, touch_id);
+                    begin_drag(piece_id, px, py, false, false, false, touch_id);
                     event.prevent_default();
                     return;
                 }
@@ -5519,6 +5763,9 @@ fn app() -> Html {
         }
         if fast_render_value {
             svg_class.push_str(" fast-render");
+        }
+        if solved_value {
+            svg_class.push_str(" solved");
         }
         let mut canvas_class = "puzzle-canvas".to_string();
         if active_id_value.is_some() {

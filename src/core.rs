@@ -41,6 +41,7 @@ pub(crate) const WORKSPACE_SCALE_DEFAULT: f32 = 0.8;
 pub(crate) const FRAME_SNAP_MIN: f32 = 0.4;
 pub(crate) const FRAME_SNAP_MAX: f32 = 3.0;
 pub(crate) const FRAME_SNAP_DEFAULT: f32 = 1.0;
+pub(crate) const COMPLETE_SNAP_MULTIPLIER: f32 = 2.0;
 pub(crate) const TAB_WIDTH_MIN: f32 = 0.2;
 pub(crate) const TAB_WIDTH_MAX: f32 = 0.72;
 pub(crate) const TAB_WIDTH_RANGE: f32 = 0.16;
@@ -153,6 +154,9 @@ pub(crate) struct DragState {
     pub(crate) anchor_rot: f32,
     pub(crate) touch_id: Option<i32>,
     pub(crate) rotate_mode: bool,
+    pub(crate) right_click: bool,
+    pub(crate) cursor_x: f32,
+    pub(crate) cursor_y: f32,
     pub(crate) pivot_x: f32,
     pub(crate) pivot_y: f32,
     pub(crate) start_angle: f32,
@@ -192,6 +196,7 @@ pub(crate) struct QueuedRotation {
     pub(crate) pivot_x: f32,
     pub(crate) pivot_y: f32,
     pub(crate) noise: f32,
+    pub(crate) reverse: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1075,6 +1080,7 @@ pub(crate) fn apply_snaps_for_group(
     piece_height: f32,
     snap_distance: f32,
     frame_snap_ratio: f32,
+    complete_snap: bool,
     center_min_x: f32,
     center_max_x: f32,
     center_min_y: f32,
@@ -1638,17 +1644,35 @@ pub(crate) fn apply_snaps_for_group(
 
         if group_after.len() == total {
             let target_center = (piece_width * 0.5, piece_height * 0.5);
-            align_group_to_anchor(
-                positions,
-                rotations,
-                &group_after,
-                0,
-                target_center,
-                0.0,
-                cols,
-                piece_width,
-                piece_height,
-            );
+            let anchor_id = 0usize;
+            if let Some(anchor_pos) = positions.get(anchor_id) {
+                let current_center = (
+                    anchor_pos.0 + piece_width * 0.5,
+                    anchor_pos.1 + piece_height * 0.5,
+                );
+                let dx = current_center.0 - target_center.0;
+                let dy = current_center.1 - target_center.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let rotation_ok =
+                    !rotation_enabled || angle_matches(group_rot, 0.0, rotation_snap_tolerance);
+                let frame_snap_distance =
+                    snap_distance * frame_snap_ratio * COMPLETE_SNAP_MULTIPLIER;
+                let should_snap = complete_snap
+                    || (frame_snap_distance > 0.0 && rotation_ok && dist <= frame_snap_distance);
+                if should_snap {
+                    align_group_to_anchor(
+                        positions,
+                        rotations,
+                        &group_after,
+                        anchor_id,
+                        target_center,
+                        0.0,
+                        cols,
+                        piece_width,
+                        piece_height,
+                    );
+                }
+            }
         } else {
             let mut in_group = vec![false; total];
             for id in &group_after {
