@@ -1,0 +1,15 @@
+[package]
+name = "heddobureika-cli"
+version = "0.1.0"
+edition = "2021"
+license = "CC-BY-NC-SA-4.0"
+
+[dependencies]
+heddobureika-core = { path = "../core" }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+url = "2"
+
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.28" }

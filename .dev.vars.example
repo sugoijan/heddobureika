@@ -1,0 +1,2 @@
+# Copy to .dev.vars for local wrangler dev
+ADMIN_TOKEN=change-me

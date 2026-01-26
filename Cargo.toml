@@ -37,3 +37,7 @@ overflow-checks = true
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[workspace]
+members = [".", "core", "worker", "cli"]
+default-members = ["."]

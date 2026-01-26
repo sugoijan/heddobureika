@@ -1,0 +1,8 @@
+[package]
+name = "heddobureika-core"
+version = "0.1.0"
+edition = "2021"
+license = "CC-BY-NC-SA-4.0"
+
+[dependencies]
+rkyv = "0.8.14"
