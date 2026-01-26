@@ -214,6 +214,14 @@ body {
   opacity: 1;
 }
 
+.piece.owned-other .piece-outline-group.edge-external {
+  opacity: 1;
+}
+
+.piece.owned-other .piece-outline-group.edge-internal {
+  opacity: 1;
+}
+
 .piece-outline.edge-external {
   stroke: #f00;
   stroke-width: 3;
@@ -222,6 +230,11 @@ body {
 .piece-outline.edge-internal {
   stroke: #f00;
   stroke-width: 3;
+}
+
+.piece.owned-other .piece-outline.edge-external,
+.piece.owned-other .piece-outline.edge-internal {
+  stroke: #1e78d2;
 }
 
 .puzzle-image.solved .piece-outline.edge-external,

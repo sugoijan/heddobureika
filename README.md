@@ -28,6 +28,14 @@ Dev tasks live in `justfile` (run `just --list`). Common flow:
 - `just web-dev` (run the frontend locally)
 - `just worker-dev` (run the worker locally via Miniflare)
 - `just room-create` (admin-activate a room)
+  - If `.dev.vars` exists, `ADMIN_TOKEN` is loaded from it automatically.
+- `just mp-test` (integration test; requires `worker-dev` running and admin token set)
+
+Frontend multiplayer config (optional):
+
+- Add `#room=ROOM_ID` to the URL to auto-join a room.
+- `just web-dev` sets `HEDDOBUREIKA_WS_BASE` from `ROOM_WS_BASE_URL` so the dev WS endpoint matches your worker.
+- You can still override `HEDDOBUREIKA_WS_BASE` manually (e.g. via your shell or `.env`) if needed. It must end with `/ws`.
 
 ## Disclaimer
 

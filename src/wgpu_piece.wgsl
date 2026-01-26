@@ -97,6 +97,14 @@ fn apply_output_gamma(color: vec3<f32>) -> vec3<f32> {
     return pow(color, vec3<f32>(globals.output_gamma));
 }
 
+fn outline_rgb_for(hover: f32) -> vec3<f32> {
+    let owned = hover > 1.5 && hover < 2.5;
+    let solved = globals.outline_color.g > 0.5;
+    let use_owned = owned && !solved;
+    let owned_rgb = vec3<f32>(0.1176, 0.4706, 0.8235);
+    return select(globals.outline_color.rgb, owned_rgb, use_owned);
+}
+
 fn back_pattern(local_pos: vec2<f32>) -> vec3<f32> {
     let tile = vec2<f32>(28.0, 28.0);
     let p = local_pos - floor(local_pos / tile) * tile;
@@ -150,7 +158,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let outside = 1.0 - smoothstep(outline_threshold, outline_threshold + outline_aa, mask);
         let inside = smoothstep(outline_threshold, outline_threshold + outline_aa, max_neighbor);
         let edge = outside * inside;
-        let outline = srgb_to_linear(globals.outline_color.rgb);
+        let outline = srgb_to_linear(outline_rgb_for(input.hover));
         let outline_alpha = globals.outline_color.a * edge;
         return vec4<f32>(apply_output_gamma(outline), outline_alpha);
     }
@@ -169,7 +177,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         rgb = art.rgb;
         alpha = art.a * edge_alpha;
     }
-    if (input.hover > 1.5) {
+    if (input.hover > 2.5) {
         let center = globals.piece_size * 0.5;
         let dot = select(0.0, 1.0, distance(input.local_pos, center) < 4.0);
         let dot_color = srgb_to_linear(vec3<f32>(0.0, 1.0, 0.0));
@@ -225,7 +233,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let inside = smoothstep(outline_threshold, outline_threshold + outline_aa, mask);
         let outside = 1.0 - smoothstep(outline_threshold, outline_threshold + outline_aa, min_neighbor);
         let edge = inside * outside;
-        let outline = srgb_to_linear(vec3<f32>(1.0, 0.0, 0.0));
+        let outline = srgb_to_linear(outline_rgb_for(input.hover));
         rgb = mix(rgb, outline, edge);
     }
     return vec4<f32>(apply_output_gamma(rgb), alpha);

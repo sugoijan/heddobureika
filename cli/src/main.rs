@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::codec::{decode, encode};
+use heddobureika_core::catalog::{puzzle_by_slug, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG};
 use heddobureika_core::protocol::{AdminMsg, RoomPersistence, ServerMsg};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
 use rand::Rng;
@@ -29,6 +30,12 @@ enum RoomCommand {
         base_url: String,
         #[arg(long, env = "ROOM_ADMIN_TOKEN")]
         admin_token: String,
+        #[arg(long, default_value = DEFAULT_PUZZLE_SLUG)]
+        puzzle: String,
+        #[arg(long)]
+        pieces: Option<u32>,
+        #[arg(long)]
+        seed: Option<String>,
         #[arg(long)]
         room_id: Option<String>,
         #[arg(long)]
@@ -47,6 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             RoomCommand::Create {
                 base_url,
                 admin_token,
+                puzzle,
+                pieces,
+                seed,
                 room_id,
                 best_effort,
                 no_connect,
@@ -59,6 +69,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     RoomPersistence::BestEffort
                 } else {
                     RoomPersistence::Durable
+                };
+                if puzzle_by_slug(&puzzle).is_none() {
+                    eprintln!("unknown puzzle: {puzzle}");
+                    eprintln!("available puzzles:");
+                    for entry in PUZZLE_CATALOG {
+                        eprintln!("  {} ({})", entry.slug, entry.label);
+                    }
+                    return Ok(());
+                }
+                let seed = match seed.as_deref() {
+                    Some(raw) => Some(parse_seed_arg(raw)?),
+                    None => None,
                 };
 
                 let admin_url = build_admin_url(&base_url, &room_id, &admin_token)?;
@@ -75,7 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (ws, _response) = tokio_tungstenite::connect_async(admin_url.as_str()).await?;
                 let (mut write, mut read) = ws.split();
 
-                let msg = AdminMsg::Create { persistence };
+                let msg = AdminMsg::Create {
+                    persistence,
+                    puzzle,
+                    pieces,
+                    seed,
+                };
                 if let Some(payload) = encode(&msg) {
                     write.send(Message::Binary(payload.into())).await?;
                 }
@@ -126,4 +153,15 @@ fn build_join_url(base_url: &str, room_id: &str) -> Result<Url, url::ParseError>
     url.set_path(&path);
     url.set_query(None);
     Ok(url)
+}
+
+fn parse_seed_arg(raw: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let trimmed = raw.trim();
+    let value = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)?
+    } else {
+        trimmed.parse::<u32>()?
+    };
+    Ok(value)
 }

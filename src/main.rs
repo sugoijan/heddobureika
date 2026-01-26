@@ -3,17 +3,19 @@ use gloo::render::{request_animation_frame, AnimationFrame};
 use gloo::timers::callback::Interval;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
-use js_sys::{Date, Function, Reflect};
+use js_sys::{Date, Function, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    CanvasRenderingContext2d, Element, Event, HtmlCanvasElement, HtmlImageElement, HtmlInputElement,
-    HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent,
+    BinaryType, CanvasRenderingContext2d, CloseEvent, Element, ErrorEvent, Event,
+    HtmlCanvasElement, HtmlImageElement, HtmlInputElement, HtmlSelectElement, InputEvent,
+    KeyboardEvent, MessageEvent, Touch, TouchEvent, UrlSearchParams, WebSocket,
 };
 use yew::prelude::*;
 use taffy::prelude::*;
@@ -22,6 +24,11 @@ mod core;
 use crate::core::*;
 mod model;
 use crate::model::*;
+use heddobureika_core::{
+    apply_room_update_to_snapshot, decode, encode, is_valid_room_id, ClientMsg, PuzzleInfo,
+    PuzzleStateSnapshot, RoomSnapshot, RoomUpdate, ServerMsg,
+};
+use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 #[cfg(not(target_arch = "wasm32"))]
@@ -32,19 +39,11 @@ use crate::renderer::{
     UiTextId, UiTextSpec, WgpuRenderer,
 };
 
-const DEFAULT_PUZZLE_SRC: &str = "puzzles/zoe-samurai.jpg";
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
 const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
 const FPS_FONT_BYTES: &[u8] = include_bytes!("../fonts/chirufont.ttf");
 const UI_FONT_FAMILY: &str = "KaoriGel";
-const WORKSPACE_ASPECT_RATIO: f32 = 1.618034;
-const WORKSPACE_SLOT_WIDTH_FRAC: f32 = 0.76;
-const WORKSPACE_SLOT_HEIGHT_FRAC: f32 = 0.82;
-const WORKSPACE_SLOT_LEFT_FRAC: f32 = (1.0 - WORKSPACE_SLOT_WIDTH_FRAC) * 0.5;
-const WORKSPACE_SLOT_TOP_FRAC: f32 = (1.0 - WORKSPACE_SLOT_HEIGHT_FRAC) * 0.5;
-const WORKSPACE_SLOT_MARGIN_FRAC: f32 = 0.03;
-const WORKSPACE_SLOT_MARGIN_MIN: f32 = 6.0;
 const UI_CREDIT_FONT_RATIO: f32 = 0.026;
 const UI_CREDIT_ROTATION_DEG: f32 = -1.1;
 const UI_MENU_SUB_FONT_RATIO: f32 = 0.028;
@@ -64,36 +63,19 @@ const UI_TITLE_FONT_RATIO: f32 = 0.058;
 const UI_TITLE_ROTATION_DEG: f32 = 0.5;
 const DRAG_SCALE: f32 = 1.01;
 const DRAG_ROTATION_DEG: f32 = 1.0;
+const OUTLINE_KIND_HOVER: f32 = 1.0;
+const OUTLINE_KIND_OWNED: f32 = 2.0;
+const OUTLINE_KIND_DEBUG: f32 = 3.0;
+const ROOM_SESSION_KEY: &str = "heddobureika.room.v1";
+const ROOM_SESSION_VERSION: u32 = 1;
 
 fn drag_angle_for_group(count: usize) -> f32 {
     let denom = (count.max(1) as f32).sqrt();
     DRAG_ROTATION_DEG / denom
 }
 
-#[derive(Clone, Copy)]
-struct PuzzleArt {
-    label: &'static str,
-    slug: &'static str,
-    src: &'static str,
-}
-
-const PUZZLE_ARTS: &[PuzzleArt] = &[
-    PuzzleArt {
-        label: "Zoe Samurai",
-        slug: "zoe-samurai",
-        src: DEFAULT_PUZZLE_SRC,
-    },
-    PuzzleArt {
-        label: "Zoe Potter",
-        slug: "zoe-potter",
-        src: "puzzles/zoe-potter.jpg",
-    },
-    PuzzleArt {
-        label: "Raora by Noy",
-        slug: "raora-by-noy",
-        src: "puzzles/raora-by-noy.avif",
-    },
-];
+type PuzzleArt = PuzzleCatalogEntry;
+const PUZZLE_ARTS: &[PuzzleArt] = PUZZLE_CATALOG;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SavedPuzzleSelection {
@@ -110,6 +92,497 @@ struct SavedGame {
     image_height: u32,
     instance: PuzzleInstance,
     state: PuzzleState,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedRoomSession {
+    version: u32,
+    room_id: String,
+    ws_base: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MultiplayerConfig {
+    room_id: String,
+    ws_base: String,
+    clear_hash: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameMode {
+    Local,
+    Online,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct GameViewState {
+    mode: GameMode,
+    puzzle: Option<PuzzleInfo>,
+    solved: bool,
+}
+
+#[derive(Clone)]
+struct PuzzleInfoStore {
+    state: UseStateHandle<Option<PuzzleInfo>>,
+    live: Rc<RefCell<Option<PuzzleInfo>>>,
+}
+
+impl PuzzleInfoStore {
+    fn new(state: UseStateHandle<Option<PuzzleInfo>>, live: Rc<RefCell<Option<PuzzleInfo>>>) -> Self {
+        Self { state, live }
+    }
+
+    fn get(&self) -> Option<PuzzleInfo> {
+        self.live.borrow().clone()
+    }
+
+    fn set(&self, info: Option<PuzzleInfo>) {
+        *self.live.borrow_mut() = info.clone();
+        self.state.set(info);
+    }
+
+    #[allow(dead_code)]
+    fn view(&self) -> Option<PuzzleInfo> {
+        (*self.state).clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LocalSnapshot {
+    positions: Vec<(f32, f32)>,
+    rotations: Vec<f32>,
+    flips: Vec<bool>,
+    connections: Vec<[bool; 4]>,
+    group_order: Vec<u32>,
+    z_order: Vec<usize>,
+    scramble_nonce: u32,
+}
+
+impl LocalSnapshot {
+    fn empty() -> Self {
+        Self {
+            positions: Vec::new(),
+            rotations: Vec::new(),
+            flips: Vec::new(),
+            connections: Vec::new(),
+            group_order: Vec::new(),
+            z_order: Vec::new(),
+            scramble_nonce: 0,
+        }
+    }
+}
+
+trait GameState {
+    #[allow(dead_code)]
+    fn mode(&self) -> GameMode;
+    #[allow(dead_code)]
+    fn view(&self) -> GameViewState;
+    fn on_image_loaded(&self, _logical_size: (u32, u32)) {}
+    fn on_snapshot(&self, _snapshot: &RoomSnapshot) {}
+    fn apply_update(&self, _update: RoomUpdate) {}
+}
+
+struct LocalGame {
+    puzzle_info: PuzzleInfoStore,
+    puzzle_art_index: UseStateHandle<usize>,
+}
+
+impl LocalGame {
+    fn new(puzzle_info: PuzzleInfoStore, puzzle_art_index: UseStateHandle<usize>) -> Self {
+        Self {
+            puzzle_info,
+            puzzle_art_index,
+        }
+    }
+}
+
+impl GameState for LocalGame {
+    fn mode(&self) -> GameMode {
+        GameMode::Local
+    }
+
+    fn view(&self) -> GameViewState {
+        GameViewState {
+            mode: GameMode::Local,
+            puzzle: self.puzzle_info.view(),
+            solved: false,
+        }
+    }
+
+    fn on_image_loaded(&self, logical_size: (u32, u32)) {
+        let (logical_w, logical_h) = logical_size;
+        let mut choices = build_grid_choices(logical_w, logical_h);
+        if choices.is_empty() {
+            choices.push(FALLBACK_GRID);
+        }
+        let default_index = choices
+            .iter()
+            .position(|choice| choice.target_count == DEFAULT_TARGET_COUNT)
+            .unwrap_or(0);
+        let grid = choices
+            .get(default_index)
+            .copied()
+            .unwrap_or(FALLBACK_GRID);
+        let art_index = *self.puzzle_art_index;
+        let art = PUZZLE_ARTS.get(art_index).copied().unwrap_or(PUZZLE_ARTS[0]);
+        let info = PuzzleInfo {
+            label: art.label.to_string(),
+            image_src: art.src.to_string(),
+            rows: grid.rows,
+            cols: grid.cols,
+            shape_seed: PUZZLE_SEED,
+            image_width: logical_w,
+            image_height: logical_h,
+        };
+        self.puzzle_info.set(Some(info));
+    }
+}
+
+struct OnlineGame {
+    puzzle_info: PuzzleInfoStore,
+    local_snapshot: Rc<RefCell<LocalSnapshot>>,
+    apply_puzzle_state: Rc<dyn Fn(PuzzleState, usize, f32, f32)>,
+    render_wgpu_now: Rc<dyn Fn()>,
+    solved: UseStateHandle<bool>,
+    rotation_enabled: bool,
+}
+
+impl OnlineGame {
+    fn new(
+        puzzle_info: PuzzleInfoStore,
+        local_snapshot: Rc<RefCell<LocalSnapshot>>,
+        apply_puzzle_state: Rc<dyn Fn(PuzzleState, usize, f32, f32)>,
+        render_wgpu_now: Rc<dyn Fn()>,
+        solved: UseStateHandle<bool>,
+        rotation_enabled: bool,
+    ) -> Self {
+        Self {
+            puzzle_info,
+            local_snapshot,
+            apply_puzzle_state,
+            render_wgpu_now,
+            solved,
+            rotation_enabled,
+        }
+    }
+}
+
+impl GameState for OnlineGame {
+    fn mode(&self) -> GameMode {
+        GameMode::Online
+    }
+
+    fn view(&self) -> GameViewState {
+        GameViewState {
+            mode: GameMode::Online,
+            puzzle: self.puzzle_info.view(),
+            solved: *self.solved,
+        }
+    }
+
+    fn on_snapshot(&self, snapshot: &RoomSnapshot) {
+        if snapshot.puzzle.image_width == 0 || snapshot.puzzle.image_height == 0 {
+            return;
+        }
+        self.puzzle_info.set(Some(snapshot.puzzle.clone()));
+    }
+
+    fn apply_update(&self, update: RoomUpdate) {
+        let kind = update_kind(&update);
+        let Some(info) = self.puzzle_info.get() else {
+            #[cfg(test)]
+            record_mp_warn("puzzle info not ready");
+            gloo::console::warn!(
+                "multiplayer update dropped (puzzle info not ready)",
+                kind
+            );
+            return;
+        };
+        let cols = info.cols as usize;
+        let rows = info.rows as usize;
+        let total = cols * rows;
+        let piece_width = info.image_width as f32 / info.cols as f32;
+        let piece_height = info.image_height as f32 / info.rows as f32;
+        let snapshot = self.local_snapshot.borrow().clone();
+        let positions_len = snapshot.positions.len();
+        let rotations_len = snapshot.rotations.len();
+        let flips_len = snapshot.flips.len();
+        let connections_len = snapshot.connections.len();
+        if positions_len != total
+            || rotations_len != total
+            || flips_len != total
+            || connections_len != total
+        {
+            gloo::console::warn!(
+                "multiplayer update dropped (state size mismatch)",
+                kind,
+                format!(
+                    "expected={total} positions={positions_len} rotations={rotations_len} flips={flips_len} connections={connections_len} cols={cols} rows={rows}"
+                )
+            );
+            return;
+        }
+        let mut snapshot = PuzzleStateSnapshot {
+            positions: snapshot.positions,
+            rotations: snapshot.rotations,
+            flips: snapshot.flips,
+            connections: snapshot.connections,
+            group_order: snapshot.group_order,
+            scramble_nonce: snapshot.scramble_nonce,
+        };
+        if !apply_room_update_to_snapshot(
+            &update,
+            &mut snapshot,
+            cols,
+            rows,
+            piece_width,
+            piece_height,
+        ) {
+            gloo::console::warn!("multiplayer update rejected", kind);
+            return;
+        }
+        let group_order: Vec<usize> = snapshot
+            .group_order
+            .iter()
+            .filter_map(|id| {
+                let id = *id as usize;
+                if id < total {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let anchor_of = anchor_of_from_connections(&snapshot.connections, cols, rows);
+        let piece_order = crate::core::build_piece_order_from_groups(&group_order, &anchor_of);
+        let next_state = PuzzleState::rebuild_from_piece_state(
+            &snapshot.positions,
+            &snapshot.rotations,
+            &snapshot.flips,
+            &snapshot.connections,
+            cols,
+            rows,
+            Some(piece_order.as_slice()),
+            snapshot.scramble_nonce,
+        );
+        let solved_now = is_solved(
+            &snapshot.positions,
+            &snapshot.rotations,
+            &snapshot.flips,
+            &snapshot.connections,
+            cols,
+            rows,
+            piece_width,
+            piece_height,
+            self.rotation_enabled,
+        );
+        (self.apply_puzzle_state)(next_state, cols, piece_width, piece_height);
+        self.solved.set(solved_now);
+        (self.render_wgpu_now)();
+        gloo::console::log!("multiplayer update applied", kind);
+    }
+}
+
+enum GameSession {
+    Local(LocalGame),
+    Online(OnlineGame),
+}
+
+impl GameSession {
+    #[allow(dead_code)]
+    fn local(game: LocalGame) -> Self {
+        GameSession::Local(game)
+    }
+
+    fn online(game: OnlineGame) -> Self {
+        GameSession::Online(game)
+    }
+}
+
+impl GameState for GameSession {
+    fn mode(&self) -> GameMode {
+        match self {
+            GameSession::Local(game) => game.mode(),
+            GameSession::Online(game) => game.mode(),
+        }
+    }
+
+    fn view(&self) -> GameViewState {
+        match self {
+            GameSession::Local(game) => game.view(),
+            GameSession::Online(game) => game.view(),
+        }
+    }
+
+    fn on_image_loaded(&self, logical_size: (u32, u32)) {
+        match self {
+            GameSession::Local(game) => game.on_image_loaded(logical_size),
+            GameSession::Online(game) => game.on_image_loaded(logical_size),
+        }
+    }
+
+    fn on_snapshot(&self, snapshot: &RoomSnapshot) {
+        match self {
+            GameSession::Local(game) => game.on_snapshot(snapshot),
+            GameSession::Online(game) => game.on_snapshot(snapshot),
+        }
+    }
+
+    fn apply_update(&self, update: RoomUpdate) {
+        match self {
+            GameSession::Local(game) => game.apply_update(update),
+            GameSession::Online(game) => game.apply_update(update),
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct WsHandlers {
+    onopen: Closure<dyn FnMut(Event)>,
+    onmessage: Closure<dyn FnMut(MessageEvent)>,
+    onerror: Closure<dyn FnMut(ErrorEvent)>,
+    onclose: Closure<dyn FnMut(Event)>,
+}
+
+fn default_ws_base() -> Option<String> {
+    if let Some(raw) = option_env!("HEDDOBUREIKA_WS_BASE")
+        .or(option_env!("TRUNK_PUBLIC_WS_BASE"))
+    {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(normalize_ws_base(trimmed));
+        }
+    }
+    let window = web_sys::window()?;
+    let location = window.location();
+    let host = location.host().ok()?;
+    if host.trim().is_empty() {
+        return None;
+    }
+    let protocol = location.protocol().ok()?.to_ascii_lowercase();
+    let scheme = if protocol == "https:" { "wss" } else { "ws" };
+    Some(format!("{scheme}://{host}/ws"))
+}
+
+fn normalize_ws_base(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_room_ws_url(ws_base: &str, room_id: &str) -> String {
+    let base = ws_base.trim_end_matches('/');
+    format!("{base}/{room_id}")
+}
+
+fn parse_multiplayer_config() -> Option<MultiplayerConfig> {
+    let window = web_sys::window()?;
+    let hash = window.location().hash().ok()?;
+    if let Some(config) = parse_multiplayer_config_from_hash(&hash) {
+        return Some(config);
+    }
+    let search = window.location().search().ok()?;
+    if let Some(config) = parse_multiplayer_config_from_query(&search) {
+        return Some(config);
+    }
+    load_room_session().and_then(|session| {
+        let room_id = session.room_id.trim().to_string();
+        if room_id.is_empty() || !is_valid_room_id(&room_id) {
+            clear_room_session();
+            return None;
+        }
+        let ws_base = session.ws_base.trim().to_string();
+        if ws_base.is_empty() || !ws_base.ends_with("/ws") {
+            clear_room_session();
+            return None;
+        }
+        Some(MultiplayerConfig {
+            room_id,
+            ws_base,
+            clear_hash: false,
+        })
+    })
+}
+
+fn parse_multiplayer_config_from_hash(hash: &str) -> Option<MultiplayerConfig> {
+    let raw = hash.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.trim_start_matches('#').trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("resume") {
+        return None;
+    }
+    let mut room_id = None;
+    let mut ws_base = None;
+    for chunk in raw.split(';') {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut iter = chunk.splitn(2, '=');
+        let key = iter.next().unwrap_or("").trim();
+        let value = iter.next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("room") || key.eq_ignore_ascii_case("room_id") {
+            let decoded = decode_hash_value(value);
+            room_id = Some(decoded);
+        } else if key.eq_ignore_ascii_case("ws") || key.eq_ignore_ascii_case("ws_base") {
+            let decoded = decode_hash_value(value);
+            if !decoded.trim().is_empty() {
+                ws_base = Some(normalize_ws_base(&decoded));
+            }
+        }
+    }
+    let room_id = room_id?;
+    let room_id = room_id.trim().to_string();
+    if room_id.is_empty() || !is_valid_room_id(&room_id) {
+        return None;
+    }
+    let ws_base = ws_base.or_else(default_ws_base)?;
+    let ws_base = ws_base.trim_end_matches('/').to_string();
+    if !ws_base.ends_with("/ws") {
+        gloo::console::warn!("ws base must end with /ws");
+        return None;
+    }
+    Some(MultiplayerConfig {
+        room_id,
+        ws_base,
+        clear_hash: true,
+    })
+}
+
+fn parse_multiplayer_config_from_query(search: &str) -> Option<MultiplayerConfig> {
+    let search = search.trim();
+    if search.is_empty() {
+        return None;
+    }
+    let params = UrlSearchParams::new_with_str(search).ok()?;
+    let room = params.get("room").or_else(|| params.get("room_id"))?;
+    let room_id = room.trim().to_string();
+    if room_id.is_empty() || !is_valid_room_id(&room_id) {
+        return None;
+    }
+    let ws_param = params.get("ws").or_else(|| params.get("ws_base"));
+    let ws_base = match ws_param {
+        Some(raw) if !raw.trim().is_empty() => normalize_ws_base(&raw),
+        _ => default_ws_base()?,
+    };
+    let ws_base = ws_base.trim_end_matches('/').to_string();
+    if !ws_base.ends_with("/ws") {
+        gloo::console::warn!("ws base must end with /ws");
+        return None;
+    }
+    Some(MultiplayerConfig {
+        room_id,
+        ws_base,
+        clear_hash: false,
+    })
 }
 
 fn puzzle_art_index_by_src(src: &str) -> Option<usize> {
@@ -209,6 +682,7 @@ fn parse_hash_route() -> Option<HashRoute> {
     let mut pieces = None;
     let mut seed = None;
     let mut saw_param = false;
+    let mut saw_known = false;
     for chunk in raw.split(';') {
         let chunk = chunk.trim();
         if chunk.is_empty() {
@@ -219,17 +693,20 @@ fn parse_hash_route() -> Option<HashRoute> {
         let key = iter.next().unwrap_or("").trim();
         let value = iter.next().unwrap_or("").trim();
         if key.eq_ignore_ascii_case("puzzle") {
+            saw_known = true;
             let decoded = decode_hash_value(value);
             puzzle_index = puzzle_art_index_by_slug(&decoded)
                 .or_else(|| puzzle_art_index_by_label(&decoded))
                 .or_else(|| puzzle_art_index_by_src(&decoded));
         } else if key.eq_ignore_ascii_case("pieces") {
+            saw_known = true;
             if let Ok(parsed) = value.parse::<u32>() {
                 if parsed > 0 {
                     pieces = Some(parsed);
                 }
             }
         } else if key.eq_ignore_ascii_case("seed") {
+            saw_known = true;
             seed = parse_seed_value(value);
         }
     }
@@ -243,7 +720,7 @@ fn parse_hash_route() -> Option<HashRoute> {
             clear_hash: true,
         });
     }
-    if saw_param {
+    if saw_param && saw_known {
         return Some(HashRoute {
             mode: HashRouteMode::Resume,
             clear_hash: true,
@@ -267,6 +744,60 @@ fn clear_location_hash() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MP_TEST_HOOKS: std::cell::RefCell<Option<MpTestHooks>> = std::cell::RefCell::new(None);
+    static MP_TEST_LAST_WARN: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MpTestHooks {
+    send_msg: Rc<dyn Fn(ServerMsg)>,
+    set_puzzle_info: Rc<dyn Fn(Option<PuzzleInfo>)>,
+    set_server_state_applied: Rc<dyn Fn(bool)>,
+}
+
+#[cfg(test)]
+fn set_mp_test_hooks(hooks: MpTestHooks) {
+    MP_TEST_HOOKS.with(|slot| {
+        *slot.borrow_mut() = Some(hooks);
+    });
+}
+
+#[cfg(test)]
+fn clear_mp_test_hooks() {
+    MP_TEST_HOOKS.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
+#[cfg(test)]
+fn record_mp_warn(msg: &str) {
+    MP_TEST_LAST_WARN.with(|slot| {
+        *slot.borrow_mut() = Some(msg.to_string());
+    });
+}
+
+#[cfg(test)]
+fn take_mp_warn() -> Option<String> {
+    MP_TEST_LAST_WARN.with(|slot| slot.borrow_mut().take())
+}
+
+fn update_kind(update: &RoomUpdate) -> &'static str {
+    match update {
+        RoomUpdate::Ownership { .. } => "ownership",
+        RoomUpdate::GroupTransform { .. } => "group_transform",
+        RoomUpdate::Flip { .. } => "flip",
+        RoomUpdate::GroupOrder { .. } => "group_order",
+        RoomUpdate::Connections { .. } => "connections",
+    }
+}
+
+fn log_state_update(label: &str, len: usize, context: &str) {
+    gloo::console::log!("state vector updated", label, len, context);
+}
+
 #[derive(Default)]
 struct DragHandlers {
     on_move: Option<Rc<dyn Fn(&MouseEvent)>>,
@@ -283,13 +814,23 @@ struct HoverDeps {
     show_debug: bool,
 }
 
-#[derive(Clone, Copy)]
-struct WorkspaceLayout {
-    view_min_x: f32,
-    view_min_y: f32,
-    view_width: f32,
-    view_height: f32,
-    puzzle_scale: f32,
+#[derive(Clone, PartialEq)]
+struct WgpuRenderDeps {
+    using_wgpu: bool,
+    puzzle_dims: Option<(u32, u32)>,
+    grid: GridChoice,
+    workspace_scale: f32,
+    image_max_dim: u32,
+    theme_mode: ThemeMode,
+    solved: bool,
+    menu_visible: bool,
+    ui_revision: u32,
+    z_order: Vec<usize>,
+    hover_deps: HoverDeps,
+    mask_atlas_revision: u32,
+    wgpu_settings: WgpuRenderSettings,
+    ownership_by_anchor: HashMap<u32, u64>,
+    mp_client_id: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -308,45 +849,6 @@ impl GlyphonMeasureState {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(FPS_FONT_BYTES.to_vec());
         Self { font_system }
-    }
-}
-
-fn compute_workspace_layout(
-    width: f32,
-    height: f32,
-    scale: f32,
-    max_dim: f32,
-) -> WorkspaceLayout {
-    let max_dim = max_dim.max(1.0);
-    let safe_width = width.max(1.0);
-    let safe_height = height.max(1.0);
-    let min_height_for_slot = max_dim / WORKSPACE_SLOT_HEIGHT_FRAC;
-    let min_height_for_width = max_dim / (WORKSPACE_SLOT_WIDTH_FRAC * WORKSPACE_ASPECT_RATIO);
-    let base_height = min_height_for_slot.max(min_height_for_width);
-    let base_width = base_height * WORKSPACE_ASPECT_RATIO;
-    let workspace_width = base_width * scale;
-    let workspace_height = base_height * scale;
-    let slot_width = workspace_width * WORKSPACE_SLOT_WIDTH_FRAC;
-    let slot_height = workspace_height * WORKSPACE_SLOT_HEIGHT_FRAC;
-    let slot_origin_x = workspace_width * WORKSPACE_SLOT_LEFT_FRAC;
-    let slot_origin_y = workspace_height * WORKSPACE_SLOT_TOP_FRAC;
-    let slot_min = slot_width.min(slot_height).max(1.0);
-    let margin = (slot_min * WORKSPACE_SLOT_MARGIN_FRAC).max(WORKSPACE_SLOT_MARGIN_MIN);
-    let fit_width = (slot_width - margin * 2.0).max(1.0);
-    let fit_height = (slot_height - margin * 2.0).max(1.0);
-    let puzzle_scale = (fit_width / safe_width)
-        .min(fit_height / safe_height)
-        .min(1.0);
-    let scaled_width = safe_width * puzzle_scale;
-    let scaled_height = safe_height * puzzle_scale;
-    let puzzle_offset_x = slot_origin_x + (slot_width - scaled_width) * 0.5;
-    let puzzle_offset_y = slot_origin_y + (slot_height - scaled_height) * 0.5;
-    WorkspaceLayout {
-        view_min_x: -puzzle_offset_x,
-        view_min_y: -puzzle_offset_y,
-        view_width: workspace_width,
-        view_height: workspace_height,
-        puzzle_scale,
     }
 }
 
@@ -791,6 +1293,20 @@ fn load_saved_game() -> Option<SavedGame> {
     Some(state)
 }
 
+fn load_room_session() -> Option<SavedRoomSession> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(ROOM_SESSION_KEY).ok()??;
+    let session: SavedRoomSession = serde_json::from_str(&raw).ok()?;
+    if session.version != ROOM_SESSION_VERSION {
+        return None;
+    }
+    if session.room_id.trim().is_empty() || session.ws_base.trim().is_empty() {
+        return None;
+    }
+    Some(session)
+}
+
 fn validate_saved_game(state: &SavedGame, total: usize) -> bool {
     if state.state.pieces.len() != total
         || state.state.groups.len() != total
@@ -857,6 +1373,19 @@ fn load_render_settings() -> Option<RenderSettings> {
     serde_json::from_str(&raw).ok()
 }
 
+fn initial_render_settings() -> RenderSettings {
+    #[cfg(test)]
+    {
+        let mut settings = RenderSettings::default();
+        settings.renderer = RendererKind::Svg;
+        settings
+    }
+    #[cfg(not(test))]
+    {
+        load_render_settings().unwrap_or_default()
+    }
+}
+
 fn load_theme_mode() -> Option<ThemeMode> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
@@ -873,6 +1402,22 @@ fn save_game_state(state: &SavedGame) {
         return;
     };
     let _ = storage.set_item(STORAGE_KEY, &raw);
+}
+
+fn save_room_session(room_id: &str, ws_base: &str) {
+    let session = SavedRoomSession {
+        version: ROOM_SESSION_VERSION,
+        room_id: room_id.to_string(),
+        ws_base: ws_base.to_string(),
+    };
+    let Ok(raw) = serde_json::to_string(&session) else {
+        return;
+    };
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.set_item(ROOM_SESSION_KEY, &raw);
 }
 
 fn save_puzzle_selection(selection: &SavedPuzzleSelection) {
@@ -892,6 +1437,14 @@ fn clear_saved_game() {
         return;
     };
     let _ = storage.remove_item(STORAGE_KEY);
+}
+
+fn clear_room_session() {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.remove_item(ROOM_SESSION_KEY);
 }
 
 fn clear_puzzle_selection() {
@@ -949,189 +1502,6 @@ fn now_ms() -> f32 {
     (Date::now() % 1_000_000.0) as f32
 }
 
-fn piece_local_offset(
-    id: usize,
-    anchor: usize,
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-) -> (f32, f32) {
-    let col = (id % cols) as f32;
-    let row = (id / cols) as f32;
-    let anchor_col = (anchor % cols) as f32;
-    let anchor_row = (anchor / cols) as f32;
-    (
-        (col - anchor_col) * piece_width,
-        (row - anchor_row) * piece_height,
-    )
-}
-
-fn derive_piece_state(
-    anchor_of: &[usize],
-    group_pos: &[(f32, f32)],
-    group_rot: &[f32],
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-) -> (Vec<(f32, f32)>, Vec<f32>) {
-    let total = anchor_of.len();
-    let mut positions = vec![(0.0, 0.0); total];
-    let mut rotations = vec![0.0; total];
-    for id in 0..total {
-        let anchor = anchor_of[id];
-        if anchor >= group_pos.len() || anchor >= group_rot.len() {
-            continue;
-        }
-        let base = group_pos[anchor];
-        let rot = group_rot[anchor];
-        let (dx, dy) = piece_local_offset(id, anchor, cols, piece_width, piece_height);
-        let (rx, ry) = rotate_vec(dx, dy, rot);
-        positions[id] = (base.0 + rx, base.1 + ry);
-        rotations[id] = rot;
-    }
-    (positions, rotations)
-}
-
-fn update_group_members_state(
-    members: &[usize],
-    anchor_id: usize,
-    group_pos: &[(f32, f32)],
-    group_rot: &[f32],
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-    positions: &mut [(f32, f32)],
-    rotations: &mut [f32],
-) {
-    if anchor_id >= group_pos.len() || anchor_id >= group_rot.len() {
-        return;
-    }
-    let base = group_pos[anchor_id];
-    let rot = group_rot[anchor_id];
-    for &id in members {
-        if id >= positions.len() || id >= rotations.len() {
-            continue;
-        }
-        let (dx, dy) = piece_local_offset(id, anchor_id, cols, piece_width, piece_height);
-        let (rx, ry) = rotate_vec(dx, dy, rot);
-        positions[id] = (base.0 + rx, base.1 + ry);
-        rotations[id] = rot;
-    }
-}
-
-fn build_group_order_from_piece_order(piece_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
-    let total = anchor_of.len();
-    let mut seen = vec![false; total];
-    let mut group_order = Vec::new();
-    for &id in piece_order {
-        if id >= total {
-            continue;
-        }
-        let anchor = anchor_of[id];
-        if anchor < total && !seen[anchor] {
-            seen[anchor] = true;
-            group_order.push(anchor);
-        }
-    }
-    for anchor in 0..total {
-        if anchor_of[anchor] == anchor && !seen[anchor] {
-            group_order.push(anchor);
-        }
-    }
-    group_order
-}
-
-fn build_piece_order_from_groups(group_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
-    let total = anchor_of.len();
-    let mut members: Vec<Vec<usize>> = vec![Vec::new(); total];
-    for id in 0..total {
-        let anchor = anchor_of[id];
-        if anchor < total {
-            members[anchor].push(id);
-        }
-    }
-    for group in &mut members {
-        if group.len() > 1 {
-            group.sort_unstable();
-        }
-    }
-    let mut group_seen = vec![false; total];
-    for &anchor in group_order {
-        if anchor < total {
-            group_seen[anchor] = true;
-        }
-    }
-    let mut order = Vec::with_capacity(total);
-    for &anchor in group_order {
-        if anchor < total {
-            order.extend_from_slice(&members[anchor]);
-        }
-    }
-    for anchor in 0..total {
-        if anchor_of[anchor] == anchor && !group_seen[anchor] {
-            order.extend_from_slice(&members[anchor]);
-        }
-    }
-    if order.len() < total {
-        let mut seen = vec![false; total];
-        for &id in &order {
-            if id < total {
-                seen[id] = true;
-            }
-        }
-        for id in 0..total {
-            if !seen[id] {
-                order.push(id);
-            }
-        }
-    }
-    order
-}
-
-fn rebuild_groups_from_piece_state(
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-    connections: &[[bool; 4]],
-    cols: usize,
-    rows: usize,
-    piece_order: Option<&[usize]>,
-) -> (Vec<usize>, Vec<(f32, f32)>, Vec<f32>, Vec<usize>) {
-    let total = cols * rows;
-    let mut anchor_of = vec![0usize; total];
-    let mut group_pos = vec![(0.0, 0.0); total];
-    let mut group_rot = vec![0.0; total];
-    let groups = groups_from_connections(connections, cols, rows);
-    for group in &groups {
-        if group.is_empty() {
-            continue;
-        }
-        let anchor = group[0];
-        for &id in group {
-            if id < total {
-                anchor_of[id] = anchor;
-            }
-        }
-        if anchor < positions.len() {
-            group_pos[anchor] = positions[anchor];
-        }
-        if anchor < rotations.len() {
-            group_rot[anchor] = rotations[anchor];
-        }
-    }
-    let group_order = if let Some(order) = piece_order {
-        build_group_order_from_piece_order(order, &anchor_of)
-    } else {
-        let mut order = Vec::new();
-        for id in 0..total {
-            if anchor_of[id] == id {
-                order.push(id);
-            }
-        }
-        order
-    };
-    (anchor_of, group_pos, group_rot, group_order)
-}
-
 fn grid_index_for_piece_count(
     choices: &[GridChoice],
     width: u32,
@@ -1151,75 +1521,26 @@ fn grid_index_for_piece_count(
         })
 }
 
-fn group_transforms_from_anchor(
-    anchor_of: &[usize],
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-) -> (Vec<(f32, f32)>, Vec<f32>) {
-    let total = anchor_of.len();
-    let mut group_pos = vec![(0.0, 0.0); total];
-    let mut group_rot = vec![0.0; total];
-    for (id, anchor) in anchor_of.iter().copied().enumerate() {
-        if anchor == id {
-            if let Some(pos) = positions.get(id) {
-                group_pos[id] = *pos;
-            }
-            if let Some(rot) = rotations.get(id) {
-                group_rot[id] = *rot;
+fn anchor_of_from_state(state: &PuzzleState) -> Vec<usize> {
+    state.pieces.iter().map(|piece| piece.group()).collect()
+}
+
+fn anchor_of_from_connections(connections: &[[bool; 4]], cols: usize, rows: usize) -> Vec<usize> {
+    let total = cols * rows;
+    let mut anchor_of = vec![0usize; total];
+    let groups = groups_from_connections(connections, cols, rows);
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+        let anchor = group[0];
+        for id in group {
+            if id < total {
+                anchor_of[id] = anchor;
             }
         }
     }
-    (group_pos, group_rot)
-}
-
-fn rebuild_group_state(
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-    connections: &[[bool; 4]],
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
-    piece_order: Option<&[usize]>,
-) -> (
-    Vec<usize>,
-    Vec<(f32, f32)>,
-    Vec<f32>,
-    Vec<usize>,
-    Vec<(f32, f32)>,
-    Vec<f32>,
-    Vec<usize>,
-) {
-    let (anchor_of, group_pos, group_rot, group_order) = rebuild_groups_from_piece_state(
-        positions,
-        rotations,
-        connections,
-        cols,
-        rows,
-        piece_order,
-    );
-    let (derived_positions, derived_rotations) = derive_piece_state(
-        &anchor_of,
-        &group_pos,
-        &group_rot,
-        cols,
-        piece_width,
-        piece_height,
-    );
-    let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
-    (
-        anchor_of,
-        group_pos,
-        group_rot,
-        group_order,
-        derived_positions,
-        derived_rotations,
-        piece_order,
-    )
-}
-
-fn anchor_of_from_state(state: &PuzzleState) -> Vec<usize> {
-    state.pieces.iter().map(|piece| piece.group()).collect()
+    anchor_of
 }
 
 fn group_transforms_from_state(
@@ -1395,6 +1716,17 @@ fn drag_group_position(
     )
 }
 
+fn drag_visual_from_state(
+    drag_state: &Option<DragState>,
+) -> Option<(Vec<usize>, (f32, f32), f32)> {
+    let drag = drag_state.as_ref()?;
+    if drag.members.is_empty() {
+        return None;
+    }
+    let dir = if drag.right_click { -1.0 } else { 1.0 };
+    Some((drag.members.clone(), (drag.cursor_x, drag.cursor_y), dir))
+}
+
 fn build_wgpu_instances(
     positions: &[(f32, f32)],
     rotations: &[f32],
@@ -1411,6 +1743,8 @@ fn build_wgpu_instances(
     highlighted_members: Option<&[usize]>,
     drag_origin: Option<(f32, f32)>,
     drag_dir: f32,
+    ownership_by_anchor: &HashMap<u32, u64>,
+    own_client_id: Option<u64>,
 ) -> InstanceSet {
     let total = cols * rows;
     if total == 0 {
@@ -1470,19 +1804,28 @@ fn build_wgpu_instances(
     } else {
         None
     };
+    let mut owned_mask = vec![false; total];
     let mut group_id = vec![usize::MAX; total];
     let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_has_owned: Vec<bool> = Vec::new();
     let mut queue = VecDeque::new();
     for start in 0..total {
         if group_id[start] != usize::MAX {
             continue;
         }
+        let owned = ownership_by_anchor
+            .get(&(start as u32))
+            .map(|owner_id| Some(*owner_id) != own_client_id)
+            .unwrap_or(false);
         let gid = groups.len();
         let mut members = Vec::new();
         group_id[start] = gid;
         queue.push_back(start);
         while let Some(id) = queue.pop_front() {
             members.push(id);
+            if owned {
+                owned_mask[id] = true;
+            }
             for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
                 if connections
                     .get(id)
@@ -1499,6 +1842,7 @@ fn build_wgpu_instances(
             }
         }
         groups.push(members);
+        group_has_owned.push(owned);
     }
     let mut group_members: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
     let mut group_order = Vec::new();
@@ -1543,6 +1887,7 @@ fn build_wgpu_instances(
             let rotation = rotations.get(id).copied().unwrap_or(0.0);
             let flipped = flips.get(id).copied().unwrap_or(false);
             let hovered = hovered_mask.get(id).copied().unwrap_or(false);
+            let owned = owned_mask.get(id).copied().unwrap_or(false);
             let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
             instances.push(Instance {
                 pos: [render_pos.0, render_pos.1],
@@ -1550,9 +1895,11 @@ fn build_wgpu_instances(
                 rotation,
                 flip: if flipped { 1.0 } else { 0.0 },
                 hover: if show_debug {
-                    2.0
+                    OUTLINE_KIND_DEBUG
+                } else if owned {
+                    OUTLINE_KIND_OWNED
                 } else if hovered {
-                    1.0
+                    OUTLINE_KIND_HOVER
                 } else {
                     0.0
                 },
@@ -1569,7 +1916,7 @@ fn build_wgpu_instances(
         if count == 0 {
             continue;
         }
-        let draw_outline = show_debug || group_has_hover[gid];
+        let draw_outline = show_debug || group_has_hover[gid] || group_has_owned[gid];
         if !show_debug && !draw_outline {
             if let Some(last) = batches.last_mut() {
                 if !last.draw_outline {
@@ -1693,9 +2040,15 @@ fn prefers_dark_mode() -> bool {
 }
 #[function_component(App)]
 fn app() -> Html {
-    let image_size = use_state(|| None::<(u32, u32)>);
+    #[cfg(test)]
+    gloo::console::log!("app render");
+    let puzzle_info = use_state(|| None::<PuzzleInfo>);
+    let puzzle_info_live = use_mut_ref(|| None::<PuzzleInfo>);
+    let puzzle_info_store = PuzzleInfoStore::new(puzzle_info.clone(), puzzle_info_live.clone());
+    let puzzle_info_value = (*puzzle_info).clone();
+    let puzzle_dims_value =
+        puzzle_info_value.as_ref().map(|info| (info.image_width, info.image_height));
     let image_revision = use_state(|| 0u32);
-    let image_size_value = *image_size;
     let image_revision_value = *image_revision;
     let image_element = use_state(|| None::<HtmlImageElement>);
     let settings = use_state(ShapeSettings::default);
@@ -1706,12 +2059,12 @@ fn app() -> Html {
     let curve_detail = settings_value
         .curve_detail
         .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
-    let mut grid_choices = if let Some((width, height)) = image_size_value {
-        build_grid_choices(width, height)
+    let mut grid_choices = if let Some(info) = puzzle_info_value.as_ref() {
+        build_grid_choices(info.image_width, info.image_height)
     } else {
         Vec::new()
     };
-    if image_size_value.is_some() && grid_choices.is_empty() {
+    if puzzle_info_value.is_some() && grid_choices.is_empty() {
         grid_choices.push(FALLBACK_GRID);
     }
     let grid_default_index = grid_choices
@@ -1726,12 +2079,12 @@ fn app() -> Html {
         .or_else(|| grid_choices.first().copied())
         .unwrap_or(FALLBACK_GRID);
     let total = (grid.cols * grid.rows) as usize;
-    let grid_label = if image_size_value.is_some() && !grid_choices.is_empty() {
+    let grid_label = if puzzle_info_value.is_some() && !grid_choices.is_empty() {
         grid_choice_label(&grid)
     } else {
         "--".to_string()
     };
-    let solve_time_label = if image_size_value.is_some() {
+    let solve_time_label = if puzzle_info_value.is_some() {
         let pieces = grid.actual_count as f32;
         format_duration(SOLVE_TIME_FACTOR * pieces.powf(SOLVE_TIME_EXPONENT))
     } else {
@@ -1785,6 +2138,19 @@ fn app() -> Html {
             }
         })
         .collect();
+    let multiplayer_config = use_state(parse_multiplayer_config);
+    let multiplayer_config_value = (*multiplayer_config).clone();
+    let game_mode = if multiplayer_config_value.is_some() {
+        GameMode::Online
+    } else {
+        GameMode::Local
+    };
+    let multiplayer_active = matches!(game_mode, GameMode::Online);
+    let mp_init_required = use_state(|| false);
+    let mp_client_id = use_state(|| None::<u64>);
+    let ownership_by_anchor = use_state(HashMap::<u32, u64>::new);
+    let mp_init_required_value = *mp_init_required;
+    let lock_puzzle_controls = multiplayer_active && !mp_init_required_value;
 
     let tab_width_input = on_setting_change(settings.clone(), |settings, value| {
         settings.tab_width = value.clamp(TAB_WIDTH_MIN, TAB_WIDTH_MAX);
@@ -1829,7 +2195,15 @@ fn app() -> Html {
         settings.line_bend_ratio = value.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
     });
     let puzzle_state = use_state(PuzzleState::empty);
-    let positions = use_state(Vec::<(f32, f32)>::new);
+    let ui_revision = use_state(|| 0u32);
+    let ui_revision_value = *ui_revision;
+    let bump_ui_revision: Rc<dyn Fn()> = {
+        let ui_revision = ui_revision.clone();
+        Rc::new(move || {
+            ui_revision.set(ui_revision.wrapping_add(1));
+        })
+    };
+    let local_snapshot = use_mut_ref(LocalSnapshot::empty);
     let group_anchor = use_state(Vec::<usize>::new);
     let group_pos = use_state(Vec::<(f32, f32)>::new);
     let group_rot = use_state(Vec::<f32>::new);
@@ -1862,12 +2236,10 @@ fn app() -> Html {
     let workspace_scale = use_state(|| WORKSPACE_SCALE_DEFAULT);
     let workspace_scale_value = *workspace_scale;
     let z_order = use_state(Vec::<usize>::new);
-    let connections = use_state(Vec::<[bool; 4]>::new);
-    let rotations = use_state(Vec::<f32>::new);
-    let flips = use_state(Vec::<bool>::new);
+    let _ = ui_revision_value;
     let rotation_enabled = use_state(|| true);
     let rotation_enabled_value = *rotation_enabled;
-    let render_settings = use_state(|| load_render_settings().unwrap_or_default());
+    let render_settings = use_state(initial_render_settings);
     let render_settings_value = (*render_settings).clone();
     let image_max_dim = render_settings_value
         .image_max_dim
@@ -1915,8 +2287,8 @@ fn app() -> Html {
             include_share_seed.set(input.checked());
         })
     };
-    let share_seed_value = if include_share_seed_value {
-        if image_size_value.is_some() {
+    let share_seed_value = if !multiplayer_active && include_share_seed_value {
+        if puzzle_info_value.is_some() {
             Some(scramble_seed(
                 PUZZLE_SEED,
                 scramble_nonce_value,
@@ -1929,14 +2301,27 @@ fn app() -> Html {
     } else {
         None
     };
+    let share_link_label = if multiplayer_active { "Room link" } else { "Share link" };
     let share_link = base_url_without_hash()
         .map(|base| {
-            let slug = encode_hash_value(puzzle_art.slug);
-            let mut fragment = format!("puzzle={slug};pieces={}", grid.actual_count);
-            if let Some(seed) = share_seed_value {
-                fragment.push_str(&format!(";seed={:#x}", seed));
+            if let Some(config) = multiplayer_config_value.as_ref() {
+                let room_id = encode_hash_value(&config.room_id);
+                let mut fragment = format!("room={room_id}");
+                let ws_base = config.ws_base.trim();
+                let default_ws = default_ws_base().unwrap_or_default();
+                if !ws_base.is_empty() && ws_base != default_ws {
+                    let ws_base = encode_hash_value(ws_base);
+                    fragment.push_str(&format!(";ws={ws_base}"));
+                }
+                format!("{base}#{fragment}")
+            } else {
+                let slug = encode_hash_value(puzzle_art.slug);
+                let mut fragment = format!("puzzle={slug};pieces={}", grid.actual_count);
+                if let Some(seed) = share_seed_value {
+                    fragment.push_str(&format!(";seed={:#x}", seed));
+                }
+                format!("{base}#{fragment}")
             }
-            format!("{base}#{fragment}")
         })
         .unwrap_or_default();
     let save_revision = use_state(|| 0u32);
@@ -1956,12 +2341,26 @@ fn app() -> Html {
     let dragging_members_value = (*dragging_members).clone();
     let animating_members_value = (*animating_members).clone();
     let hovered_id_value = *hovered_id;
-    let board_ready_value = image_size_value.is_some()
-        && positions.len() == total
-        && rotations.len() == total
-        && flips.len() == total
-        && connections.len() == total
+    let mp_client_id_value = *mp_client_id;
+    let ownership_by_anchor_value = (*ownership_by_anchor).clone();
+    let local_snapshot_value = (*local_snapshot.borrow()).clone();
+    let positions_len = local_snapshot_value.positions.len();
+    let rotations_len = local_snapshot_value.rotations.len();
+    let flips_len = local_snapshot_value.flips.len();
+    let connections_len = local_snapshot_value.connections.len();
+    let board_ready_value = puzzle_info_value.is_some()
+        && positions_len == total
+        && rotations_len == total
+        && flips_len == total
+        && connections_len == total
         && z_order.len() == total;
+    let ws_ref = use_mut_ref(|| None::<WebSocket>);
+    let ws_handlers = use_mut_ref(|| None::<WsHandlers>);
+    let mp_need_init = use_mut_ref(|| false);
+    let pending_snapshot = use_mut_ref(|| None::<RoomSnapshot>);
+    let pending_snapshot_revision = use_state(|| 0u32);
+    let last_seq = use_mut_ref(|| 0u64);
+    let server_state_applied = use_mut_ref(|| false);
     let hover_deps = HoverDeps {
         hovered_id: hovered_id_value,
         active_id: active_id_value,
@@ -1969,10 +2368,8 @@ fn app() -> Html {
         show_debug: show_debug_value,
     };
     let apply_puzzle_state: Rc<dyn Fn(PuzzleState, usize, f32, f32)> = {
-        let positions = positions.clone();
-        let rotations = rotations.clone();
-        let flips = flips.clone();
-        let connections = connections.clone();
+        let local_snapshot = local_snapshot.clone();
+        let bump_ui_revision = bump_ui_revision.clone();
         let z_order = z_order.clone();
         let group_anchor = group_anchor.clone();
         let group_pos = group_pos.clone();
@@ -1982,10 +2379,25 @@ fn app() -> Html {
         let puzzle_state = puzzle_state.clone();
         Rc::new(move |next_state: PuzzleState, cols: usize, piece_width: f32, piece_height: f32| {
             let derived = derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
-            positions.set(derived.positions);
-            rotations.set(derived.rotations);
-            flips.set(next_state.flips.clone());
-            connections.set(next_state.connections.clone());
+            {
+                let mut snapshot = local_snapshot.borrow_mut();
+                snapshot.positions = derived.positions.clone();
+                snapshot.rotations = derived.rotations.clone();
+                snapshot.flips = next_state.flips.clone();
+                snapshot.connections = next_state.connections.clone();
+                snapshot.group_order = next_state
+                    .group_order
+                    .iter()
+                    .filter_map(|id| u32::try_from(*id).ok())
+                    .collect();
+                snapshot.z_order = derived.z_order.clone();
+                snapshot.scramble_nonce = next_state.scramble_nonce;
+            }
+            log_state_update("positions", derived.positions.len(), "apply_puzzle_state");
+            log_state_update("rotations", derived.rotations.len(), "apply_puzzle_state");
+            log_state_update("flips", next_state.flips.len(), "apply_puzzle_state");
+            log_state_update("connections", next_state.connections.len(), "apply_puzzle_state");
+            bump_ui_revision();
             group_anchor.set(derived.anchor_of);
             group_pos.set(derived.group_pos);
             group_rot.set(derived.group_rot);
@@ -1995,6 +2407,628 @@ fn app() -> Html {
             puzzle_state.set(next_state);
         })
     };
+    let render_wgpu_now: Rc<dyn Fn()> = {
+        let puzzle_info = puzzle_info_store.clone();
+        let local_snapshot = local_snapshot.clone();
+        let wgpu_renderer = wgpu_renderer.clone();
+        let mask_atlas = mask_atlas.clone();
+        let z_order = z_order.clone();
+        let hovered_id = hovered_id.clone();
+        let active_id = active_id.clone();
+        let dragging_members = dragging_members.clone();
+        let show_debug = show_debug.clone();
+        let drag_state = drag_state.clone();
+        let ownership_by_anchor = ownership_by_anchor.clone();
+        let mp_client_id = mp_client_id.clone();
+        let solved = solved.clone();
+        let menu_visible = menu_visible.clone();
+        let using_wgpu = using_wgpu;
+        Rc::new(move || {
+            if !using_wgpu || *menu_visible {
+                return;
+            }
+            let Some(info) = puzzle_info.get() else {
+                return;
+            };
+            if info.image_width == 0 || info.image_height == 0 {
+                return;
+            }
+            let cols = info.cols as usize;
+            let rows = info.rows as usize;
+            let total = cols * rows;
+            if total == 0 {
+                return;
+            }
+            let piece_width = info.image_width as f32 / info.cols as f32;
+            let piece_height = info.image_height as f32 / info.rows as f32;
+            let mask_atlas = match mask_atlas.borrow().as_ref().cloned() {
+                Some(mask_atlas) => mask_atlas,
+                None => return,
+            };
+            let (positions_value, rotations_value, flips_value, connections_value, z_order_snapshot) = {
+                let snapshot = local_snapshot.borrow();
+                if snapshot.positions.len() != total
+                    || snapshot.rotations.len() != total
+                    || snapshot.flips.len() != total
+                    || snapshot.connections.len() != total
+                {
+                    return;
+                }
+                (
+                    snapshot.positions.clone(),
+                    snapshot.rotations.clone(),
+                    snapshot.flips.clone(),
+                    snapshot.connections.clone(),
+                    snapshot.z_order.clone(),
+                )
+            };
+            let z_order_value = if z_order_snapshot.len() == total {
+                z_order_snapshot
+            } else {
+                (*z_order).clone()
+            };
+            let hovered_id_value = *hovered_id;
+            let show_debug_value = *show_debug;
+            let dragging_members_value = (*dragging_members).clone();
+            let active_id_value = *active_id;
+            let ownership_by_anchor_value = (*ownership_by_anchor).clone();
+            let mp_client_id_value = *mp_client_id;
+            let drag_visual = drag_visual_from_state(&drag_state.borrow());
+            let mut drag_members_override: Option<Vec<usize>> = None;
+            let mut drag_origin = None;
+            let mut drag_dir = 0.0;
+            if let Some((members, origin, dir)) = drag_visual {
+                drag_members_override = Some(members);
+                drag_origin = Some(origin);
+                drag_dir = dir;
+            }
+            let highlight_members = if let Some(members) = drag_members_override.as_ref() {
+                Some(members.as_slice())
+            } else if active_id_value.is_some() && !dragging_members_value.is_empty() {
+                Some(dragging_members_value.as_slice())
+            } else {
+                None
+            };
+            let instances = build_wgpu_instances(
+                &positions_value,
+                &rotations_value,
+                &flips_value,
+                &z_order_value,
+                &connections_value,
+                hovered_id_value,
+                show_debug_value,
+                cols,
+                rows,
+                piece_width,
+                piece_height,
+                &mask_atlas,
+                highlight_members,
+                drag_origin,
+                drag_dir,
+                &ownership_by_anchor_value,
+                mp_client_id_value,
+            );
+            let mut renderer_ref = wgpu_renderer.borrow_mut();
+            let Some(renderer) = renderer_ref.as_mut() else {
+                return;
+            };
+            renderer.set_solved(*solved);
+            renderer.update_instances(instances);
+            renderer.render();
+        })
+    };
+    let pending_snapshot_revision_value = *pending_snapshot_revision;
+    let send_client_msg: Rc<dyn Fn(ClientMsg)> = {
+        let ws_ref = ws_ref.clone();
+        Rc::new(move |msg: ClientMsg| {
+            let ws = {
+                let ws_guard = ws_ref.borrow();
+                let Some(ws) = ws_guard.as_ref() else {
+                    return;
+                };
+                ws.clone()
+            };
+            if ws.ready_state() != WebSocket::OPEN {
+                return;
+            }
+            if let Some(bytes) = encode(&msg) {
+                let _ = ws.send_with_u8_array(&bytes);
+            }
+        })
+    };
+    let try_send_init: Rc<dyn Fn()> = {
+        let mp_need_init = mp_need_init.clone();
+        let mp_init_required = mp_init_required.clone();
+        let send_client_msg = send_client_msg.clone();
+        let puzzle_info = puzzle_info_store.clone();
+        let local_snapshot = local_snapshot.clone();
+        Rc::new(move || {
+            if !*mp_need_init.borrow() {
+                return;
+            }
+            let Some(puzzle) = puzzle_info.get() else {
+                return;
+            };
+            let cols = puzzle.cols as usize;
+            let rows = puzzle.rows as usize;
+            let total = cols * rows;
+            let snapshot = local_snapshot.borrow();
+            if snapshot.positions.len() != total
+                || snapshot.rotations.len() != total
+                || snapshot.flips.len() != total
+                || snapshot.connections.len() != total
+            {
+                return;
+            }
+            let state = PuzzleStateSnapshot {
+                positions: snapshot.positions.clone(),
+                rotations: snapshot.rotations.clone(),
+                flips: snapshot.flips.clone(),
+                connections: snapshot.connections.clone(),
+                group_order: snapshot.group_order.clone(),
+                scramble_nonce: snapshot.scramble_nonce,
+            };
+            let msg = ClientMsg::Init {
+                puzzle,
+                rules: None,
+                state: Some(state),
+            };
+            send_client_msg(msg);
+            *mp_need_init.borrow_mut() = false;
+            mp_init_required.set(false);
+        })
+    };
+    let queue_snapshot = {
+        let pending_snapshot = pending_snapshot.clone();
+        let pending_snapshot_revision = pending_snapshot_revision.clone();
+        let last_seq = last_seq.clone();
+        Rc::new(move |snapshot: RoomSnapshot, seq: u64| {
+            *last_seq.borrow_mut() = seq;
+            *pending_snapshot.borrow_mut() = Some(snapshot);
+            let next = (*pending_snapshot_revision).wrapping_add(1);
+            pending_snapshot_revision.set(next);
+        })
+    };
+    let handle_server_msg: Rc<dyn Fn(ServerMsg)> = {
+        let mp_need_init = mp_need_init.clone();
+        let mp_init_required = mp_init_required.clone();
+        let mp_client_id = mp_client_id.clone();
+        let ownership_by_anchor = ownership_by_anchor.clone();
+        let try_send_init = try_send_init.clone();
+        let queue_snapshot = queue_snapshot.clone();
+        let last_seq = last_seq.clone();
+        let server_state_applied = server_state_applied.clone();
+        let puzzle_info = puzzle_info_store.clone();
+        let local_snapshot = local_snapshot.clone();
+        let apply_puzzle_state = apply_puzzle_state.clone();
+        let render_wgpu_now = render_wgpu_now.clone();
+        let solved = solved.clone();
+        let rotation_enabled_value = rotation_enabled_value;
+        Rc::new(move |msg: ServerMsg| match msg {
+            ServerMsg::Welcome {
+                room_id,
+                persistence,
+                initialized,
+                client_id,
+            } => {
+                gloo::console::log!(
+                    "multiplayer connected",
+                    room_id,
+                    format!("{persistence:?}"),
+                    format!("initialized={initialized}"),
+                    format!("client_id={:?}", client_id)
+                );
+                mp_client_id.set(client_id);
+                ownership_by_anchor.set(HashMap::new());
+                if !initialized {
+                    mp_init_required.set(true);
+                }
+            }
+            ServerMsg::AdminAck { .. } => {}
+            ServerMsg::NeedInit => {
+                *mp_need_init.borrow_mut() = true;
+                mp_init_required.set(true);
+                try_send_init();
+            }
+            ServerMsg::Warning { minutes_idle } => {
+                gloo::console::warn!("room idle for", minutes_idle, "minutes");
+            }
+            ServerMsg::State { seq, snapshot } => {
+                gloo::console::log!(
+                    "multiplayer state received",
+                    seq,
+                    snapshot.state.positions.len(),
+                    format!("{}x{}", snapshot.puzzle.cols, snapshot.puzzle.rows)
+                );
+                let game = GameSession::online(OnlineGame::new(
+                    puzzle_info.clone(),
+                    local_snapshot.clone(),
+                    apply_puzzle_state.clone(),
+                    render_wgpu_now.clone(),
+                    solved.clone(),
+                    rotation_enabled_value,
+                ));
+                game.on_snapshot(&snapshot);
+                mp_init_required.set(false);
+                queue_snapshot(snapshot, seq);
+            }
+            ServerMsg::Update { seq, update, source } => {
+                let kind = update_kind(&update);
+                gloo::console::log!(
+                    "multiplayer update received",
+                    seq,
+                    kind,
+                    format!("source={:?}", source)
+                );
+                if let RoomUpdate::Ownership { anchor_id, owner, .. } = &update {
+                    let mut next = (*ownership_by_anchor).clone();
+                    if let Some(owner_id) = *owner {
+                        next.insert(*anchor_id, owner_id);
+                    } else {
+                        next.remove(anchor_id);
+                    }
+                    ownership_by_anchor.set(next);
+                    return;
+                }
+                let mut last = last_seq.borrow_mut();
+                if seq <= *last {
+                    gloo::console::warn!(
+                        "multiplayer update dropped (stale)",
+                        seq,
+                        *last,
+                        kind
+                    );
+                    return;
+                }
+                *last = seq;
+                if !*server_state_applied.borrow() {
+                    #[cfg(test)]
+                    record_mp_warn("not ready");
+                    gloo::console::warn!(
+                        "multiplayer update dropped (not ready)",
+                        seq,
+                        kind
+                    );
+                    return;
+                }
+                let game = GameSession::online(OnlineGame::new(
+                    puzzle_info.clone(),
+                    local_snapshot.clone(),
+                    apply_puzzle_state.clone(),
+                    render_wgpu_now.clone(),
+                    solved.clone(),
+                    rotation_enabled_value,
+                ));
+                game.apply_update(update);
+            }
+            ServerMsg::Pong { .. } => {}
+            ServerMsg::Error { code, message } => {
+                gloo::console::warn!("server error", code, message);
+            }
+        })
+    };
+    #[cfg(test)]
+    {
+        let send_msg = handle_server_msg.clone();
+        let set_puzzle_info = {
+            let puzzle_info = puzzle_info_store.clone();
+            Rc::new(move |info: Option<PuzzleInfo>| {
+                puzzle_info.set(info);
+            })
+        };
+        let set_server_state_applied = {
+            let server_state_applied = server_state_applied.clone();
+            Rc::new(move |ready: bool| {
+                *server_state_applied.borrow_mut() = ready;
+            })
+        };
+        use_effect_with((), move |_| {
+            gloo::console::log!("mp hooks set");
+            set_mp_test_hooks(MpTestHooks {
+                send_msg,
+                set_puzzle_info,
+                set_server_state_applied,
+            });
+            || {
+                clear_mp_test_hooks();
+            }
+        });
+    }
+    {
+        let pending_snapshot = pending_snapshot.clone();
+        let puzzle_art_index = puzzle_art_index.clone();
+        let grid_index = grid_index.clone();
+        let puzzle_state = puzzle_state.clone();
+        let apply_puzzle_state = apply_puzzle_state.clone();
+        let solved = solved.clone();
+        let rotation_enabled_value = rotation_enabled_value;
+        let server_state_applied = server_state_applied.clone();
+        use_effect_with(
+            (
+                pending_snapshot_revision_value,
+                grid_index_value,
+                puzzle_art_index_value,
+            ),
+            move |(pending_rev, grid_index_value, puzzle_art_index_value)| {
+                let cleanup = || ();
+                let _ = pending_rev;
+                let Some(snapshot) = pending_snapshot.borrow().clone() else {
+                    return cleanup;
+                };
+                let desired_index = puzzle_art_index_by_src(&snapshot.puzzle.image_src)
+                    .or_else(|| puzzle_art_index_by_label(&snapshot.puzzle.label));
+                let Some(desired_index) = desired_index else {
+                    gloo::console::warn!(
+                        "multiplayer snapshot puzzle not found",
+                        snapshot.puzzle.image_src.clone()
+                    );
+                    pending_snapshot.borrow_mut().take();
+                    return cleanup;
+                };
+                if *puzzle_art_index_value != desired_index {
+                    puzzle_art_index.set(desired_index);
+                    return cleanup;
+                }
+                let logical = (snapshot.puzzle.image_width, snapshot.puzzle.image_height);
+                if logical.0 == 0 || logical.1 == 0 {
+                    gloo::console::log!("multiplayer snapshot deferred (image size missing)");
+                    return cleanup;
+                }
+                let mut snapshot_grid_choices =
+                    build_grid_choices(snapshot.puzzle.image_width, snapshot.puzzle.image_height);
+                if snapshot_grid_choices.is_empty() {
+                    snapshot_grid_choices.push(FALLBACK_GRID);
+                }
+                let target_grid_index = grid_choice_index(
+                    &snapshot_grid_choices,
+                    snapshot.puzzle.cols,
+                    snapshot.puzzle.rows,
+                );
+                let Some(target_grid_index) = target_grid_index else {
+                    gloo::console::warn!(
+                        "multiplayer snapshot grid not available",
+                        snapshot.puzzle.cols,
+                        snapshot.puzzle.rows
+                    );
+                    pending_snapshot.borrow_mut().take();
+                    return cleanup;
+                };
+                if *grid_index_value != target_grid_index {
+                    grid_index.set(target_grid_index);
+                    return cleanup;
+                }
+                let cols = snapshot.puzzle.cols as usize;
+                let rows = snapshot.puzzle.rows as usize;
+                let total = cols * rows;
+                if snapshot.state.positions.len() != total
+                    || snapshot.state.rotations.len() != total
+                    || snapshot.state.flips.len() != total
+                    || snapshot.state.connections.len() != total
+                {
+                    gloo::console::warn!("multiplayer snapshot invalid sizes");
+                    pending_snapshot.borrow_mut().take();
+                    return cleanup;
+                }
+                let piece_width = logical.0 as f32 / cols as f32;
+                let piece_height = logical.1 as f32 / rows as f32;
+                let local_state = (*puzzle_state).clone();
+                let was_initialized = *server_state_applied.borrow();
+                if was_initialized && local_state.total_pieces() == total {
+                    let (local_positions, local_rotations) =
+                        local_state.derive_piece_transforms(cols, piece_width, piece_height);
+                    let mut drift_count = 0usize;
+                    let pos_eps = 0.5;
+                    let rot_eps = 0.5;
+                    for idx in 0..total {
+                        let local_pos = local_positions
+                            .get(idx)
+                            .copied()
+                            .unwrap_or((0.0, 0.0));
+                        let snap_pos = snapshot.state.positions[idx];
+                        if (local_pos.0 - snap_pos.0).abs() > pos_eps
+                            || (local_pos.1 - snap_pos.1).abs() > pos_eps
+                        {
+                            drift_count += 1;
+                            continue;
+                        }
+                        let local_rot = local_rotations.get(idx).copied().unwrap_or(0.0);
+                        let snap_rot = snapshot.state.rotations[idx];
+                        if angle_delta(local_rot, snap_rot).abs() > rot_eps {
+                            drift_count += 1;
+                        }
+                    }
+                    if drift_count > 0 {
+                        gloo::console::warn!(
+                            "multiplayer drift detected",
+                            drift_count,
+                            "pieces"
+                        );
+                    }
+                }
+                let group_order: Vec<usize> = snapshot
+                    .state
+                    .group_order
+                    .iter()
+                    .filter_map(|id| {
+                        let id = *id as usize;
+                        if id < total {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let anchor_of =
+                    anchor_of_from_connections(&snapshot.state.connections, cols, rows);
+                let piece_order = crate::core::build_piece_order_from_groups(
+                    &group_order,
+                    &anchor_of,
+                );
+                let next_state = PuzzleState::rebuild_from_piece_state(
+                    &snapshot.state.positions,
+                    &snapshot.state.rotations,
+                    &snapshot.state.flips,
+                    &snapshot.state.connections,
+                    cols,
+                    rows,
+                    Some(piece_order.as_slice()),
+                    snapshot.state.scramble_nonce,
+                );
+                let solved_now = is_solved(
+                    &snapshot.state.positions,
+                    &snapshot.state.rotations,
+                    &snapshot.state.flips,
+                    &snapshot.state.connections,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                    rotation_enabled_value,
+                );
+                apply_puzzle_state(next_state, cols, piece_width, piece_height);
+                solved.set(solved_now);
+                *server_state_applied.borrow_mut() = true;
+                gloo::console::log!("multiplayer snapshot applied", snapshot.seq);
+                pending_snapshot.borrow_mut().take();
+                cleanup
+            },
+        );
+    }
+    {
+        let multiplayer_config = multiplayer_config_value.clone();
+        let ws_ref = ws_ref.clone();
+        let ws_handlers = ws_handlers.clone();
+        let pending_snapshot = pending_snapshot.clone();
+        let last_seq = last_seq.clone();
+        let mp_need_init = mp_need_init.clone();
+        let server_state_applied = server_state_applied.clone();
+        let mp_init_required = mp_init_required.clone();
+        let mp_client_id = mp_client_id.clone();
+        let ownership_by_anchor = ownership_by_anchor.clone();
+        let handle_server_msg = handle_server_msg.clone();
+        use_effect_with(multiplayer_config, move |config| {
+            ws_handlers.borrow_mut().take();
+            if let Some(ws) = ws_ref.borrow_mut().take() {
+                let _ = ws.close();
+            }
+            *mp_need_init.borrow_mut() = false;
+            mp_init_required.set(false);
+            pending_snapshot.borrow_mut().take();
+            *last_seq.borrow_mut() = 0;
+            *server_state_applied.borrow_mut() = false;
+            mp_client_id.set(None);
+            ownership_by_anchor.set(HashMap::new());
+            let mut ws_opt: Option<WebSocket> = None;
+            if let Some(config) = config.clone() {
+                if config.clear_hash {
+                    clear_location_hash();
+                }
+                let url = build_room_ws_url(&config.ws_base, &config.room_id);
+                match WebSocket::new(&url) {
+                    Ok(ws) => {
+                        ws.set_binary_type(BinaryType::Arraybuffer);
+                        *ws_ref.borrow_mut() = Some(ws.clone());
+                        let opened = Rc::new(Cell::new(false));
+                        let onopen = {
+                            let opened = opened.clone();
+                            let url = url.clone();
+                            Closure::wrap(
+                                Box::new(move |_event: Event| {
+                                    opened.set(true);
+                                    gloo::console::log!("websocket connected", url.clone());
+                                }) as Box<dyn FnMut(Event)>,
+                            )
+                        };
+                        let onmessage = {
+                            let handle_server_msg = handle_server_msg.clone();
+                            Closure::wrap(Box::new(move |event: MessageEvent| {
+                                let data = event.data();
+                                let Ok(buffer) = data.dyn_into::<js_sys::ArrayBuffer>() else {
+                                    return;
+                                };
+                                let bytes = Uint8Array::new(&buffer).to_vec();
+                                if let Some(msg) = decode::<ServerMsg>(&bytes) {
+                                    handle_server_msg(msg);
+                                }
+                            }) as Box<dyn FnMut(MessageEvent)>)
+                        };
+                        let onerror = {
+                            let url = url.clone();
+                            Closure::wrap(Box::new(move |_event: ErrorEvent| {
+                                gloo::console::warn!("websocket error", url.clone());
+                            }) as Box<dyn FnMut(ErrorEvent)>)
+                        };
+                        let onclose = {
+                            let ws_ref = ws_ref.clone();
+                            let ws_handlers = ws_handlers.clone();
+                            let opened = opened.clone();
+                            let url = url.clone();
+                            Closure::wrap(Box::new(move |event: Event| {
+                                ws_ref.borrow_mut().take();
+                                ws_handlers.borrow_mut().take();
+                                if !opened.get() {
+                                    gloo::console::warn!(
+                                        "websocket failed to connect (room may be invalid)",
+                                        url.clone()
+                                    );
+                                    return;
+                                }
+                                if let Some(close) = event.dyn_ref::<CloseEvent>() {
+                                    let reason = close.reason();
+                                    if reason.is_empty() {
+                                        gloo::console::log!(
+                                            "websocket closed",
+                                            url.clone(),
+                                            close.code()
+                                        );
+                                    } else {
+                                        gloo::console::log!(
+                                            "websocket closed",
+                                            url.clone(),
+                                            close.code(),
+                                            reason
+                                        );
+                                    }
+                                } else {
+                                    gloo::console::log!("websocket closed", url.clone());
+                                }
+                            }) as Box<dyn FnMut(Event)>)
+                        };
+                        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+                        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+                        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+                        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+                        *ws_handlers.borrow_mut() = Some(WsHandlers {
+                            onopen,
+                            onmessage,
+                            onerror,
+                            onclose,
+                        });
+                        ws_opt = Some(ws);
+                    }
+                    Err(_) => {
+                        gloo::console::warn!("failed to open websocket", url);
+                    }
+                }
+            }
+            move || {
+                ws_handlers.borrow_mut().take();
+                ws_ref.borrow_mut().take();
+                if let Some(ws) = ws_opt {
+                    let _ = ws.close();
+                }
+            }
+        });
+    }
+    {
+        let try_send_init = try_send_init.clone();
+        use_effect_with(board_ready_value, move |board_ready_value| {
+            if *board_ready_value {
+                try_send_init();
+            }
+            || ()
+        });
+    }
     let mask_atlas_revision_value = *mask_atlas_revision;
     let preview_revealed_value = *preview_revealed;
     let renderer_value = if using_wgpu { "wgpu" } else { "svg" };
@@ -2014,9 +3048,25 @@ fn app() -> Html {
     {
         let grid_choices = grid_choices.clone();
         use_effect_with(
-            (grid_index_value, image_revision_value, image_size_value),
-            move |(grid_index_value, _image_revision_value, image_size_value)| {
-                if image_size_value.is_some() {
+            (
+                grid_index_value,
+                image_revision_value,
+                puzzle_dims_value,
+                multiplayer_active,
+                mp_init_required_value,
+            ),
+            move |(
+                grid_index_value,
+                _image_revision_value,
+                puzzle_dims_value,
+                multiplayer_active,
+                mp_init_required_value,
+            )| {
+                let cleanup = || ();
+                if *multiplayer_active && !*mp_init_required_value {
+                    return cleanup;
+                }
+                if puzzle_dims_value.is_some() {
                     if let Some(grid) = grid_choices.get(*grid_index_value).copied() {
                         let selection = SavedPuzzleSelection {
                             version: PUZZLE_SELECTION_VERSION,
@@ -2027,7 +3077,39 @@ fn app() -> Html {
                         save_puzzle_selection(&selection);
                     }
                 }
-                || ()
+                cleanup
+            },
+        );
+    }
+    {
+        let puzzle_info = puzzle_info_store.clone();
+        let grid_choices = grid_choices.clone();
+        let puzzle_art = puzzle_art;
+        use_effect_with(
+            (grid_index_value, puzzle_dims_value, multiplayer_active),
+            move |(grid_index_value, puzzle_dims_value, multiplayer_active)| {
+                let cleanup = || ();
+                if *multiplayer_active {
+                    return cleanup;
+                }
+                let Some((width, height)) = *puzzle_dims_value else {
+                    return cleanup;
+                };
+                let grid = grid_choices
+                    .get(*grid_index_value)
+                    .copied()
+                    .unwrap_or(FALLBACK_GRID);
+                let info = PuzzleInfo {
+                    label: puzzle_art.label.to_string(),
+                    image_src: puzzle_art.src.to_string(),
+                    rows: grid.rows,
+                    cols: grid.cols,
+                    shape_seed: PUZZLE_SEED,
+                    image_width: width,
+                    image_height: height,
+                };
+                puzzle_info.set(Some(info));
+                cleanup
             },
         );
     }
@@ -2044,7 +3126,7 @@ fn app() -> Html {
         "status"
     };
     let solved_banner = html! {};
-    let seed_label = if image_size_value.is_some() {
+    let seed_label = if puzzle_info_value.is_some() {
         let cols = grid.cols as usize;
         let rows = grid.rows as usize;
         format!(
@@ -2054,8 +3136,8 @@ fn app() -> Html {
     } else {
         "--".to_string()
     };
-    let (connections_label, border_connections_label) = if image_size_value.is_some() {
-        let connections_value = &*connections;
+    let (connections_label, border_connections_label) = if puzzle_info_value.is_some() {
+        let connections_value = local_snapshot_value.connections.as_slice();
         if connections_value.len() == total {
             let (connected, border_connected, total_expected, border_expected) = count_connections(
                 connections_value,
@@ -2095,12 +3177,28 @@ fn app() -> Html {
         let saved_puzzle_selection = saved_puzzle_selection.clone();
         let puzzle_src = puzzle_src;
         use_effect_with(
-            (grid_index_value, image_size_value),
-            move |(grid_index_value, image_size_value)| {
-                if let Some((width, height)) = *image_size_value {
+            (
+                grid_index_value,
+                puzzle_dims_value,
+                multiplayer_active,
+                mp_init_required_value,
+            ),
+            move |(
+                grid_index_value,
+                puzzle_dims_value,
+                multiplayer_active,
+                mp_init_required_value,
+            )| {
+                let cleanup = || ();
+                let multiplayer_active = *multiplayer_active;
+                let mp_init_required = *mp_init_required_value;
+                if let Some((width, height)) = *puzzle_dims_value {
                     let mut allow_scramble = true;
                     let mut skip_scramble = false;
                     let mut skip_restore = false;
+                    if multiplayer_active && !mp_init_required {
+                        return cleanup;
+                    }
                     let route_snapshot = route_state.borrow().clone();
                     let mut route_force_new = false;
                     let mut route_piece_target = None;
@@ -2139,7 +3237,7 @@ fn app() -> Html {
                             }
                         }
                     }
-                    if allow_scramble {
+                    if allow_scramble && !multiplayer_active {
                         if let Some(selection) = saved_puzzle_selection.borrow_mut().take() {
                             if selection.puzzle_src == puzzle_src {
                                 if let Some(saved_index) =
@@ -2161,7 +3259,7 @@ fn app() -> Html {
                             }
                         }
                     }
-                    if allow_scramble && !skip_restore {
+                    if allow_scramble && !skip_restore && !multiplayer_active {
                         let saved_state = {
                             let mut attempted = restore_attempted.borrow_mut();
                             if !*attempted {
@@ -2330,7 +3428,7 @@ fn app() -> Html {
                         }
                     }
                 }
-                || ()
+                cleanup
             },
         );
     }
@@ -2338,7 +3436,11 @@ fn app() -> Html {
     let on_grid_change = {
         let grid_index = grid_index.clone();
         let grid_choices_len = grid_choices.len();
+        let lock_puzzle_controls = lock_puzzle_controls;
         Callback::from(move |event: Event| {
+            if lock_puzzle_controls {
+                return;
+            }
             let select: HtmlSelectElement = event.target_unchecked_into();
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < grid_choices_len {
@@ -2351,7 +3453,11 @@ fn app() -> Html {
     let on_puzzle_art_change = {
         let puzzle_art_index = puzzle_art_index.clone();
         let puzzle_art_len = PUZZLE_ARTS.len();
+        let lock_puzzle_controls = lock_puzzle_controls;
         Callback::from(move |event: Event| {
+            if lock_puzzle_controls {
+                return;
+            }
             let select: HtmlSelectElement = event.target_unchecked_into();
             if let Ok(value) = select.value().parse::<usize>() {
                 if value < puzzle_art_len {
@@ -2393,41 +3499,37 @@ fn app() -> Html {
     };
     let on_rotation_toggle = {
         let rotation_enabled = rotation_enabled.clone();
-        let positions = positions.clone();
-        let rotations = rotations.clone();
-        let flips = flips.clone();
-        let connections = connections.clone();
+        let local_snapshot = local_snapshot.clone();
         let z_order = z_order.clone();
         let apply_puzzle_state = apply_puzzle_state.clone();
         let scramble_nonce = scramble_nonce.clone();
-        let image_size = image_size.clone();
-        let grid_index = grid_index.clone();
-        let grid_choices = grid_choices.clone();
+        let puzzle_info = puzzle_info_store.clone();
         let solved = solved.clone();
         let save_revision = save_revision.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
             rotation_enabled.set(enabled);
-            let total = positions.len();
-            let rotations_snapshot = if enabled {
-                (*rotations).clone()
-            } else {
-                let zeroed = vec![0.0; total];
-                zeroed
+            let (positions_snapshot, rotations_snapshot, flips_snapshot, connections_snapshot) = {
+                let snapshot = local_snapshot.borrow();
+                let total = snapshot.positions.len();
+                let rotations_snapshot = if enabled {
+                    snapshot.rotations.clone()
+                } else {
+                    vec![0.0; total]
+                };
+                (
+                    snapshot.positions.clone(),
+                    rotations_snapshot,
+                    snapshot.flips.clone(),
+                    snapshot.connections.clone(),
+                )
             };
-            if let Some((width, height)) = *image_size {
-                let grid = grid_choices
-                    .get(*grid_index)
-                    .copied()
-                    .unwrap_or(FALLBACK_GRID);
-                let cols = grid.cols as usize;
-                let rows = grid.rows as usize;
-                let piece_width = width as f32 / grid.cols as f32;
-                let piece_height = height as f32 / grid.rows as f32;
-                let positions_snapshot = (*positions).clone();
-                let flips_snapshot = (*flips).clone();
-                let connections_snapshot = (*connections).clone();
+            if let Some(info) = puzzle_info.get() {
+                let cols = info.cols as usize;
+                let rows = info.rows as usize;
+                let piece_width = info.image_width as f32 / info.cols as f32;
+                let piece_height = info.image_height as f32 / info.rows as f32;
                 let order_snapshot = (*z_order).clone();
                 let order_opt = if order_snapshot.len() == cols * rows {
                     Some(order_snapshot.as_slice())
@@ -2502,11 +3604,15 @@ fn app() -> Html {
     };
     let on_rotation_lock_threshold = {
         let rotation_lock_threshold = rotation_lock_threshold.clone();
-        let positions = positions.clone();
+        let local_snapshot = local_snapshot.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
-                let max_value = positions.len().max(ROTATION_LOCK_THRESHOLD_MIN);
+                let snapshot = local_snapshot.borrow();
+                let max_value = snapshot
+                    .positions
+                    .len()
+                    .max(ROTATION_LOCK_THRESHOLD_MIN);
                 let rounded = value.round() as usize;
                 let clamped = rounded
                     .max(ROTATION_LOCK_THRESHOLD_MIN)
@@ -2690,11 +3796,8 @@ fn app() -> Html {
         let mask_atlas = mask_atlas.clone();
         let mask_atlas_revision = mask_atlas_revision.clone();
         let hovered_id = hovered_id.clone();
-        let positions = positions.clone();
-        let rotations = rotations.clone();
-        let flips = flips.clone();
+        let local_snapshot = local_snapshot.clone();
         let z_order = z_order.clone();
-        let connections = connections.clone();
         let dragging_members = dragging_members.clone();
         let active_id = active_id.clone();
         let drag_state = drag_state.clone();
@@ -2703,11 +3806,13 @@ fn app() -> Html {
         let wgpu_edge_aa = wgpu_edge_aa;
         let wgpu_render_scale = wgpu_render_scale;
         let solved = solved.clone();
+        let ownership_by_anchor = ownership_by_anchor.clone();
+        let mp_client_id = mp_client_id.clone();
         use_effect_with(
             (
                 using_wgpu,
                 board_ready_value,
-                image_size_value,
+                puzzle_dims_value,
                 image_revision_value,
                 grid,
                 settings_value.clone(),
@@ -2721,7 +3826,7 @@ fn app() -> Html {
             move |(
                 using_wgpu,
                 board_ready_value,
-                image_size_value,
+                puzzle_dims_value,
                 _image_revision_value,
                 grid,
                 settings_value,
@@ -2738,7 +3843,7 @@ fn app() -> Html {
                 }
                 let build_inputs = if *using_wgpu && *board_ready_value {
                     if let (Some((width, height)), Some(image), Some(canvas)) = (
-                        *image_size_value,
+                        *puzzle_dims_value,
                         (*image_element).clone(),
                         canvas_ref.cast::<HtmlCanvasElement>(),
                     ) {
@@ -2872,43 +3977,46 @@ fn app() -> Html {
                                     }
                                     renderer.render();
                                 } else {
-                                    let positions_snapshot = (*positions).clone();
-                                    let rotations_snapshot = (*rotations).clone();
-                                    let flips_snapshot = (*flips).clone();
-                                    let z_order_snapshot = (*z_order).clone();
-                                    let connections_snapshot = (*connections).clone();
+                                    let snapshot = local_snapshot.borrow();
+                                    let positions_snapshot = snapshot.positions.clone();
+                                    let rotations_snapshot = snapshot.rotations.clone();
+                                    let flips_snapshot = snapshot.flips.clone();
+                                    let connections_snapshot = snapshot.connections.clone();
+                                    let z_order_snapshot = if snapshot.z_order.len() == total {
+                                        snapshot.z_order.clone()
+                                    } else {
+                                        (*z_order).clone()
+                                    };
                                     let hovered_snapshot = *hovered_id;
                                     let dragging_snapshot = (*dragging_members).clone();
-                                    let highlight_members = if (*active_id).is_some()
+                                    let drag_visual = drag_visual_from_state(&drag_state.borrow());
+                                    let mut drag_members_override: Option<Vec<usize>> = None;
+                                    let mut drag_origin = None;
+                                    let mut drag_dir = 0.0;
+                                    if let Some((members, origin, dir)) = drag_visual {
+                                        drag_members_override = Some(members);
+                                        drag_origin = Some(origin);
+                                        drag_dir = dir;
+                                    }
+                                    let highlight_members = if let Some(members) =
+                                        drag_members_override.as_ref()
+                                    {
+                                        Some(members.as_slice())
+                                    } else if (*active_id).is_some()
                                         && !dragging_snapshot.is_empty()
                                     {
                                         Some(dragging_snapshot.as_slice())
                                     } else {
                                         None
                                     };
-                    let drag_dir = if highlight_members.is_some() {
-                        let right_click = drag_state
-                            .borrow()
-                            .as_ref()
-                            .map(|drag| drag.right_click)
-                            .unwrap_or(false);
-                        if right_click { -1.0 } else { 1.0 }
-                    } else {
-                        0.0
-                    };
-                    let drag_origin = if highlight_members.is_some() {
-                        drag_state
-                            .borrow()
-                            .as_ref()
-                            .map(|drag| (drag.cursor_x, drag.cursor_y))
-                    } else {
-                        None
-                    };
-                    let show_debug_snapshot = *show_debug;
-                    let has_state = positions_snapshot.len() == total
-                        && rotations_snapshot.len() == total
-                        && flips_snapshot.len() == total
-                        && z_order_snapshot.len() == total
+                                    let ownership_by_anchor_value =
+                                        (*ownership_by_anchor).clone();
+                                    let mp_client_id_value = *mp_client_id;
+                                    let show_debug_snapshot = *show_debug;
+                                    let has_state = positions_snapshot.len() == total
+                                        && rotations_snapshot.len() == total
+                                        && flips_snapshot.len() == total
+                                        && z_order_snapshot.len() == total
                                         && connections_snapshot.len() == total;
                                     if has_state {
                                         let instances = build_wgpu_instances(
@@ -2927,6 +4035,8 @@ fn app() -> Html {
                                             highlight_members,
                                             drag_origin,
                                             drag_dir,
+                                            &ownership_by_anchor_value,
+                                            mp_client_id_value,
                                         );
                                         renderer.update_instances(instances);
                                     }
@@ -2958,62 +4068,41 @@ fn app() -> Html {
         let ui_credit_hovered = ui_credit_hovered.clone();
         let mask_atlas = mask_atlas.clone();
         let drag_state = drag_state.clone();
-        let wgpu_settings_value = wgpu_settings_value.clone();
-        use_effect_with(
-            (
-                using_wgpu,
-                image_size_value,
-                grid,
-                workspace_scale_value,
-                image_max_dim,
-                theme_mode_value,
-                solved_value,
-                menu_visible_value,
-                (
-                    (*positions).clone(),
-                    (*rotations).clone(),
-                    (*flips).clone(),
-                    (*z_order).clone(),
-                    (*connections).clone(),
-                    hover_deps.clone(),
-                ),
-                mask_atlas_revision_value,
-                wgpu_settings_value,
-            ),
-            move |(
-                using_wgpu,
-                image_size_value,
-                grid,
-                workspace_scale_value,
-                image_max_dim,
-                theme_mode_value,
-                solved_value,
-                menu_visible_value,
-                (
-                    positions_value,
-                    rotations_value,
-                    flips_value,
-                    z_order_value,
-                    connections_value,
-                    hover_deps,
-                ),
-                _mask_atlas_revision_value,
-                wgpu_settings_value,
-            )| {
+        let local_snapshot = local_snapshot.clone();
+        let wgpu_render_deps = WgpuRenderDeps {
+            using_wgpu,
+            puzzle_dims: puzzle_dims_value,
+            grid,
+            workspace_scale: workspace_scale_value,
+            image_max_dim,
+            theme_mode: theme_mode_value,
+            solved: solved_value,
+            menu_visible: menu_visible_value,
+            ui_revision: ui_revision_value,
+            z_order: (*z_order).clone(),
+            hover_deps: hover_deps.clone(),
+            mask_atlas_revision: mask_atlas_revision_value,
+            wgpu_settings: wgpu_settings_value.clone(),
+            ownership_by_anchor: ownership_by_anchor_value.clone(),
+            mp_client_id: mp_client_id_value,
+        };
+        use_effect_with(wgpu_render_deps, move |deps| {
                 let cleanup: fn() = || ();
-                if !*using_wgpu {
+                let _ = deps.ui_revision;
+                let _ = deps.mask_atlas_revision;
+                if !deps.using_wgpu {
                     *ui_credit_hitbox.borrow_mut() = None;
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
                     return cleanup;
                 }
-                let Some((width, height)) = *image_size_value else {
+                let Some((width, height)) = deps.puzzle_dims else {
                     return cleanup;
                 };
 
                 let prefers_dark = prefers_dark_mode();
-                let is_dark_theme = match theme_mode_value {
+                let is_dark_theme = match deps.theme_mode {
                     ThemeMode::Dark => true,
                     ThemeMode::Light => false,
                     ThemeMode::System => prefers_dark,
@@ -3023,20 +4112,30 @@ fn app() -> Html {
                 let layout = compute_workspace_layout(
                     width_f,
                     height_f,
-                    *workspace_scale_value,
-                    *image_max_dim as f32,
+                    deps.workspace_scale,
+                    deps.image_max_dim as f32,
                 );
-                let cols = grid.cols as usize;
-                let rows = grid.rows as usize;
-                let piece_width = width as f32 / grid.cols as f32;
-                let piece_height = height as f32 / grid.rows as f32;
+                let cols = deps.grid.cols as usize;
+                let rows = deps.grid.rows as usize;
+                let piece_width = width as f32 / deps.grid.cols as f32;
+                let piece_height = height as f32 / deps.grid.rows as f32;
                 let total = cols * rows;
+                let snapshot = local_snapshot.borrow();
+                let positions_value = snapshot.positions.clone();
+                let rotations_value = snapshot.rotations.clone();
+                let flips_value = snapshot.flips.clone();
+                let connections_value = snapshot.connections.clone();
+                let z_order_value = if snapshot.z_order.len() == total {
+                    snapshot.z_order.clone()
+                } else {
+                    deps.z_order.clone()
+                };
                 let HoverDeps {
                     hovered_id,
                     active_id,
                     dragging_members,
                     show_debug,
-                } = hover_deps.clone();
+                } = deps.hover_deps.clone();
                 let has_state = positions_value.len() == total
                     && rotations_value.len() == total
                     && flips_value.len() == total
@@ -3050,30 +4149,25 @@ fn app() -> Html {
                     pending_instances.borrow_mut().take();
                     return cleanup;
                 };
-                let highlight_members = if active_id.is_some() && !dragging_members.is_empty() {
+                let drag_visual = drag_visual_from_state(&drag_state.borrow());
+                let mut drag_members_override: Option<Vec<usize>> = None;
+                let mut drag_origin = None;
+                let mut drag_dir = 0.0;
+                if let Some((members, origin, dir)) = drag_visual {
+                    drag_members_override = Some(members);
+                    drag_origin = Some(origin);
+                    drag_dir = dir;
+                }
+                let ownership_by_anchor_value = &deps.ownership_by_anchor;
+                let mp_client_id_value = deps.mp_client_id;
+                let highlight_members = if let Some(members) = drag_members_override.as_ref() {
+                    Some(members.as_slice())
+                } else if active_id.is_some() && !dragging_members.is_empty() {
                     Some(dragging_members.as_slice())
                 } else {
                     None
                 };
-                let drag_dir = if highlight_members.is_some() {
-                    let right_click = drag_state
-                        .borrow()
-                        .as_ref()
-                        .map(|drag| drag.right_click)
-                        .unwrap_or(false);
-                    if right_click { -1.0 } else { 1.0 }
-                } else {
-                    0.0
-                };
-                let drag_origin = if highlight_members.is_some() {
-                    drag_state
-                        .borrow()
-                        .as_ref()
-                        .map(|drag| (drag.cursor_x, drag.cursor_y))
-                } else {
-                    None
-                };
-                let show_menu = *menu_visible_value;
+                let show_menu = deps.menu_visible;
                 let instances = if show_menu {
                     InstanceSet {
                         instances: Vec::new(),
@@ -3096,6 +4190,8 @@ fn app() -> Html {
                         highlight_members,
                         drag_origin,
                         drag_dir,
+                        ownership_by_anchor_value,
+                        mp_client_id_value,
                     )
                 };
                 let (connections_label, border_connections_label) = if connections_value.len() == total {
@@ -3115,7 +4211,7 @@ fn app() -> Html {
                     width_f,
                     height_f,
                     UI_TITLE_TEXT,
-                    *solved_value,
+                    deps.solved,
                     &connections_label,
                     &border_connections_label,
                     show_menu,
@@ -3132,10 +4228,10 @@ fn app() -> Html {
                 let mut renderer_ref = wgpu_renderer.borrow_mut();
                 if let Some(renderer) = renderer_ref.as_mut() {
                     renderer.set_emboss_enabled(true);
-                    renderer.set_edge_aa(wgpu_settings_value.edge_aa);
-                    renderer.set_show_fps(wgpu_settings_value.show_fps);
+                    renderer.set_edge_aa(deps.wgpu_settings.edge_aa);
+                    renderer.set_show_fps(deps.wgpu_settings.show_fps);
                     renderer.set_show_frame(!show_menu);
-                    renderer.set_solved(*solved_value);
+                    renderer.set_solved(deps.solved);
                     renderer.set_ui_texts(&ui_specs);
                     renderer.update_instances(instances);
                     renderer.render();
@@ -3145,29 +4241,25 @@ fn app() -> Html {
                     *pending_ui.borrow_mut() = Some(ui_specs);
                 }
                 cleanup
-            },
-        );
+            });
     }
 
     {
-        let image_size = image_size.clone();
-        let grid_index = grid_index.clone();
-        let grid_choices = grid_choices.clone();
-        let puzzle_art = puzzle_art;
+        let puzzle_info = puzzle_info_store.clone();
         let puzzle_state = puzzle_state.clone();
         let active_id = active_id.clone();
         let animating_members = animating_members.clone();
         let pending_hash_clear = pending_hash_clear.clone();
         use_effect_with(save_revision_value, move |save_revision_value| {
+            let cleanup = || ();
+            if multiplayer_active {
+                return cleanup;
+            }
             let should_save =
                 *save_revision_value > 0 && active_id.is_none() && animating_members.is_empty();
             if should_save {
-                if let Some((width, height)) = *image_size {
-                    let grid = grid_choices
-                        .get(*grid_index)
-                        .copied()
-                        .unwrap_or(FALLBACK_GRID);
-                    let total = (grid.cols * grid.rows) as usize;
+                if let Some(info) = puzzle_info.get() {
+                    let total = (info.cols * info.rows) as usize;
                     let puzzle_snapshot = (*puzzle_state).clone();
                     let state_ok = puzzle_snapshot.pieces.len() == total
                         && puzzle_snapshot.groups.len() == total
@@ -3175,16 +4267,16 @@ fn app() -> Html {
                         && puzzle_snapshot.flips.len() == total;
                     if state_ok {
                         let instance = PuzzleInstance {
-                            label: puzzle_art.label.to_string(),
-                            image_src: puzzle_art.src.to_string(),
-                            rows: grid.rows,
-                            cols: grid.cols,
-                            shape_seed: PUZZLE_SEED,
+                            label: info.label.clone(),
+                            image_src: info.image_src.clone(),
+                            rows: info.rows,
+                            cols: info.cols,
+                            shape_seed: info.shape_seed,
                         };
                         let state = SavedGame {
                             version: STORAGE_VERSION,
-                            image_width: width,
-                            image_height: height,
+                            image_width: info.image_width,
+                            image_height: info.image_height,
                             instance,
                             state: puzzle_snapshot,
                         };
@@ -3195,6 +4287,16 @@ fn app() -> Html {
                         }
                     }
                 }
+            }
+            cleanup
+        });
+    }
+
+    {
+        let multiplayer_config = multiplayer_config_value.clone();
+        use_effect_with(multiplayer_config, move |config| {
+            if let Some(config) = config.as_ref() {
+                save_room_session(&config.room_id, &config.ws_base);
             }
             || ()
         });
@@ -3346,15 +4448,19 @@ fn app() -> Html {
     }
 
     {
-        let image_size = image_size.clone();
+        let puzzle_info = puzzle_info_store.clone();
+        let puzzle_art_index = puzzle_art_index.clone();
         let image_element = image_element.clone();
         let image_revision = image_revision.clone();
         use_effect_with(
-            (image_max_dim, image_render_scale, puzzle_src),
-            move |(image_max_dim, image_render_scale, puzzle_src)| {
+            (image_max_dim, image_render_scale, puzzle_src, multiplayer_active),
+            move |(image_max_dim, image_render_scale, puzzle_src, multiplayer_active)| {
                 let img = HtmlImageElement::new().expect("create image element");
                 let img_clone = img.clone();
                 let logical_max_dim = *image_max_dim;
+                let multiplayer_active = *multiplayer_active;
+                let puzzle_info = puzzle_info.clone();
+                let puzzle_art_index = puzzle_art_index.clone();
                 let render_scale = image_render_scale
                     .clamp(WGPU_RENDER_SCALE_MIN, WGPU_RENDER_SCALE_MAX);
                 let source_cap = (IMAGE_MAX_DIMENSION_MAX as f32 * WGPU_RENDER_SCALE_MAX)
@@ -3376,6 +4482,10 @@ fn app() -> Html {
                     };
                     let logical_w = ((width as f64) * logical_scale).round().max(1.0) as u32;
                     let logical_h = ((height as f64) * logical_scale).round().max(1.0) as u32;
+                    if !multiplayer_active {
+                        let game = LocalGame::new(puzzle_info.clone(), puzzle_art_index.clone());
+                        game.on_image_loaded((logical_w, logical_h));
+                    }
                     let source_scale = if max_axis > source_max_dim {
                         (source_max_dim as f64) / (max_axis as f64)
                     } else {
@@ -3384,7 +4494,6 @@ fn app() -> Html {
                     let target_w = ((width as f64) * source_scale).round().max(1.0) as u32;
                     let target_h = ((height as f64) * source_scale).round().max(1.0) as u32;
                     if target_w == width && target_h == height {
-                        image_size.set(Some((logical_w, logical_h)));
                         image_element.set(Some(img_clone.clone()));
                         let next = (*image_revision).wrapping_add(1);
                         image_revision.set(next);
@@ -3393,7 +4502,6 @@ fn app() -> Html {
                     let document = match web_sys::window().and_then(|window| window.document()) {
                         Some(doc) => doc,
                         None => {
-                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
                             let next = (*image_revision).wrapping_add(1);
                             image_revision.set(next);
@@ -3407,7 +4515,6 @@ fn app() -> Html {
                     {
                         Some(canvas) => canvas,
                         None => {
-                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
                             let next = (*image_revision).wrapping_add(1);
                             image_revision.set(next);
@@ -3424,7 +4531,6 @@ fn app() -> Html {
                     {
                         Some(ctx) => ctx,
                         None => {
-                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
                             let next = (*image_revision).wrapping_add(1);
                             image_revision.set(next);
@@ -3442,7 +4548,6 @@ fn app() -> Html {
                         )
                         .is_err()
                     {
-                        image_size.set(Some((logical_w, logical_h)));
                         image_element.set(Some(img_clone.clone()));
                         let next = (*image_revision).wrapping_add(1);
                         image_revision.set(next);
@@ -3451,7 +4556,6 @@ fn app() -> Html {
                     let data_url = match canvas.to_data_url() {
                         Ok(data_url) => data_url,
                         Err(_) => {
-                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
                             let next = (*image_revision).wrapping_add(1);
                             image_revision.set(next);
@@ -3461,7 +4565,6 @@ fn app() -> Html {
                     let scaled = match HtmlImageElement::new() {
                         Ok(image) => image,
                         Err(_) => {
-                            image_size.set(Some((logical_w, logical_h)));
                             image_element.set(Some(img_clone.clone()));
                             let next = (*image_revision).wrapping_add(1);
                             image_revision.set(next);
@@ -3469,12 +4572,9 @@ fn app() -> Html {
                         }
                     };
                     let scaled_clone = scaled.clone();
-                    let image_size_scaled = image_size.clone();
                     let image_element_scaled = image_element.clone();
                     let image_revision_scaled = image_revision.clone();
-                    let logical_size = (logical_w, logical_h);
                     let onload_scaled = Closure::<dyn FnMut()>::wrap(Box::new(move || {
-                        image_size_scaled.set(Some(logical_size));
                         image_element_scaled.set(Some(scaled_clone.clone()));
                         let next = (*image_revision_scaled).wrapping_add(1);
                         image_revision_scaled.set(next);
@@ -3492,7 +4592,7 @@ fn app() -> Html {
     }
 
     let (content, on_scramble, on_solve, on_solve_rotation, on_unflip, scramble_disabled) =
-        if let Some((width, height)) = *image_size {
+        if let Some((width, height)) = puzzle_dims_value {
         let width_f = width as f32;
         let height_f = height as f32;
         let layout = compute_workspace_layout(
@@ -3533,28 +4633,11 @@ fn app() -> Html {
         let piece_width = width_f / grid.cols as f32;
         let piece_height = height_f / grid.rows as f32;
         let max_depth = piece_width.max(piece_height) * depth_cap;
-        let pieces = build_pieces(grid.rows, grid.cols);
-
-        let (horizontal, vertical) =
-            build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &settings_value);
-        let (horizontal_waves, vertical_waves) = build_line_waves(
-            grid.rows,
-            grid.cols,
-            PUZZLE_SEED,
-            piece_width,
-            piece_height,
-            settings_value.line_bend_ratio,
-        );
-        let warp_field = WarpField {
-            width: width_f,
-            height: height_f,
-            horizontal: &horizontal_waves,
-            vertical: &vertical_waves,
-        };
-        let max_bend = horizontal_waves
-            .iter()
-            .chain(vertical_waves.iter())
-            .fold(0.0_f32, |acc, wave| acc.max(wave.amplitude.abs()));
+        let bend_ratio =
+            settings_value
+                .line_bend_ratio
+                .clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
+        let max_bend = piece_width.max(piece_height) * bend_ratio;
         let mask_pad = (max_depth + max_bend).ceil();
         let base_w = piece_width + mask_pad * 2.0;
         let base_h = piece_height + mask_pad * 2.0;
@@ -3587,29 +4670,51 @@ fn app() -> Html {
         if center_max_y < center_min_y {
             center_max_y = center_min_y;
         }
-        let piece_shapes: Vec<(Piece, PiecePaths)> = pieces
-            .iter()
-            .map(|piece| {
-                let paths = build_piece_path(
-                    piece,
-                    piece_width,
-                    piece_height,
-                    &horizontal,
-                    &vertical,
-                    &warp_field,
-                    depth_cap,
-                    curve_detail,
-                );
-                (*piece, paths)
-            })
-            .collect();
+        let piece_shapes: Vec<(Piece, PiecePaths)> = if using_wgpu {
+            Vec::new()
+        } else {
+            let pieces = build_pieces(grid.rows, grid.cols);
+            let (horizontal, vertical) =
+                build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &settings_value);
+            let (horizontal_waves, vertical_waves) = build_line_waves(
+                grid.rows,
+                grid.cols,
+                PUZZLE_SEED,
+                piece_width,
+                piece_height,
+                settings_value.line_bend_ratio,
+            );
+            let warp_field = WarpField {
+                width: width_f,
+                height: height_f,
+                horizontal: &horizontal_waves,
+                vertical: &vertical_waves,
+            };
+            pieces
+                .iter()
+                .map(|piece| {
+                    let paths = build_piece_path(
+                        piece,
+                        piece_width,
+                        piece_height,
+                        &horizontal,
+                        &vertical,
+                        &warp_field,
+                        depth_cap,
+                        curve_detail,
+                    );
+                    (*piece, paths)
+                })
+                .collect()
+        };
 
         let cols = grid.cols as usize;
         let rows = grid.rows as usize;
-        let positions_value = (*positions).clone();
-        let rotations_value = (*rotations).clone();
-        let flips_value = (*flips).clone();
-        let connections_value = (*connections).clone();
+        let total = cols * rows;
+        let positions_value = local_snapshot_value.positions.clone();
+        let rotations_value = local_snapshot_value.rotations.clone();
+        let flips_value = local_snapshot_value.flips.clone();
+        let connections_value = local_snapshot_value.connections.clone();
         let hovered_group = if active_id_value.is_some() && !dragging_members_value.is_empty() {
             dragging_members_value.clone()
         } else if let Some(id) = hovered_id_value {
@@ -3621,19 +4726,30 @@ fn app() -> Html {
         } else {
             Vec::new()
         };
-        let mut hovered_mask = vec![false; (grid.cols * grid.rows) as usize];
+        let mut hovered_mask = vec![false; total];
         for id in &hovered_group {
             if *id < hovered_mask.len() {
                 hovered_mask[*id] = true;
             }
         }
-        let mut dragging_mask = vec![false; (grid.cols * grid.rows) as usize];
+        let mut owned_mask = vec![false; total];
+        if !ownership_by_anchor_value.is_empty() {
+            let anchor_of = anchor_of_from_connections(&connections_value, cols, rows);
+            for (id, anchor) in anchor_of.iter().enumerate() {
+                if let Some(owner_id) = ownership_by_anchor_value.get(&(*anchor as u32)) {
+                    if Some(*owner_id) != mp_client_id_value {
+                        owned_mask[id] = true;
+                    }
+                }
+            }
+        }
+        let mut dragging_mask = vec![false; total];
         for id in &dragging_members_value {
             if *id < dragging_mask.len() {
                 dragging_mask[*id] = true;
             }
         }
-        let mut animating_mask = vec![false; (grid.cols * grid.rows) as usize];
+        let mut animating_mask = vec![false; total];
         for id in &animating_members_value {
             if *id < animating_mask.len() {
                 animating_mask[*id] = true;
@@ -3670,12 +4786,10 @@ fn app() -> Html {
         };
         let z_order_value = (*z_order).clone();
         let drag_move_common: Rc<dyn Fn(f32, f32) -> bool> = {
-            let positions = positions.clone();
-            let rotations = rotations.clone();
+            let local_snapshot = local_snapshot.clone();
+            let bump_ui_revision = bump_ui_revision.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
-            let flips = flips.clone();
-            let connections = connections.clone();
             let group_anchor = group_anchor.clone();
             let group_pos = group_pos.clone();
             let group_rot = group_rot.clone();
@@ -3686,6 +4800,9 @@ fn app() -> Html {
             let mask_atlas = mask_atlas.clone();
             let z_order = z_order.clone();
             let show_debug = show_debug.clone();
+            let ownership_by_anchor = ownership_by_anchor.clone();
+            let mp_client_id = mp_client_id.clone();
+            let send_client_msg = send_client_msg.clone();
             let using_wgpu = using_wgpu;
             let wgpu_edge_aa = wgpu_edge_aa;
             Rc::new(move |x: f32, y: f32| {
@@ -3707,9 +4824,16 @@ fn app() -> Html {
                         let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
                             return;
                         };
-                        let flips_snapshot = &*flips;
-                        let z_order_snapshot = &*z_order;
-                        let connections_snapshot = &*connections;
+                        let ownership_by_anchor_value = (*ownership_by_anchor).clone();
+                        let mp_client_id_value = *mp_client_id;
+                        let snapshot = local_snapshot.borrow();
+                        let flips_snapshot = snapshot.flips.as_slice();
+                        let connections_snapshot = snapshot.connections.as_slice();
+                        let z_order_snapshot = if snapshot.z_order.len() == cols * rows {
+                            snapshot.z_order.as_slice()
+                        } else {
+                            &*z_order
+                        };
                         let drag_dir = if drag.right_click { -1.0 } else { 1.0 };
                         let drag_origin = Some((drag.cursor_x, drag.cursor_y));
                         let instances = build_wgpu_instances(
@@ -3728,6 +4852,8 @@ fn app() -> Html {
                             Some(drag.members.as_slice()),
                             drag_origin,
                             drag_dir,
+                            &ownership_by_anchor_value,
+                            mp_client_id_value,
                         );
                         let mut renderer_ref = wgpu_renderer.borrow_mut();
                         if let Some(renderer) = renderer_ref.as_mut() {
@@ -3740,8 +4866,13 @@ fn app() -> Html {
                     if drag.rotate_mode && rotation_enabled_value {
                         let current_angle = (y - drag.pivot_y).atan2(x - drag.pivot_x);
                         let delta_deg = (current_angle - drag.start_angle).to_degrees();
-                        let flips_snapshot = &*flips;
                         let anchor_id = drag.anchor_id;
+                        let flipped = local_snapshot
+                            .borrow()
+                            .flips
+                            .get(anchor_id)
+                            .copied()
+                            .unwrap_or(false);
                         if using_wgpu {
                             {
                                 let mut group_pos_ref = group_pos_live.borrow_mut();
@@ -3764,8 +4895,6 @@ fn app() -> Html {
                                         rx - piece_width * 0.5,
                                         ry - piece_height * 0.5,
                                     );
-                                    let flipped =
-                                        flips_snapshot.get(anchor_id).copied().unwrap_or(false);
                                     let signed_delta = if flipped { -delta_deg } else { delta_deg };
                                     group_rot_ref[anchor_id] =
                                         normalize_angle(drag.anchor_rot + signed_delta);
@@ -3807,7 +4936,6 @@ fn app() -> Html {
                                 rx - piece_width * 0.5,
                                 ry - piece_height * 0.5,
                             );
-                            let flipped = flips_snapshot.get(anchor_id).copied().unwrap_or(false);
                             let signed_delta = if flipped { -delta_deg } else { delta_deg };
                             next_group_rot[anchor_id] =
                                 normalize_angle(drag.anchor_rot + signed_delta);
@@ -3821,8 +4949,22 @@ fn app() -> Html {
                                     piece_width,
                                     piece_height,
                                 );
-                                positions.set(derived_positions);
-                                rotations.set(derived_rotations);
+                                log_state_update(
+                                    "positions",
+                                    derived_positions.len(),
+                                    "drag_rotate",
+                                );
+                                log_state_update(
+                                    "rotations",
+                                    derived_rotations.len(),
+                                    "drag_rotate",
+                                );
+                                {
+                                    let mut snapshot = local_snapshot.borrow_mut();
+                                    snapshot.positions = derived_positions;
+                                    snapshot.rotations = derived_rotations;
+                                }
+                                bump_ui_revision();
                             }
                             group_pos.set(next_group_pos);
                             group_rot.set(next_group_rot);
@@ -3897,6 +5039,11 @@ fn app() -> Html {
                                 if anchor_id < group_pos_ref.len() {
                                     group_pos_ref[anchor_id] =
                                         (drag.anchor_pos.0 + dx, drag.anchor_pos.1 + dy);
+                                    let anchor_pos = group_pos_ref[anchor_id];
+                                    send_client_msg(ClientMsg::Move {
+                                        anchor_id: anchor_id as u32,
+                                        pos: anchor_pos,
+                                    });
                                     let mut positions_ref = positions_live.borrow_mut();
                                     let mut rotations_ref = rotations_live.borrow_mut();
                                     update_group_members_state(
@@ -3922,6 +5069,11 @@ fn app() -> Html {
                         if anchor_id < next_group_pos.len() {
                             next_group_pos[anchor_id] =
                                 (drag.anchor_pos.0 + dx, drag.anchor_pos.1 + dy);
+                            let anchor_pos = next_group_pos[anchor_id];
+                            send_client_msg(ClientMsg::Move {
+                                anchor_id: anchor_id as u32,
+                                pos: anchor_pos,
+                            });
                             let anchor_of = &*group_anchor;
                             if !anchor_of.is_empty() {
                                 let group_rot_snapshot = (*group_rot).clone();
@@ -3933,8 +5085,22 @@ fn app() -> Html {
                                     piece_width,
                                     piece_height,
                                 );
-                                positions.set(derived_positions);
-                                rotations.set(derived_rotations);
+                                log_state_update(
+                                    "positions",
+                                    derived_positions.len(),
+                                    "drag_move",
+                                );
+                                log_state_update(
+                                    "rotations",
+                                    derived_rotations.len(),
+                                    "drag_move",
+                                );
+                                {
+                                    let mut snapshot = local_snapshot.borrow_mut();
+                                    snapshot.positions = derived_positions;
+                                    snapshot.rotations = derived_rotations;
+                                }
+                                bump_ui_revision();
                             }
                             group_pos.set(next_group_pos);
                         }
@@ -4044,18 +5210,16 @@ fn app() -> Html {
             }
         };
         let drag_release_common: Rc<dyn Fn(Option<(f32, f32)>) -> bool> = {
-            let positions = positions.clone();
-            let rotations = rotations.clone();
+            let local_snapshot = local_snapshot.clone();
+            let bump_ui_revision = bump_ui_revision.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
-            let flips = flips.clone();
             let apply_puzzle_state = apply_puzzle_state.clone();
             let puzzle_state = puzzle_state.clone();
             let active_id = active_id.clone();
             let drag_state = drag_state.clone();
             let drag_pending = drag_pending.clone();
             let drag_frame = drag_frame.clone();
-            let connections = connections.clone();
             let dragging_members = dragging_members.clone();
             let animating_members = animating_members.clone();
             let rotation_anim = rotation_anim.clone();
@@ -4069,6 +5233,7 @@ fn app() -> Html {
             let scramble_nonce = scramble_nonce.clone();
             let solved = solved.clone();
             let save_revision = save_revision.clone();
+            let send_client_msg = send_client_msg.clone();
             let using_wgpu = using_wgpu;
             Rc::new(move |coords: Option<(f32, f32)>| {
                 let drag = drag_state.borrow().clone();
@@ -4081,10 +5246,13 @@ fn app() -> Html {
                             rotations_live.borrow().clone(),
                         )
                     } else {
-                        ((*positions).clone(), (*rotations).clone())
+                        let snapshot = local_snapshot.borrow();
+                        (snapshot.positions.clone(), snapshot.rotations.clone())
                     };
-                    let mut next_flips = (*flips).clone();
-                    let mut next_connections = (*connections).clone();
+                    let (mut next_flips, mut next_connections) = {
+                        let snapshot = local_snapshot.borrow();
+                        (snapshot.flips.clone(), snapshot.connections.clone())
+                    };
                     let start_positions_all = next.clone();
                     let start_rotations_all = next_rotations.clone();
                     let cols = grid.cols as usize;
@@ -4094,10 +5262,8 @@ fn app() -> Html {
                     let start_group_animation = {
                         let apply_puzzle_state = apply_puzzle_state.clone();
                         let scramble_nonce = scramble_nonce.clone();
-                        let positions = positions.clone();
-                        let rotations = rotations.clone();
-                        let flips = flips.clone();
-                        let connections = connections.clone();
+                        let local_snapshot = local_snapshot.clone();
+                        let bump_ui_revision = bump_ui_revision.clone();
                         let group_anchor = group_anchor.clone();
                         let group_pos = group_pos.clone();
                         let group_rot = group_rot.clone();
@@ -4131,8 +5297,23 @@ fn app() -> Html {
                             let connections_override = connections_override.map(Rc::new);
                             if !animations_enabled_value {
                                 rotation_queue.borrow_mut().clear();
-                                let mut next_positions = (*positions).clone();
-                                let mut next_rotations = (*rotations).clone();
+                                let (mut next_positions, mut next_rotations, mut connections_snapshot, flips_snapshot) =
+                                    {
+                                        let snapshot = local_snapshot.borrow();
+                                        let next_positions = snapshot.positions.clone();
+                                        let next_rotations = snapshot.rotations.clone();
+                                        let connections_snapshot = connections_override
+                                            .as_ref()
+                                            .map(|snapshot| (**snapshot).clone())
+                                            .unwrap_or_else(|| snapshot.connections.clone());
+                                        let flips_snapshot = snapshot.flips.clone();
+                                        (
+                                            next_positions,
+                                            next_rotations,
+                                            connections_snapshot,
+                                            flips_snapshot,
+                                        )
+                                    };
                                 match &anim.kind {
                                     AnimationKind::Pivot {
                                         pivot_x,
@@ -4208,11 +5389,6 @@ fn app() -> Html {
                                     }
                                 }
                                 let should_snap = matches!(&anim.kind, AnimationKind::Pivot { .. });
-                                let mut connections_snapshot = connections_override
-                                    .as_ref()
-                                    .map(|snapshot| (**snapshot).clone())
-                                    .unwrap_or_else(|| (*connections).clone());
-                                let flips_snapshot = (*flips).clone();
                                 if should_snap {
                                     let complete_snap = !*solved;
                                     let snap_distance = piece_width.min(piece_height)
@@ -4299,10 +5475,8 @@ fn app() -> Html {
                             *rotation_anim.borrow_mut() = Some(anim);
                             animating_members.set(members);
                             rotation_anim_handle.borrow_mut().take();
-                            let positions = positions.clone();
-                            let rotations = rotations.clone();
-                            let flips = flips.clone();
-                            let connections = connections.clone();
+                            let local_snapshot = local_snapshot.clone();
+                            let bump_ui_revision = bump_ui_revision.clone();
                             let solved = solved.clone();
                             let rotation_anim = rotation_anim.clone();
                             let rotation_anim_handle = rotation_anim_handle.clone();
@@ -4327,8 +5501,10 @@ fn app() -> Html {
                                     t = 1.0;
                                 }
                                 let eased = t * t * (3.0 - 2.0 * t);
-                                let mut next_positions = (*positions).clone();
-                                let mut next_rotations = (*rotations).clone();
+                                let (mut next_positions, mut next_rotations) = {
+                                    let snapshot = local_snapshot.borrow();
+                                    (snapshot.positions.clone(), snapshot.rotations.clone())
+                                };
                                 match &anim.kind {
                                     AnimationKind::Pivot {
                                         pivot_x,
@@ -4410,8 +5586,22 @@ fn app() -> Html {
                                         }
                                     }
                                 }
-                                positions.set(next_positions.clone());
-                                rotations.set(next_rotations.clone());
+                                log_state_update(
+                                    "positions",
+                                    next_positions.len(),
+                                    "animation_step",
+                                );
+                                {
+                                    let mut snapshot = local_snapshot.borrow_mut();
+                                    snapshot.positions = next_positions.clone();
+                                    snapshot.rotations = next_rotations.clone();
+                                }
+                                bump_ui_revision();
+                                log_state_update(
+                                    "rotations",
+                                    next_rotations.len(),
+                                    "animation_step",
+                                );
                                 let anchor_of_snapshot = (*group_anchor).clone();
                                 if !anchor_of_snapshot.is_empty() {
                                     let (next_group_pos, next_group_rot) =
@@ -4478,11 +5668,15 @@ fn app() -> Html {
                                         matches!(&anim.kind, AnimationKind::Pivot { .. });
                                     let mut snapped_positions = next_positions.clone();
                                     let mut snapped_rotations = next_rotations.clone();
-                                    let mut connections_snapshot = connections_override
-                                        .as_ref()
-                                        .map(|snapshot| (**snapshot).clone())
-                                        .unwrap_or_else(|| (*connections).clone());
-                                    let flips_snapshot = (*flips).clone();
+                                    let (mut connections_snapshot, flips_snapshot) = {
+                                        let snapshot = local_snapshot.borrow();
+                                        let connections_snapshot = connections_override
+                                            .as_ref()
+                                            .map(|snapshot| (**snapshot).clone())
+                                            .unwrap_or_else(|| snapshot.connections.clone());
+                                        let flips_snapshot = snapshot.flips.clone();
+                                        (connections_snapshot, flips_snapshot)
+                                    };
                                     if should_snap {
                                         let complete_snap = !*solved;
                                         let snap_distance = piece_width.min(piece_height)
@@ -4581,6 +5775,10 @@ fn app() -> Html {
                                 if let Some(flip) = next_flips.get_mut(click_id) {
                                     *flip = !*flip;
                                 }
+                                send_client_msg(ClientMsg::Flip {
+                                    piece_id: click_id as u32,
+                                    flipped: !was_flipped,
+                                });
                                 clear_piece_connections(&mut next_connections, click_id, cols, rows);
                                 let order_snapshot = (*z_order).clone();
                                 let order_opt = if order_snapshot.len() == cols * rows {
@@ -4641,6 +5839,10 @@ fn app() -> Html {
                                 if let Some(flip) = next_flips.get_mut(click_id) {
                                     *flip = false;
                                 }
+                                send_client_msg(ClientMsg::Flip {
+                                    piece_id: click_id as u32,
+                                    flipped: false,
+                                });
                                 clear_piece_connections(&mut next_connections, click_id, cols, rows);
                                 let order_snapshot = (*z_order).clone();
                                 let order_opt = if order_snapshot.len() == cols * rows {
@@ -4778,6 +5980,33 @@ fn app() -> Html {
                                     let rot = next_rotations.get(*member).copied().unwrap_or(0.0);
                                     start_rotations.push(rot);
                                 }
+                                let anchor_id = if drag.anchor_id < next.len() {
+                                    drag.anchor_id
+                                } else {
+                                    *members.first().unwrap_or(&drag.primary_id)
+                                };
+                                if anchor_id < next.len() && anchor_id < next_rotations.len() {
+                                    let start_pos = next[anchor_id];
+                                    let start_rot = next_rotations[anchor_id];
+                                    let center = (
+                                        start_pos.0 + piece_width * 0.5,
+                                        start_pos.1 + piece_height * 0.5,
+                                    );
+                                    let (rx, ry) = rotate_point(
+                                        center.0,
+                                        center.1,
+                                        pivot_x,
+                                        pivot_y,
+                                        delta,
+                                    );
+                                    let next_pos = (rx - piece_width * 0.5, ry - piece_height * 0.5);
+                                    let next_rot = normalize_angle(start_rot + delta);
+                                    send_client_msg(ClientMsg::Place {
+                                        anchor_id: anchor_id as u32,
+                                        pos: next_pos,
+                                        rot_deg: next_rot,
+                                    });
+                                }
                                 rotation_queue.borrow_mut().clear();
                                 start_group_animation(
                                     RotationAnimation {
@@ -4828,6 +6057,15 @@ fn app() -> Html {
                         rotation_snap_tolerance_value,
                         rotation_enabled_value,
                     );
+                    if drag.anchor_id < next.len() && drag.anchor_id < next_rotations.len() {
+                        let anchor_pos = next[drag.anchor_id];
+                        let anchor_rot = next_rotations[drag.anchor_id];
+                        send_client_msg(ClientMsg::Place {
+                            anchor_id: drag.anchor_id as u32,
+                            pos: anchor_pos,
+                            rot_deg: anchor_rot,
+                        });
+                    }
 
                     let mut pending_animation = None;
                     if rotation_enabled_value && !group_after.is_empty() {
@@ -4926,6 +6164,12 @@ fn app() -> Html {
                     );
                     if let Some(anim) = pending_animation {
                         let connections_snapshot = next_state.connections.clone();
+                        let group_order_snapshot: Vec<u32> = next_state
+                            .group_order
+                            .iter()
+                            .filter_map(|id| u32::try_from(*id).ok())
+                            .collect();
+                        let scramble_nonce_snapshot = next_state.scramble_nonce;
                         let (group_pos_now, group_rot_now) = group_transforms_from_anchor(
                             &anchor_of,
                             &start_positions_all,
@@ -4936,9 +6180,23 @@ fn app() -> Html {
                         group_pos.set(group_pos_now);
                         group_rot.set(group_rot_now);
                         group_order.set(group_order_value);
+                        let piece_order_snapshot = piece_order.clone();
                         z_order.set(piece_order);
-                        connections.set(connections_snapshot.clone());
-                        flips.set(next_flips);
+                        log_state_update(
+                            "connections",
+                            connections_snapshot.len(),
+                            "drag_finalize",
+                        );
+                        log_state_update("flips", next_flips.len(), "drag_finalize");
+                        {
+                            let mut snapshot = local_snapshot.borrow_mut();
+                            snapshot.connections = connections_snapshot.clone();
+                            snapshot.flips = next_flips.clone();
+                            snapshot.group_order = group_order_snapshot;
+                            snapshot.z_order = piece_order_snapshot;
+                            snapshot.scramble_nonce = scramble_nonce_snapshot;
+                        }
+                        bump_ui_revision();
                         start_group_animation(anim, Some(connections_snapshot));
                         active_id.set(None);
                         dragging_members.set(Vec::new());
@@ -5163,9 +6421,7 @@ fn app() -> Html {
             })
         };
         let on_solve_rotation = {
-            let positions = positions.clone();
-            let flips = flips.clone();
-            let connections = connections.clone();
+            let local_snapshot = local_snapshot.clone();
             let z_order = z_order.clone();
             let apply_puzzle_state = apply_puzzle_state.clone();
             let dragging_members = dragging_members.clone();
@@ -5183,9 +6439,14 @@ fn app() -> Html {
                 if total == 0 {
                     return;
                 }
-                let positions_snapshot = (*positions).clone();
-                let flips_snapshot = (*flips).clone();
-                let connections_snapshot = (*connections).clone();
+                let (positions_snapshot, flips_snapshot, connections_snapshot) = {
+                    let snapshot = local_snapshot.borrow();
+                    (
+                        snapshot.positions.clone(),
+                        snapshot.flips.clone(),
+                        snapshot.connections.clone(),
+                    )
+                };
                 let zeroed = vec![0.0; total];
                 let order_snapshot = (*z_order).clone();
                 let order_opt = if order_snapshot.len() == total {
@@ -5231,9 +6492,7 @@ fn app() -> Html {
             })
         };
         let on_unflip = {
-            let positions = positions.clone();
-            let rotations = rotations.clone();
-            let connections = connections.clone();
+            let local_snapshot = local_snapshot.clone();
             let z_order = z_order.clone();
             let apply_puzzle_state = apply_puzzle_state.clone();
             let dragging_members = dragging_members.clone();
@@ -5251,9 +6510,14 @@ fn app() -> Html {
                 if total == 0 {
                     return;
                 }
-                let positions_snapshot = (*positions).clone();
-                let rotations_snapshot = (*rotations).clone();
-                let connections_snapshot = (*connections).clone();
+                let (positions_snapshot, rotations_snapshot, connections_snapshot) = {
+                    let snapshot = local_snapshot.borrow();
+                    (
+                        snapshot.positions.clone(),
+                        snapshot.rotations.clone(),
+                        snapshot.connections.clone(),
+                    )
+                };
                 let cleared = vec![false; total];
                 let order_snapshot = (*z_order).clone();
                 let order_opt = if order_snapshot.len() == total {
@@ -5404,13 +6668,11 @@ fn app() -> Html {
             .collect();
 
         let begin_drag: Rc<dyn Fn(usize, f32, f32, bool, bool, bool, Option<i32>)> = {
-            let positions = positions.clone();
-            let rotations = rotations.clone();
+            let local_snapshot = local_snapshot.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
             let group_pos_live = group_pos_live.clone();
             let group_rot_live = group_rot_live.clone();
-            let flips = flips.clone();
             let apply_puzzle_state = apply_puzzle_state.clone();
             let scramble_nonce = scramble_nonce.clone();
             let drag_state = drag_state.clone();
@@ -5421,15 +6683,20 @@ fn app() -> Html {
             let rotation_anim_handle = rotation_anim_handle.clone();
             let rotation_queue = rotation_queue.clone();
             let z_order = z_order.clone();
-            let connections = connections.clone();
+            let send_client_msg = send_client_msg.clone();
             let cols = grid.cols as usize;
             let rows = grid.rows as usize;
             let using_wgpu = using_wgpu;
             Rc::new(move |piece_id, x, y, shift_key, rotate_mode, right_click, touch_id| {
-                let positions_snapshot = (*positions).clone();
-                let rotations_snapshot = (*rotations).clone();
-                let mut connections_snapshot = (*connections).clone();
-                let flips_snapshot = (*flips).clone();
+                let (positions_snapshot, rotations_snapshot, flips_snapshot, mut connections_snapshot) = {
+                    let snapshot = local_snapshot.borrow();
+                    (
+                        snapshot.positions.clone(),
+                        snapshot.rotations.clone(),
+                        snapshot.flips.clone(),
+                        snapshot.connections.clone(),
+                    )
+                };
                 let mut members = if shift_key {
                     clear_piece_connections(&mut connections_snapshot, piece_id, cols, rows);
                     vec![piece_id]
@@ -5473,7 +6740,7 @@ fn app() -> Html {
                 let anchor_id = members.first().copied().unwrap_or(piece_id);
                 group_order_value.retain(|id| *id != anchor_id);
                 group_order_value.push(anchor_id);
-                let piece_order = build_piece_order_from_groups(&group_order_value, &anchor_of);
+                let piece_order = crate::core::build_piece_order_from_groups(&group_order_value, &anchor_of);
                 let next_state = PuzzleState::rebuild_from_piece_state(
                     &derived_positions,
                     &derived_rotations,
@@ -5521,6 +6788,9 @@ fn app() -> Html {
                         start_positions.push(pos);
                     }
                 }
+                send_client_msg(ClientMsg::Select {
+                    piece_id: piece_id as u32,
+                });
                 *drag_state.borrow_mut() = Some(DragState {
                     start_x: x,
                     start_y: y,
@@ -5616,6 +6886,7 @@ fn app() -> Html {
             let img_y = fmt_f32(-piece_y);
             let is_animating = animating_mask.get(piece.id).copied().unwrap_or(false);
             let is_hovered = hovered_mask.get(piece.id).copied().unwrap_or(false);
+            let is_owned_other = owned_mask.get(piece.id).copied().unwrap_or(false);
             let mut class = if is_dragging {
                 if flipped {
                     "piece dragging flipped".to_string()
@@ -5635,6 +6906,9 @@ fn app() -> Html {
             };
             if is_hovered {
                 class.push_str(" hovered");
+            }
+            if is_owned_other {
+                class.push_str(" owned-other");
             }
             let connection = connections_value
                 .get(piece.id)
@@ -5861,9 +7135,7 @@ fn app() -> Html {
             let canvas_ref = canvas_ref.clone();
             let ui_credit_hitbox = ui_credit_hitbox.clone();
             let ui_credit_hovered = ui_credit_hovered.clone();
-            let positions = positions.clone();
-            let rotations = rotations.clone();
-            let flips = flips.clone();
+            let local_snapshot = local_snapshot.clone();
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let begin_drag = begin_drag.clone();
@@ -5895,27 +7167,28 @@ fn app() -> Html {
                     }
                     return;
                 };
-                let positions_snapshot = (*positions).clone();
-                let rotations_snapshot = (*rotations).clone();
-                let flips_snapshot = (*flips).clone();
                 let mut order = (*z_order).clone();
                 let total = cols * rows;
                 if order.len() != total {
                     order = (0..total).collect();
                 }
-                if let Some(piece_id) = pick_piece_at(
-                    px,
-                    py,
-                    &positions_snapshot,
-                    &rotations_snapshot,
-                    &flips_snapshot,
-                    &order,
-                    mask_atlas,
-                    cols,
-                    piece_width,
-                    piece_height,
-                    mask_pad,
-                ) {
+                let piece_hit = {
+                    let snapshot = local_snapshot.borrow();
+                    pick_piece_at(
+                        px,
+                        py,
+                        snapshot.positions.as_slice(),
+                        snapshot.rotations.as_slice(),
+                        snapshot.flips.as_slice(),
+                        &order,
+                        mask_atlas,
+                        cols,
+                        piece_width,
+                        piece_height,
+                        mask_pad,
+                    )
+                };
+                if let Some(piece_id) = piece_hit {
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
@@ -5943,9 +7216,7 @@ fn app() -> Html {
             let canvas_ref = canvas_ref.clone();
             let ui_credit_hitbox = ui_credit_hitbox.clone();
             let ui_credit_hovered = ui_credit_hovered.clone();
-            let positions = positions.clone();
-            let rotations = rotations.clone();
-            let flips = flips.clone();
+            let local_snapshot = local_snapshot.clone();
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let begin_drag = begin_drag.clone();
@@ -5985,27 +7256,28 @@ fn app() -> Html {
                     }
                     return;
                 };
-                let positions_snapshot = (*positions).clone();
-                let rotations_snapshot = (*rotations).clone();
-                let flips_snapshot = (*flips).clone();
                 let mut order = (*z_order).clone();
                 let total = cols * rows;
                 if order.len() != total {
                     order = (0..total).collect();
                 }
-                if let Some(piece_id) = pick_piece_at(
-                    px,
-                    py,
-                    &positions_snapshot,
-                    &rotations_snapshot,
-                    &flips_snapshot,
-                    &order,
-                    mask_atlas,
-                    cols,
-                    piece_width,
-                    piece_height,
-                    mask_pad,
-                ) {
+                let piece_hit = {
+                    let snapshot = local_snapshot.borrow();
+                    pick_piece_at(
+                        px,
+                        py,
+                        snapshot.positions.as_slice(),
+                        snapshot.rotations.as_slice(),
+                        snapshot.flips.as_slice(),
+                        &order,
+                        mask_atlas,
+                        cols,
+                        piece_width,
+                        piece_height,
+                        mask_pad,
+                    )
+                };
+                if let Some(piece_id) = piece_hit {
                     if *ui_credit_hovered {
                         ui_credit_hovered.set(false);
                     }
@@ -6023,9 +7295,7 @@ fn app() -> Html {
         };
         let on_canvas_move = {
             let canvas_ref = canvas_ref.clone();
-            let positions = positions.clone();
-            let rotations = rotations.clone();
-            let flips = flips.clone();
+            let local_snapshot = local_snapshot.clone();
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let hovered_id = hovered_id.clone();
@@ -6057,9 +7327,10 @@ fn app() -> Html {
                 let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                 let mut piece_hit = None;
                 if let Some(mask_atlas) = mask_atlas.borrow().as_ref() {
-                    let positions_snapshot = &*positions;
-                    let rotations_snapshot = &*rotations;
-                    let flips_snapshot = &*flips;
+                    let snapshot = local_snapshot.borrow();
+                    let positions_snapshot = snapshot.positions.as_slice();
+                    let rotations_snapshot = snapshot.rotations.as_slice();
+                    let flips_snapshot = snapshot.flips.as_slice();
                     let order_snapshot = &*z_order;
                     let total = cols * rows;
                     let fallback_order = if order_snapshot.len() == total {
@@ -6470,7 +7741,7 @@ fn app() -> Html {
                 </div>
                 <div class="control">
                     <label for="share-link">
-                        { "Share link" }
+                        { share_link_label }
                     </label>
                     <input
                         id="share-link"
@@ -6479,17 +7750,23 @@ fn app() -> Html {
                         readonly=true
                     />
                 </div>
-                <div class="control">
-                    <label for="share-seed">
-                        { "Include shuffle seed" }
-                        <input
-                            id="share-seed"
-                            type="checkbox"
-                            checked={include_share_seed_value}
-                            onchange={on_share_seed_toggle}
-                        />
-                    </label>
-                </div>
+                { if !multiplayer_active {
+                    html! {
+                        <div class="control">
+                            <label for="share-seed">
+                                { "Include shuffle seed" }
+                                <input
+                                    id="share-seed"
+                                    type="checkbox"
+                                    checked={include_share_seed_value}
+                                    onchange={on_share_seed_toggle}
+                                />
+                            </label>
+                        </div>
+                    }
+                } else {
+                    html! {}
+                }}
                 <div class="control">
                     <label>
                         { "Expected solve time" }
@@ -6509,69 +7786,89 @@ fn app() -> Html {
                     </label>
                 </div>
                 <div class="control">
-                    <label for="puzzle-art-select">
+                    <label>
                         { "Puzzle art" }
                         <span class="control-value">{ puzzle_art.label }</span>
                     </label>
-                    <select
-                        id="puzzle-art-select"
-                        onchange={on_puzzle_art_change}
-                    >
-                        {puzzle_art_options}
-                    </select>
+                    { if !multiplayer_active {
+                        html! {
+                            <select
+                                id="puzzle-art-select"
+                                onchange={on_puzzle_art_change}
+                            >
+                                {puzzle_art_options}
+                            </select>
+                        }
+                    } else {
+                        html! {}
+                    }}
                 </div>
                 <div class="control">
-                    <label for="grid-select">
+                    <label>
                         { "Grid" }
                         <span class="control-value">{ grid_label }</span>
                     </label>
-                    <select
-                        id="grid-select"
-                        onchange={on_grid_change}
-                    >
-                        {grid_options}
-                    </select>
+                    { if !multiplayer_active {
+                        html! {
+                            <select
+                                id="grid-select"
+                                onchange={on_grid_change}
+                            >
+                                {grid_options}
+                            </select>
+                        }
+                    } else {
+                        html! {}
+                    }}
                 </div>
-                <div class="control">
-                    <button
-                        class="control-button"
-                        type="button"
-                        onclick={on_scramble}
-                        disabled={scramble_disabled}
-                    >
-                        { "Scramble" }
-                    </button>
-                </div>
-                <div class="control">
-                    <button
-                        class="control-button"
-                        type="button"
-                        onclick={on_solve}
-                        disabled={scramble_disabled}
-                    >
-                        { "Solve" }
-                    </button>
-                </div>
-                <div class="control">
-                    <button
-                        class="control-button"
-                        type="button"
-                        onclick={on_solve_rotation}
-                        disabled={scramble_disabled}
-                    >
-                        { "Solve rotation" }
-                    </button>
-                </div>
-                <div class="control">
-                    <button
-                        class="control-button"
-                        type="button"
-                        onclick={on_unflip}
-                        disabled={scramble_disabled}
-                    >
-                        { "Unflip all" }
-                    </button>
-                </div>
+                { if !multiplayer_active {
+                    html! {
+                        <>
+                            <div class="control">
+                                <button
+                                    class="control-button"
+                                    type="button"
+                                    onclick={on_scramble}
+                                    disabled={scramble_disabled}
+                                >
+                                    { "Scramble" }
+                                </button>
+                            </div>
+                            <div class="control">
+                                <button
+                                    class="control-button"
+                                    type="button"
+                                    onclick={on_solve}
+                                    disabled={scramble_disabled}
+                                >
+                                    { "Solve" }
+                                </button>
+                            </div>
+                            <div class="control">
+                                <button
+                                    class="control-button"
+                                    type="button"
+                                    onclick={on_solve_rotation}
+                                    disabled={scramble_disabled}
+                                >
+                                    { "Solve rotation" }
+                                </button>
+                            </div>
+                            <div class="control">
+                                <button
+                                    class="control-button"
+                                    type="button"
+                                    onclick={on_unflip}
+                                    disabled={scramble_disabled}
+                                >
+                                    { "Unflip all" }
+                                </button>
+                            </div>
+                        </>
+                    }
+                } else {
+                    html! {}
+                }}
                 <div class="control">
                     <label for="workspace-scale">
                         { "Workspace scale" }
@@ -7046,6 +8343,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use console_error_panic_hook::set_once as set_panic_hook;
+    use gloo::timers::future::TimeoutFuture;
+    use js_sys::Date;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -7110,5 +8410,61 @@ mod tests {
         let center = (pos.0 + piece_width * 0.5, pos.1 + piece_height * 0.5);
         assert_close(center.0, expected_center.0);
         assert_close(center.1, expected_center.1);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn multiplayer_warns_when_image_missing() {
+        set_panic_hook();
+        gloo::console::log!("mp test start");
+        let document = web_sys::window()
+            .and_then(|window| window.document())
+            .expect("document available");
+        let root = document
+            .create_element("div")
+            .expect("create test root");
+        root.set_id("wasm-test-root");
+        document
+            .body()
+            .expect("body available")
+            .append_child(&root)
+            .expect("append test root");
+        let _app_handle = yew::Renderer::<App>::with_root(root).render();
+        gloo::console::log!("mp test rendered app");
+        let start = Date::now();
+        let hooks = loop {
+            if let Some(hooks) = MP_TEST_HOOKS.with(|slot| slot.borrow().clone()) {
+                break hooks;
+            }
+            if Date::now() - start > 5000.0 {
+                panic!("mp hooks not set after 5s (App may not have rendered)");
+            }
+            TimeoutFuture::new(10).await;
+        };
+        gloo::console::log!("mp test hooks ready");
+
+        (hooks.set_server_state_applied)(true);
+        (hooks.set_puzzle_info)(None);
+        MP_TEST_LAST_WARN.with(|slot| slot.borrow_mut().take());
+
+        let update = RoomUpdate::GroupTransform {
+            anchor_id: 0,
+            pos: (10.0, 12.0),
+            rot_deg: 0.0,
+        };
+        (hooks.send_msg)(ServerMsg::Update {
+            seq: 1,
+            update,
+            source: None,
+        });
+
+        TimeoutFuture::new(0).await;
+        let warn = take_mp_warn();
+        assert_eq!(warn.as_deref(), Some("puzzle info not ready"));
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_smoke() {
+        set_panic_hook();
+        assert_eq!(1 + 1, 2);
     }
 }

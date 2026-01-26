@@ -1,0 +1,9 @@
+[watch]
+ignore = [
+  ".wrangler",
+  "target",
+  "node_modules",
+  "dist",
+  "worker",
+  "cli",
+]
