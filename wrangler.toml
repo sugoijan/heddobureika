@@ -3,8 +3,11 @@ main = "worker/build/worker/shim.mjs"
 compatibility_date = "2026-01-26"
 workers_dev = true
 
+[vars]
+ROOM_PATH_PREFIX = "/ws/"
+
 [build]
-command = "worker-build --release"
+command = "cargo install -q worker-build && worker-build --release"
 cwd = "worker"
 
 [durable_objects]
@@ -13,3 +16,15 @@ bindings = [{ name = "ROOMS", class_name = "Room" }]
 [[migrations]]
 tag = "v1"
 new_classes = ["Room"]
+
+[env.production]
+workers_dev = false
+routes = [
+  { pattern = "sugoijan.dev/heddobureika/ws/*", zone_name = "sugoijan.dev" }
+]
+
+[env.production.durable_objects]
+bindings = [{ name = "ROOMS", class_name = "Room" }]
+
+[env.production.vars]
+ROOM_PATH_PREFIX = "/heddobureika/ws/"

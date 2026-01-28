@@ -1,6 +1,6 @@
 use heddobureika_core::apply_room_update_to_snapshot;
 use heddobureika_core::game::{set_connection, DIR_RIGHT};
-use heddobureika_core::protocol::{PuzzleStateSnapshot, RoomUpdate};
+use heddobureika_core::{PuzzleStateSnapshot, RoomUpdate};
 
 fn build_state(cols: usize, rows: usize) -> PuzzleStateSnapshot {
     let total = cols * rows;

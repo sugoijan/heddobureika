@@ -1,0 +1,372 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
+use std::collections::hash_map::DefaultHasher;
+
+use crate::app_core::{AppCore, AppSnapshot};
+use crate::core::InitMode;
+use crate::local_snapshot::{
+    apply_game_snapshot_to_core, build_game_snapshot_from_app, load_local_snapshot,
+    save_local_snapshot, ApplySnapshotResult,
+};
+use heddobureika_core::RoomPersistence;
+
+#[derive(Clone, Debug)]
+pub enum SyncAction {
+    Move { anchor_id: usize, pos: (f32, f32) },
+    Transform {
+        anchor_id: usize,
+        pos: (f32, f32),
+        rot_deg: f32,
+    },
+    Place {
+        anchor_id: usize,
+        pos: (f32, f32),
+        rot_deg: f32,
+    },
+    Flip { piece_id: usize, flipped: bool },
+    Release { anchor_id: usize },
+}
+
+#[derive(Clone, Debug)]
+pub enum CoreAction {
+    BeginDrag {
+        piece_id: usize,
+        x: f32,
+        y: f32,
+        shift_key: bool,
+        rotate_mode: bool,
+        right_click: bool,
+        touch_id: Option<i32>,
+    },
+    DragMove {
+        x: f32,
+        y: f32,
+    },
+    DragEnd {
+        touch_id: Option<i32>,
+    },
+    SetHovered {
+        hovered: Option<usize>,
+    },
+    Sync(SyncAction),
+}
+
+#[derive(Clone)]
+pub struct ViewHooks {
+    pub on_action: Rc<dyn Fn(CoreAction)>,
+}
+
+#[derive(Clone)]
+pub struct SyncHooks {
+    #[allow(dead_code)]
+    pub on_remote_action: Rc<dyn Fn(CoreAction)>,
+    pub on_snapshot: Rc<dyn Fn(AppSnapshot)>,
+}
+
+#[allow(dead_code)]
+pub trait GameSyncView {
+    fn mode(&self) -> InitMode;
+    fn connected(&self) -> bool;
+    fn client_id(&self) -> Option<u64>;
+    fn init_required(&self) -> bool;
+    fn room_id(&self) -> Option<&str>;
+    fn persistence(&self) -> Option<RoomPersistence>;
+    fn ownership_by_anchor(&self) -> Rc<HashMap<u32, u64>>;
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct SyncView {
+    mode: InitMode,
+    connected: bool,
+    client_id: Option<u64>,
+    init_required: bool,
+    room_id: Option<String>,
+    persistence: Option<RoomPersistence>,
+    ownership_by_anchor: Rc<HashMap<u32, u64>>,
+}
+
+impl Default for SyncView {
+    fn default() -> Self {
+        Self {
+            mode: InitMode::Local,
+            connected: false,
+            client_id: None,
+            init_required: false,
+            room_id: None,
+            persistence: None,
+            ownership_by_anchor: Rc::new(HashMap::new()),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SyncView {
+    pub(crate) fn new(
+        mode: InitMode,
+        connected: bool,
+        client_id: Option<u64>,
+        init_required: bool,
+        room_id: Option<String>,
+        persistence: Option<RoomPersistence>,
+        ownership_by_anchor: Rc<HashMap<u32, u64>>,
+    ) -> Self {
+        Self {
+            mode,
+            connected,
+            client_id,
+            init_required,
+            room_id,
+            persistence,
+            ownership_by_anchor,
+        }
+    }
+
+    pub fn mode(&self) -> InitMode {
+        self.mode
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn client_id(&self) -> Option<u64> {
+        self.client_id
+    }
+
+    pub fn init_required(&self) -> bool {
+        self.init_required
+    }
+
+    pub fn room_id(&self) -> Option<&str> {
+        self.room_id.as_deref()
+    }
+
+    pub fn persistence(&self) -> Option<RoomPersistence> {
+        self.persistence
+    }
+
+    pub fn ownership_by_anchor(&self) -> Rc<HashMap<u32, u64>> {
+        self.ownership_by_anchor.clone()
+    }
+}
+
+impl GameSyncView for SyncView {
+    fn mode(&self) -> InitMode {
+        self.mode()
+    }
+
+    fn connected(&self) -> bool {
+        self.connected()
+    }
+
+    fn client_id(&self) -> Option<u64> {
+        self.client_id()
+    }
+
+    fn init_required(&self) -> bool {
+        self.init_required()
+    }
+
+    fn room_id(&self) -> Option<&str> {
+        self.room_id()
+    }
+
+    fn persistence(&self) -> Option<RoomPersistence> {
+        self.persistence()
+    }
+
+    fn ownership_by_anchor(&self) -> Rc<HashMap<u32, u64>> {
+        self.ownership_by_anchor()
+    }
+}
+
+#[allow(dead_code)]
+pub trait GameView {
+    fn init(&mut self, hooks: ViewHooks);
+    fn render(&mut self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView);
+    fn shutdown(&mut self);
+}
+
+#[allow(dead_code)]
+pub trait GameSync {
+    fn init(&mut self, hooks: SyncHooks);
+    fn handle_local_action(&mut self, action: &CoreAction);
+    fn shutdown(&mut self);
+    fn sync_view(&self) -> SyncView;
+}
+
+pub struct LocalSyncAdapter {
+    hooks: Option<SyncHooks>,
+    observer: Option<Rc<dyn Fn(&CoreAction)>>,
+    pending_snapshot: Option<heddobureika_core::GameSnapshot>,
+    pending_loaded: bool,
+    last_saved_fingerprint: Option<u64>,
+}
+
+impl LocalSyncAdapter {
+    pub fn new() -> Self {
+        Self {
+            hooks: None,
+            observer: None,
+            pending_snapshot: None,
+            pending_loaded: false,
+            last_saved_fingerprint: None,
+        }
+    }
+
+    pub fn set_observer(&mut self, observer: Option<Rc<dyn Fn(&CoreAction)>>) {
+        self.observer = observer;
+    }
+
+    pub fn take_pending_snapshot(&mut self) -> Option<heddobureika_core::GameSnapshot> {
+        self.ensure_pending_loaded();
+        self.pending_snapshot.take()
+    }
+
+    pub fn requeue_pending_snapshot(&mut self, snapshot: heddobureika_core::GameSnapshot) {
+        self.pending_snapshot = Some(snapshot);
+    }
+
+    pub fn save_if_needed(&mut self, snapshot: &AppSnapshot) {
+        self.maybe_save(snapshot);
+    }
+
+    #[allow(dead_code)]
+    pub fn with_observer(observer: Rc<dyn Fn(&CoreAction)>) -> Self {
+        Self {
+            hooks: None,
+            observer: Some(observer),
+            pending_snapshot: None,
+            pending_loaded: false,
+            last_saved_fingerprint: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn handle_snapshot(
+        &mut self,
+        snapshot: AppSnapshot,
+        core: &AppCore,
+        allow_persist: bool,
+    ) {
+        if allow_persist {
+            if self.try_restore(&snapshot, core) {
+                return;
+            }
+            self.maybe_save(&snapshot);
+        }
+        if let Some(hooks) = &self.hooks {
+            (hooks.on_snapshot)(snapshot);
+        }
+    }
+
+    fn try_restore(&mut self, snapshot: &AppSnapshot, core: &AppCore) -> bool {
+        self.ensure_pending_loaded();
+        let Some(pending) = self.pending_snapshot.take() else {
+            return false;
+        };
+        match apply_game_snapshot_to_core(&pending, core, snapshot) {
+            ApplySnapshotResult::Applied => true,
+            ApplySnapshotResult::NotReady => {
+                self.pending_snapshot = Some(pending);
+                false
+            }
+            ApplySnapshotResult::Mismatch => false,
+        }
+    }
+
+    fn ensure_pending_loaded(&mut self) {
+        if self.pending_loaded {
+            return;
+        }
+        self.pending_snapshot = load_local_snapshot();
+        self.pending_loaded = true;
+    }
+
+    fn maybe_save(&mut self, snapshot: &AppSnapshot) {
+        let fingerprint = snapshot_fingerprint(snapshot);
+        if fingerprint.is_none() {
+            return;
+        }
+        if self.last_saved_fingerprint == fingerprint {
+            return;
+        }
+        let Some(game_snapshot) = build_game_snapshot_from_app(snapshot) else {
+            return;
+        };
+        save_local_snapshot(&game_snapshot);
+        self.last_saved_fingerprint = fingerprint;
+    }
+}
+
+impl Default for LocalSyncAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
+    let info = snapshot.puzzle_info.as_ref()?;
+    let cols = info.cols as usize;
+    let rows = info.rows as usize;
+    let total = cols * rows;
+    if total == 0 {
+        return None;
+    }
+    if snapshot.positions.len() != total
+        || snapshot.rotations.len() != total
+        || snapshot.flips.len() != total
+        || snapshot.connections.len() != total
+    {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    info.label.hash(&mut hasher);
+    info.image_src.hash(&mut hasher);
+    info.rows.hash(&mut hasher);
+    info.cols.hash(&mut hasher);
+    info.shape_seed.hash(&mut hasher);
+    info.image_width.hash(&mut hasher);
+    info.image_height.hash(&mut hasher);
+    snapshot.scramble_nonce.hash(&mut hasher);
+    for (x, y) in &snapshot.positions {
+        x.to_bits().hash(&mut hasher);
+        y.to_bits().hash(&mut hasher);
+    }
+    for rot in &snapshot.rotations {
+        rot.to_bits().hash(&mut hasher);
+    }
+    for flip in &snapshot.flips {
+        flip.hash(&mut hasher);
+    }
+    for conn in &snapshot.connections {
+        conn.hash(&mut hasher);
+    }
+    for id in &snapshot.z_order {
+        id.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+impl GameSync for LocalSyncAdapter {
+    fn init(&mut self, hooks: SyncHooks) {
+        self.hooks = Some(hooks);
+    }
+
+    fn handle_local_action(&mut self, action: &CoreAction) {
+        if let Some(observer) = self.observer.as_ref() {
+            observer(action);
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.hooks = None;
+    }
+
+    fn sync_view(&self) -> SyncView {
+        SyncView::default()
+    }
+}

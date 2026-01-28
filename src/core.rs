@@ -49,11 +49,11 @@ pub(crate) const LINE_BEND_MIN: f32 = 0.0;
 pub(crate) const EDGE_STEP_DIV: f32 = 6.0;
 pub(crate) const EDGE_STEP_MIN: f32 = 6.0;
 pub(crate) const CORNER_RADIUS_RATIO: f32 = 0.05;
-pub(crate) const STORAGE_KEY: &str = "heddobureika.board.v3";
+pub(crate) const LOCAL_GAME_KEY: &str = "heddobureika.game.v1";
 pub(crate) const PUZZLE_SELECTION_KEY: &str = "heddobureika.puzzle.v1";
 pub(crate) const RENDER_SETTINGS_KEY: &str = "heddobureika.render.v1";
 pub(crate) const THEME_MODE_KEY: &str = "heddobureika.theme.v1";
-pub(crate) const STORAGE_VERSION: u32 = 3;
+pub(crate) const INIT_SETTINGS_KEY: &str = "heddobureika.init.v1";
 pub(crate) const PUZZLE_SELECTION_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]
@@ -193,7 +193,20 @@ pub(crate) enum ThemeMode {
     Dark,
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InitMode {
+    Local,
+    Online,
+}
+
+impl Default for InitMode {
+    fn default() -> Self {
+        InitMode::Local
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RendererKind {
     Svg,
@@ -962,6 +975,7 @@ pub(crate) fn append_segments(
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PiecePaths {
     pub(crate) outline: String,
     pub(crate) edges: [String; 4],

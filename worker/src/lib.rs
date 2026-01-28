@@ -8,9 +8,9 @@ use heddobureika_core::game::{
     scramble_nonce_from_seed, scramble_rotations, scramble_seed, splitmix32, DEFAULT_TAB_DEPTH_CAP,
     FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
 };
-use heddobureika_core::protocol::{
-    AdminMsg, ClientMsg, OwnershipReason, PuzzleInfo, PuzzleStateSnapshot, RoomPersistence,
-    RoomRules, RoomSnapshot, RoomUpdate, ServerMsg,
+use heddobureika_core::{
+    AdminMsg, ClientMsg, GameRules, GameSnapshot, OwnershipReason, PuzzleInfo, PuzzleStateSnapshot,
+    RoomPersistence, RoomUpdate, ServerMsg, GAME_SNAPSHOT_VERSION,
 };
 use heddobureika_core::{
     best_grid_for_count, logical_image_size, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
@@ -20,7 +20,7 @@ use js_sys::Date;
 use rkyv::{Archive, Deserialize, Serialize};
 use worker::*;
 
-const ROOM_PATH_PREFIX: &str = "/ws/";
+const DEFAULT_ROOM_PATH_PREFIX: &str = "/ws/";
 const META_KEY: &str = "room_meta";
 const SNAPSHOT_KEY: &str = "room_snapshot";
 
@@ -28,12 +28,13 @@ const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
 const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
 const FULL_STATE_INTERVAL_MS: i64 = 30 * 1000;
 const OWNERSHIP_TIMEOUT_MS: i64 = 5 * 1000;
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = GAME_SNAPSHOT_VERSION;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
-    let room_id = match extract_room_id(&path) {
+    let prefix = room_path_prefix(&env);
+    let room_id = match extract_room_id(&path, &prefix) {
         Some(room_id) => room_id,
         None => return Response::error("not found", 404),
     };
@@ -48,8 +49,32 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     stub.fetch_with_request(req).await
 }
 
-fn extract_room_id(path: &str) -> Option<&str> {
-    let room = path.strip_prefix(ROOM_PATH_PREFIX)?;
+fn room_path_prefix(env: &Env) -> String {
+    let raw = env
+        .var("ROOM_PATH_PREFIX")
+        .ok()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| DEFAULT_ROOM_PATH_PREFIX.to_string());
+    normalize_room_path_prefix(&raw)
+}
+
+fn normalize_room_path_prefix(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_ROOM_PATH_PREFIX.to_string();
+    }
+    let mut value = trimmed.to_string();
+    if !value.starts_with('/') {
+        value.insert(0, '/');
+    }
+    if !value.ends_with('/') {
+        value.push('/');
+    }
+    value
+}
+
+fn extract_room_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let room = path.strip_prefix(prefix)?;
     if room.is_empty() || room.contains('/') {
         return None;
     }
@@ -119,7 +144,7 @@ struct Ownership {
 struct RoomRuntime {
     loaded: bool,
     meta: RoomMeta,
-    snapshot: Option<RoomSnapshot>,
+    snapshot: Option<GameSnapshot>,
     owners_by_anchor: HashMap<u32, Ownership>,
     owner_by_client: HashMap<u64, u32>,
     next_client_id: u64,
@@ -201,7 +226,8 @@ impl DurableObject for Room {
                 (inner.meta.persistence, inner.snapshot.is_some())
             };
             let path = req.path();
-            let room_id = extract_room_id(&path).unwrap_or("unknown");
+            let prefix = room_path_prefix(&self.env);
+            let room_id = extract_room_id(&path, &prefix).unwrap_or("unknown");
             let welcome = ServerMsg::Welcome {
                 room_id: room_id.to_string(),
                 persistence,
@@ -268,6 +294,14 @@ impl DurableObject for Room {
             }
             ClientMsg::Move { anchor_id, pos } => {
                 self.handle_move(client_id, anchor_id, pos).await?;
+            }
+            ClientMsg::Transform {
+                anchor_id,
+                pos,
+                rot_deg,
+            } => {
+                self.handle_transform(client_id, anchor_id, pos, rot_deg)
+                    .await?;
             }
             ClientMsg::Rotate { anchor_id, rot_deg } => {
                 self.handle_rotate(client_id, anchor_id, rot_deg).await?;
@@ -407,7 +441,7 @@ impl Room {
             }
         }
         if let Some(bytes) = snapshot_bytes {
-            if let Some(snapshot) = decode::<RoomSnapshot>(&bytes) {
+            if let Some(snapshot) = decode::<GameSnapshot>(&bytes) {
                 inner.snapshot = Some(snapshot);
             }
         }
@@ -415,7 +449,7 @@ impl Room {
         Ok(())
     }
 
-    fn geometry_for_snapshot(snapshot: &RoomSnapshot) -> Option<RoomGeometry> {
+    fn geometry_for_snapshot(snapshot: &GameSnapshot) -> Option<RoomGeometry> {
         let cols = snapshot.puzzle.cols as usize;
         let rows = snapshot.puzzle.rows as usize;
         if cols == 0 || rows == 0 {
@@ -492,7 +526,7 @@ impl Room {
                 return Ok(());
             }
         };
-        let rules = RoomRules::default();
+        let rules = GameRules::default();
         let (image_width, image_height) = logical_image_size(
             puzzle_entry.width,
             puzzle_entry.height,
@@ -570,7 +604,7 @@ impl Room {
         &self,
         ws: WebSocket,
         puzzle: PuzzleInfo,
-        rules: Option<RoomRules>,
+        rules: Option<GameRules>,
         state: Option<PuzzleStateSnapshot>,
     ) -> Result<()> {
         let now = now_ms();
@@ -599,7 +633,7 @@ impl Room {
             }
         }
 
-        let rules = RoomRules::default();
+        let rules = GameRules::default();
         let snapshot = match self.build_initial_snapshot(puzzle, rules, state, None) {
             Some(snapshot) => snapshot,
             None => {
@@ -632,10 +666,10 @@ impl Room {
     fn build_initial_snapshot(
         &self,
         puzzle: PuzzleInfo,
-        rules: RoomRules,
+        rules: GameRules,
         state: Option<PuzzleStateSnapshot>,
         scramble_override: Option<u32>,
-    ) -> Option<RoomSnapshot> {
+    ) -> Option<GameSnapshot> {
         let cols = puzzle.cols as usize;
         let rows = puzzle.rows as usize;
         if cols == 0 || rows == 0 {
@@ -712,7 +746,7 @@ impl Room {
         let anchor_of = anchor_of_from_connections(&connections, cols, rows);
         group_order = reconcile_group_order(&group_order, &anchor_of);
 
-        Some(RoomSnapshot {
+        Some(GameSnapshot {
             version: SNAPSHOT_VERSION,
             seq: 0,
             rules,
@@ -948,6 +982,129 @@ impl Room {
         if let Some(update) = update {
             console_log!(
                 "move accepted: client={} anchor={} seq={}",
+                client_id,
+                anchor_id,
+                match &update {
+                    ServerMsg::Update { seq, .. } => *seq,
+                    _ => 0,
+                }
+            );
+            let _ = self.broadcast(&update);
+        }
+        self.schedule_alarm().await?;
+        Ok(())
+    }
+
+    async fn handle_transform(
+        &self,
+        client_id: u64,
+        anchor_id: u32,
+        pos: (f32, f32),
+        rot_deg: f32,
+    ) -> Result<()> {
+        let now = now_ms();
+        let update = {
+            let mut inner = self.inner.borrow_mut();
+            let mut snapshot = match inner.snapshot.take() {
+                Some(snapshot) => snapshot,
+                None => return Ok(()),
+            };
+            let owns_anchor = inner
+                .owners_by_anchor
+                .get(&anchor_id)
+                .map(|owner| owner.owner_id == client_id)
+                .unwrap_or(false);
+            if !owns_anchor {
+                inner.snapshot = Some(snapshot);
+                return Ok(());
+            }
+            let geometry = match Self::geometry_for_snapshot(&snapshot) {
+                Some(geometry) => geometry,
+                None => {
+                    inner.snapshot = Some(snapshot);
+                    return Ok(());
+                }
+            };
+            let total = geometry.cols * geometry.rows;
+            if anchor_id as usize >= total {
+                inner.snapshot = Some(snapshot);
+                return Ok(());
+            }
+
+            let members = collect_group(
+                &snapshot.state.connections,
+                anchor_id as usize,
+                geometry.cols,
+                geometry.rows,
+            );
+            let mut members = members;
+            if members.is_empty() {
+                members.push(anchor_id as usize);
+            }
+            members.sort_unstable();
+            let anchor_id_usize = members[0];
+            if anchor_id_usize as u32 != anchor_id {
+                console_log!(
+                    "transform ignored: anchor mismatch (client={} anchor={} canonical={})",
+                    client_id,
+                    anchor_id,
+                    anchor_id_usize
+                );
+                inner.snapshot = Some(snapshot);
+                return Ok(());
+            }
+
+            let mut next_positions = Vec::with_capacity(members.len());
+            for &id in &members {
+                let (dx, dy) = piece_local_offset(
+                    id,
+                    anchor_id_usize,
+                    geometry.cols,
+                    geometry.piece_width,
+                    geometry.piece_height,
+                );
+                let (rx, ry) = rotate_vec(dx, dy, rot_deg);
+                next_positions.push((id, (pos.0 + rx, pos.1 + ry)));
+            }
+
+            if !self.group_in_bounds(&members, &next_positions, &geometry) {
+                console_log!(
+                    "transform ignored: out of bounds (client={} anchor={})",
+                    client_id,
+                    anchor_id
+                );
+                inner.snapshot = Some(snapshot);
+                return Ok(());
+            }
+
+            for (id, next_pos) in next_positions {
+                if let Some(slot) = snapshot.state.positions.get_mut(id) {
+                    *slot = next_pos;
+                }
+                if let Some(rot) = snapshot.state.rotations.get_mut(id) {
+                    *rot = rot_deg;
+                }
+            }
+
+            let seq = self.bump_seq(&mut snapshot);
+            let update = Some(ServerMsg::Update {
+                seq,
+                update: RoomUpdate::GroupTransform {
+                    anchor_id,
+                    pos,
+                    rot_deg,
+                },
+                source: Some(client_id),
+            });
+            inner.snapshot = Some(snapshot);
+            update
+        };
+
+        self.touch_command(now, false).await?;
+        self.persist_snapshot_if_needed().await?;
+        if let Some(update) = update {
+            console_log!(
+                "transform accepted: client={} anchor={} seq={}",
                 client_id,
                 anchor_id,
                 match &update {
@@ -1399,7 +1556,7 @@ impl Room {
         Ok(())
     }
 
-    fn bump_seq(&self, snapshot: &mut RoomSnapshot) -> u64 {
+    fn bump_seq(&self, snapshot: &mut GameSnapshot) -> u64 {
         snapshot.seq = snapshot.seq.saturating_add(1);
         snapshot.seq
     }

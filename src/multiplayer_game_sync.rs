@@ -1,0 +1,305 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use gloo::console;
+
+use crate::app_router;
+use crate::runtime::{CoreAction, GameSync, SyncAction, SyncHooks, SyncView};
+use crate::core::InitMode;
+use crate::multiplayer_sync::MultiplayerSyncAdapter;
+use heddobureika_core::{ClientMsg, GameSnapshot, RoomPersistence, RoomUpdate, ServerMsg};
+
+#[derive(Clone)]
+pub(crate) struct MultiplayerSyncCallbacks {
+    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<u64>)>,
+    pub(crate) on_need_init: Rc<dyn Fn()>,
+    pub(crate) on_warning: Rc<dyn Fn(u32)>,
+    pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
+    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64)>,
+    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<u64>)>,
+    pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
+    pub(crate) on_error: Rc<dyn Fn(String, String)>,
+}
+
+pub(crate) struct MultiplayerGameSync {
+    adapter: MultiplayerSyncAdapter,
+    last_seq: Rc<Cell<u64>>,
+    state_applied: Rc<Cell<bool>>,
+    handler: RefCell<Option<Rc<dyn Fn(ServerMsg)>>>,
+    connected: Rc<Cell<bool>>,
+    client_id: Rc<Cell<Option<u64>>>,
+    init_required: Rc<Cell<bool>>,
+    room_id: Rc<RefCell<Option<String>>>,
+    persistence: Rc<Cell<Option<RoomPersistence>>>,
+    ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, u64>>>>,
+}
+
+impl MultiplayerGameSync {
+    pub(crate) fn new() -> Self {
+        Self {
+            adapter: MultiplayerSyncAdapter::new(),
+            last_seq: Rc::new(Cell::new(0)),
+            state_applied: Rc::new(Cell::new(false)),
+            handler: RefCell::new(None),
+            connected: Rc::new(Cell::new(false)),
+            client_id: Rc::new(Cell::new(None)),
+            init_required: Rc::new(Cell::new(false)),
+            room_id: Rc::new(RefCell::new(None)),
+            persistence: Rc::new(Cell::new(None)),
+            ownership_by_anchor: Rc::new(RefCell::new(Rc::new(HashMap::new()))),
+        }
+    }
+
+    pub(crate) fn connect(
+        &mut self,
+        room_id: &str,
+        callbacks: MultiplayerSyncCallbacks,
+        on_fail: Rc<dyn Fn()>,
+    ) {
+        self.reset_state();
+        let room_id = room_id.trim();
+        if room_id.is_empty() {
+            console::warn!("missing room id for multiplayer connect");
+            on_fail();
+            return;
+        }
+        let Some(ws_base) = app_router::default_ws_base() else {
+            console::warn!("missing websocket base for multiplayer connect");
+            on_fail();
+            return;
+        };
+        *self.room_id.borrow_mut() = Some(room_id.to_string());
+        let url = app_router::build_room_ws_url(&ws_base, room_id);
+        let handler = self.install_handler(callbacks);
+        self.adapter.connect(&url, handler, on_fail);
+    }
+
+    pub(crate) fn disconnect(&mut self) {
+        self.adapter.disconnect();
+        self.reset_state();
+        self.handler.borrow_mut().take();
+    }
+
+    pub(crate) fn send(&self, msg: ClientMsg) {
+        self.adapter.send(msg);
+    }
+
+    pub(crate) fn set_state_applied(&self, value: bool) {
+        self.state_applied.set(value);
+    }
+
+    pub(crate) fn install_handler(
+        &mut self,
+        callbacks: MultiplayerSyncCallbacks,
+    ) -> Rc<dyn Fn(ServerMsg)> {
+        let handler = self.build_handler(callbacks);
+        *self.handler.borrow_mut() = Some(handler.clone());
+        handler
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn inject_server_msg(&self, msg: ServerMsg) {
+        if let Some(handler) = self.handler.borrow().as_ref() {
+            handler(msg);
+        }
+    }
+
+    fn reset_state(&self) {
+        self.last_seq.set(0);
+        self.state_applied.set(false);
+        self.connected.set(false);
+        self.client_id.set(None);
+        self.init_required.set(false);
+        *self.room_id.borrow_mut() = None;
+        self.persistence.set(None);
+        *self.ownership_by_anchor.borrow_mut() = Rc::new(HashMap::new());
+    }
+
+    fn build_handler(&self, callbacks: MultiplayerSyncCallbacks) -> Rc<dyn Fn(ServerMsg)> {
+        let last_seq = Rc::clone(&self.last_seq);
+        let state_applied = Rc::clone(&self.state_applied);
+        let connected_cell = Rc::clone(&self.connected);
+        let client_id_cell = Rc::clone(&self.client_id);
+        let init_required_cell = Rc::clone(&self.init_required);
+        let room_id_cell = Rc::clone(&self.room_id);
+        let persistence_cell = Rc::clone(&self.persistence);
+        let ownership_by_anchor = Rc::clone(&self.ownership_by_anchor);
+        Rc::new(move |msg: ServerMsg| match msg {
+            ServerMsg::Welcome {
+                room_id,
+                persistence,
+                initialized,
+                client_id,
+            } => {
+                console::log!(
+                    "multiplayer connected",
+                    room_id.clone(),
+                    format!("{persistence:?}"),
+                    format!("initialized={initialized}"),
+                    format!("client_id={:?}", client_id)
+                );
+                connected_cell.set(true);
+                client_id_cell.set(client_id);
+                init_required_cell.set(!initialized);
+                *room_id_cell.borrow_mut() = Some(room_id.clone());
+                persistence_cell.set(Some(persistence));
+                *ownership_by_anchor.borrow_mut() = Rc::new(HashMap::new());
+                (callbacks.on_welcome)(room_id, persistence, initialized, client_id);
+                if !initialized {
+                    (callbacks.on_need_init)();
+                }
+            }
+            ServerMsg::AdminAck { room_id, persistence } => {
+                *room_id_cell.borrow_mut() = Some(room_id);
+                persistence_cell.set(Some(persistence));
+            }
+            ServerMsg::NeedInit => {
+                init_required_cell.set(true);
+                (callbacks.on_need_init)();
+            }
+            ServerMsg::Warning { minutes_idle } => {
+                console::warn!("room idle for", minutes_idle, "minutes");
+                (callbacks.on_warning)(minutes_idle);
+            }
+            ServerMsg::State { seq, snapshot } => {
+                console::log!(
+                    "multiplayer state received",
+                    seq,
+                    snapshot.state.positions.len(),
+                    format!("{}x{}", snapshot.puzzle.cols, snapshot.puzzle.rows)
+                );
+                last_seq.set(seq);
+                init_required_cell.set(false);
+                (callbacks.on_state)(snapshot, seq);
+            }
+            ServerMsg::Update { seq, update, source } => {
+                let kind = update_kind(&update);
+                console::log!(
+                    "multiplayer update received",
+                    seq,
+                    kind,
+                    format!("source={:?}", source)
+                );
+                if let RoomUpdate::Ownership { anchor_id, owner, .. } = &update {
+                    let next = {
+                        let current = ownership_by_anchor.borrow();
+                        let mut next = (**current).clone();
+                        if let Some(owner_id) = owner {
+                            next.insert(*anchor_id, *owner_id);
+                        } else {
+                            next.remove(anchor_id);
+                        }
+                        next
+                    };
+                    *ownership_by_anchor.borrow_mut() = Rc::new(next);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        crate::wgpu_app::request_render();
+                    }
+                    (callbacks.on_ownership)(*anchor_id, *owner);
+                    return;
+                }
+                let last = last_seq.get();
+                if seq <= last {
+                    console::warn!("multiplayer update dropped (stale)", seq, last, kind);
+                    return;
+                }
+                last_seq.set(seq);
+                if !state_applied.get() {
+                    console::warn!("multiplayer update dropped (not ready)", seq, kind);
+                    (callbacks.on_drop_not_ready)();
+                    return;
+                }
+                (callbacks.on_update)(update, seq);
+            }
+            ServerMsg::Pong { .. } => {}
+            ServerMsg::Error { code, message } => {
+                console::warn!("server error", code.clone(), message.clone());
+                (callbacks.on_error)(code, message);
+            }
+        })
+    }
+}
+
+impl GameSync for MultiplayerGameSync {
+    fn init(&mut self, _hooks: SyncHooks) {}
+
+    fn handle_local_action(&mut self, action: &CoreAction) {
+        match action {
+            CoreAction::BeginDrag { piece_id, .. } => {
+                self.send(ClientMsg::Select {
+                    piece_id: *piece_id as u32,
+                });
+            }
+            CoreAction::Sync(sync_action) => match sync_action {
+                SyncAction::Move { anchor_id, pos } => {
+                    self.send(ClientMsg::Move {
+                        anchor_id: *anchor_id as u32,
+                        pos: *pos,
+                    });
+                }
+                SyncAction::Transform {
+                    anchor_id,
+                    pos,
+                    rot_deg,
+                } => {
+                    self.send(ClientMsg::Transform {
+                        anchor_id: *anchor_id as u32,
+                        pos: *pos,
+                        rot_deg: *rot_deg,
+                    });
+                }
+                SyncAction::Place {
+                    anchor_id,
+                    pos,
+                    rot_deg,
+                } => {
+                    self.send(ClientMsg::Place {
+                        anchor_id: *anchor_id as u32,
+                        pos: *pos,
+                        rot_deg: *rot_deg,
+                    });
+                }
+                SyncAction::Flip { piece_id, flipped } => {
+                    self.send(ClientMsg::Flip {
+                        piece_id: *piece_id as u32,
+                        flipped: *flipped,
+                    });
+                }
+                SyncAction::Release { anchor_id } => {
+                    self.send(ClientMsg::Release {
+                        anchor_id: *anchor_id as u32,
+                    });
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.disconnect();
+    }
+
+    fn sync_view(&self) -> SyncView {
+        SyncView::new(
+            InitMode::Online,
+            self.connected.get(),
+            self.client_id.get(),
+            self.init_required.get(),
+            self.room_id.borrow().clone(),
+            self.persistence.get(),
+            self.ownership_by_anchor.borrow().clone(),
+        )
+    }
+}
+
+pub(crate) fn update_kind(update: &RoomUpdate) -> &'static str {
+    match update {
+        RoomUpdate::Ownership { .. } => "ownership",
+        RoomUpdate::GroupTransform { .. } => "group_transform",
+        RoomUpdate::Flip { .. } => "flip",
+        RoomUpdate::GroupOrder { .. } => "group_order",
+        RoomUpdate::Connections { .. } => "connections",
+    }
+}

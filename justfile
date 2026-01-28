@@ -21,7 +21,7 @@ worker-dev:
 # Run the frontend locally (requires trunk)
 web-dev:
     @mkdir -p .wrangler
-    @HEDDOBUREIKA_WS_BASE="{{ROOM_WS_BASE_URL}}" trunk serve
+    @trunk serve
 
 # Build the worker (requires worker-build)
 worker-build:

@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::catalog::DEFAULT_PUZZLE_SLUG;
 use heddobureika_core::codec::{decode, encode};
-use heddobureika_core::protocol::{
+use heddobureika_core::{
     AdminMsg, ClientMsg, PuzzleInfo, PuzzleStateSnapshot, RoomPersistence, ServerMsg,
 };
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};

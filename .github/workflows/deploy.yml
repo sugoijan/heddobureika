@@ -41,6 +41,7 @@ jobs:
             PUBLIC_URL="/${REPO_NAME}/"
           fi
           echo "PUBLIC_URL=$PUBLIC_URL" >> "$GITHUB_ENV"
+          echo "TRUNK_PUBLIC_HEDDOBUREIKA_WS_BASE=wss://sugoijan.dev/heddobureika/ws" >> "$GITHUB_ENV"
       - name: Trunk build
         run: trunk build --release --public-url "$PUBLIC_URL"
       - name: Setup Pages

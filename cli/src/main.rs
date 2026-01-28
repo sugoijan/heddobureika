@@ -5,6 +5,7 @@ use heddobureika_core::catalog::{puzzle_by_slug, DEFAULT_PUZZLE_SLUG, PUZZLE_CAT
 use heddobureika_core::protocol::{AdminMsg, RoomPersistence, ServerMsg};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
 use rand::Rng;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
@@ -76,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for entry in PUZZLE_CATALOG {
                         eprintln!("  {} ({})", entry.slug, entry.label);
                     }
-                    return Ok(());
+                    return Err(err_msg(format!("unknown puzzle: {puzzle}")));
                 }
                 let seed = match seed.as_deref() {
                     Some(raw) => Some(parse_seed_arg(raw)?),
@@ -86,15 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let admin_url = build_admin_url(&base_url, &room_id, &admin_token)?;
                 let join_url = build_join_url(&base_url, &room_id)?;
 
-                println!("room_id: {room_id}");
-                println!("join_url: {join_url}");
-
                 if no_connect {
+                    println!("room_id: {room_id}");
+                    println!("join_url: {join_url}");
                     println!("admin_url: {admin_url}");
                     return Ok(());
                 }
 
-                let (ws, _response) = tokio_tungstenite::connect_async(admin_url.as_str()).await?;
+                let (ws, _response) = tokio_tungstenite::connect_async(admin_url.as_str())
+                    .await
+                    .map_err(|err| format!("failed to connect to {admin_url}: {err}"))?;
                 let (mut write, mut read) = ws.split();
 
                 let msg = AdminMsg::Create {
@@ -103,22 +105,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pieces,
                     seed,
                 };
-                if let Some(payload) = encode(&msg) {
-                    write.send(Message::Binary(payload.into())).await?;
+                let Some(payload) = encode(&msg) else {
+                    return Err(err_msg("failed to encode admin create message"));
+                };
+                write.send(Message::Binary(payload.into())).await?;
+
+                let ack_result = timeout(Duration::from_secs(30), async {
+                    while let Some(message) = read.next().await {
+                        let message = match message {
+                            Ok(message) => message,
+                            Err(err) => {
+                                return Err(format!("websocket error: {err}"));
+                            }
+                        };
+                        match message {
+                            Message::Binary(bytes) => {
+                                let Some(msg) = decode::<ServerMsg>(&bytes) else {
+                                    return Err("received unknown binary server message".to_string());
+                                };
+                                match msg {
+                                    ServerMsg::AdminAck { .. } => return Ok(()),
+                                    ServerMsg::Error { code, message } => {
+                                        return Err(format!("server error {code}: {message}"));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Message::Text(text) => {
+                                return Err(format!("server text message: {text}"));
+                            }
+                            Message::Close(frame) => {
+                                return Err(format!("server closed connection: {frame:?}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err("server closed before acknowledging admin create".to_string())
+                })
+                .await;
+
+                match ack_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err_msg(err)),
+                    Err(_) => return Err(err_msg("timed out waiting for admin create ack")),
                 }
 
-                if let Some(message) = read.next().await {
-                    match message? {
-                        Message::Text(text) => println!("server: {text}"),
-                        Message::Binary(bytes) => {
-                            if let Some(msg) = decode::<ServerMsg>(&bytes) {
-                                println!("server: {:?}", msg);
-                            }
-                        }
-                        Message::Close(frame) => println!("server closed: {frame:?}"),
-                        _ => {}
-                    }
-                }
+                println!("room_id: {room_id}");
+                println!("join_url: {join_url}");
             }
         },
     }
@@ -164,4 +197,8 @@ fn parse_seed_arg(raw: &str) -> Result<u32, Box<dyn std::error::Error>> {
         trimmed.parse::<u32>()?
     };
     Ok(value)
+}
+
+fn err_msg(msg: impl Into<String>) -> Box<dyn std::error::Error> {
+    std::io::Error::new(std::io::ErrorKind::Other, msg.into()).into()
 }

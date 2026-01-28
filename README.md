@@ -34,8 +34,7 @@ Dev tasks live in `justfile` (run `just --list`). Common flow:
 Frontend multiplayer config (optional):
 
 - Add `#room=ROOM_ID` to the URL to auto-join a room.
-- `just web-dev` sets `HEDDOBUREIKA_WS_BASE` from `ROOM_WS_BASE_URL` so the dev WS endpoint matches your worker.
-- You can still override `HEDDOBUREIKA_WS_BASE` manually (e.g. via your shell or `.env`) if needed. It must end with `/ws`.
+- Canonical dev config: set `TRUNK_PUBLIC_HEDDOBUREIKA_WS_BASE` in `.env` (default in this repo). It must end with `/ws`.
 
 ## Disclaimer
 

@@ -1,5 +1,6 @@
 use crate::game::{collect_group, piece_local_offset, rotate_vec};
-use crate::protocol::{PuzzleStateSnapshot, RoomUpdate};
+use crate::protocol::RoomUpdate;
+use crate::snapshot::PuzzleStateSnapshot;
 
 pub fn apply_room_update_to_snapshot(
     update: &RoomUpdate,

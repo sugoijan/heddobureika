@@ -83,15 +83,6 @@ impl GroupState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PuzzleInstance {
-    pub(crate) label: String,
-    pub(crate) image_src: String,
-    pub(crate) rows: u32,
-    pub(crate) cols: u32,
-    pub(crate) shape_seed: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PuzzleState {
     pub(crate) pieces: Vec<PieceState>,
     pub(crate) groups: Vec<Option<GroupState>>,

@@ -29,6 +29,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
   /*padding: 24px;*/
 }
 
@@ -130,6 +131,40 @@ body {
 
 .puzzle-image.no-anim .piece {
   transition: none;
+}
+
+.sync-status {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(240, 80, 80, 0.9);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease-out;
+}
+
+.app.sync-disconnected .sync-status {
+  opacity: 1;
+}
+
+.app.sync-disconnected .puzzle-canvas.hover,
+.app.sync-disconnected .piece.hovered,
+.app.sync-disconnected .piece.hovered .piece-hitbox {
+  cursor: wait;
+}
+
+.app.sync-disconnected .puzzle-canvas.ui-link-hover {
+  cursor: pointer;
 }
 
 .piece.dragging {
