@@ -18,6 +18,7 @@ tag = "v1"
 new_classes = ["Room"]
 
 [env.production]
+name = "heddobureika"
 workers_dev = false
 routes = [
   { pattern = "sugoijan.dev/heddobureika/ws/*", zone_name = "sugoijan.dev" }
