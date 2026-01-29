@@ -16,7 +16,7 @@ pub(crate) struct MultiplayerSyncCallbacks {
     pub(crate) on_need_init: Rc<dyn Fn()>,
     pub(crate) on_warning: Rc<dyn Fn(u32)>,
     pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64)>,
+    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<u64>, Option<u64>)>,
     pub(crate) on_ownership: Rc<dyn Fn(u32, Option<u64>)>,
     pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
     pub(crate) on_error: Rc<dyn Fn(String, String)>,
@@ -25,6 +25,8 @@ pub(crate) struct MultiplayerSyncCallbacks {
 pub(crate) struct MultiplayerGameSync {
     adapter: MultiplayerSyncAdapter,
     last_seq: Rc<Cell<u64>>,
+    next_client_seq: Rc<Cell<u64>>,
+    last_sent_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
     state_applied: Rc<Cell<bool>>,
     handler: RefCell<Option<Rc<dyn Fn(ServerMsg)>>>,
     connected: Rc<Cell<bool>>,
@@ -33,6 +35,9 @@ pub(crate) struct MultiplayerGameSync {
     room_id: Rc<RefCell<Option<String>>>,
     persistence: Rc<Cell<Option<RoomPersistence>>>,
     ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, u64>>>>,
+    local_transform_observer:
+        Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>>>,
+    local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool)>>>>,
 }
 
 impl MultiplayerGameSync {
@@ -40,6 +45,8 @@ impl MultiplayerGameSync {
         Self {
             adapter: MultiplayerSyncAdapter::new(),
             last_seq: Rc::new(Cell::new(0)),
+            next_client_seq: Rc::new(Cell::new(0)),
+            last_sent_by_anchor: Rc::new(RefCell::new(HashMap::new())),
             state_applied: Rc::new(Cell::new(false)),
             handler: RefCell::new(None),
             connected: Rc::new(Cell::new(false)),
@@ -48,6 +55,8 @@ impl MultiplayerGameSync {
             room_id: Rc::new(RefCell::new(None)),
             persistence: Rc::new(Cell::new(None)),
             ownership_by_anchor: Rc::new(RefCell::new(Rc::new(HashMap::new()))),
+            local_transform_observer: Rc::new(RefCell::new(None)),
+            local_flip_observer: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -85,6 +94,26 @@ impl MultiplayerGameSync {
         self.adapter.send(msg);
     }
 
+    pub(crate) fn set_local_transform_observer(
+        &self,
+        observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>,
+    ) {
+        *self.local_transform_observer.borrow_mut() = observer;
+    }
+
+    pub(crate) fn set_local_flip_observer(&self, observer: Option<Rc<dyn Fn(u32, bool)>>) {
+        *self.local_flip_observer.borrow_mut() = observer;
+    }
+
+    fn next_client_seq_for(&self, anchor_id: u32) -> u64 {
+        let next = self.next_client_seq.get().saturating_add(1);
+        self.next_client_seq.set(next);
+        self.last_sent_by_anchor
+            .borrow_mut()
+            .insert(anchor_id, next);
+        next
+    }
+
     pub(crate) fn set_state_applied(&self, value: bool) {
         self.state_applied.set(value);
     }
@@ -107,6 +136,8 @@ impl MultiplayerGameSync {
 
     fn reset_state(&self) {
         self.last_seq.set(0);
+        self.next_client_seq.set(0);
+        self.last_sent_by_anchor.borrow_mut().clear();
         self.state_applied.set(false);
         self.connected.set(false);
         self.client_id.set(None);
@@ -173,7 +204,12 @@ impl MultiplayerGameSync {
                 init_required_cell.set(false);
                 (callbacks.on_state)(snapshot, seq);
             }
-            ServerMsg::Update { seq, update, source } => {
+            ServerMsg::Update {
+                seq,
+                update,
+                source,
+                client_seq,
+            } => {
                 let kind = update_kind(&update);
                 console::log!(
                     "multiplayer update received",
@@ -211,7 +247,7 @@ impl MultiplayerGameSync {
                     (callbacks.on_drop_not_ready)();
                     return;
                 }
-                (callbacks.on_update)(update, seq);
+                (callbacks.on_update)(update, seq, source, client_seq);
             }
             ServerMsg::Pong { .. } => {}
             ServerMsg::Error { code, message } => {
@@ -234,21 +270,31 @@ impl GameSync for MultiplayerGameSync {
             }
             CoreAction::Sync(sync_action) => match sync_action {
                 SyncAction::Move { anchor_id, pos } => {
+                    let client_seq = self.next_client_seq_for(*anchor_id as u32);
                     self.send(ClientMsg::Move {
                         anchor_id: *anchor_id as u32,
                         pos: *pos,
+                        client_seq,
                     });
+                    if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
+                        observer(*anchor_id as u32, *pos, None, client_seq);
+                    }
                 }
                 SyncAction::Transform {
                     anchor_id,
                     pos,
                     rot_deg,
                 } => {
+                    let client_seq = self.next_client_seq_for(*anchor_id as u32);
                     self.send(ClientMsg::Transform {
                         anchor_id: *anchor_id as u32,
                         pos: *pos,
                         rot_deg: *rot_deg,
+                        client_seq,
                     });
+                    if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
+                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq);
+                    }
                 }
                 SyncAction::Place {
                     anchor_id,
@@ -260,12 +306,19 @@ impl GameSync for MultiplayerGameSync {
                         pos: *pos,
                         rot_deg: *rot_deg,
                     });
+                    if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
+                        let client_seq = self.next_client_seq_for(*anchor_id as u32);
+                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq);
+                    }
                 }
                 SyncAction::Flip { piece_id, flipped } => {
                     self.send(ClientMsg::Flip {
                         piece_id: *piece_id as u32,
                         flipped: *flipped,
                     });
+                    if let Some(observer) = self.local_flip_observer.borrow().as_ref() {
+                        observer(*piece_id as u32, *flipped);
+                    }
                 }
                 SyncAction::Release { anchor_id } => {
                     self.send(ClientMsg::Release {

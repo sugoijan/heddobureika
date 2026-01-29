@@ -54,6 +54,7 @@ pub(crate) const PUZZLE_SELECTION_KEY: &str = "heddobureika.puzzle.v1";
 pub(crate) const RENDER_SETTINGS_KEY: &str = "heddobureika.render.v1";
 pub(crate) const THEME_MODE_KEY: &str = "heddobureika.theme.v1";
 pub(crate) const INIT_SETTINGS_KEY: &str = "heddobureika.init.v1";
+pub(crate) const ADMIN_TOKEN_KEY: &str = "heddobureika.admin.v1";
 pub(crate) const PUZZLE_SELECTION_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]

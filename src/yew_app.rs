@@ -4,15 +4,15 @@ use gloo::timers::callback::Interval;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
 use js_sys::{Date, Function, Reflect};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    CanvasRenderingContext2d, Element, Event, HtmlCanvasElement, HtmlImageElement,
-    HtmlInputElement, HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent,
+    CanvasRenderingContext2d, Element, Event, HtmlCanvasElement, HtmlImageElement, HtmlInputElement,
+    HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent,
 };
 use yew::prelude::*;
 use taffy::prelude::*;
@@ -25,12 +25,11 @@ use crate::sync_runtime;
 use crate::core::*;
 use crate::model::*;
 use crate::multiplayer_bridge::{self, MultiplayerUiHooks};
+use crate::multiplayer_sync::MultiplayerSyncAdapter;
 use crate::runtime::{CoreAction, SyncAction, SyncHooks};
 use heddobureika_core::{
-    GameSnapshot, PuzzleInfo, RoomUpdate,
+    logical_image_size, AdminMsg, GameSnapshot, PuzzleInfo, RoomUpdate, ServerMsg,
 };
-#[cfg(test)]
-use heddobureika_core::ServerMsg;
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
 use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
@@ -43,6 +42,14 @@ use crate::svg_view;
 enum AppMode {
     Svg,
     DevPanel,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdminStatus {
+    Idle,
+    Connecting,
+    Accepted,
+    Failed,
 }
 
 #[derive(Properties, PartialEq)]
@@ -59,6 +66,14 @@ impl Default for AppProps {
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
 const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
+const WS_DELAY_IN_KEY: &str = "heddobureika.debug.ws_in_ms";
+const WS_DELAY_OUT_KEY: &str = "heddobureika.debug.ws_out_ms";
+const WS_DELAY_JITTER_KEY: &str = "heddobureika.debug.ws_jitter_ms";
+const DEV_PANEL_GROUP_PUZZLE_KEY: &str = "heddobureika.devpanel.group.puzzle.v1";
+const DEV_PANEL_GROUP_MULTIPLAYER_KEY: &str = "heddobureika.devpanel.group.multiplayer.v1";
+const DEV_PANEL_GROUP_GRAPHICS_KEY: &str = "heddobureika.devpanel.group.graphics.v1";
+const DEV_PANEL_GROUP_RULES_KEY: &str = "heddobureika.devpanel.group.rules.v1";
+const DEV_PANEL_GROUP_SHAPING_KEY: &str = "heddobureika.devpanel.group.shaping.v1";
 const FPS_FONT_BYTES: &[u8] = include_bytes!("../fonts/chirufont.ttf");
 const UI_FONT_FAMILY: &str = "KaoriGel";
 const UI_CREDIT_FONT_RATIO: f32 = 0.026;
@@ -139,6 +154,145 @@ impl LocalSnapshot {
             group_order: Vec::new(),
             z_order: Vec::new(),
             scramble_nonce: 0,
+        }
+    }
+}
+
+struct AdminSocket {
+    adapter: Rc<RefCell<MultiplayerSyncAdapter>>,
+    url: Option<String>,
+    connected: Rc<Cell<bool>>,
+    pending: Rc<RefCell<Vec<AdminMsg>>>,
+    status: Rc<Cell<AdminStatus>>,
+    status_hook: Option<Rc<dyn Fn(AdminStatus)>>,
+}
+
+impl AdminSocket {
+    fn new() -> Self {
+        Self {
+            adapter: Rc::new(RefCell::new(MultiplayerSyncAdapter::new())),
+            url: None,
+            connected: Rc::new(Cell::new(false)),
+            pending: Rc::new(RefCell::new(Vec::new())),
+            status: Rc::new(Cell::new(AdminStatus::Idle)),
+            status_hook: None,
+        }
+    }
+
+    fn set_status_hook(&mut self, hook: Rc<dyn Fn(AdminStatus)>) {
+        self.status_hook = Some(hook);
+    }
+
+    fn reset(&mut self) {
+        self.adapter.borrow_mut().disconnect();
+        self.url = None;
+        self.connected.set(false);
+        self.pending.borrow_mut().clear();
+        self.update_status(AdminStatus::Idle);
+    }
+
+    fn send(&mut self, url: String, msg: AdminMsg) {
+        self.pending.borrow_mut().push(msg);
+        let url_changed = self.url.as_deref() != Some(url.as_str());
+        if url_changed {
+            self.url = Some(url.clone());
+            self.connected.set(false);
+            self.update_status(AdminStatus::Connecting);
+            self.connect(url);
+            return;
+        }
+        if self.connected.get() {
+            self.flush();
+        } else {
+            self.update_status(AdminStatus::Connecting);
+            self.connect(url);
+        }
+    }
+
+    fn ensure_connected(&mut self, url: String) {
+        if self.url.as_deref() == Some(url.as_str()) && self.connected.get() {
+            return;
+        }
+        self.url = Some(url.clone());
+        self.connected.set(false);
+        self.update_status(AdminStatus::Connecting);
+        self.connect(url);
+    }
+
+    fn connect(&mut self, url: String) {
+        let adapter = self.adapter.clone();
+        let adapter_for_open = adapter.clone();
+        let pending = self.pending.clone();
+        let connected = self.connected.clone();
+        let status_cell = self.status.clone();
+        let status_on_fail = status_cell.clone();
+        let status_on_msg = status_cell.clone();
+        let status_hook = self.status_hook.clone();
+        let on_open = Rc::new(move || {
+            connected.set(true);
+            let messages = pending.borrow_mut().drain(..).collect::<Vec<_>>();
+            for msg in messages {
+                adapter_for_open.borrow().send_admin(msg);
+            }
+        });
+        let connected_on_fail = self.connected.clone();
+        let on_fail = Rc::new(move || {
+            connected_on_fail.set(false);
+            status_on_fail.set(AdminStatus::Failed);
+            if let Some(hook) = status_hook.as_ref() {
+                hook(AdminStatus::Failed);
+            }
+        });
+        let status_hook = self.status_hook.clone();
+        let on_server_msg = Rc::new(move |msg: ServerMsg| match msg {
+            ServerMsg::AdminAck { room_id, persistence } => {
+                status_on_msg.set(AdminStatus::Accepted);
+                if let Some(hook) = status_hook.as_ref() {
+                    hook(AdminStatus::Accepted);
+                }
+                gloo::console::log!(
+                    "admin ack",
+                    room_id,
+                    format!("{persistence:?}")
+                );
+            }
+            ServerMsg::Welcome { .. } => {
+                status_on_msg.set(AdminStatus::Accepted);
+                if let Some(hook) = status_hook.as_ref() {
+                    hook(AdminStatus::Accepted);
+                }
+            }
+            ServerMsg::Error { code, message } => {
+                status_on_msg.set(AdminStatus::Failed);
+                if let Some(hook) = status_hook.as_ref() {
+                    hook(AdminStatus::Failed);
+                }
+                gloo::console::warn!("admin error", code, message);
+            }
+            _ => {}
+        });
+        adapter
+            .borrow_mut()
+            .connect_with_open(&url, on_server_msg, on_fail, Some(on_open));
+    }
+
+    fn flush(&self) {
+        if !self.connected.get() {
+            return;
+        }
+        let messages = self.pending.borrow_mut().drain(..).collect::<Vec<_>>();
+        for msg in messages {
+            self.adapter.borrow().send_admin(msg);
+        }
+    }
+
+    fn update_status(&mut self, status: AdminStatus) {
+        if self.status.get() == status {
+            return;
+        }
+        self.status.set(status);
+        if let Some(hook) = self.status_hook.as_ref() {
+            hook(status);
         }
     }
 }
@@ -734,6 +888,93 @@ fn save_theme_mode(mode: ThemeMode) {
     let _ = storage.set_item(THEME_MODE_KEY, &raw);
 }
 
+fn load_admin_token() -> Option<String> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(ADMIN_TOKEN_KEY).ok()??;
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn save_admin_token(token: &str) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        let _ = storage.remove_item(ADMIN_TOKEN_KEY);
+        return;
+    }
+    let _ = storage.set_item(ADMIN_TOKEN_KEY, token);
+}
+
+fn load_ws_delay_value(key: &str) -> String {
+    let Some(window) = web_sys::window() else {
+        return String::new();
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return String::new();
+    };
+    storage.get_item(key).ok().flatten().unwrap_or_default()
+}
+
+fn save_ws_delay_value(key: &str, raw: &str) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        let _ = storage.remove_item(key);
+        return;
+    }
+    if trimmed.parse::<u32>().is_ok() {
+        let _ = storage.set_item(key, trimmed);
+    }
+}
+
+fn load_dev_panel_group_open(key: &str, default_value: bool) -> bool {
+    let Some(window) = web_sys::window() else {
+        return default_value;
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return default_value;
+    };
+    match storage.get_item(key).ok().flatten().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default_value,
+    }
+}
+
+fn save_dev_panel_group_open(key: &str, value: bool) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let stored = if value { "1" } else { "0" };
+    let _ = storage.set_item(key, stored);
+}
+
+fn details_toggle(handle: UseStateHandle<bool>, key: &'static str) -> Callback<Event> {
+    Callback::from(move |event: Event| {
+        let element: Element = event.target_unchecked_into();
+        let details = element
+            .closest("details")
+            .ok()
+            .flatten()
+            .unwrap_or(element);
+        let open = details.has_attribute("open");
+        handle.set(open);
+        save_dev_panel_group_open(key, open);
+    })
+}
+
 fn sync_theme_checkbox(input: &HtmlInputElement, mode: ThemeMode) {
     let (checked, indeterminate) = match mode {
         ThemeMode::System => (false, true),
@@ -1263,6 +1504,19 @@ fn time_nonce(previous: u32) -> u32 {
     splitmix32(now ^ previous.wrapping_add(0x9E37_79B9))
 }
 
+fn parse_optional_seed(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (value, radix) = if let Some(rest) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        (rest, 16)
+    } else {
+        (trimmed, 10)
+    };
+    u32::from_str_radix(value, radix).ok()
+}
+
 fn prefers_dark_mode() -> bool {
     let Some(window) = web_sys::window() else {
         return false;
@@ -1360,6 +1614,8 @@ fn app(props: &AppProps) -> Html {
         .unwrap_or(0);
     let puzzle_art_index = use_state(|| initial_puzzle_art_index);
     let puzzle_art_index_value = *puzzle_art_index;
+    let admin_puzzle_index = use_state(|| initial_puzzle_art_index);
+    let admin_puzzle_index_value = *admin_puzzle_index;
     let puzzle_art = PUZZLE_ARTS
         .get(puzzle_art_index_value)
         .copied()
@@ -1380,9 +1636,43 @@ fn app(props: &AppProps) -> Html {
             }
         })
         .collect();
+    let admin_puzzle_options: Html = PUZZLE_ARTS
+        .iter()
+        .enumerate()
+        .map(|(index, art)| {
+            html! {
+                <option value={index.to_string()} selected={index == admin_puzzle_index_value}>
+                    {art.label}
+                </option>
+            }
+        })
+        .collect();
     let init_config = app_runtime::init_config();
     let multiplayer_config = use_state(|| init_config.multiplayer.clone());
     let multiplayer_config_value = (*multiplayer_config).clone();
+    let admin_token_input = use_state(|| load_admin_token().unwrap_or_default());
+    let admin_token_input_value = (*admin_token_input).clone();
+    let admin_token_active = use_state(|| load_admin_token().unwrap_or_default());
+    let admin_token_active_value = (*admin_token_active).clone();
+    let admin_status = use_state(|| AdminStatus::Idle);
+    let admin_status_value = *admin_status;
+    let admin_seed = use_state(|| String::new());
+    let admin_seed_value = (*admin_seed).clone();
+    let admin_pieces_index = use_state(|| 0usize);
+    let admin_pieces_index_value = *admin_pieces_index;
+    let admin_socket = use_mut_ref(AdminSocket::new);
+    let ws_delay_in = use_state(|| load_ws_delay_value(WS_DELAY_IN_KEY));
+    let ws_delay_in_value = (*ws_delay_in).clone();
+    let ws_delay_out = use_state(|| load_ws_delay_value(WS_DELAY_OUT_KEY));
+    let ws_delay_out_value = (*ws_delay_out).clone();
+    let ws_delay_jitter = use_state(|| load_ws_delay_value(WS_DELAY_JITTER_KEY));
+    let ws_delay_jitter_value = (*ws_delay_jitter).clone();
+    let puzzle_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_PUZZLE_KEY, true));
+    let multiplayer_group_open =
+        use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_MULTIPLAYER_KEY, true));
+    let graphics_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_GRAPHICS_KEY, false));
+    let rules_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_RULES_KEY, false));
+    let shaping_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_SHAPING_KEY, false));
     let sync_revision = use_state(|| 0u32);
     let sync_view = sync_runtime::sync_view();
     let multiplayer_active = matches!(sync_view.mode(), InitMode::Online);
@@ -1488,6 +1778,43 @@ fn app(props: &AppProps) -> Html {
     let image_max_dim = render_settings_value
         .image_max_dim
         .clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
+    let admin_puzzle_entry = PUZZLE_ARTS
+        .get(admin_puzzle_index_value)
+        .copied()
+        .unwrap_or(PUZZLE_ARTS[0]);
+    let (admin_logical_width, admin_logical_height) = logical_image_size(
+        admin_puzzle_entry.width,
+        admin_puzzle_entry.height,
+        image_max_dim,
+    );
+    let mut admin_grid_choices = build_grid_choices(admin_logical_width, admin_logical_height);
+    if admin_grid_choices.is_empty() {
+        admin_grid_choices.push(FALLBACK_GRID);
+    }
+    let admin_pieces_options: Html = std::iter::once(html! {
+        <option value="default" selected={admin_pieces_index_value == 0}>
+            { "Default pieces" }
+        </option>
+    })
+    .chain(admin_grid_choices.iter().enumerate().map(|(index, choice)| {
+        let value = (index + 1).to_string();
+        html! {
+            <option value={value} selected={admin_pieces_index_value == index + 1}>
+                { grid_choice_label(choice) }
+            </option>
+        }
+    }))
+    .collect();
+    {
+        let admin_pieces_index = admin_pieces_index.clone();
+        use_effect_with(
+            (admin_puzzle_index_value, image_max_dim),
+            move |_| {
+                admin_pieces_index.set(0);
+                || ()
+            },
+        );
+    }
     let renderer_kind = render_settings_value.renderer;
     let svg_settings_value = render_settings_value.svg.clone();
     let wgpu_settings_value = render_settings_value.wgpu.clone();
@@ -1612,6 +1939,132 @@ fn app(props: &AppProps) -> Html {
         "Connected"
     } else {
         "Connecting"
+    };
+    let admin_room_id = sync_view
+        .room_id()
+        .map(|room_id| room_id.to_string())
+        .or_else(|| multiplayer_config_value.as_ref().map(|config| config.room_id.clone()));
+    {
+        let admin_socket = admin_socket.clone();
+        let admin_status = admin_status.clone();
+        use_effect_with((), move |_| {
+            admin_socket
+                .borrow_mut()
+                .set_status_hook(Rc::new(move |status| {
+                    admin_status.set(status);
+                }));
+            || ()
+        });
+    }
+    {
+        let admin_socket = admin_socket.clone();
+        let admin_status = admin_status.clone();
+        let admin_room_id = admin_room_id.clone();
+        let admin_token_value = admin_token_active_value.clone();
+        let multiplayer_active = multiplayer_active;
+        use_effect_with(
+            (
+                admin_token_value.clone(),
+                admin_room_id.clone(),
+                multiplayer_active,
+            ),
+            move |(token, room_id, active)| {
+                let cleanup = || ();
+                if !*active {
+                    admin_socket.borrow_mut().reset();
+                    admin_status.set(AdminStatus::Idle);
+                    return cleanup;
+                }
+                let Some(room_id) = room_id.as_ref() else {
+                    admin_socket.borrow_mut().reset();
+                    admin_status.set(AdminStatus::Idle);
+                    return cleanup;
+                };
+                let token = token.trim();
+                if token.is_empty() {
+                    admin_socket.borrow_mut().reset();
+                    admin_status.set(AdminStatus::Idle);
+                    return cleanup;
+                }
+                let Some(ws_base) = app_router::default_ws_base() else {
+                    return cleanup;
+                };
+                let url = app_router::build_room_admin_ws_url(&ws_base, room_id, token);
+                admin_socket.borrow_mut().ensure_connected(url);
+                cleanup
+            },
+        );
+    }
+    let admin_enabled = multiplayer_active && matches!(admin_status_value, AdminStatus::Accepted);
+    let admin_status_label = match admin_status_value {
+        AdminStatus::Idle => "Admin token not verified",
+        AdminStatus::Connecting => "Admin token: connecting...",
+        AdminStatus::Accepted => "Admin token accepted",
+        AdminStatus::Failed => "Admin token rejected",
+    };
+    let on_admin_change_puzzle = {
+        let admin_socket = admin_socket.clone();
+        let admin_room_id = admin_room_id.clone();
+        let admin_token_value = admin_token_active_value.clone();
+        let admin_seed_value = admin_seed_value.clone();
+        let admin_grid_choices = admin_grid_choices.clone();
+        let admin_pieces_index_value = admin_pieces_index_value;
+        Callback::from(move |_: MouseEvent| {
+            let Some(room_id) = admin_room_id.as_ref() else {
+                return;
+            };
+            let token = admin_token_value.trim();
+            if token.is_empty() {
+                return;
+            }
+            let Some(ws_base) = app_router::default_ws_base() else {
+                return;
+            };
+            let url = app_router::build_room_admin_ws_url(&ws_base, room_id, token);
+            let entry = PUZZLE_ARTS
+                .get(admin_puzzle_index_value)
+                .copied()
+                .unwrap_or(PUZZLE_ARTS[0]);
+            let pieces = if admin_pieces_index_value == 0 {
+                None
+            } else {
+                admin_grid_choices
+                    .get(admin_pieces_index_value.saturating_sub(1))
+                    .map(|choice| choice.target_count)
+            };
+            let seed = parse_optional_seed(&admin_seed_value);
+            admin_socket.borrow_mut().send(
+                url,
+                AdminMsg::ChangePuzzle {
+                    puzzle: entry.slug.to_string(),
+                    pieces,
+                    seed,
+                },
+            );
+        })
+    };
+    let on_admin_scramble = {
+        let admin_socket = admin_socket.clone();
+        let admin_room_id = admin_room_id.clone();
+        let admin_token_value = admin_token_active_value.clone();
+        let admin_seed_value = admin_seed_value.clone();
+        Callback::from(move |_: MouseEvent| {
+            let Some(room_id) = admin_room_id.as_ref() else {
+                return;
+            };
+            let token = admin_token_value.trim();
+            if token.is_empty() {
+                return;
+            }
+            let Some(ws_base) = app_router::default_ws_base() else {
+                return;
+            };
+            let url = app_router::build_room_admin_ws_url(&ws_base, room_id, token);
+            let seed = parse_optional_seed(&admin_seed_value);
+            admin_socket
+                .borrow_mut()
+                .send(url, AdminMsg::Scramble { seed });
+        })
     };
     let save_revision = use_state(|| 0u32);
     let frame_snap_ratio = use_state(|| FRAME_SNAP_DEFAULT);
@@ -2032,7 +2485,7 @@ fn app(props: &AppProps) -> Html {
             let bump_sync_revision = bump_sync_revision.clone();
             #[cfg(test)]
             let puzzle_info = puzzle_info_store.clone();
-            Rc::new(move |_update: RoomUpdate, _seq: u64| {
+            Rc::new(move |_update: RoomUpdate, _seq: u64, _source: Option<u64>, _client_seq: Option<u64>| {
                 #[cfg(test)]
                 {
                     if puzzle_info.get().is_none() {
@@ -2044,7 +2497,28 @@ fn app(props: &AppProps) -> Html {
         };
         let on_ownership = {
             let bump_sync_revision = bump_sync_revision.clone();
-            Rc::new(move |_anchor_id: u32, _owner: Option<u64>| {
+            let drag_state = drag_state.clone();
+            let drag_pending = drag_pending.clone();
+            let drag_frame = drag_frame.clone();
+            let dragging_members = dragging_members.clone();
+            let active_id = active_id.clone();
+            Rc::new(move |anchor_id: u32, owner: Option<u64>| {
+                if let Some(my_id) = sync_runtime::sync_view().client_id() {
+                    if owner != Some(my_id) {
+                        let should_cancel = drag_state
+                            .borrow()
+                            .as_ref()
+                            .map(|drag| drag.anchor_id as u32 == anchor_id)
+                            .unwrap_or(false);
+                        if should_cancel {
+                            dragging_members.set(Vec::new());
+                            *drag_state.borrow_mut() = None;
+                            drag_pending.borrow_mut().take();
+                            drag_frame.borrow_mut().take();
+                            active_id.set(None);
+                        }
+                    }
+                }
                 bump_sync_revision();
             })
         };
@@ -2271,6 +2745,87 @@ fn app(props: &AppProps) -> Html {
                     );
                 }
             }
+        })
+    };
+    let on_admin_token_input = {
+        let admin_token_input = admin_token_input.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            admin_token_input.set(input.value());
+        })
+    };
+    let on_admin_token_apply = {
+        let admin_token_input = admin_token_input.clone();
+        let admin_token_active = admin_token_active.clone();
+        let admin_status = admin_status.clone();
+        let admin_socket = admin_socket.clone();
+        Callback::from(move |_: MouseEvent| {
+            let value = (*admin_token_input).clone();
+            let trimmed = value.trim().to_string();
+            save_admin_token(&value);
+            admin_token_active.set(trimmed);
+            admin_socket.borrow_mut().reset();
+            admin_status.set(AdminStatus::Idle);
+        })
+    };
+    let on_admin_puzzle_change = {
+        let admin_puzzle_index = admin_puzzle_index.clone();
+        let puzzle_art_len = PUZZLE_ARTS.len();
+        Callback::from(move |event: Event| {
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            if let Ok(value) = select.value().parse::<usize>() {
+                if value < puzzle_art_len {
+                    admin_puzzle_index.set(value);
+                }
+            }
+        })
+    };
+    let on_admin_seed_input = {
+        let admin_seed = admin_seed.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            admin_seed.set(input.value());
+        })
+    };
+    let on_admin_pieces_change = {
+        let admin_pieces_index = admin_pieces_index.clone();
+        Callback::from(move |event: Event| {
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            let value = select.value();
+            if value == "default" {
+                admin_pieces_index.set(0);
+                return;
+            }
+            if let Ok(index) = value.parse::<usize>() {
+                admin_pieces_index.set(index);
+            }
+        })
+    };
+    let on_ws_delay_in_input = {
+        let ws_delay_in = ws_delay_in.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let value = input.value();
+            ws_delay_in.set(value.clone());
+            save_ws_delay_value(WS_DELAY_IN_KEY, &value);
+        })
+    };
+    let on_ws_delay_out_input = {
+        let ws_delay_out = ws_delay_out.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let value = input.value();
+            ws_delay_out.set(value.clone());
+            save_ws_delay_value(WS_DELAY_OUT_KEY, &value);
+        })
+    };
+    let on_ws_delay_jitter_input = {
+        let ws_delay_jitter = ws_delay_jitter.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let value = input.value();
+            ws_delay_jitter.set(value.clone());
+            save_ws_delay_value(WS_DELAY_JITTER_KEY, &value);
         })
     };
     let on_workspace_scale = {
@@ -5549,9 +6104,32 @@ fn app(props: &AppProps) -> Html {
             let rows = grid.rows as usize;
             let yew_wgpu_enabled = yew_wgpu_enabled;
             let allow_drag = allow_drag;
+            let ownership_by_anchor_value = ownership_by_anchor_value.clone();
+            let mp_client_id_value = mp_client_id_value;
             Rc::new(move |piece_id, x, y, shift_key, rotate_mode, right_click, touch_id| {
                 if !allow_drag {
                     return;
+                }
+                let (positions_snapshot, rotations_snapshot, flips_snapshot, mut connections_snapshot) = {
+                    let snapshot = local_snapshot.borrow();
+                    (
+                        snapshot.positions.clone(),
+                        snapshot.rotations.clone(),
+                        snapshot.flips.clone(),
+                        snapshot.connections.clone(),
+                    )
+                };
+                if !ownership_by_anchor_value.is_empty() {
+                    let mut members = collect_group(&connections_snapshot, piece_id, cols, rows);
+                    if members.is_empty() {
+                        members.push(piece_id);
+                    }
+                    let anchor_id = members.iter().copied().min().unwrap_or(piece_id);
+                    if let Some(owner_id) = ownership_by_anchor_value.get(&(anchor_id as u32)) {
+                        if Some(*owner_id) != mp_client_id_value {
+                            return;
+                        }
+                    }
                 }
                 let action = CoreAction::BeginDrag {
                     piece_id,
@@ -5563,15 +6141,6 @@ fn app(props: &AppProps) -> Html {
                     touch_id,
                 };
                 dispatch_view_action(action);
-                let (positions_snapshot, rotations_snapshot, flips_snapshot, mut connections_snapshot) = {
-                    let snapshot = local_snapshot.borrow();
-                    (
-                        snapshot.positions.clone(),
-                        snapshot.rotations.clone(),
-                        snapshot.flips.clone(),
-                        snapshot.connections.clone(),
-                    )
-                };
                 let mut members = if shift_key {
                     clear_piece_connections(&mut connections_snapshot, piece_id, cols, rows);
                     vec![piece_id]
@@ -6592,659 +7161,836 @@ fn app(props: &AppProps) -> Html {
     } else {
         html! {}
     };
+    let on_puzzle_toggle = details_toggle(puzzle_group_open.clone(), DEV_PANEL_GROUP_PUZZLE_KEY);
+    let on_multiplayer_toggle =
+        details_toggle(multiplayer_group_open.clone(), DEV_PANEL_GROUP_MULTIPLAYER_KEY);
+    let on_graphics_toggle = details_toggle(graphics_group_open.clone(), DEV_PANEL_GROUP_GRAPHICS_KEY);
+    let on_rules_toggle = details_toggle(rules_group_open.clone(), DEV_PANEL_GROUP_RULES_KEY);
+    let on_shaping_toggle = details_toggle(shaping_group_open.clone(), DEV_PANEL_GROUP_SHAPING_KEY);
+    let puzzle_controls = html! {
+        <>
+            <div class="control">
+                <label>
+                    { "Seed" }
+                    <span class="control-value">{ seed_label }</span>
+                </label>
+            </div>
+            <div class="control">
+                <label for="share-link">
+                    { share_link_label }
+                </label>
+                <input
+                    id="share-link"
+                    type="text"
+                    value={share_link}
+                    readonly=true
+                />
+            </div>
+            { if !multiplayer_active {
+                html! {
+                    <div class="control">
+                        <label for="share-seed">
+                            { "Include shuffle seed" }
+                            <input
+                                id="share-seed"
+                                type="checkbox"
+                                checked={include_share_seed_value}
+                                onchange={on_share_seed_toggle}
+                            />
+                        </label>
+                    </div>
+                }
+            } else {
+                html! {}
+            }}
+            <div class="control">
+                <label>
+                    { "Expected solve time" }
+                    <span class="control-value">{ solve_time_label }</span>
+                </label>
+            </div>
+            <div class="control">
+                <label>
+                    { "Connections" }
+                    <span class="control-value">{ connections_label }</span>
+                </label>
+            </div>
+            <div class="control">
+                <label>
+                    { "Border connections" }
+                    <span class="control-value">{ border_connections_label }</span>
+                </label>
+            </div>
+            <div class="control">
+                <label>
+                    { "Puzzle art" }
+                    <span class="control-value">{ puzzle_art.label }</span>
+                </label>
+                { if !multiplayer_active {
+                    html! {
+                        <select
+                            id="puzzle-art-select"
+                            onchange={on_puzzle_art_change}
+                        >
+                            {puzzle_art_options}
+                        </select>
+                    }
+                } else {
+                    html! {}
+                }}
+            </div>
+            <div class="control">
+                <label>
+                    { "Grid" }
+                    <span class="control-value">{ grid_label }</span>
+                </label>
+                { if !multiplayer_active {
+                    html! {
+                        <select
+                            id="grid-select"
+                            onchange={on_grid_change}
+                        >
+                            {grid_options}
+                        </select>
+                    }
+                } else {
+                    html! {}
+                }}
+            </div>
+            { if !multiplayer_active {
+                html! {
+                    <>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_scramble}
+                                disabled={scramble_disabled}
+                            >
+                                { "Scramble" }
+                            </button>
+                        </div>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_solve}
+                                disabled={scramble_disabled}
+                            >
+                                { "Solve" }
+                            </button>
+                        </div>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_solve_rotation}
+                                disabled={scramble_disabled}
+                            >
+                                { "Solve rotation" }
+                            </button>
+                        </div>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_unflip}
+                                disabled={scramble_disabled}
+                            >
+                                { "Unflip all" }
+                            </button>
+                        </div>
+                    </>
+                }
+            } else {
+                html! {}
+            }}
+        </>
+    };
+    let multiplayer_controls = html! {
+        <>
+            <div class="control">
+                <label for="mode-select">{ "Mode" }</label>
+                <select
+                    id="mode-select"
+                    value={mode_value}
+                    onchange={on_mode_change}
+                >
+                    <option value="local" selected={!multiplayer_active}>
+                        { "Local" }
+                    </option>
+                    <option value="online" selected={multiplayer_active}>
+                        { "Online" }
+                    </option>
+                </select>
+            </div>
+            { if multiplayer_active {
+                html! {
+                    <div class="control">
+                        <button
+                            class="control-button"
+                            type="button"
+                            onclick={on_leave_room}
+                        >
+                            { "Leave room" }
+                        </button>
+                    </div>
+                }
+            } else {
+                html! {}
+            }}
+            { if multiplayer_active {
+                html! {
+                    <>
+                        <div class="control">
+                            <label>
+                                { "Room" }
+                                <span class="control-value">{ mp_room_label.clone() }</span>
+                            </label>
+                        </div>
+                        <div class="control">
+                            <label>
+                                { "Connection" }
+                                <span class="control-value">{ mp_connection_label }</span>
+                            </label>
+                        </div>
+                        <div class="control">
+                            <label for="admin-token">
+                                { "Admin token" }
+                            </label>
+                            <input
+                                id="admin-token"
+                                type="password"
+                                value={admin_token_input_value.clone()}
+                                oninput={on_admin_token_input}
+                            />
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_admin_token_apply}
+                            >
+                                { "Apply" }
+                            </button>
+                            <span class="control-value">{ admin_status_label }</span>
+                        </div>
+                        { if admin_enabled {
+                            html! {
+                                <>
+                                    <div class="control">
+                                        <label for="admin-puzzle">
+                                            { "Admin puzzle" }
+                                        </label>
+                                        <select
+                                            id="admin-puzzle"
+                                            onchange={on_admin_puzzle_change}
+                                        >
+                                            {admin_puzzle_options}
+                                        </select>
+                                    </div>
+                                    <div class="control">
+                                        <label for="admin-pieces">
+                                            { "Admin pieces" }
+                                        </label>
+                                        <select
+                                            id="admin-pieces"
+                                            onchange={on_admin_pieces_change}
+                                        >
+                                            {admin_pieces_options}
+                                        </select>
+                                    </div>
+                                    <div class="control">
+                                        <label for="admin-seed">
+                                            { "Admin seed (optional)" }
+                                        </label>
+                                        <input
+                                            id="admin-seed"
+                                            type="text"
+                                            value={admin_seed_value.clone()}
+                                            placeholder="0x1234"
+                                            oninput={on_admin_seed_input}
+                                        />
+                                    </div>
+                                    <div class="control">
+                                        <button
+                                            class="control-button"
+                                            type="button"
+                                            onclick={on_admin_change_puzzle}
+                                        >
+                                            { "Admin: Change puzzle" }
+                                        </button>
+                                    </div>
+                                    <div class="control">
+                                        <button
+                                            class="control-button"
+                                            type="button"
+                                            onclick={on_admin_scramble}
+                                        >
+                                            { "Admin: Scramble" }
+                                        </button>
+                                    </div>
+                                </>
+                            }
+                        } else {
+                            html! {}
+                        }}
+                    </>
+                }
+            } else {
+                html! {}
+            }}
+            <div class="control">
+                <label for="ws-delay-in">{ "WS in delay (ms)" }</label>
+                <input
+                    id="ws-delay-in"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={ws_delay_in_value.clone()}
+                    oninput={on_ws_delay_in_input}
+                />
+            </div>
+            <div class="control">
+                <label for="ws-delay-out">{ "WS out delay (ms)" }</label>
+                <input
+                    id="ws-delay-out"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={ws_delay_out_value.clone()}
+                    oninput={on_ws_delay_out_input}
+                />
+            </div>
+            <div class="control">
+                <label for="ws-delay-jitter">{ "WS jitter (ms)" }</label>
+                <input
+                    id="ws-delay-jitter"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={ws_delay_jitter_value.clone()}
+                    oninput={on_ws_delay_jitter_input}
+                />
+            </div>
+        </>
+    };
+    let graphics_controls = html! {
+        <>
+            <div class="control">
+                <label for="menu-visible">
+                    { "Menu overlay" }
+                    <input
+                        id="menu-visible"
+                        type="checkbox"
+                        checked={menu_visible_value}
+                        onchange={on_menu_toggle}
+                    />
+                </label>
+            </div>
+            <div class="control">
+                <label for="renderer-select">{ "Renderer" }</label>
+                <select
+                    id="renderer-select"
+                    value={renderer_value}
+                    onchange={on_renderer_change}
+                >
+                    <option value="wgpu" selected={renderer_kind == RendererKind::Wgpu}>
+                        { "WGPU" }
+                    </option>
+                    <option value="svg" selected={renderer_kind == RendererKind::Svg}>
+                        { "SVG" }
+                    </option>
+                </select>
+            </div>
+            <div class="control">
+                <label for="image-max-dim">
+                    { "Image max dimension" }
+                    <span class="control-value">{ image_max_dim }</span>
+                </label>
+                <input
+                    id="image-max-dim"
+                    type="range"
+                    min={IMAGE_MAX_DIMENSION_MIN.to_string()}
+                    max={IMAGE_MAX_DIMENSION_MAX.to_string()}
+                    step="256"
+                    value={image_max_dim.to_string()}
+                    onchange={on_image_max_dim}
+                />
+            </div>
+            { if renderer_kind == RendererKind::Svg {
+                html! {
+                    <>
+                        <div class="control">
+                            <label for="animations-enabled">
+                                { "Animations: " }
+                                { if svg_animations_enabled { "On" } else { "Off" } }
+                                <input
+                                    id="animations-enabled"
+                                    type="checkbox"
+                                    checked={svg_animations_enabled}
+                                    onchange={on_animations_toggle}
+                                />
+                            </label>
+                        </div>
+                        <div class="control">
+                            <label for="emboss-enabled">
+                                { "Emboss: " }
+                                { if svg_emboss_enabled { "On" } else { "Off" } }
+                                <input
+                                    id="emboss-enabled"
+                                    type="checkbox"
+                                    checked={svg_emboss_enabled}
+                                    onchange={on_emboss_toggle}
+                                />
+                            </label>
+                        </div>
+                        <div class="control">
+                            <label for="fast-render">
+                                { "Fast render: " }
+                                { if svg_fast_render { "On" } else { "Off" } }
+                                <input
+                                    id="fast-render"
+                                    type="checkbox"
+                                    checked={svg_fast_render}
+                                    onchange={on_fast_render_toggle}
+                                />
+                            </label>
+                        </div>
+                        <div class="control">
+                            <label for="fast-filter">
+                                { "Fast filter: " }
+                                { if svg_fast_filter { "On" } else { "Off" } }
+                                <input
+                                    id="fast-filter"
+                                    type="checkbox"
+                                    checked={svg_fast_filter}
+                                    onchange={on_fast_filter_toggle}
+                                />
+                            </label>
+                        </div>
+                    </>
+                }
+            } else {
+                html! {
+                    <>
+                        <div class="control">
+                            <label for="wgpu-show-fps">
+                                { "Show FPS: " }
+                                { if wgpu_show_fps { "On" } else { "Off" } }
+                                <input
+                                    id="wgpu-show-fps"
+                                    type="checkbox"
+                                    checked={wgpu_show_fps}
+                                    onchange={on_wgpu_fps_toggle}
+                                />
+                            </label>
+                        </div>
+                        <div class="control">
+                            <label for="wgpu-edge-aa">
+                                { "Edge AA" }
+                                <span class="control-value">{ fmt_f32(wgpu_edge_aa) }</span>
+                            </label>
+                            <input
+                                id="wgpu-edge-aa"
+                                type="range"
+                                min={WGPU_EDGE_AA_MIN.to_string()}
+                                max={WGPU_EDGE_AA_MAX.to_string()}
+                                step="0.01"
+                                value={wgpu_edge_aa.to_string()}
+                                oninput={on_wgpu_edge_aa}
+                            />
+                        </div>
+                        <div class="control">
+                            <label for="wgpu-render-scale">
+                                { "Render scale" }
+                                <span class="control-value">{ fmt_f32(wgpu_render_scale) }</span>
+                            </label>
+                            <input
+                                id="wgpu-render-scale"
+                                type="range"
+                                min={WGPU_RENDER_SCALE_MIN.to_string()}
+                                max={WGPU_RENDER_SCALE_MAX.to_string()}
+                                step="0.05"
+                                value={wgpu_render_scale.to_string()}
+                                oninput={on_wgpu_render_scale}
+                            />
+                        </div>
+                    </>
+                }
+            } }
+            <div class="control">
+                <label for="theme-mode">
+                    { "Theme: " }
+                    { match theme_mode_value {
+                        ThemeMode::System => "System",
+                        ThemeMode::Light => "Light",
+                        ThemeMode::Dark => "Dark",
+                    } }
+                    <input
+                        id="theme-mode"
+                        type="checkbox"
+                        checked={theme_mode_value == ThemeMode::Dark}
+                        ref={theme_toggle_ref}
+                        onchange={on_theme_toggle}
+                    />
+                </label>
+            </div>
+            <div class="control">
+                <label for="debug-enabled">
+                    { "Debug overlay: " } { if show_debug_value { "On" } else { "Off" } }
+                    <input
+                        id="debug-enabled"
+                        type="checkbox"
+                        checked={show_debug_value}
+                        onchange={on_debug_toggle}
+                    />
+                </label>
+            </div>
+        </>
+    };
+    let rules_controls = html! {
+        <>
+            <div class="control">
+                <label for="workspace-scale">
+                    { "Workspace scale" }
+                    <span class="control-value">{ fmt_f32(workspace_scale_value) }</span>
+                </label>
+                <input
+                    id="workspace-scale"
+                    type="range"
+                    min={WORKSPACE_SCALE_MIN.to_string()}
+                    max={WORKSPACE_SCALE_MAX.to_string()}
+                    step="0.05"
+                    value={workspace_scale_value.to_string()}
+                    oninput={on_workspace_scale}
+                />
+            </div>
+            <div class="control">
+                <label for="frame-snap">
+                    { "Frame snap" }
+                    <span class="control-value">{ fmt_f32(frame_snap_ratio_value) }</span>
+                </label>
+                <input
+                    id="frame-snap"
+                    type="range"
+                    min={FRAME_SNAP_MIN.to_string()}
+                    max={FRAME_SNAP_MAX.to_string()}
+                    step="0.05"
+                    value={frame_snap_ratio_value.to_string()}
+                    oninput={on_frame_snap}
+                />
+            </div>
+            <div class="control">
+                <label for="snap-distance">
+                    { "Snap distance tol" }
+                    <span class="control-value">{ fmt_f32(snap_distance_ratio_value) }</span>
+                </label>
+                <input
+                    id="snap-distance"
+                    type="range"
+                    min={SNAP_DISTANCE_RATIO_MIN.to_string()}
+                    max={SNAP_DISTANCE_RATIO_MAX.to_string()}
+                    step="0.01"
+                    value={snap_distance_ratio_value.to_string()}
+                    oninput={on_snap_distance}
+                />
+            </div>
+            <div class="control">
+                <label for="rotation-snap-tolerance">
+                    { "Snap angle tol (deg)" }
+                    <span class="control-value">{ fmt_f32(rotation_snap_tolerance_value) }</span>
+                </label>
+                <input
+                    id="rotation-snap-tolerance"
+                    type="range"
+                    min={ROTATION_SNAP_TOLERANCE_MIN_DEG.to_string()}
+                    max={ROTATION_SNAP_TOLERANCE_MAX_DEG.to_string()}
+                    step="0.5"
+                    value={rotation_snap_tolerance_value.to_string()}
+                    oninput={on_rotation_snap_tolerance}
+                />
+            </div>
+            <div class="control">
+                <label for="rotation-lock-threshold">
+                    { "Aligned rotate <= " }
+                    <span class="control-value">{ rotation_lock_threshold_value }</span>
+                </label>
+                <input
+                    id="rotation-lock-threshold"
+                    type="range"
+                    min={ROTATION_LOCK_THRESHOLD_MIN.to_string()}
+                    max={total.max(ROTATION_LOCK_THRESHOLD_MIN).to_string()}
+                    step="1"
+                    value={rotation_lock_threshold_value.to_string()}
+                    oninput={on_rotation_lock_threshold}
+                />
+            </div>
+            <div class="control">
+                <label for="rotation-enabled">
+                    { "Rotation: " } { if rotation_enabled_value { "On" } else { "Off" } }
+                    <input
+                        id="rotation-enabled"
+                        type="checkbox"
+                        checked={rotation_enabled_value}
+                        onchange={on_rotation_toggle}
+                    />
+                </label>
+            </div>
+            <div class="control">
+                <label for="rotation-noise">
+                    { "Rotation noise" }
+                    <span class="control-value">{ fmt_f32(rotation_noise_value) }</span>
+                </label>
+                <input
+                    id="rotation-noise"
+                    type="range"
+                    min={ROTATION_NOISE_MIN.to_string()}
+                    max={ROTATION_NOISE_MAX.to_string()}
+                    step="0.1"
+                    value={rotation_noise_value.to_string()}
+                    oninput={on_rotation_noise}
+                />
+            </div>
+        </>
+    };
+    let shaping_controls = html! {
+        <>
+            <div class="control">
+                <label for="tab-width">
+                    { "Tab size" }
+                    <span class="control-value">{ fmt_f32(settings_value.tab_width) }</span>
+                </label>
+                <input
+                    id="tab-width"
+                    type="range"
+                    min={TAB_WIDTH_MIN.to_string()}
+                    max={TAB_WIDTH_MAX.to_string()}
+                    step="0.005"
+                    value={settings_value.tab_width.to_string()}
+                    oninput={tab_width_input}
+                />
+            </div>
+            <div class="control">
+                <label for="tab-depth">
+                    { "Tab depth" }
+                    <span class="control-value">{ fmt_f32(settings_value.tab_depth) }</span>
+                </label>
+                <input
+                    id="tab-depth"
+                    type="range"
+                    min={TAB_DEPTH_MIN.to_string()}
+                    max={TAB_DEPTH_MAX.to_string()}
+                    step="0.01"
+                    value={settings_value.tab_depth.to_string()}
+                    oninput={tab_depth_input}
+                />
+            </div>
+            <div class="control">
+                <label for="tab-size-scale">
+                    { "Tab size scale" }
+                    <span class="control-value">
+                        { fmt_f32(settings_value.tab_size_scale) }
+                    </span>
+                </label>
+                <input
+                    id="tab-size-scale"
+                    type="range"
+                    min={TAB_SIZE_SCALE_MIN.to_string()}
+                    max={TAB_SIZE_SCALE_MAX.to_string()}
+                    step="0.005"
+                    value={settings_value.tab_size_scale.to_string()}
+                    oninput={tab_size_scale_input}
+                />
+            </div>
+            <div class="control">
+                <label for="tab-size-min">
+                    { "Tab size min" }
+                    <span class="control-value">{ fmt_f32(settings_value.tab_size_min) }</span>
+                </label>
+                <input
+                    id="tab-size-min"
+                    type="range"
+                    min={TAB_SIZE_MIN_LIMIT.to_string()}
+                    max={settings_value.tab_size_max.to_string()}
+                    step="0.005"
+                    value={settings_value.tab_size_min.to_string()}
+                    oninput={tab_size_min_input}
+                />
+            </div>
+            <div class="control">
+                <label for="tab-size-max">
+                    { "Tab size max" }
+                    <span class="control-value">{ fmt_f32(settings_value.tab_size_max) }</span>
+                </label>
+                <input
+                    id="tab-size-max"
+                    type="range"
+                    min={settings_value.tab_size_min.to_string()}
+                    max={TAB_SIZE_MAX_LIMIT.to_string()}
+                    step="0.005"
+                    value={settings_value.tab_size_max.to_string()}
+                    oninput={tab_size_max_input}
+                />
+            </div>
+            <div class="control">
+                <label for="skew-range">
+                    { "Center skew" }
+                    <span class="control-value">{ fmt_f32(settings_value.skew_range) }</span>
+                </label>
+                <input
+                    id="skew-range"
+                    type="range"
+                    min="0.0"
+                    max={SKEW_RANGE_MAX.to_string()}
+                    step="0.005"
+                    value={settings_value.skew_range.to_string()}
+                    oninput={skew_input}
+                />
+            </div>
+            <div class="control">
+                <label for="variation">
+                    { "Variation" }
+                    <span class="control-value">{ fmt_f32(settings_value.variation) }</span>
+                </label>
+                <input
+                    id="variation"
+                    type="range"
+                    min={VARIATION_MIN.to_string()}
+                    max={VARIATION_MAX.to_string()}
+                    step="0.01"
+                    value={settings_value.variation.to_string()}
+                    oninput={variation_input}
+                />
+            </div>
+            <div class="control">
+                <label for="jitter-strength">
+                    { "Jitter strength" }
+                    <span class="control-value">
+                        { fmt_f32(settings_value.jitter_strength) }
+                    </span>
+                </label>
+                <input
+                    id="jitter-strength"
+                    type="range"
+                    min={JITTER_STRENGTH_MIN.to_string()}
+                    max={JITTER_STRENGTH_MAX.to_string()}
+                    step="0.005"
+                    value={settings_value.jitter_strength.to_string()}
+                    oninput={jitter_strength_input}
+                />
+            </div>
+            <div class="control">
+                <label for="jitter-len-bias">
+                    { "Length jitter bias" }
+                    <span class="control-value">
+                        { fmt_f32(settings_value.jitter_len_bias) }
+                    </span>
+                </label>
+                <input
+                    id="jitter-len-bias"
+                    type="range"
+                    min={JITTER_LEN_BIAS_MIN.to_string()}
+                    max={JITTER_LEN_BIAS_MAX.to_string()}
+                    step="0.01"
+                    value={settings_value.jitter_len_bias.to_string()}
+                    oninput={jitter_len_bias_input}
+                />
+            </div>
+            <div class="control">
+                <label for="line-bend">
+                    { "Grid bend" }
+                    <span class="control-value">{ fmt_f32(settings_value.line_bend_ratio) }</span>
+                </label>
+                <input
+                    id="line-bend"
+                    type="range"
+                    min={LINE_BEND_MIN.to_string()}
+                    max={MAX_LINE_BEND_RATIO.to_string()}
+                    step="0.01"
+                    value={settings_value.line_bend_ratio.to_string()}
+                    oninput={line_bend_input}
+                />
+            </div>
+            <div class="control">
+                <label for="tab-depth-cap">
+                    { "Tab depth cap" }
+                    <span class="control-value">
+                        { fmt_f32(settings_value.tab_depth_cap) }
+                    </span>
+                </label>
+                <input
+                    id="tab-depth-cap"
+                    type="range"
+                    min={TAB_DEPTH_CAP_MIN.to_string()}
+                    max={TAB_DEPTH_CAP_MAX.to_string()}
+                    step="0.01"
+                    value={settings_value.tab_depth_cap.to_string()}
+                    oninput={tab_depth_cap_input}
+                />
+            </div>
+            <div class="control">
+                <label for="curve-detail">
+                    { "Curve detail" }
+                    <span class="control-value">
+                        { fmt_f32(settings_value.curve_detail) }
+                    </span>
+                </label>
+                <input
+                    id="curve-detail"
+                    type="range"
+                    min={CURVE_DETAIL_MIN.to_string()}
+                    max={CURVE_DETAIL_MAX.to_string()}
+                    step="0.05"
+                    value={settings_value.curve_detail.to_string()}
+                    oninput={curve_detail_input}
+                />
+            </div>
+        </>
+    };
     let controls_panel = if show_dev_panel && show_controls_value {
         html! {
             <aside class="controls">
                 <h2>{ "Dev Panel" }</h2>
                 <p class={status_class}>{ status_label }</p>
-                <div class="control">
-                    <label for="menu-visible">
-                        { "Menu overlay" }
-                        <input
-                            id="menu-visible"
-                            type="checkbox"
-                            checked={menu_visible_value}
-                            onchange={on_menu_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label>
-                        { "Seed" }
-                        <span class="control-value">{ seed_label }</span>
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="share-link">
-                        { share_link_label }
-                    </label>
-                    <input
-                        id="share-link"
-                        type="text"
-                        value={share_link}
-                        readonly=true
-                    />
-                </div>
-                { if !multiplayer_active {
-                    html! {
-                        <div class="control">
-                            <label for="share-seed">
-                                { "Include shuffle seed" }
-                                <input
-                                    id="share-seed"
-                                    type="checkbox"
-                                    checked={include_share_seed_value}
-                                    onchange={on_share_seed_toggle}
-                                />
-                            </label>
-                        </div>
-                    }
-                } else {
-                    html! {}
-                }}
-                { if multiplayer_active {
-                    html! {
-                        <>
-                            <div class="control">
-                                <label>
-                                    { "Room" }
-                                    <span class="control-value">{ mp_room_label.clone() }</span>
-                                </label>
-                            </div>
-                            <div class="control">
-                                <label>
-                                    { "Connection" }
-                                    <span class="control-value">{ mp_connection_label }</span>
-                                </label>
-                            </div>
-                        </>
-                    }
-                } else {
-                    html! {}
-                }}
-                <div class="control">
-                    <label>
-                        { "Expected solve time" }
-                        <span class="control-value">{ solve_time_label }</span>
-                    </label>
-                </div>
-                <div class="control">
-                    <label>
-                        { "Connections" }
-                        <span class="control-value">{ connections_label }</span>
-                    </label>
-                </div>
-                <div class="control">
-                    <label>
-                        { "Border connections" }
-                        <span class="control-value">{ border_connections_label }</span>
-                    </label>
-                </div>
-                <div class="control">
-                    <label>
-                        { "Puzzle art" }
-                        <span class="control-value">{ puzzle_art.label }</span>
-                    </label>
-                    { if !multiplayer_active {
-                        html! {
-                            <select
-                                id="puzzle-art-select"
-                                onchange={on_puzzle_art_change}
-                            >
-                                {puzzle_art_options}
-                            </select>
-                        }
-                    } else {
-                        html! {}
-                    }}
-                </div>
-                <div class="control">
-                    <label>
-                        { "Grid" }
-                        <span class="control-value">{ grid_label }</span>
-                    </label>
-                    { if !multiplayer_active {
-                        html! {
-                            <select
-                                id="grid-select"
-                                onchange={on_grid_change}
-                            >
-                                {grid_options}
-                            </select>
-                        }
-                    } else {
-                        html! {}
-                    }}
-                </div>
-                { if !multiplayer_active {
-                    html! {
-                        <>
-                            <div class="control">
-                                <button
-                                    class="control-button"
-                                    type="button"
-                                    onclick={on_scramble}
-                                    disabled={scramble_disabled}
-                                >
-                                    { "Scramble" }
-                                </button>
-                            </div>
-                            <div class="control">
-                                <button
-                                    class="control-button"
-                                    type="button"
-                                    onclick={on_solve}
-                                    disabled={scramble_disabled}
-                                >
-                                    { "Solve" }
-                                </button>
-                            </div>
-                            <div class="control">
-                                <button
-                                    class="control-button"
-                                    type="button"
-                                    onclick={on_solve_rotation}
-                                    disabled={scramble_disabled}
-                                >
-                                    { "Solve rotation" }
-                                </button>
-                            </div>
-                            <div class="control">
-                                <button
-                                    class="control-button"
-                                    type="button"
-                                    onclick={on_unflip}
-                                    disabled={scramble_disabled}
-                                >
-                                    { "Unflip all" }
-                                </button>
-                            </div>
-                        </>
-                    }
-                } else {
-                    html! {}
-                }}
-                <div class="control">
-                    <label for="workspace-scale">
-                        { "Workspace scale" }
-                        <span class="control-value">{ fmt_f32(workspace_scale_value) }</span>
-                    </label>
-                    <input
-                        id="workspace-scale"
-                        type="range"
-                        min={WORKSPACE_SCALE_MIN.to_string()}
-                        max={WORKSPACE_SCALE_MAX.to_string()}
-                        step="0.05"
-                        value={workspace_scale_value.to_string()}
-                        oninput={on_workspace_scale}
-                    />
-                </div>
-                <div class="control">
-                    <label for="mode-select">{ "Mode" }</label>
-                    <select
-                        id="mode-select"
-                        value={mode_value}
-                        onchange={on_mode_change}
-                    >
-                        <option value="local" selected={!multiplayer_active}>
-                            { "Local" }
-                        </option>
-                        <option value="online" selected={multiplayer_active}>
-                            { "Online" }
-                        </option>
-                    </select>
-                </div>
-                { if multiplayer_active {
-                    html! {
-                        <div class="control">
-                            <button
-                                class="control-button"
-                                type="button"
-                                onclick={on_leave_room}
-                            >
-                                { "Leave room" }
-                            </button>
-                        </div>
-                    }
-                } else {
-                    html! {}
-                }}
-                <div class="control">
-                    <label for="renderer-select">{ "Renderer" }</label>
-                    <select
-                        id="renderer-select"
-                        value={renderer_value}
-                        onchange={on_renderer_change}
-                    >
-                        <option value="wgpu" selected={renderer_kind == RendererKind::Wgpu}>
-                            { "WGPU" }
-                        </option>
-                        <option value="svg" selected={renderer_kind == RendererKind::Svg}>
-                            { "SVG" }
-                        </option>
-                    </select>
-                </div>
-                <div class="control">
-                    <label for="image-max-dim">
-                        { "Image max dimension" }
-                        <span class="control-value">{ image_max_dim }</span>
-                    </label>
-                    <input
-                        id="image-max-dim"
-                        type="range"
-                        min={IMAGE_MAX_DIMENSION_MIN.to_string()}
-                        max={IMAGE_MAX_DIMENSION_MAX.to_string()}
-                        step="256"
-                        value={image_max_dim.to_string()}
-                        onchange={on_image_max_dim}
-                    />
-                </div>
-                { if renderer_kind == RendererKind::Svg {
-                    html! {
-                        <>
-                            <div class="control">
-                                <label for="animations-enabled">
-                                    { "Animations: " }
-                                    { if svg_animations_enabled { "On" } else { "Off" } }
-                                    <input
-                                        id="animations-enabled"
-                                        type="checkbox"
-                                        checked={svg_animations_enabled}
-                                        onchange={on_animations_toggle}
-                                    />
-                                </label>
-                            </div>
-                            <div class="control">
-                                <label for="emboss-enabled">
-                                    { "Emboss: " }
-                                    { if svg_emboss_enabled { "On" } else { "Off" } }
-                                    <input
-                                        id="emboss-enabled"
-                                        type="checkbox"
-                                        checked={svg_emboss_enabled}
-                                        onchange={on_emboss_toggle}
-                                    />
-                                </label>
-                            </div>
-                            <div class="control">
-                                <label for="fast-render">
-                                    { "Fast render: " }
-                                    { if svg_fast_render { "On" } else { "Off" } }
-                                    <input
-                                        id="fast-render"
-                                        type="checkbox"
-                                        checked={svg_fast_render}
-                                        onchange={on_fast_render_toggle}
-                                    />
-                                </label>
-                            </div>
-                            <div class="control">
-                                <label for="fast-filter">
-                                    { "Fast filter: " }
-                                    { if svg_fast_filter { "On" } else { "Off" } }
-                                    <input
-                                        id="fast-filter"
-                                        type="checkbox"
-                                        checked={svg_fast_filter}
-                                        onchange={on_fast_filter_toggle}
-                                    />
-                                </label>
-                            </div>
-                        </>
-                    }
-                } else {
-                    html! {
-                        <>
-                            <div class="control">
-                                <label for="wgpu-show-fps">
-                                    { "Show FPS: " }
-                                    { if wgpu_show_fps { "On" } else { "Off" } }
-                                    <input
-                                        id="wgpu-show-fps"
-                                        type="checkbox"
-                                        checked={wgpu_show_fps}
-                                        onchange={on_wgpu_fps_toggle}
-                                    />
-                                </label>
-                            </div>
-                            <div class="control">
-                                <label for="wgpu-edge-aa">
-                                    { "Edge AA" }
-                                    <span class="control-value">{ fmt_f32(wgpu_edge_aa) }</span>
-                                </label>
-                                <input
-                                    id="wgpu-edge-aa"
-                                    type="range"
-                                    min={WGPU_EDGE_AA_MIN.to_string()}
-                                    max={WGPU_EDGE_AA_MAX.to_string()}
-                                    step="0.01"
-                                    value={wgpu_edge_aa.to_string()}
-                                    oninput={on_wgpu_edge_aa}
-                                />
-                            </div>
-                            <div class="control">
-                                <label for="wgpu-render-scale">
-                                    { "Render scale" }
-                                    <span class="control-value">{ fmt_f32(wgpu_render_scale) }</span>
-                                </label>
-                                <input
-                                    id="wgpu-render-scale"
-                                    type="range"
-                                    min={WGPU_RENDER_SCALE_MIN.to_string()}
-                                    max={WGPU_RENDER_SCALE_MAX.to_string()}
-                                    step="0.05"
-                                    value={wgpu_render_scale.to_string()}
-                                    oninput={on_wgpu_render_scale}
-                                />
-                            </div>
-                        </>
-                    }
-                } }
-                <hr class="control-separator" />
-                <div class="control">
-                    <label for="theme-mode">
-                        { "Theme: " }
-                        { match theme_mode_value {
-                            ThemeMode::System => "System",
-                            ThemeMode::Light => "Light",
-                            ThemeMode::Dark => "Dark",
-                        } }
-                        <input
-                            id="theme-mode"
-                            type="checkbox"
-                            checked={theme_mode_value == ThemeMode::Dark}
-                            ref={theme_toggle_ref}
-                            onchange={on_theme_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="frame-snap">
-                        { "Frame snap" }
-                        <span class="control-value">{ fmt_f32(frame_snap_ratio_value) }</span>
-                    </label>
-                    <input
-                        id="frame-snap"
-                        type="range"
-                        min={FRAME_SNAP_MIN.to_string()}
-                        max={FRAME_SNAP_MAX.to_string()}
-                        step="0.05"
-                        value={frame_snap_ratio_value.to_string()}
-                        oninput={on_frame_snap}
-                    />
-                </div>
-                <div class="control">
-                    <label for="snap-distance">
-                        { "Snap distance tol" }
-                        <span class="control-value">{ fmt_f32(snap_distance_ratio_value) }</span>
-                    </label>
-                    <input
-                        id="snap-distance"
-                        type="range"
-                        min={SNAP_DISTANCE_RATIO_MIN.to_string()}
-                        max={SNAP_DISTANCE_RATIO_MAX.to_string()}
-                        step="0.01"
-                        value={snap_distance_ratio_value.to_string()}
-                        oninput={on_snap_distance}
-                    />
-                </div>
-                <div class="control">
-                    <label for="rotation-snap-tolerance">
-                        { "Snap angle tol (deg)" }
-                        <span class="control-value">{ fmt_f32(rotation_snap_tolerance_value) }</span>
-                    </label>
-                    <input
-                        id="rotation-snap-tolerance"
-                        type="range"
-                        min={ROTATION_SNAP_TOLERANCE_MIN_DEG.to_string()}
-                        max={ROTATION_SNAP_TOLERANCE_MAX_DEG.to_string()}
-                        step="0.5"
-                        value={rotation_snap_tolerance_value.to_string()}
-                        oninput={on_rotation_snap_tolerance}
-                    />
-                </div>
-                <div class="control">
-                    <label for="rotation-lock-threshold">
-                        { "Aligned rotate <= " }
-                        <span class="control-value">{ rotation_lock_threshold_value }</span>
-                    </label>
-                    <input
-                        id="rotation-lock-threshold"
-                        type="range"
-                        min={ROTATION_LOCK_THRESHOLD_MIN.to_string()}
-                        max={total.max(ROTATION_LOCK_THRESHOLD_MIN).to_string()}
-                        step="1"
-                        value={rotation_lock_threshold_value.to_string()}
-                        oninput={on_rotation_lock_threshold}
-                    />
-                </div>
-                <div class="control">
-                    <label for="rotation-enabled">
-                        { "Rotation: " } { if rotation_enabled_value { "On" } else { "Off" } }
-                        <input
-                            id="rotation-enabled"
-                            type="checkbox"
-                            checked={rotation_enabled_value}
-                            onchange={on_rotation_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="rotation-noise">
-                        { "Rotation noise" }
-                        <span class="control-value">{ fmt_f32(rotation_noise_value) }</span>
-                    </label>
-                    <input
-                        id="rotation-noise"
-                        type="range"
-                        min={ROTATION_NOISE_MIN.to_string()}
-                        max={ROTATION_NOISE_MAX.to_string()}
-                        step="0.1"
-                        value={rotation_noise_value.to_string()}
-                        oninput={on_rotation_noise}
-                    />
-                </div>
-                <div class="control">
-                    <label for="debug-enabled">
-                        { "Debug overlay: " } { if show_debug_value { "On" } else { "Off" } }
-                        <input
-                            id="debug-enabled"
-                            type="checkbox"
-                            checked={show_debug_value}
-                            onchange={on_debug_toggle}
-                        />
-                    </label>
-                </div>
-                <div class="control">
-                    <label for="tab-width">
-                        { "Tab size" }
-                        <span class="control-value">{ fmt_f32(settings_value.tab_width) }</span>
-                    </label>
-                    <input
-                        id="tab-width"
-                        type="range"
-                        min={TAB_WIDTH_MIN.to_string()}
-                        max={TAB_WIDTH_MAX.to_string()}
-                        step="0.005"
-                        value={settings_value.tab_width.to_string()}
-                        oninput={tab_width_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="tab-depth">
-                        { "Tab depth" }
-                        <span class="control-value">{ fmt_f32(settings_value.tab_depth) }</span>
-                    </label>
-                    <input
-                        id="tab-depth"
-                        type="range"
-                        min={TAB_DEPTH_MIN.to_string()}
-                        max={TAB_DEPTH_MAX.to_string()}
-                        step="0.01"
-                        value={settings_value.tab_depth.to_string()}
-                        oninput={tab_depth_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="tab-size-scale">
-                        { "Tab size scale" }
-                        <span class="control-value">
-                            { fmt_f32(settings_value.tab_size_scale) }
-                        </span>
-                    </label>
-                    <input
-                        id="tab-size-scale"
-                        type="range"
-                        min={TAB_SIZE_SCALE_MIN.to_string()}
-                        max={TAB_SIZE_SCALE_MAX.to_string()}
-                        step="0.005"
-                        value={settings_value.tab_size_scale.to_string()}
-                        oninput={tab_size_scale_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="tab-size-min">
-                        { "Tab size min" }
-                        <span class="control-value">{ fmt_f32(settings_value.tab_size_min) }</span>
-                    </label>
-                    <input
-                        id="tab-size-min"
-                        type="range"
-                        min={TAB_SIZE_MIN_LIMIT.to_string()}
-                        max={settings_value.tab_size_max.to_string()}
-                        step="0.005"
-                        value={settings_value.tab_size_min.to_string()}
-                        oninput={tab_size_min_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="tab-size-max">
-                        { "Tab size max" }
-                        <span class="control-value">{ fmt_f32(settings_value.tab_size_max) }</span>
-                    </label>
-                    <input
-                        id="tab-size-max"
-                        type="range"
-                        min={settings_value.tab_size_min.to_string()}
-                        max={TAB_SIZE_MAX_LIMIT.to_string()}
-                        step="0.005"
-                        value={settings_value.tab_size_max.to_string()}
-                        oninput={tab_size_max_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="skew-range">
-                        { "Center skew" }
-                        <span class="control-value">{ fmt_f32(settings_value.skew_range) }</span>
-                    </label>
-                    <input
-                        id="skew-range"
-                        type="range"
-                        min="0.0"
-                        max={SKEW_RANGE_MAX.to_string()}
-                        step="0.005"
-                        value={settings_value.skew_range.to_string()}
-                        oninput={skew_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="variation">
-                        { "Variation" }
-                        <span class="control-value">{ fmt_f32(settings_value.variation) }</span>
-                    </label>
-                    <input
-                        id="variation"
-                        type="range"
-                        min={VARIATION_MIN.to_string()}
-                        max={VARIATION_MAX.to_string()}
-                        step="0.01"
-                        value={settings_value.variation.to_string()}
-                        oninput={variation_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="jitter-strength">
-                        { "Jitter strength" }
-                        <span class="control-value">
-                            { fmt_f32(settings_value.jitter_strength) }
-                        </span>
-                    </label>
-                    <input
-                        id="jitter-strength"
-                        type="range"
-                        min={JITTER_STRENGTH_MIN.to_string()}
-                        max={JITTER_STRENGTH_MAX.to_string()}
-                        step="0.005"
-                        value={settings_value.jitter_strength.to_string()}
-                        oninput={jitter_strength_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="jitter-len-bias">
-                        { "Length jitter bias" }
-                        <span class="control-value">
-                            { fmt_f32(settings_value.jitter_len_bias) }
-                        </span>
-                    </label>
-                    <input
-                        id="jitter-len-bias"
-                        type="range"
-                        min={JITTER_LEN_BIAS_MIN.to_string()}
-                        max={JITTER_LEN_BIAS_MAX.to_string()}
-                        step="0.01"
-                        value={settings_value.jitter_len_bias.to_string()}
-                        oninput={jitter_len_bias_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="line-bend">
-                        { "Grid bend" }
-                        <span class="control-value">{ fmt_f32(settings_value.line_bend_ratio) }</span>
-                    </label>
-                    <input
-                        id="line-bend"
-                        type="range"
-                        min={LINE_BEND_MIN.to_string()}
-                        max={MAX_LINE_BEND_RATIO.to_string()}
-                        step="0.01"
-                        value={settings_value.line_bend_ratio.to_string()}
-                        oninput={line_bend_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="tab-depth-cap">
-                        { "Tab depth cap" }
-                        <span class="control-value">
-                            { fmt_f32(settings_value.tab_depth_cap) }
-                        </span>
-                    </label>
-                    <input
-                        id="tab-depth-cap"
-                        type="range"
-                        min={TAB_DEPTH_CAP_MIN.to_string()}
-                        max={TAB_DEPTH_CAP_MAX.to_string()}
-                        step="0.01"
-                        value={settings_value.tab_depth_cap.to_string()}
-                        oninput={tab_depth_cap_input}
-                    />
-                </div>
-                <div class="control">
-                    <label for="curve-detail">
-                        { "Curve detail" }
-                        <span class="control-value">
-                            { fmt_f32(settings_value.curve_detail) }
-                        </span>
-                    </label>
-                    <input
-                        id="curve-detail"
-                        type="range"
-                        min={CURVE_DETAIL_MIN.to_string()}
-                        max={CURVE_DETAIL_MAX.to_string()}
-                        step="0.05"
-                        value={settings_value.curve_detail.to_string()}
-                        oninput={curve_detail_input}
-                    />
-                </div>
+                <details
+                    class="control-group"
+                    open={*puzzle_group_open}
+                    ontoggle={on_puzzle_toggle}
+                >
+                    <summary class="control-group-title">{ "Puzzle" }</summary>
+                    <div class="control-group-body">{ puzzle_controls }</div>
+                </details>
+                <details
+                    class="control-group"
+                    open={*multiplayer_group_open}
+                    ontoggle={on_multiplayer_toggle}
+                >
+                    <summary class="control-group-title">{ "Multiplayer" }</summary>
+                    <div class="control-group-body">{ multiplayer_controls }</div>
+                </details>
+                <details
+                    class="control-group"
+                    open={*graphics_group_open}
+                    ontoggle={on_graphics_toggle}
+                >
+                    <summary class="control-group-title">{ "Graphics" }</summary>
+                    <div class="control-group-body">{ graphics_controls }</div>
+                </details>
+                <details
+                    class="control-group"
+                    open={*rules_group_open}
+                    ontoggle={on_rules_toggle}
+                >
+                    <summary class="control-group-title">{ "Rules" }</summary>
+                    <div class="control-group-body">{ rules_controls }</div>
+                </details>
+                <details
+                    class="control-group"
+                    open={*shaping_group_open}
+                    ontoggle={on_shaping_toggle}
+                >
+                    <summary class="control-group-title">{ "Piece shaping" }</summary>
+                    <div class="control-group-body">{ shaping_controls }</div>
+                </details>
             </aside>
         }
     } else {
@@ -7431,6 +8177,7 @@ mod tests {
             seq: 1,
             update,
             source: None,
+            client_seq: None,
         });
 
         TimeoutFuture::new(0).await;

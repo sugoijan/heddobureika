@@ -1,12 +1,14 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use js_sys::Uint8Array;
+use gloo::timers::future::TimeoutFuture;
+use js_sys::{Math, Uint8Array};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
-use heddobureika_core::{decode, encode, ClientMsg, ServerMsg};
+use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
 
 #[allow(dead_code)]
 pub(crate) struct WsHandlers {
@@ -20,6 +22,73 @@ pub(crate) struct MultiplayerSyncAdapter {
     ws: Rc<RefCell<Option<WebSocket>>>,
     handlers: Rc<RefCell<Option<WsHandlers>>>,
     closing: Rc<Cell<bool>>,
+}
+
+const WS_DELAY_IN_KEY: &str = "heddobureika.debug.ws_in_ms";
+const WS_DELAY_OUT_KEY: &str = "heddobureika.debug.ws_out_ms";
+const WS_DELAY_JITTER_KEY: &str = "heddobureika.debug.ws_jitter_ms";
+
+#[derive(Clone, Copy)]
+struct WsDelayConfig {
+    inbound_ms: u32,
+    outbound_ms: u32,
+    jitter_ms: u32,
+}
+
+fn read_storage_u32(key: &str) -> Option<u32> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let raw = storage.get_item(key).ok()??;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok()
+}
+
+fn load_ws_delay_config() -> WsDelayConfig {
+    WsDelayConfig {
+        inbound_ms: read_storage_u32(WS_DELAY_IN_KEY).unwrap_or(0),
+        outbound_ms: read_storage_u32(WS_DELAY_OUT_KEY).unwrap_or(0),
+        jitter_ms: read_storage_u32(WS_DELAY_JITTER_KEY).unwrap_or(0),
+    }
+}
+
+fn compute_delay_ms(base: u32, jitter: u32) -> u32 {
+    if base == 0 && jitter == 0 {
+        return 0;
+    }
+    let extra = if jitter == 0 {
+        0
+    } else {
+        (Math::random() * jitter as f64).round() as u32
+    };
+    base.saturating_add(extra)
+}
+
+fn inbound_delay_ms() -> u32 {
+    let config = load_ws_delay_config();
+    compute_delay_ms(config.inbound_ms, config.jitter_ms)
+}
+
+fn outbound_delay_ms() -> u32 {
+    let config = load_ws_delay_config();
+    compute_delay_ms(config.outbound_ms, config.jitter_ms)
+}
+
+fn send_bytes_with_delay(ws: &WebSocket, bytes: Vec<u8>) {
+    let delay = outbound_delay_ms();
+    if delay == 0 {
+        let _ = ws.send_with_u8_array(&bytes);
+        return;
+    }
+    let ws = ws.clone();
+    spawn_local(async move {
+        TimeoutFuture::new(delay).await;
+        if ws.ready_state() == WebSocket::OPEN {
+            let _ = ws.send_with_u8_array(&bytes);
+        }
+    });
 }
 
 impl MultiplayerSyncAdapter {
@@ -36,6 +105,16 @@ impl MultiplayerSyncAdapter {
         url: &str,
         on_server_msg: Rc<dyn Fn(ServerMsg)>,
         on_fail: Rc<dyn Fn()>,
+    ) {
+        self.connect_with_open(url, on_server_msg, on_fail, None);
+    }
+
+    pub(crate) fn connect_with_open(
+        &mut self,
+        url: &str,
+        on_server_msg: Rc<dyn Fn(ServerMsg)>,
+        on_fail: Rc<dyn Fn()>,
+        on_open: Option<Rc<dyn Fn()>>,
     ) {
         self.disconnect();
         let closing = Rc::new(Cell::new(false));
@@ -61,9 +140,13 @@ impl MultiplayerSyncAdapter {
         let onopen = {
             let opened = opened.clone();
             let url = url.to_string();
+            let on_open = on_open.clone();
             Closure::wrap(Box::new(move |_event: Event| {
                 opened.set(true);
                 gloo::console::log!("websocket connected", url.clone());
+                if let Some(on_open) = on_open.as_ref() {
+                    on_open();
+                }
             }) as Box<dyn FnMut(Event)>)
         };
         let onmessage = {
@@ -74,9 +157,20 @@ impl MultiplayerSyncAdapter {
                     return;
                 };
                 let bytes = Uint8Array::new(&buffer).to_vec();
-                if let Some(msg) = decode::<ServerMsg>(&bytes) {
-                    on_server_msg(msg);
+                let on_server_msg = on_server_msg.clone();
+                let delay = inbound_delay_ms();
+                if delay == 0 {
+                    if let Some(msg) = decode::<ServerMsg>(&bytes) {
+                        on_server_msg(msg);
+                    }
+                    return;
                 }
+                spawn_local(async move {
+                    TimeoutFuture::new(delay).await;
+                    if let Some(msg) = decode::<ServerMsg>(&bytes) {
+                        on_server_msg(msg);
+                    }
+                });
             }) as Box<dyn FnMut(MessageEvent)>)
         };
         let onerror = {
@@ -150,7 +244,23 @@ impl MultiplayerSyncAdapter {
             return;
         }
         if let Some(bytes) = encode(&msg) {
-            let _ = ws.send_with_u8_array(&bytes);
+            send_bytes_with_delay(&ws, bytes);
+        }
+    }
+
+    pub(crate) fn send_admin(&self, msg: AdminMsg) {
+        let ws = {
+            let ws_guard = self.ws.borrow();
+            let Some(ws) = ws_guard.as_ref() else {
+                return;
+            };
+            ws.clone()
+        };
+        if ws.ready_state() != WebSocket::OPEN {
+            return;
+        }
+        if let Some(bytes) = encode(&msg) {
+            send_bytes_with_delay(&ws, bytes);
         }
     }
 

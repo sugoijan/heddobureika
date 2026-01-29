@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
-use heddobureika_core::codec::{decode, encode};
+use heddobureika_core::codec::{decode_result, encode};
 use heddobureika_core::catalog::{puzzle_by_slug, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG};
 use heddobureika_core::protocol::{AdminMsg, RoomPersistence, ServerMsg};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
@@ -48,6 +48,7 @@ enum RoomCommand {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_crypto_provider()?;
     let cli = Cli::parse();
 
     match cli.command {
@@ -120,8 +121,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         match message {
                             Message::Binary(bytes) => {
-                                let Some(msg) = decode::<ServerMsg>(&bytes) else {
-                                    return Err("received unknown binary server message".to_string());
+                                println!("message has {} bytes", bytes.len());
+                                let msg = match decode_result::<ServerMsg>(&bytes) {
+                                    Ok(msg) => msg,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "warning: received undecodable binary message ({} bytes): {err}; waiting for admin ack...",
+                                            bytes.len()
+                                        );
+                                        continue;
+                                    }
                                 };
                                 match msg {
                                     ServerMsg::AdminAck { .. } => return Ok(()),
@@ -201,4 +210,17 @@ fn parse_seed_arg(raw: &str) -> Result<u32, Box<dyn std::error::Error>> {
 
 fn err_msg(msg: impl Into<String>) -> Box<dyn std::error::Error> {
     std::io::Error::new(std::io::ErrorKind::Other, msg.into()).into()
+}
+
+fn install_crypto_provider() -> Result<(), Box<dyn std::error::Error>> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Another thread already installed a provider; continue.
+    }
+    Ok(())
 }

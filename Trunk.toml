@@ -7,3 +7,10 @@ ignore = [
   "worker",
   "cli",
 ]
+
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+  "scripts/minify_dist_assets.sh",
+]

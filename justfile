@@ -16,7 +16,7 @@ dev-vars:
 
 # Run the worker locally (no Cloudflare login required)
 worker-dev:
-    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --persist-to .wrangler/state
+    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --host 0.0.0.0 --persist-to .wrangler/state
 
 # Run the frontend locally (requires trunk)
 web-dev:

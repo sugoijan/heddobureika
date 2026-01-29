@@ -46,6 +46,14 @@ pub enum AdminMsg {
         pieces: Option<u32>,
         seed: Option<u32>,
     },
+    ChangePuzzle {
+        puzzle: String,
+        pieces: Option<u32>,
+        seed: Option<u32>,
+    },
+    Scramble {
+        seed: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -56,8 +64,17 @@ pub enum ClientMsg {
         state: Option<PuzzleStateSnapshot>,
     },
     Select { piece_id: u32 },
-    Move { anchor_id: u32, pos: (f32, f32) },
-    Transform { anchor_id: u32, pos: (f32, f32), rot_deg: f32 },
+    Move {
+        anchor_id: u32,
+        pos: (f32, f32),
+        client_seq: u64,
+    },
+    Transform {
+        anchor_id: u32,
+        pos: (f32, f32),
+        rot_deg: f32,
+        client_seq: u64,
+    },
     Rotate { anchor_id: u32, rot_deg: f32 },
     Place { anchor_id: u32, pos: (f32, f32), rot_deg: f32 },
     Flip { piece_id: u32, flipped: bool },
@@ -81,6 +98,7 @@ pub enum ServerMsg {
         seq: u64,
         update: RoomUpdate,
         source: Option<u64>,
+        client_seq: Option<u64>,
     },
     Pong { nonce: Option<u64> },
     Error { code: String, message: String },

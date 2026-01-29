@@ -806,6 +806,18 @@ impl AppCore {
         self.notify();
     }
 
+    pub(crate) fn cancel_drag(&self) {
+        let mut state = self.state.borrow_mut();
+        if state.drag_state.is_none() {
+            return;
+        }
+        state.drag_state = None;
+        state.dragging_members.clear();
+        state.active_id = None;
+        drop(state);
+        self.notify();
+    }
+
     pub(crate) fn set_hovered(&self, hovered: Option<usize>) {
         let mut state = self.state.borrow_mut();
         if state.hovered_id == hovered {

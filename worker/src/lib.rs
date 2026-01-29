@@ -267,12 +267,27 @@ impl DurableObject for Room {
         let tags = self.state.get_tags(&ws);
         let is_admin = is_admin_from_tags(&tags);
         if is_admin {
-            if let Some(AdminMsg::Create { persistence, puzzle, pieces, seed }) =
-                decode::<AdminMsg>(&bytes)
-            {
-                return self
-                    .handle_admin_create(ws, persistence, puzzle, pieces, seed)
-                    .await;
+            if let Some(msg) = decode::<AdminMsg>(&bytes) {
+                match msg {
+                    AdminMsg::Create {
+                        persistence,
+                        puzzle,
+                        pieces,
+                        seed,
+                    } => {
+                        return self
+                            .handle_admin_create(ws, persistence, puzzle, pieces, seed)
+                            .await;
+                    }
+                    AdminMsg::ChangePuzzle { puzzle, pieces, seed } => {
+                        return self
+                            .handle_admin_change_puzzle(ws, puzzle, pieces, seed)
+                            .await;
+                    }
+                    AdminMsg::Scramble { seed } => {
+                        return self.handle_admin_scramble(ws, seed).await;
+                    }
+                }
             }
             return Ok(());
         }
@@ -292,15 +307,21 @@ impl DurableObject for Room {
             ClientMsg::Select { piece_id } => {
                 self.handle_select(client_id, piece_id).await?;
             }
-            ClientMsg::Move { anchor_id, pos } => {
-                self.handle_move(client_id, anchor_id, pos).await?;
+            ClientMsg::Move {
+                anchor_id,
+                pos,
+                client_seq,
+            } => {
+                self.handle_move(client_id, anchor_id, pos, client_seq)
+                    .await?;
             }
             ClientMsg::Transform {
                 anchor_id,
                 pos,
                 rot_deg,
+                client_seq,
             } => {
-                self.handle_transform(client_id, anchor_id, pos, rot_deg)
+                self.handle_transform(client_id, anchor_id, pos, rot_deg, client_seq)
                     .await?;
             }
             ClientMsg::Rotate { anchor_id, rot_deg } => {
@@ -600,6 +621,173 @@ impl Room {
         Ok(())
     }
 
+    async fn handle_admin_change_puzzle(
+        &self,
+        ws: WebSocket,
+        puzzle_slug: String,
+        pieces: Option<u32>,
+        seed: Option<u32>,
+    ) -> Result<()> {
+        let now = now_ms();
+        let puzzle_entry = match puzzle_by_slug(&puzzle_slug) {
+            Some(entry) => entry,
+            None => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "unknown_puzzle".to_string(),
+                        message: format!("unknown puzzle: {}", puzzle_slug),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        let rules = {
+            let inner = self.inner.borrow();
+            if !inner.meta.activated {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "inactive".to_string(),
+                        message: "room not activated".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+            inner
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.rules.clone())
+                .unwrap_or_default()
+        };
+        let (image_width, image_height) = logical_image_size(
+            puzzle_entry.width,
+            puzzle_entry.height,
+            rules.image_max_dimension,
+        );
+        let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
+        let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
+        let puzzle = PuzzleInfo {
+            label: puzzle_entry.label.to_string(),
+            image_src: puzzle_entry.src.to_string(),
+            rows: grid.rows,
+            cols: grid.cols,
+            shape_seed: PUZZLE_SEED,
+            image_width,
+            image_height,
+        };
+        let scramble_override = seed.map(|seed| {
+            scramble_nonce_from_seed(
+                PUZZLE_SEED,
+                seed,
+                grid.cols as usize,
+                grid.rows as usize,
+            )
+        });
+        let mut snapshot =
+            match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
+                Some(snapshot) => snapshot,
+                None => {
+                    let _ = self.send_server_msg(
+                        &ws,
+                        &ServerMsg::Error {
+                            code: "invalid_init".to_string(),
+                            message: "failed to initialize room".to_string(),
+                        },
+                    );
+                    return Ok(());
+                }
+            };
+        {
+            let mut inner = self.inner.borrow_mut();
+            let next_seq = inner
+                .snapshot
+                .as_ref()
+                .map(|snap| snap.seq.saturating_add(1))
+                .unwrap_or(0);
+            snapshot.seq = next_seq;
+            inner.snapshot = Some(snapshot.clone());
+            inner.owners_by_anchor.clear();
+            inner.owner_by_client.clear();
+        }
+
+        self.touch_command(now, true).await?;
+        self.persist_snapshot_if_needed().await?;
+        self.broadcast(&ServerMsg::State {
+            seq: snapshot.seq,
+            snapshot,
+        })?;
+        self.schedule_alarm().await?;
+        Ok(())
+    }
+
+    async fn handle_admin_scramble(&self, ws: WebSocket, seed: Option<u32>) -> Result<()> {
+        let now = now_ms();
+        let (puzzle, rules) = {
+            let inner = self.inner.borrow();
+            if !inner.meta.activated {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "inactive".to_string(),
+                        message: "room not activated".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+            let Some(snapshot) = inner.snapshot.as_ref() else {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "uninitialized".to_string(),
+                        message: "room not initialized".to_string(),
+                    },
+                );
+                return Ok(());
+            };
+            (snapshot.puzzle.clone(), snapshot.rules.clone())
+        };
+        let cols = puzzle.cols as usize;
+        let rows = puzzle.rows as usize;
+        let scramble_override =
+            seed.map(|seed| scramble_nonce_from_seed(PUZZLE_SEED, seed, cols, rows));
+        let mut snapshot =
+            match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
+                Some(snapshot) => snapshot,
+                None => {
+                    let _ = self.send_server_msg(
+                        &ws,
+                        &ServerMsg::Error {
+                            code: "invalid_init".to_string(),
+                            message: "failed to scramble room".to_string(),
+                        },
+                    );
+                    return Ok(());
+                }
+            };
+        {
+            let mut inner = self.inner.borrow_mut();
+            let next_seq = inner
+                .snapshot
+                .as_ref()
+                .map(|snap| snap.seq.saturating_add(1))
+                .unwrap_or(0);
+            snapshot.seq = next_seq;
+            inner.snapshot = Some(snapshot.clone());
+            inner.owners_by_anchor.clear();
+            inner.owner_by_client.clear();
+        }
+
+        self.touch_command(now, true).await?;
+        self.persist_snapshot_if_needed().await?;
+        self.broadcast(&ServerMsg::State {
+            seq: snapshot.seq,
+            snapshot,
+        })?;
+        self.schedule_alarm().await?;
+        Ok(())
+    }
+
     async fn handle_init(
         &self,
         ws: WebSocket,
@@ -821,6 +1009,7 @@ impl Room {
                             reason: OwnershipReason::AutoRelease,
                         },
                         source: Some(client_id),
+                        client_seq: None,
                     });
                 }
             }
@@ -849,11 +1038,13 @@ impl Room {
                     reason: OwnershipReason::Granted,
                 },
                 source: Some(client_id),
+                client_seq: None,
             };
             let group_order_update = ServerMsg::Update {
                 seq,
                 update: RoomUpdate::GroupOrder { order: group_order },
                 source: Some(client_id),
+                client_seq: None,
             };
 
             inner.snapshot = Some(snapshot);
@@ -872,7 +1063,13 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_move(&self, client_id: u64, anchor_id: u32, pos: (f32, f32)) -> Result<()> {
+    async fn handle_move(
+        &self,
+        client_id: u64,
+        anchor_id: u32,
+        pos: (f32, f32),
+        client_seq: u64,
+    ) -> Result<()> {
         let now = now_ms();
         let update = {
             let mut inner = self.inner.borrow_mut();
@@ -972,6 +1169,7 @@ impl Room {
                     rot_deg: anchor_rot,
                 },
                 source: Some(client_id),
+                client_seq: Some(client_seq).filter(|value| *value != 0),
             });
             inner.snapshot = Some(snapshot);
             update
@@ -1001,6 +1199,7 @@ impl Room {
         anchor_id: u32,
         pos: (f32, f32),
         rot_deg: f32,
+        client_seq: u64,
     ) -> Result<()> {
         let now = now_ms();
         let update = {
@@ -1095,6 +1294,7 @@ impl Room {
                     rot_deg,
                 },
                 source: Some(client_id),
+                client_seq: Some(client_seq).filter(|value| *value != 0),
             });
             inner.snapshot = Some(snapshot);
             update
@@ -1120,7 +1320,7 @@ impl Room {
 
     async fn handle_flip(&self, client_id: u64, piece_id: u32, flipped: bool) -> Result<()> {
         let now = now_ms();
-        let update = {
+        let updates = {
             let mut inner = self.inner.borrow_mut();
             let mut snapshot = match inner.snapshot.take() {
                 Some(snapshot) => snapshot,
@@ -1202,25 +1402,37 @@ impl Room {
             inner.owners_by_anchor.remove(&anchor_id);
 
             let seq = self.bump_seq(&mut snapshot);
-            let update = ServerMsg::Update {
+            let flip_update = ServerMsg::Update {
                 seq,
                 update: RoomUpdate::Flip { piece_id, flipped },
                 source: Some(client_id),
+                client_seq: None,
+            };
+            let ownership_update = ServerMsg::Update {
+                seq,
+                update: RoomUpdate::Ownership {
+                    anchor_id,
+                    owner: None,
+                    reason: OwnershipReason::Released,
+                },
+                source: Some(client_id),
+                client_seq: None,
             };
             inner.snapshot = Some(snapshot);
-            Some(update)
+            Some((flip_update, ownership_update))
         };
 
         self.touch_command(now, false).await?;
         self.persist_snapshot_if_needed().await?;
-        if let Some(update) = update {
+        if let Some((flip_update, ownership_update)) = updates {
             console_log!(
                 "flip accepted: client={} piece={} flipped={}",
                 client_id,
                 piece_id,
                 flipped
             );
-            let _ = self.broadcast(&update);
+            let _ = self.broadcast(&flip_update);
+            let _ = self.broadcast(&ownership_update);
         }
         self.schedule_alarm().await?;
         Ok(())
@@ -1415,6 +1627,7 @@ impl Room {
                     reason: OwnershipReason::Released,
                 },
                 source: Some(client_id),
+                client_seq: None,
             };
             let _ = self.broadcast(&update);
         }
@@ -1504,6 +1717,7 @@ impl Room {
                     reason,
                 },
                 source: Some(client_id),
+                client_seq: None,
             };
             let _ = self.broadcast(&msg);
         }
@@ -1550,6 +1764,7 @@ impl Room {
                 seq,
                 update,
                 source: None,
+                client_seq: None,
             };
             let _ = self.broadcast(&msg);
         }

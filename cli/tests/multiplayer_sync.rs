@@ -204,6 +204,7 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
         ClientMsg::Move {
             anchor_id,
             pos: new_pos,
+            client_seq: 1,
         },
     )
     .await?;

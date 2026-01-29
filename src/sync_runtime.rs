@@ -32,6 +32,9 @@ struct SyncRuntimeState {
     retry_timer: Option<Timeout>,
     sync_view_hooks: Vec<(u64, Rc<dyn Fn()>)>,
     next_sync_view_hook_id: u64,
+    mp_local_transform_observer:
+        Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>,
+    mp_local_flip_observer: Option<Rc<dyn Fn(u32, bool)>>,
 }
 
 impl SyncRuntimeState {
@@ -52,6 +55,8 @@ impl SyncRuntimeState {
             retry_timer: None,
             sync_view_hooks: Vec::new(),
             next_sync_view_hook_id: 0,
+            mp_local_transform_observer: None,
+            mp_local_flip_observer: None,
         }
     }
 
@@ -61,6 +66,18 @@ impl SyncRuntimeState {
             self.active = ActiveSync::Multiplayer;
             if self.multiplayer.is_none() {
                 self.multiplayer = Some(Rc::new(RefCell::new(MultiplayerGameSync::new())));
+            }
+            if let (Some(sync), Some(observer)) =
+                (self.multiplayer.as_ref(), self.mp_local_transform_observer.as_ref())
+            {
+                sync.borrow()
+                    .set_local_transform_observer(Some(observer.clone()));
+            }
+            if let (Some(sync), Some(observer)) =
+                (self.multiplayer.as_ref(), self.mp_local_flip_observer.as_ref())
+            {
+                sync.borrow()
+                    .set_local_flip_observer(Some(observer.clone()));
             }
             if let Some(mut local_sync) = self.local_sync.take() {
                 local_sync.shutdown();
@@ -375,6 +392,28 @@ pub(crate) fn set_local_observer(observer: Option<Rc<dyn Fn(&CoreAction)>>) {
     STATE.with(|slot| {
         if let Some(sync) = slot.borrow_mut().local_sync.as_mut() {
             sync.set_observer(observer);
+        }
+    });
+}
+
+pub(crate) fn set_multiplayer_local_transform_observer(
+    observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>,
+) {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.mp_local_transform_observer = observer.clone();
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow().set_local_transform_observer(observer);
+        }
+    });
+}
+
+pub(crate) fn set_multiplayer_local_flip_observer(observer: Option<Rc<dyn Fn(u32, bool)>>) {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.mp_local_flip_observer = observer.clone();
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow().set_local_flip_observer(observer);
         }
     });
 }

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gloo::console;
@@ -6,14 +7,17 @@ use gloo::console;
 use crate::app_core::{AppCore, AppSubscription};
 use crate::core::{
     build_group_order_from_piece_order, build_grid_choices, build_piece_order_from_groups,
-    grid_choice_index, groups_from_connections, GridChoice, FALLBACK_GRID,
+    clear_piece_connections, grid_choice_index, groups_from_connections, GridChoice, FALLBACK_GRID,
 };
 use crate::multiplayer_game_sync::MultiplayerSyncCallbacks;
 use crate::sync_runtime;
 use heddobureika_core::{
-    apply_room_update_to_snapshot, ClientMsg, GameSnapshot, PuzzleInfo, PuzzleStateSnapshot,
-    RoomPersistence, RoomUpdate,
+    angle_matches, apply_room_update_to_snapshot, ClientMsg, GameSnapshot, PuzzleInfo,
+    PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
 };
+
+const PENDING_POS_EPS: f32 = 0.02;
+const PENDING_ROT_EPS: f32 = 0.05;
 
 #[derive(Clone)]
 pub(crate) struct MultiplayerUiHooks {
@@ -21,7 +25,7 @@ pub(crate) struct MultiplayerUiHooks {
     pub(crate) on_need_init: Rc<dyn Fn()>,
     pub(crate) on_warning: Rc<dyn Fn(u32)>,
     pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64)>,
+    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<u64>, Option<u64>)>,
     pub(crate) on_ownership: Rc<dyn Fn(u32, Option<u64>)>,
     pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
     pub(crate) on_error: Rc<dyn Fn(String, String)>,
@@ -83,9 +87,18 @@ impl LocalSnapshot {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PendingTransform {
+    pos: (f32, f32),
+    rot_deg: Option<f32>,
+    client_seq: u64,
+}
+
 struct MultiplayerBridgeState {
     core: Rc<AppCore>,
     local_snapshot: RefCell<LocalSnapshot>,
+    pending_by_anchor: RefCell<HashMap<u32, PendingTransform>>,
+    pending_flips: RefCell<HashMap<u32, bool>>,
     init_pending: Cell<bool>,
     ui_hooks: RefCell<Vec<(u64, MultiplayerUiHooks)>>,
     next_ui_hook_id: Cell<u64>,
@@ -97,6 +110,8 @@ impl MultiplayerBridgeState {
         Self {
             core,
             local_snapshot: RefCell::new(LocalSnapshot::empty()),
+            pending_by_anchor: RefCell::new(HashMap::new()),
+            pending_flips: RefCell::new(HashMap::new()),
             init_pending: Cell::new(false),
             ui_hooks: RefCell::new(Vec::new()),
             next_ui_hook_id: Cell::new(0),
@@ -107,6 +122,18 @@ impl MultiplayerBridgeState {
     fn install(self: &Rc<Self>) {
         let callbacks = self.build_callbacks();
         sync_runtime::set_callbacks(callbacks);
+        let state = Rc::clone(self);
+        sync_runtime::set_multiplayer_local_transform_observer(Some(Rc::new(
+            move |anchor_id, pos, rot_deg, client_seq| {
+                state.record_pending_transform(anchor_id, pos, rot_deg, client_seq);
+            },
+        )));
+        let state = Rc::clone(self);
+        sync_runtime::set_multiplayer_local_flip_observer(Some(Rc::new(
+            move |piece_id, flipped| {
+                state.record_pending_flip(piece_id, flipped);
+            },
+        )));
         let state = Rc::clone(self);
         let subscription = self.core.subscribe(Rc::new(move || {
             state.try_send_init();
@@ -132,8 +159,8 @@ impl MultiplayerBridgeState {
             state.handle_state(snapshot, seq);
         });
         let state = Rc::clone(self);
-        let on_update = Rc::new(move |update, seq| {
-            state.handle_update(update, seq);
+        let on_update = Rc::new(move |update, seq, source, client_seq| {
+            state.handle_update(update, seq, source, client_seq);
         });
         let state = Rc::clone(self);
         let on_ownership = Rc::new(move |anchor_id, owner| {
@@ -193,6 +220,8 @@ impl MultiplayerBridgeState {
             sync.borrow().set_state_applied(false);
         }
         *self.local_snapshot.borrow_mut() = LocalSnapshot::empty();
+        self.pending_by_anchor.borrow_mut().clear();
+        self.pending_flips.borrow_mut().clear();
         if !initialized {
             self.try_send_init();
         }
@@ -203,6 +232,8 @@ impl MultiplayerBridgeState {
 
     fn handle_need_init(&self) {
         self.init_pending.set(true);
+        self.pending_by_anchor.borrow_mut().clear();
+        self.pending_flips.borrow_mut().clear();
         self.try_send_init();
         for hooks in self.ui_hooks_snapshot() {
             (hooks.on_need_init)();
@@ -219,23 +250,31 @@ impl MultiplayerBridgeState {
         let applied = self.apply_room_snapshot(&snapshot);
         if applied {
             self.init_pending.set(false);
-        if let Some(sync) = sync_runtime::multiplayer_handle() {
-            sync.borrow().set_state_applied(true);
-        }
+            if let Some(sync) = sync_runtime::multiplayer_handle() {
+                sync.borrow().set_state_applied(true);
+            }
         }
         for hooks in self.ui_hooks_snapshot() {
             (hooks.on_state)(snapshot.clone(), seq);
         }
     }
 
-    fn handle_update(&self, update: RoomUpdate, seq: u64) {
+    fn handle_update(
+        &self,
+        update: RoomUpdate,
+        seq: u64,
+        source: Option<u64>,
+        client_seq: Option<u64>,
+    ) {
+        self.ack_pending_transform(&update, source, client_seq);
         self.apply_room_update(&update);
         for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_update)(update.clone(), seq);
+            (hooks.on_update)(update.clone(), seq, source, client_seq);
         }
     }
 
     fn handle_ownership(&self, anchor_id: u32, owner: Option<u64>) {
+        self.maybe_drop_drag_on_ownership(anchor_id, owner);
         for hooks in self.ui_hooks_snapshot() {
             (hooks.on_ownership)(anchor_id, owner);
         }
@@ -251,6 +290,147 @@ impl MultiplayerBridgeState {
         for hooks in self.ui_hooks_snapshot() {
             (hooks.on_error)(code.clone(), message.clone());
         }
+    }
+
+    fn record_pending_transform(
+        &self,
+        anchor_id: u32,
+        pos: (f32, f32),
+        rot_deg: Option<f32>,
+        client_seq: u64,
+    ) {
+        if client_seq == 0 {
+            return;
+        }
+        let mut pending = self.pending_by_anchor.borrow_mut();
+        let rot_deg = rot_deg.or_else(|| pending.get(&anchor_id).and_then(|entry| entry.rot_deg));
+        let pending_entry = PendingTransform {
+            pos,
+            rot_deg,
+            client_seq,
+        };
+        pending.insert(anchor_id, pending_entry);
+    }
+
+    fn record_pending_flip(&self, piece_id: u32, flipped: bool) {
+        self.pending_flips.borrow_mut().insert(piece_id, flipped);
+    }
+
+    fn ack_pending_transform(
+        &self,
+        update: &RoomUpdate,
+        source: Option<u64>,
+        client_seq: Option<u64>,
+    ) {
+        let Some(client_seq) = client_seq else {
+            return;
+        };
+        let Some(source_id) = source else {
+            return;
+        };
+        if sync_runtime::sync_view().client_id() != Some(source_id) {
+            return;
+        }
+        let anchor_id = match update {
+            RoomUpdate::GroupTransform { anchor_id, .. } => *anchor_id,
+            _ => return,
+        };
+        let mut pending = self.pending_by_anchor.borrow_mut();
+        let Some(entry) = pending.get(&anchor_id) else {
+            return;
+        };
+        if client_seq >= entry.client_seq {
+            pending.remove(&anchor_id);
+        }
+    }
+
+    fn prune_pending_against_state(&self, state: &PuzzleStateSnapshot) {
+        let mut pending = self.pending_by_anchor.borrow_mut();
+        if !pending.is_empty() {
+            let mut to_remove = Vec::new();
+            for (anchor_id, entry) in pending.iter() {
+                let idx = *anchor_id as usize;
+                let Some(pos) = state.positions.get(idx) else {
+                    to_remove.push(*anchor_id);
+                    continue;
+                };
+                let Some(rot) = state.rotations.get(idx) else {
+                    to_remove.push(*anchor_id);
+                    continue;
+                };
+                let pos_match = (pos.0 - entry.pos.0).abs() <= PENDING_POS_EPS
+                    && (pos.1 - entry.pos.1).abs() <= PENDING_POS_EPS;
+                let rot_match = match entry.rot_deg {
+                    Some(target) => angle_matches(*rot, target, PENDING_ROT_EPS),
+                    None => true,
+                };
+                if pos_match && rot_match {
+                    to_remove.push(*anchor_id);
+                }
+            }
+            for anchor_id in to_remove {
+                pending.remove(&anchor_id);
+            }
+        }
+        drop(pending);
+        let mut pending_flips = self.pending_flips.borrow_mut();
+        if pending_flips.is_empty() {
+            return;
+        }
+        let mut flips_remove = Vec::new();
+        for (piece_id, desired) in pending_flips.iter() {
+            let idx = *piece_id as usize;
+            let Some(current) = state.flips.get(idx) else {
+                flips_remove.push(*piece_id);
+                continue;
+            };
+            if current == desired {
+                flips_remove.push(*piece_id);
+            }
+        }
+        for piece_id in flips_remove {
+            pending_flips.remove(&piece_id);
+        }
+    }
+
+    fn maybe_drop_drag_on_ownership(&self, anchor_id: u32, owner: Option<u64>) {
+        let snapshot = self.core.snapshot();
+        let Some(drag_anchor) = snapshot.dragging_members.first().copied() else {
+            return;
+        };
+        if drag_anchor as u32 != anchor_id {
+            return;
+        }
+        let my_id = sync_runtime::sync_view().client_id();
+        let lost = match my_id {
+            Some(id) => owner != Some(id),
+            None => false,
+        };
+        if !lost {
+            return;
+        }
+        self.pending_by_anchor.borrow_mut().remove(&anchor_id);
+        self.drop_pending_flips_for_anchor(anchor_id);
+        if !self.apply_predicted_state(false) {
+            self.core.cancel_drag();
+        }
+    }
+
+    fn drop_pending_flips_for_anchor(&self, anchor_id: u32) {
+        let snapshot = self.core.snapshot();
+        let cols = snapshot.grid.cols as usize;
+        let rows = snapshot.grid.rows as usize;
+        let total = cols * rows;
+        let local = self.local_snapshot.borrow();
+        if total == 0 || local.connections.len() != total {
+            return;
+        }
+        let anchor_of = anchor_of_from_connections(&local.connections, cols, rows);
+        let mut pending = self.pending_flips.borrow_mut();
+        pending.retain(|piece_id, _| {
+            let idx = *piece_id as usize;
+            anchor_of.get(idx).copied().unwrap_or(usize::MAX) != anchor_id as usize
+        });
     }
 
     fn try_send_init(&self) {
@@ -360,7 +540,132 @@ impl MultiplayerBridgeState {
             preserve_drag,
         );
         *self.local_snapshot.borrow_mut() = LocalSnapshot::from_room(snapshot);
+        self.prune_pending_against_state(&snapshot.state);
+        if !self.pending_by_anchor.borrow().is_empty() || !self.pending_flips.borrow().is_empty() {
+            let _ = self.apply_predicted_state(preserve_drag);
+        }
         true
+    }
+
+    fn apply_state_snapshot(
+        &self,
+        state_snapshot: PuzzleStateSnapshot,
+        preserve_drag: bool,
+    ) -> bool {
+        let snapshot = self.core.snapshot();
+        let Some(info) = snapshot.puzzle_info.clone() else {
+            console::warn!("multiplayer state apply skipped (puzzle info not ready)");
+            return false;
+        };
+        let cols = info.cols as usize;
+        let rows = info.rows as usize;
+        let total = cols * rows;
+        if total == 0 {
+            return false;
+        }
+        if state_snapshot.positions.len() != total
+            || state_snapshot.rotations.len() != total
+            || state_snapshot.flips.len() != total
+            || state_snapshot.connections.len() != total
+        {
+            console::warn!("multiplayer state apply skipped (state size mismatch)");
+            return false;
+        }
+        let group_order = filter_group_order(&state_snapshot.group_order, total);
+        let anchor_of = anchor_of_from_connections(&state_snapshot.connections, cols, rows);
+        let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
+        self.core.apply_snapshot_with_drag(
+            state_snapshot.positions.clone(),
+            state_snapshot.rotations.clone(),
+            state_snapshot.flips.clone(),
+            state_snapshot.connections.clone(),
+            piece_order,
+            state_snapshot.scramble_nonce,
+            preserve_drag,
+        );
+        true
+    }
+
+    fn apply_predicted_state(&self, preserve_drag: bool) -> bool {
+        let snapshot = self.core.snapshot();
+        let Some(info) = snapshot.puzzle_info.clone() else {
+            console::warn!("multiplayer prediction skipped (puzzle info not ready)");
+            return false;
+        };
+        let cols = info.cols as usize;
+        let rows = info.rows as usize;
+        let total = cols * rows;
+        if total == 0 {
+            return false;
+        }
+        let piece_width = info.image_width as f32 / info.cols as f32;
+        let piece_height = info.image_height as f32 / info.rows as f32;
+        let mut predicted = self.local_snapshot.borrow().clone().to_state_snapshot();
+        let pending_snapshot = self.pending_by_anchor.borrow().clone();
+        if !pending_snapshot.is_empty() {
+            let mut invalid = Vec::new();
+            for (anchor_id, pending) in pending_snapshot.iter() {
+                let anchor = *anchor_id as usize;
+                let rot_deg = pending.rot_deg.unwrap_or_else(|| {
+                    predicted
+                        .rotations
+                        .get(anchor)
+                        .copied()
+                        .unwrap_or(0.0)
+                });
+                let update = RoomUpdate::GroupTransform {
+                    anchor_id: *anchor_id,
+                    pos: pending.pos,
+                    rot_deg,
+                };
+                if !apply_room_update_to_snapshot(
+                    &update,
+                    &mut predicted,
+                    cols,
+                    rows,
+                    piece_width,
+                    piece_height,
+                ) {
+                    invalid.push(*anchor_id);
+                }
+            }
+            if !invalid.is_empty() {
+                let mut pending = self.pending_by_anchor.borrow_mut();
+                for anchor_id in invalid {
+                    pending.remove(&anchor_id);
+                }
+            }
+        }
+        let pending_flips_snapshot = self.pending_flips.borrow().clone();
+        if !pending_flips_snapshot.is_empty() {
+            let mut invalid = Vec::new();
+            for (piece_id, flipped) in pending_flips_snapshot.iter() {
+                let idx = *piece_id as usize;
+                if idx >= predicted.flips.len() || idx >= predicted.connections.len() {
+                    invalid.push(*piece_id);
+                    continue;
+                }
+                if let Some(slot) = predicted.flips.get_mut(idx) {
+                    *slot = *flipped;
+                }
+                clear_piece_connections(&mut predicted.connections, idx, cols, rows);
+            }
+            if !invalid.is_empty() {
+                let mut pending = self.pending_flips.borrow_mut();
+                for piece_id in invalid {
+                    pending.remove(&piece_id);
+                }
+            }
+            let group_order = filter_group_order(&predicted.group_order, total);
+            let anchor_of = anchor_of_from_connections(&predicted.connections, cols, rows);
+            let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
+            let next_group_order = build_group_order_from_piece_order(&piece_order, &anchor_of);
+            predicted.group_order = next_group_order
+                .into_iter()
+                .filter_map(|id| u32::try_from(id).ok())
+                .collect();
+        }
+        self.apply_state_snapshot(predicted, preserve_drag)
     }
 
     fn apply_room_update(&self, update: &RoomUpdate) {
@@ -369,7 +674,6 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer update dropped (puzzle info not ready)");
             return;
         };
-        let preserve_drag = !snapshot.dragging_members.is_empty();
         let cols = info.cols as usize;
         let rows = info.rows as usize;
         let total = cols * rows;
@@ -399,19 +703,10 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer update rejected");
             return;
         }
-        let group_order = filter_group_order(&state_snapshot.group_order, total);
-        let anchor_of = anchor_of_from_connections(&state_snapshot.connections, cols, rows);
-        let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
-        self.core.apply_snapshot_with_drag(
-            state_snapshot.positions.clone(),
-            state_snapshot.rotations.clone(),
-            state_snapshot.flips.clone(),
-            state_snapshot.connections.clone(),
-            piece_order,
-            state_snapshot.scramble_nonce,
-            preserve_drag,
-        );
+        self.prune_pending_against_state(&state_snapshot);
         *self.local_snapshot.borrow_mut() = LocalSnapshot::from_state(state_snapshot);
+        let preserve_drag = !snapshot.dragging_members.is_empty();
+        let _ = self.apply_predicted_state(preserve_drag);
     }
 }
 

@@ -627,6 +627,10 @@ impl WgpuView {
             }
             let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
             if let Some(piece_id) = view.pick_piece(px, py, &snapshot) {
+                let sync_view = sync_runtime::sync_view();
+                if piece_owned_by_other(&snapshot, &sync_view, piece_id) {
+                    return;
+                }
                 let right_click = event.button() == 2;
                 view.dispatch_action(CoreAction::BeginDrag {
                     piece_id,
@@ -676,7 +680,8 @@ impl WgpuView {
             let credit_hovered = view.hit_credit(view_x, view_y);
             if view.ui_credit_hovered.get() != credit_hovered {
                 view.ui_credit_hovered.set(credit_hovered);
-                view.update_canvas_class(&snapshot);
+                let sync_view = sync_runtime::sync_view();
+                view.update_canvas_class(&snapshot, &sync_view);
             }
             if credit_hovered {
                 view.dispatch_action(CoreAction::SetHovered { hovered: None });
@@ -692,7 +697,9 @@ impl WgpuView {
         let core_for_leave = self.core.clone();
         let listener = EventListener::new(&canvas, "mouseleave", move |_event: &Event| {
             view.ui_credit_hovered.set(false);
-            view.update_canvas_class(&core_for_leave.snapshot());
+            let snapshot = core_for_leave.snapshot();
+            let sync_view = sync_runtime::sync_view();
+            view.update_canvas_class(&snapshot, &sync_view);
             view.dispatch_action(CoreAction::SetHovered { hovered: None });
         });
         listeners.push(listener);
@@ -727,6 +734,10 @@ impl WgpuView {
             }
             let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
             if let Some(piece_id) = view.pick_piece(px, py, &snapshot) {
+                let sync_view = sync_runtime::sync_view();
+                if piece_owned_by_other(&snapshot, &sync_view, piece_id) {
+                    return;
+                }
                 view.dispatch_action(CoreAction::BeginDrag {
                     piece_id,
                     x: px,
@@ -918,12 +929,17 @@ impl WgpuView {
         }
     }
 
-    fn update_canvas_class(&self, snapshot: &AppSnapshot) {
+    fn update_canvas_class(&self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
         let mut canvas_class = "puzzle-canvas".to_string();
         if !snapshot.dragging_members.is_empty() {
             canvas_class.push_str(" dragging");
         } else if snapshot.hovered_id.is_some() {
             canvas_class.push_str(" hover");
+        }
+        if let Some(hovered_id) = snapshot.hovered_id {
+            if piece_owned_by_other(snapshot, sync_view, hovered_id) {
+                canvas_class.push_str(" owned-other");
+            }
         }
         if self.ui_credit_hovered.get() {
             canvas_class.push_str(" ui-link-hover");
@@ -999,7 +1015,7 @@ impl WgpuView {
             *self.mask_atlas.borrow_mut() = Some(mask_atlas_data);
         }
         let layout = snapshot.layout;
-        self.update_canvas_class(snapshot);
+        self.update_canvas_class(snapshot, sync_view);
         let view_width = layout.view_width.max(1.0).round() as u32;
         let view_height = layout.view_height.max(1.0).round() as u32;
         let last_size = self.last_view_size.get();
@@ -1571,6 +1587,41 @@ fn pick_piece_at(
         }
     }
     None
+}
+
+fn piece_owned_by_other(
+    snapshot: &AppSnapshot,
+    sync_view: &dyn GameSyncView,
+    piece_id: usize,
+) -> bool {
+    if matches!(sync_view.mode(), InitMode::Local) {
+        return false;
+    }
+    let ownership = sync_view.ownership_by_anchor();
+    if ownership.is_empty() {
+        return false;
+    }
+    let cols = snapshot.grid.cols as usize;
+    let rows = snapshot.grid.rows as usize;
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+    let total = cols * rows;
+    if piece_id >= total {
+        return false;
+    }
+    if snapshot.connections.len() < total {
+        return false;
+    }
+    let mut members = collect_group(&snapshot.connections, piece_id, cols, rows);
+    if members.is_empty() {
+        members.push(piece_id);
+    }
+    let anchor_id = members.iter().copied().min().unwrap_or(piece_id);
+    if let Some(owner_id) = ownership.get(&(anchor_id as u32)) {
+        return Some(*owner_id) != sync_view.client_id();
+    }
+    false
 }
 
 fn estimate_text_width(text: &str, font_size: f32) -> f32 {

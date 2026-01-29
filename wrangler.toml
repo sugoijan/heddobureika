@@ -3,6 +3,10 @@ main = "worker/build/worker/shim.mjs"
 compatibility_date = "2026-01-26"
 workers_dev = true
 
+[dev]
+port = 8787
+host = "0.0.0.0"
+
 [vars]
 ROOM_PATH_PREFIX = "/ws/"
 
@@ -18,6 +22,7 @@ tag = "v1"
 new_classes = ["Room"]
 
 [env.production]
+name = 'heddobureika'
 workers_dev = false
 routes = [
   { pattern = "sugoijan.dev/heddobureika/ws/*", zone_name = "sugoijan.dev" }
