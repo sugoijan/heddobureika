@@ -4,8 +4,7 @@ compatibility_date = "2026-01-26"
 workers_dev = true
 
 [dev]
-port = 8787
-host = "0.0.0.0"
+ip = "0.0.0.0"
 
 [vars]
 ROOM_PATH_PREFIX = "/ws/"

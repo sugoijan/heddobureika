@@ -102,10 +102,16 @@ impl WgpuRenderer {
         _view_min_y: f32,
         _view_width: f32,
         _view_height: f32,
+        _workspace_min_x: f32,
+        _workspace_min_y: f32,
+        _workspace_width: f32,
+        _workspace_height: f32,
         _puzzle_scale: f32,
         _mask_atlas: Rc<MaskAtlasData>,
         _mask_pad: f32,
         _render_scale: f32,
+        _viewport_width: f32,
+        _viewport_height: f32,
         _is_dark_theme: bool,
     ) -> Result<Self, JsValue> {
         Err(JsValue::from_str(
@@ -122,6 +128,27 @@ impl WgpuRenderer {
     pub(crate) fn set_edge_aa(&mut self, _value: f32) {}
 
     pub(crate) fn set_solved(&mut self, _value: bool) {}
+
+    pub(crate) fn set_view(
+        &mut self,
+        _view_min_x: f32,
+        _view_min_y: f32,
+        _view_width: f32,
+        _view_height: f32,
+        _puzzle_scale: f32,
+    ) {
+    }
+
+    pub(crate) fn set_workspace_rect(
+        &mut self,
+        _min_x: f32,
+        _min_y: f32,
+        _width: f32,
+        _height: f32,
+    ) {
+    }
+
+    pub(crate) fn resize(&mut self, _pixel_width: u32, _pixel_height: u32) {}
 
     pub(crate) fn update_instances(&mut self, instances: InstanceSet) {
         let _ = instances.batches.len();
@@ -143,6 +170,8 @@ impl WgpuRenderer {
     }
 
     pub(crate) fn set_show_fps(&mut self, _value: bool) {}
+
+    pub(crate) fn force_fps_fallback(&mut self) {}
 
     pub(crate) fn set_ui_texts(&mut self, specs: &[UiTextSpec]) {
         touch_rotation_origin_variants();

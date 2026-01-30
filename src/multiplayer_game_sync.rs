@@ -35,6 +35,7 @@ pub(crate) struct MultiplayerGameSync {
     room_id: Rc<RefCell<Option<String>>>,
     persistence: Rc<Cell<Option<RoomPersistence>>>,
     ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, u64>>>>,
+    ownership_seq_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
     local_transform_observer:
         Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>>>,
     local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool)>>>>,
@@ -55,6 +56,7 @@ impl MultiplayerGameSync {
             room_id: Rc::new(RefCell::new(None)),
             persistence: Rc::new(Cell::new(None)),
             ownership_by_anchor: Rc::new(RefCell::new(Rc::new(HashMap::new()))),
+            ownership_seq_by_anchor: Rc::new(RefCell::new(HashMap::new())),
             local_transform_observer: Rc::new(RefCell::new(None)),
             local_flip_observer: Rc::new(RefCell::new(None)),
         }
@@ -145,6 +147,7 @@ impl MultiplayerGameSync {
         *self.room_id.borrow_mut() = None;
         self.persistence.set(None);
         *self.ownership_by_anchor.borrow_mut() = Rc::new(HashMap::new());
+        self.ownership_seq_by_anchor.borrow_mut().clear();
     }
 
     fn build_handler(&self, callbacks: MultiplayerSyncCallbacks) -> Rc<dyn Fn(ServerMsg)> {
@@ -156,6 +159,7 @@ impl MultiplayerGameSync {
         let room_id_cell = Rc::clone(&self.room_id);
         let persistence_cell = Rc::clone(&self.persistence);
         let ownership_by_anchor = Rc::clone(&self.ownership_by_anchor);
+        let ownership_seq_by_anchor = Rc::clone(&self.ownership_seq_by_anchor);
         Rc::new(move |msg: ServerMsg| match msg {
             ServerMsg::Welcome {
                 room_id,
@@ -218,6 +222,24 @@ impl MultiplayerGameSync {
                     format!("source={:?}", source)
                 );
                 if let RoomUpdate::Ownership { anchor_id, owner, .. } = &update {
+                    let should_apply = {
+                        let mut seq_map = ownership_seq_by_anchor.borrow_mut();
+                        match seq_map.get(anchor_id) {
+                            Some(last_seq) if *last_seq >= seq => false,
+                            _ => {
+                                seq_map.insert(*anchor_id, seq);
+                                true
+                            }
+                        }
+                    };
+                    if !should_apply {
+                        console::warn!(
+                            "multiplayer ownership update dropped (stale)",
+                            seq,
+                            format!("anchor={anchor_id}")
+                        );
+                        return;
+                    }
                     let next = {
                         let current = ownership_by_anchor.borrow();
                         let mut next = (**current).clone();

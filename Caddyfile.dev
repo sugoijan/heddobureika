@@ -1,0 +1,9 @@
+{
+    auto_https off
+}
+
+:8080 {
+    @ws path /ws/*
+    reverse_proxy @ws 127.0.0.1:8787
+    reverse_proxy 127.0.0.1:8081
+}

@@ -12,9 +12,38 @@ use heddobureika_core::PuzzleInfo;
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
 
+const VIEW_ZOOM_MAX: f32 = 4.0;
+const VIEW_ZOOM_MIN: f32 = 0.2;
+const VIEW_ZOOM_MIN_FACTOR: f32 = 0.5;
+const VIEW_PAN_RUBBER_RATIO: f32 = 0.5;
+
 pub(crate) struct AppCore {
     state: RefCell<AppState>,
     subscribers: Rc<RefCell<Vec<AppSubscriber>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ViewRect {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewMode {
+    Fit,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ViewState {
+    viewport_w: f32,
+    viewport_h: f32,
+    zoom: f32,
+    center_x: f32,
+    center_y: f32,
+    mode: ViewMode,
 }
 
 #[derive(Clone)]
@@ -38,6 +67,7 @@ pub(crate) struct AppSnapshot {
     pub(crate) drag_primary_id: Option<usize>,
     pub(crate) solved: bool,
     pub(crate) layout: WorkspaceLayout,
+    pub(crate) view: ViewRect,
     pub(crate) wgpu_settings: WgpuRenderSettings,
     pub(crate) theme_mode: ThemeMode,
     pub(crate) show_debug: bool,
@@ -91,6 +121,7 @@ struct AppState {
     drag_state: Option<DragState>,
     solved: bool,
     layout: WorkspaceLayout,
+    view: ViewState,
     wgpu_settings: WgpuRenderSettings,
     renderer_kind: RendererKind,
     svg_settings: SvgRenderSettings,
@@ -155,6 +186,7 @@ impl AppCore {
             drag_primary_id: state.drag_state.as_ref().map(|drag| drag.primary_id),
             solved: state.solved,
             layout: state.layout,
+            view: state.view.view_rect(),
             wgpu_settings: state.wgpu_settings.clone(),
             theme_mode: state.theme_mode,
             show_debug: state.show_debug,
@@ -267,6 +299,8 @@ impl AppCore {
             state.workspace_scale,
             state.image_max_dim as f32,
         );
+        let layout = state.layout;
+        state.view.reset_to_fit(layout);
         let cols = grid.cols as usize;
         let rows = grid.rows as usize;
         let total = cols * rows;
@@ -444,6 +478,84 @@ impl AppCore {
         } else {
             let dx = x - drag.start_x;
             let dy = y - drag.start_y;
+            let mut dx = dx;
+            let mut dy = dy;
+            if !drag.start_positions.is_empty() {
+                let piece_width = state.piece_width;
+                let piece_height = state.piece_height;
+                let layout = state.layout;
+                let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
+                let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
+                let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
+                let puzzle_view_width = layout.view_width / puzzle_scale;
+                let puzzle_view_height = layout.view_height / puzzle_scale;
+                let center_min_x = puzzle_view_min_x + piece_width * 0.5;
+                let center_min_y = puzzle_view_min_y + piece_height * 0.5;
+                let mut center_max_x = puzzle_view_min_x + puzzle_view_width - piece_width * 0.5;
+                let mut center_max_y = puzzle_view_min_y + puzzle_view_height - piece_height * 0.5;
+                if center_max_x < center_min_x {
+                    center_max_x = center_min_x;
+                }
+                if center_max_y < center_min_y {
+                    center_max_y = center_min_y;
+                }
+                let rubber_limit = piece_width.min(piece_height) * RUBBER_BAND_RATIO;
+                let (bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y) =
+                    if drag.members.len() > 1 {
+                        let mut min_x = center_min_x + piece_width;
+                        let mut max_x = center_max_x - piece_width;
+                        let mut min_y = center_min_y + piece_height;
+                        let mut max_y = center_max_y - piece_height;
+                        if max_x < min_x {
+                            let mid = (center_min_x + center_max_x) * 0.5;
+                            min_x = mid;
+                            max_x = mid;
+                        }
+                        if max_y < min_y {
+                            let mid = (center_min_y + center_max_y) * 0.5;
+                            min_y = mid;
+                            max_y = mid;
+                        }
+                        (min_x, max_x, min_y, max_y)
+                    } else {
+                        (
+                            center_min_x,
+                            center_max_x,
+                            center_min_y,
+                            center_max_y,
+                        )
+                    };
+                let mut in_bounds = false;
+                let mut best_dx = dx;
+                let mut best_dy = dy;
+                let mut best_dist = f32::INFINITY;
+                for start in &drag.start_positions {
+                    let center_x = start.0 + piece_width * 0.5;
+                    let center_y = start.1 + piece_height * 0.5;
+                    let min_dx = bounds_min_x - center_x;
+                    let max_dx = bounds_max_x - center_x;
+                    let min_dy = bounds_min_y - center_y;
+                    let max_dy = bounds_max_y - center_y;
+                    if dx >= min_dx && dx <= max_dx && dy >= min_dy && dy <= max_dy {
+                        in_bounds = true;
+                        break;
+                    }
+                    let cand_dx = rubber_band_clamp(dx, min_dx, max_dx, rubber_limit);
+                    let cand_dy = rubber_band_clamp(dy, min_dy, max_dy, rubber_limit);
+                    let delta_dx = cand_dx - dx;
+                    let delta_dy = cand_dy - dy;
+                    let dist = delta_dx * delta_dx + delta_dy * delta_dy;
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_dx = cand_dx;
+                        best_dy = cand_dy;
+                    }
+                }
+                if !in_bounds {
+                    dx = best_dx;
+                    dy = best_dy;
+                }
+            }
             for (idx, id) in drag.members.iter().enumerate() {
                 if let Some(pos) = state.positions.get_mut(*id) {
                     let start = drag.start_positions.get(idx).copied().unwrap_or(*pos);
@@ -846,6 +958,8 @@ impl AppCore {
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
         state.layout = compute_workspace_layout(width, height, value, state.image_max_dim as f32);
+        let layout = state.layout;
+        state.view.reset_to_fit(layout);
         drop(state);
         self.notify();
     }
@@ -863,6 +977,88 @@ impl AppCore {
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
         state.layout = compute_workspace_layout(width, height, state.workspace_scale, value as f32);
+        let layout = state.layout;
+        state.view.reset_to_fit(layout);
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn set_viewport_size(&self, width: f32, height: f32) {
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let width = width.max(1.0);
+        let height = height.max(1.0);
+        if (state.view.viewport_w - width).abs() <= f32::EPSILON
+            && (state.view.viewport_h - height).abs() <= f32::EPSILON
+        {
+            return;
+        }
+        state.view.viewport_w = width;
+        state.view.viewport_h = height;
+        let layout = state.layout;
+        match state.view.mode {
+            ViewMode::Fit => state.view.reset_to_fit(layout),
+            ViewMode::Manual => {
+                state.view.zoom = state.view.clamp_zoom(state.view.zoom, layout);
+                state.view.clamp_to_layout(layout);
+            }
+        }
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn pan_view(&self, dx_world: f32, dy_world: f32) {
+        if dx_world == 0.0 && dy_world == 0.0 {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        state.view.mode = ViewMode::Manual;
+        state.view.center_x += dx_world;
+        state.view.center_y += dy_world;
+        let layout = state.layout;
+        state.view.zoom = state.view.clamp_zoom(state.view.zoom, layout);
+        state.view.clamp_to_layout_elastic(layout);
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn zoom_view_at(&self, factor: f32, anchor_world_x: f32, anchor_world_y: f32) {
+        if factor <= 0.0 {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let old_zoom = state.view.zoom.max(1.0e-4);
+        let layout = state.layout;
+        let new_zoom = state.view.clamp_zoom(old_zoom * factor, layout);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        let ratio = old_zoom / new_zoom;
+        state.view.center_x =
+            anchor_world_x - (anchor_world_x - state.view.center_x) * ratio;
+        state.view.center_y =
+            anchor_world_y - (anchor_world_y - state.view.center_y) * ratio;
+        state.view.zoom = new_zoom;
+        state.view.mode = ViewMode::Manual;
+        state.view.clamp_to_layout(layout);
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn reset_view_to_fit(&self) {
+        let mut state = self.state.borrow_mut();
+        let layout = state.layout;
+        state.view.reset_to_fit(layout);
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn settle_view(&self) {
+        let mut state = self.state.borrow_mut();
+        let layout = state.layout;
+        state.view.clamp_to_layout(layout);
         drop(state);
         self.notify();
     }
@@ -1173,6 +1369,111 @@ impl AppCore {
 
 }
 
+impl ViewState {
+    fn new(layout: WorkspaceLayout) -> Self {
+        let mut state = Self {
+            viewport_w: layout.view_width.max(1.0),
+            viewport_h: layout.view_height.max(1.0),
+            zoom: 1.0,
+            center_x: 0.0,
+            center_y: 0.0,
+            mode: ViewMode::Fit,
+        };
+        state.reset_to_fit(layout);
+        state
+    }
+
+    fn view_rect(&self) -> ViewRect {
+        let zoom = self.zoom.max(1.0e-4);
+        let width = (self.viewport_w / zoom).max(1.0e-3);
+        let height = (self.viewport_h / zoom).max(1.0e-3);
+        ViewRect {
+            min_x: self.center_x - width * 0.5,
+            min_y: self.center_y - height * 0.5,
+            width,
+            height,
+        }
+    }
+
+    fn fit_zoom(&self, layout: WorkspaceLayout) -> f32 {
+        let viewport_w = self.viewport_w.max(1.0);
+        let viewport_h = self.viewport_h.max(1.0);
+        let workspace_w = layout.view_width.max(1.0);
+        let workspace_h = layout.view_height.max(1.0);
+        (viewport_w / workspace_w).min(viewport_h / workspace_h)
+    }
+
+    fn clamp_zoom(&self, zoom: f32, layout: WorkspaceLayout) -> f32 {
+        let fit_zoom = self.fit_zoom(layout);
+        let min_zoom = (fit_zoom * VIEW_ZOOM_MIN_FACTOR).max(VIEW_ZOOM_MIN);
+        let max_zoom = VIEW_ZOOM_MAX;
+        zoom.clamp(min_zoom, max_zoom)
+    }
+
+    fn reset_to_fit(&mut self, layout: WorkspaceLayout) {
+        let fit_zoom = self.fit_zoom(layout);
+        self.zoom = self.clamp_zoom(fit_zoom, layout);
+        self.center_x = layout.view_min_x + layout.view_width * 0.5;
+        self.center_y = layout.view_min_y + layout.view_height * 0.5;
+        self.mode = ViewMode::Fit;
+        self.clamp_to_layout(layout);
+    }
+
+    fn pan_bounds(&self, layout: WorkspaceLayout) -> (f32, f32, f32, f32) {
+        let view = self.view_rect();
+        let min_x = layout.view_min_x;
+        let min_y = layout.view_min_y;
+        let max_x = min_x + layout.view_width;
+        let max_y = min_y + layout.view_height;
+        let workspace_center_x = min_x + layout.view_width * 0.5;
+        let workspace_center_y = min_y + layout.view_height * 0.5;
+        let fit_zoom = self.fit_zoom(layout);
+        let (min_cx, max_cx) = if self.zoom <= fit_zoom {
+            (
+                workspace_center_x - view.width * 0.5,
+                workspace_center_x + view.width * 0.5,
+            )
+        } else {
+            (min_x - view.width * 0.5, max_x + view.width * 0.5)
+        };
+        let (min_cy, max_cy) = if self.zoom <= fit_zoom {
+            (
+                workspace_center_y - view.height * 0.5,
+                workspace_center_y + view.height * 0.5,
+            )
+        } else {
+            (min_y - view.height * 0.5, max_y + view.height * 0.5)
+        };
+        (min_cx, max_cx, min_cy, max_cy)
+    }
+
+    fn clamp_to_layout(&mut self, layout: WorkspaceLayout) {
+        let (min_cx, max_cx, min_cy, max_cy) = self.pan_bounds(layout);
+        self.center_x = self.center_x.clamp(min_cx, max_cx);
+        self.center_y = self.center_y.clamp(min_cy, max_cy);
+    }
+
+    fn clamp_to_layout_elastic(&mut self, layout: WorkspaceLayout) {
+        let view = self.view_rect();
+        let (min_cx, max_cx, min_cy, max_cy) = self.pan_bounds(layout);
+        let min_dim = view.width.min(view.height).max(1.0);
+        let rubber_limit = min_dim * VIEW_PAN_RUBBER_RATIO;
+        let clamp_axis = |value: f32, min: f32, max: f32| {
+            let range = (max - min).max(0.0);
+            let axis_limit = rubber_limit.min(range * 0.5);
+            if axis_limit <= 0.0 {
+                return value.clamp(min, max);
+            }
+            let elastic_min = min + axis_limit;
+            let elastic_max = max - axis_limit;
+            rubber_band_clamp(value, elastic_min, elastic_max, axis_limit)
+        };
+
+        self.center_x = clamp_axis(self.center_x, min_cx, max_cx);
+        self.center_y = clamp_axis(self.center_y, min_cy, max_cy);
+    }
+}
+
 thread_local! {
     static SHARED_CORE: Rc<AppCore> = AppCore::new();
 }
@@ -1191,6 +1492,13 @@ impl Drop for AppSubscription {
 
 impl AppState {
     fn new() -> Self {
+        let layout = compute_workspace_layout(
+            1.0,
+            1.0,
+            WORKSPACE_SCALE_DEFAULT,
+            IMAGE_MAX_DIMENSION_DEFAULT as f32,
+        );
+        let view = ViewState::new(layout);
         Self {
             puzzle_info: None,
             assets: None,
@@ -1207,7 +1515,8 @@ impl AppState {
             dragging_members: Vec::new(),
             drag_state: None,
             solved: false,
-            layout: compute_workspace_layout(1.0, 1.0, WORKSPACE_SCALE_DEFAULT, IMAGE_MAX_DIMENSION_DEFAULT as f32),
+            layout,
+            view,
             wgpu_settings: WgpuRenderSettings::default(),
             renderer_kind: RendererKind::Wgpu,
             svg_settings: SvgRenderSettings::default(),

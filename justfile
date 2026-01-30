@@ -2,8 +2,10 @@ set dotenv-load
 set shell := ["zsh", "-cu"]
 
 ADMIN_TOKEN := env_var_or_default("ADMIN_TOKEN", env_var_or_default("ROOM_ADMIN_TOKEN", ""))
-ROOM_WS_BASE_URL := env_var_or_default("ROOM_WS_BASE_URL", "ws://127.0.0.1:8787/ws")
+#ROOM_WS_BASE_URL := env_var_or_default("ROOM_WS_BASE_URL", "ws://127.0.0.1:8787/ws")
 WRANGLER_LOG_PATH := env_var_or_default("WRANGLER_LOG_PATH", ".wrangler/logs")
+TRUNK_PORT := env_var_or_default("TRUNK_PORT", "8081")
+CADDY_CONFIG := env_var_or_default("CADDY_CONFIG", "Caddyfile.dev")
 
 # Show available tasks
 default:
@@ -15,13 +17,21 @@ dev-vars:
     @echo "Created .dev.vars if it didn't exist. Update ADMIN_TOKEN inside it."
 
 # Run the worker locally (no Cloudflare login required)
-worker-dev:
+wrangler-dev:
     @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --host 0.0.0.0 --persist-to .wrangler/state
 
 # Run the frontend locally (requires trunk)
-web-dev:
+trunk-serve:
     @mkdir -p .wrangler
-    @trunk serve
+    @trunk serve --port {{TRUNK_PORT}}
+
+# Run Caddy dev proxy (serves on :8080 by default)
+caddy-run:
+    @caddy run --config {{CADDY_CONFIG}}
+
+# Run worker + frontend + proxy together
+[parallel]
+dev: wrangler-dev trunk-serve caddy-run
 
 # Build the worker (requires worker-build)
 worker-build:
@@ -35,15 +45,12 @@ worker-check:
 cli-check:
     @cargo check -p heddobureika-cli
 
-# Check the web app (requires trunk)
+# Check the web app
 app-check:
-    @trunk build
+    @cargo check -p heddobureika --target wasm32-unknown-unknown
 
 # Run all checks (worker uses wasm target, CLI uses native)
-check:
-    @just worker-check
-    @just cli-check
-    @just app-check
+check: worker-check cli-check app-check
 
 # Run wasm-bindgen tests in the browser via cargo runner
 wasm-test browser="firefox":
@@ -95,5 +102,11 @@ room-create *args:
     fi
 
 # Alias
+worker-dev:
+    @just wrangler-dev
+
+web-dev:
+    @just trunk-serve
+
 create-room:
     @just room-create

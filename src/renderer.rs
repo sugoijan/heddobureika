@@ -555,6 +555,8 @@ pub(crate) struct WgpuRenderer {
     frame_stroke_bind_group: wgpu::BindGroup,
     _frame_stroke_globals_buffer: wgpu::Buffer,
     globals: Globals,
+    workspace_min: [f32; 2],
+    workspace_size: [f32; 2],
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
@@ -577,11 +579,15 @@ pub(crate) struct WgpuRenderer {
     ui_text_state: Option<UiTextState>,
     show_frame: bool,
     frame_clear_color: wgpu::Color,
+    frame_dash_color: [f32; 4],
+    workspace_fill_color: [f32; 4],
+    workspace_stroke_color: [f32; 4],
     text_state: Option<GlyphonState>,
     show_fps: bool,
     fps_tracker: FpsTracker,
     fps_text: String,
     fps_color: Color,
+    fps_force_fallback: bool,
     fps_logged_missing_text_state: bool,
     fps_logged_prepare_error: bool,
     render_scale: f32,
@@ -600,19 +606,30 @@ impl WgpuRenderer {
         view_min_y: f32,
         view_width: f32,
         view_height: f32,
+        workspace_min_x: f32,
+        workspace_min_y: f32,
+        workspace_width: f32,
+        workspace_height: f32,
         puzzle_scale: f32,
         mask_atlas: Rc<MaskAtlasData>,
         mask_pad: f32,
         render_scale: f32,
+        viewport_width: f32,
+        viewport_height: f32,
         is_dark_theme: bool,
     ) -> Result<Self, wasm_bindgen::JsValue> {
         let (art_pixels, art_width, art_height) = image_to_rgba(&image)?;
         let logical_width = piece_width * grid.cols as f32;
         let logical_height = piece_height * grid.rows as f32;
         let puzzle_scale = puzzle_scale.max(1.0e-4);
+        let inv_puzzle_scale = 1.0 / puzzle_scale;
+        let workspace_min_x = workspace_min_x * inv_puzzle_scale;
+        let workspace_min_y = workspace_min_y * inv_puzzle_scale;
+        let workspace_width = workspace_width * inv_puzzle_scale;
+        let workspace_height = workspace_height * inv_puzzle_scale;
 
-        let css_width = view_width.max(1.0);
-        let css_height = view_height.max(1.0);
+        let css_width = viewport_width.max(1.0);
+        let css_height = viewport_height.max(1.0);
         let dpr = web_sys::window()
             .map(|window| window.device_pixel_ratio())
             .unwrap_or(1.0) as f32;
@@ -621,10 +638,6 @@ impl WgpuRenderer {
         let canvas_height = (css_height * render_scale).max(1.0).ceil() as u32;
         canvas.set_width(canvas_width);
         canvas.set_height(canvas_height);
-        let _ = canvas.set_attribute(
-            "style",
-            &format!("width: {:.2}px; height: auto;", css_width),
-        );
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
@@ -1030,7 +1043,7 @@ impl WgpuRenderer {
         let ui_globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ui-globals-buffer"),
             contents: bytemuck::bytes_of(&ui_globals),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let ui_globals_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1159,49 +1172,49 @@ impl WgpuRenderer {
         if frame_corner_radius > max_corner_radius {
             frame_corner_radius = max_corner_radius;
         }
-        let workspace_stroke = 2.0;
+        let workspace_stroke_width = 2.0 * inv_puzzle_scale;
         let workspace_center = [
-            view_min_x + view_width * 0.5,
-            view_min_y + view_height * 0.5,
+            workspace_min_x + workspace_width * 0.5,
+            workspace_min_y + workspace_height * 0.5,
         ];
         let frame_bg_instances = vec![FrameInstance {
             pos: workspace_center,
-            size: [view_width, view_height],
+            size: [workspace_width, workspace_height],
             rotation: 0.0,
             _pad: 0.0,
         }];
         let frame_bg_instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("frame-bg-instance-buffer"),
             contents: bytemuck::cast_slice(&frame_bg_instances),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        let half_stroke = workspace_stroke * 0.5;
-        let left_x = view_min_x + half_stroke;
-        let right_x = view_min_x + view_width - half_stroke;
-        let top_y = view_min_y + half_stroke;
-        let bottom_y = view_min_y + view_height - half_stroke;
+        let half_stroke = workspace_stroke_width * 0.5;
+        let left_x = workspace_min_x + half_stroke;
+        let right_x = workspace_min_x + workspace_width - half_stroke;
+        let top_y = workspace_min_y + half_stroke;
+        let bottom_y = workspace_min_y + workspace_height - half_stroke;
         let frame_stroke_instances = vec![
             FrameInstance {
                 pos: [workspace_center[0], top_y],
-                size: [view_width, workspace_stroke],
+                size: [workspace_width, workspace_stroke_width],
                 rotation: 0.0,
                 _pad: 0.0,
             },
             FrameInstance {
                 pos: [workspace_center[0], bottom_y],
-                size: [view_width, workspace_stroke],
+                size: [workspace_width, workspace_stroke_width],
                 rotation: 0.0,
                 _pad: 0.0,
             },
             FrameInstance {
                 pos: [left_x, workspace_center[1]],
-                size: [workspace_stroke, view_height],
+                size: [workspace_stroke_width, workspace_height],
                 rotation: 0.0,
                 _pad: 0.0,
             },
             FrameInstance {
                 pos: [right_x, workspace_center[1]],
-                size: [workspace_stroke, view_height],
+                size: [workspace_stroke_width, workspace_height],
                 rotation: 0.0,
                 _pad: 0.0,
             },
@@ -1210,7 +1223,7 @@ impl WgpuRenderer {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("frame-stroke-instance-buffer"),
                 contents: bytemuck::cast_slice(&frame_stroke_instances),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
         let frame_inset = 0.0;
         let frame_stroke = 1.5;
@@ -1260,6 +1273,8 @@ impl WgpuRenderer {
             frame_stroke_bind_group,
             _frame_stroke_globals_buffer: frame_stroke_globals_buffer,
             globals,
+            workspace_min: [workspace_min_x, workspace_min_y],
+            workspace_size: [workspace_width, workspace_height],
             vertex_buffer,
             index_buffer,
             instance_buffer,
@@ -1282,11 +1297,15 @@ impl WgpuRenderer {
             ui_text_state: None,
             show_frame: true,
             frame_clear_color,
+            frame_dash_color: dash_color,
+            workspace_fill_color: workspace_fill,
+            workspace_stroke_color: workspace_stroke,
             text_state: None,
             show_fps: false,
             fps_tracker: FpsTracker::new(),
             fps_text: String::new(),
             fps_color,
+            fps_force_fallback: false,
             fps_logged_missing_text_state: false,
             fps_logged_prepare_error: false,
             render_scale,
@@ -1456,7 +1475,11 @@ impl WgpuRenderer {
 
         let mut draw_text = false;
         if self.show_fps {
-            if let Some(fps) = self.fps_tracker.record_frame(now_ms()) {
+            if self.fps_force_fallback {
+                self.fps_force_fallback = false;
+                self.fps_text = FPS_LABEL_FALLBACK.to_string();
+                self.fps_tracker.reset();
+            } else if let Some(fps) = self.fps_tracker.record_frame(now_ms()) {
                 self.fps_text = format!("{:.0} fps", fps);
             }
             if self.fps_text.is_empty() {
@@ -1882,6 +1905,168 @@ impl WgpuRenderer {
         }
     }
 
+    pub(crate) fn resize(&mut self, pixel_width: u32, pixel_height: u32) {
+        let width = pixel_width.max(1);
+        let height = pixel_height.max(1);
+        if self._config.width == width && self._config.height == height {
+            return;
+        }
+        self._config.width = width;
+        self._config.height = height;
+        self._canvas.set_width(width);
+        self._canvas.set_height(height);
+        self.surface.configure(&self.device, &self._config);
+    }
+
+    pub(crate) fn set_view(
+        &mut self,
+        view_min_x: f32,
+        view_min_y: f32,
+        view_width: f32,
+        view_height: f32,
+        puzzle_scale: f32,
+    ) {
+        let puzzle_scale = puzzle_scale.max(1.0e-4);
+        if self.globals.view_min == [view_min_x, view_min_y]
+            && self.globals.view_size == [view_width, view_height]
+            && (self.globals.puzzle_scale - puzzle_scale).abs() <= f32::EPSILON
+        {
+            return;
+        }
+        self.globals.view_min = [view_min_x, view_min_y];
+        self.globals.view_size = [view_width, view_height];
+        self.globals.puzzle_scale = puzzle_scale;
+        self.queue.write_buffer(
+            &self.globals_buffer_fill,
+            0,
+            bytemuck::bytes_of(&self.globals),
+        );
+        let mut globals_outline = self.globals;
+        globals_outline.render_mode = 1.0;
+        self.queue.write_buffer(
+            &self.globals_buffer_outline,
+            0,
+            bytemuck::bytes_of(&globals_outline),
+        );
+        let frame_dash_globals = FrameGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            color: self.frame_dash_color,
+            output_gamma: self.globals.output_gamma,
+            puzzle_scale,
+            _pad: [0.0; 2],
+        };
+        self.queue.write_buffer(
+            &self._frame_globals_buffer,
+            0,
+            bytemuck::bytes_of(&frame_dash_globals),
+        );
+        let frame_bg_globals = FrameGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            color: self.workspace_fill_color,
+            output_gamma: self.globals.output_gamma,
+            puzzle_scale,
+            _pad: [0.0; 2],
+        };
+        self.queue.write_buffer(
+            &self._frame_bg_globals_buffer,
+            0,
+            bytemuck::bytes_of(&frame_bg_globals),
+        );
+        let frame_stroke_globals = FrameGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            color: self.workspace_stroke_color,
+            output_gamma: self.globals.output_gamma,
+            puzzle_scale,
+            _pad: [0.0; 2],
+        };
+        self.queue.write_buffer(
+            &self._frame_stroke_globals_buffer,
+            0,
+            bytemuck::bytes_of(&frame_stroke_globals),
+        );
+        let ui_globals = UiGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            _pad: [0.0; 4],
+        };
+        self.queue
+            .write_buffer(&self._ui_globals_buffer, 0, bytemuck::bytes_of(&ui_globals));
+    }
+
+    pub(crate) fn set_workspace_rect(
+        &mut self,
+        min_x: f32,
+        min_y: f32,
+        width: f32,
+        height: f32,
+    ) {
+        let puzzle_scale = self.globals.puzzle_scale.max(1.0e-4);
+        let inv_puzzle_scale = 1.0 / puzzle_scale;
+        let min_x = min_x * inv_puzzle_scale;
+        let min_y = min_y * inv_puzzle_scale;
+        let width = width * inv_puzzle_scale;
+        let height = height * inv_puzzle_scale;
+        if self.workspace_min == [min_x, min_y] && self.workspace_size == [width, height] {
+            return;
+        }
+        self.workspace_min = [min_x, min_y];
+        self.workspace_size = [width, height];
+        let workspace_stroke_width = 2.0 * inv_puzzle_scale;
+        let workspace_center = [min_x + width * 0.5, min_y + height * 0.5];
+        let frame_bg_instances = [FrameInstance {
+            pos: workspace_center,
+            size: [width, height],
+            rotation: 0.0,
+            _pad: 0.0,
+        }];
+        self.queue.write_buffer(
+            &self.frame_bg_instance_buffer,
+            0,
+            bytemuck::cast_slice(&frame_bg_instances),
+        );
+        self.frame_bg_instance_count = frame_bg_instances.len() as u32;
+        let half_stroke = workspace_stroke_width * 0.5;
+        let left_x = min_x + half_stroke;
+        let right_x = min_x + width - half_stroke;
+        let top_y = min_y + half_stroke;
+        let bottom_y = min_y + height - half_stroke;
+        let frame_stroke_instances = [
+            FrameInstance {
+                pos: [workspace_center[0], top_y],
+                size: [width, workspace_stroke_width],
+                rotation: 0.0,
+                _pad: 0.0,
+            },
+            FrameInstance {
+                pos: [workspace_center[0], bottom_y],
+                size: [width, workspace_stroke_width],
+                rotation: 0.0,
+                _pad: 0.0,
+            },
+            FrameInstance {
+                pos: [left_x, workspace_center[1]],
+                size: [workspace_stroke_width, height],
+                rotation: 0.0,
+                _pad: 0.0,
+            },
+            FrameInstance {
+                pos: [right_x, workspace_center[1]],
+                size: [workspace_stroke_width, height],
+                rotation: 0.0,
+                _pad: 0.0,
+            },
+        ];
+        self.queue.write_buffer(
+            &self.frame_stroke_instance_buffer,
+            0,
+            bytemuck::cast_slice(&frame_stroke_instances),
+        );
+        self.frame_stroke_instance_count = frame_stroke_instances.len() as u32;
+    }
+
     pub(crate) fn set_show_frame(&mut self, enabled: bool) {
         self.show_frame = enabled;
     }
@@ -1916,6 +2101,15 @@ impl WgpuRenderer {
             console::log_1(&JsValue::from_str("WGPU FPS: disabled"));
             self.fps_text.clear();
         }
+    }
+
+    pub(crate) fn force_fps_fallback(&mut self) {
+        if !self.show_fps {
+            return;
+        }
+        self.fps_force_fallback = true;
+        self.fps_text = FPS_LABEL_FALLBACK.to_string();
+        self.fps_tracker.reset();
     }
 
     pub(crate) fn update_instances(&mut self, set: InstanceSet) {

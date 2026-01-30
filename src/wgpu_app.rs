@@ -1,21 +1,21 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
+use gloo::timers::callback::Timeout;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
-use js_sys::{Function, Reflect};
+use js_sys::{Date, Function, Reflect};
 use taffy::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, Document, Element, Event, HtmlCanvasElement, HtmlImageElement,
-    MouseEvent, Touch, TouchEvent,
+    MouseEvent, Touch, TouchEvent, WheelEvent,
 };
 
-use crate::app_core::{AppCore, AppSnapshot};
+use crate::app_core::{AppCore, AppSnapshot, ViewRect};
 use crate::app_router;
 use crate::sync_runtime;
 use crate::core::*;
@@ -53,12 +53,33 @@ const DRAG_ROTATION_DEG: f32 = 1.0;
 const OUTLINE_KIND_HOVER: f32 = 1.0;
 const OUTLINE_KIND_OWNED: f32 = 2.0;
 const OUTLINE_KIND_DEBUG: f32 = 3.0;
+const WGPU_FPS_CAP_DEFAULT: f32 = 60.0;
+const WGPU_FPS_IDLE_RESET_MS: f32 = 800.0;
 
 #[derive(Clone, Copy)]
 struct UiHitbox {
     center: [f32; 2],
     half_size: [f32; 2],
     rotation_deg: f32,
+}
+
+struct PanState {
+    last_x: f32,
+    last_y: f32,
+    touch_id: Option<i32>,
+}
+
+struct PinchState {
+    touch_a: i32,
+    touch_b: i32,
+    last_distance: f32,
+}
+
+struct TouchDragGate {
+    touch_id: i32,
+    start_x: f32,
+    start_y: f32,
+    moved: bool,
 }
 
 struct GlyphonMeasureState {
@@ -277,7 +298,7 @@ thread_local! {
 pub(crate) fn request_render() {
     WGPU_VIEW.with(|slot| {
         if let Some(view) = slot.borrow().as_ref() {
-            view.render();
+            view.request_render();
         }
     });
 }
@@ -320,7 +341,7 @@ pub(crate) fn run() {
             return;
         }
 
-        root.set_class_name("app");
+        root.set_class_name("app wgpu");
 
         let canvas = document
             .create_element("canvas")
@@ -355,6 +376,7 @@ pub(crate) fn run() {
                 sync_runtime::dispatch_view_action(&core_for_hooks, action, true);
             }),
         });
+        view.update_viewport_size();
         view.install_listeners();
         let core_for_render = core.clone();
         let adapter_for_render = adapter.clone();
@@ -391,6 +413,15 @@ struct WgpuView {
     ui_measure: RefCell<GlyphonMeasureState>,
     ui_credit_hitbox: RefCell<Option<UiHitbox>>,
     ui_credit_hovered: Cell<bool>,
+    pan_state: RefCell<Option<PanState>>,
+    pinch_state: RefCell<Option<PinchState>>,
+    touch_drag_gate: RefCell<Option<TouchDragGate>>,
+    pending_snapshot: RefCell<Option<AppSnapshot>>,
+    render_timer: RefCell<Option<Timeout>>,
+    idle_fps_timer: RefCell<Option<Timeout>>,
+    last_render_ms: Cell<f32>,
+    idle_fps_rendered: Cell<bool>,
+    force_fps_fallback: Cell<bool>,
     subscription: RefCell<Option<crate::app_core::AppSubscription>>,
     listeners: RefCell<Vec<EventListener>>,
     mask_atlas: RefCell<Option<Rc<MaskAtlasData>>>,
@@ -416,6 +447,15 @@ impl WgpuView {
             ui_measure: RefCell::new(GlyphonMeasureState::new()),
             ui_credit_hitbox: RefCell::new(None),
             ui_credit_hovered: Cell::new(false),
+            pan_state: RefCell::new(None),
+            pinch_state: RefCell::new(None),
+            touch_drag_gate: RefCell::new(None),
+            pending_snapshot: RefCell::new(None),
+            render_timer: RefCell::new(None),
+            idle_fps_timer: RefCell::new(None),
+            last_render_ms: Cell::new(0.0),
+            idle_fps_rendered: Cell::new(false),
+            force_fps_fallback: Cell::new(false),
             subscription: RefCell::new(None),
             listeners: RefCell::new(Vec::new()),
             mask_atlas: RefCell::new(None),
@@ -445,6 +485,13 @@ impl WgpuView {
         self.pending_instances.borrow_mut().take();
         self.pending_ui.borrow_mut().take();
         *self.image.borrow_mut() = None;
+    }
+
+    fn update_viewport_size(&self) {
+        let rect = self.root.get_bounding_client_rect();
+        let width = rect.width() as f32;
+        let height = rect.height() as f32;
+        self.core.set_viewport_size(width, height);
     }
 
     fn load_image_for_puzzle(
@@ -483,14 +530,14 @@ impl WgpuView {
             let target_h = ((height as f64) * source_scale).round().max(1.0) as u32;
             if target_w == width && target_h == height {
                 view.set_image(img_clone.clone());
-                view.render();
+                view.request_render();
                 return;
             }
             let document = match web_sys::window().and_then(|window| window.document()) {
                 Some(doc) => doc,
                 None => {
                     view.set_image(img_clone.clone());
-                    view.render();
+                    view.request_render();
                     return;
                 }
             };
@@ -502,7 +549,7 @@ impl WgpuView {
                 Some(canvas) => canvas,
                 None => {
                     view.set_image(img_clone.clone());
-                    view.render();
+                    view.request_render();
                     return;
                 }
             };
@@ -517,7 +564,7 @@ impl WgpuView {
                 Some(ctx) => ctx,
                 None => {
                     view.set_image(img_clone.clone());
-                    view.render();
+                    view.request_render();
                     return;
                 }
             };
@@ -533,14 +580,14 @@ impl WgpuView {
                 .is_err()
             {
                 view.set_image(img_clone.clone());
-                view.render();
+                view.request_render();
                 return;
             }
             let data_url = match canvas.to_data_url() {
                 Ok(data_url) => data_url,
                 Err(_) => {
                     view.set_image(img_clone.clone());
-                    view.render();
+                    view.request_render();
                     return;
                 }
             };
@@ -548,7 +595,7 @@ impl WgpuView {
                 Ok(image) => image,
                 Err(_) => {
                     view.set_image(img_clone.clone());
-                    view.render();
+                    view.request_render();
                     return;
                 }
             };
@@ -560,7 +607,7 @@ impl WgpuView {
                     return;
                 }
                 view_scaled.set_image(scaled_clone.clone());
-                view_scaled.render();
+                view_scaled.request_render();
             }));
             scaled.set_onload(Some(onload_scaled.as_ref().unchecked_ref()));
             scaled.set_src(&data_url);
@@ -616,21 +663,17 @@ impl WgpuView {
             }
             let snapshot = core.snapshot();
             let Some((view_x, view_y)) =
-                event_to_canvas_coords(event, &canvas_for_down, snapshot.layout)
+                event_to_canvas_coords(event, &canvas_for_down, snapshot.view)
             else {
                 return;
             };
-            if view.hit_credit(view_x, view_y) {
-                open_credit_url();
-                event.prevent_default();
-                return;
-            }
             let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
             if let Some(piece_id) = view.pick_piece(px, py, &snapshot) {
                 let sync_view = sync_runtime::sync_view();
                 if piece_owned_by_other(&snapshot, &sync_view, piece_id) {
                     return;
                 }
+                view.touch_drag_gate.borrow_mut().take();
                 let right_click = event.button() == 2;
                 view.dispatch_action(CoreAction::BeginDrag {
                     piece_id,
@@ -641,6 +684,23 @@ impl WgpuView {
                     right_click,
                     touch_id: None,
                 });
+                event.prevent_default();
+                return;
+            }
+            if view.hit_credit(view_x, view_y) {
+                open_credit_url();
+                event.prevent_default();
+                return;
+            }
+            if event.button() == 0 {
+                view.ui_credit_hovered.set(false);
+                *view.pan_state.borrow_mut() = Some(PanState {
+                    last_x: event.client_x() as f32,
+                    last_y: event.client_y() as f32,
+                    touch_id: None,
+                });
+                let sync_view = sync_runtime::sync_view();
+                view.update_canvas_class(&snapshot, &sync_view);
                 event.prevent_default();
             }
         },
@@ -661,6 +721,67 @@ impl WgpuView {
         listeners.push(listener);
 
         let core = self.core.clone();
+        let canvas_for_wheel = canvas.clone();
+        let view = Rc::clone(self);
+        let listener = EventListener::new_with_options(
+            &canvas,
+            "wheel",
+            EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: false,
+            },
+            move |event: &Event| {
+                let Some(event) = event.dyn_ref::<WheelEvent>() else {
+                    return;
+                };
+                let snapshot = core.snapshot();
+                let rect = canvas_for_wheel.get_bounding_client_rect();
+                let rect_width = rect.width() as f32;
+                let rect_height = rect.height() as f32;
+                if rect_width <= 0.0 || rect_height <= 0.0 {
+                    return;
+                }
+                let mut delta_x = event.delta_x() as f32;
+                let mut delta_y = event.delta_y() as f32;
+                match event.delta_mode() {
+                    1 => {
+                        delta_x *= 16.0;
+                        delta_y *= 16.0;
+                    }
+                    2 => {
+                        delta_x *= rect_width;
+                        delta_y *= rect_height;
+                    }
+                    _ => {}
+                }
+                if event.ctrl_key() || event.meta_key() {
+                    if let Some((dx_world, dy_world)) =
+                        screen_delta_to_world(delta_x, delta_y, &canvas_for_wheel, snapshot.view)
+                    {
+                        core.pan_view(dx_world, dy_world);
+                    }
+                } else {
+                    let Some((view_x, view_y)) = screen_to_view_coords(
+                        event.client_x() as f32,
+                        event.client_y() as f32,
+                        &canvas_for_wheel,
+                        snapshot.view,
+                    ) else {
+                        return;
+                    };
+                    let zoom_factor = (-delta_y * 0.0015).exp();
+                    if zoom_factor.is_finite() && zoom_factor > 0.0 {
+                        core.zoom_view_at(zoom_factor, view_x, view_y);
+                    }
+                }
+                let sync_view = sync_runtime::sync_view();
+                view.update_canvas_class(&snapshot, &sync_view);
+                event.prevent_default();
+            },
+        );
+        listeners.push(listener);
+
+        let core = self.core.clone();
         let canvas_for_move = canvas.clone();
         let view = Rc::clone(self);
         let listener = EventListener::new(&canvas, "mousemove", move |event: &Event| {
@@ -671,12 +792,26 @@ impl WgpuView {
             if !snapshot.dragging_members.is_empty() {
                 return;
             }
+            if view.pan_state.borrow().is_some() {
+                return;
+            }
             let Some((view_x, view_y)) =
-                event_to_canvas_coords(event, &canvas_for_move, snapshot.layout)
+                event_to_canvas_coords(event, &canvas_for_move, snapshot.view)
             else {
                 view.dispatch_action(CoreAction::SetHovered { hovered: None });
                 return;
             };
+            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+            let hovered = view.pick_piece(px, py, &snapshot);
+            if hovered.is_some() {
+                if view.ui_credit_hovered.get() {
+                    view.ui_credit_hovered.set(false);
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                }
+                view.dispatch_action(CoreAction::SetHovered { hovered });
+                return;
+            }
             let credit_hovered = view.hit_credit(view_x, view_y);
             if view.ui_credit_hovered.get() != credit_hovered {
                 view.ui_credit_hovered.set(credit_hovered);
@@ -687,8 +822,6 @@ impl WgpuView {
                 view.dispatch_action(CoreAction::SetHovered { hovered: None });
                 return;
             }
-            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-            let hovered = view.pick_piece(px, py, &snapshot);
             view.dispatch_action(CoreAction::SetHovered { hovered });
         });
         listeners.push(listener);
@@ -718,26 +851,61 @@ impl WgpuView {
             let Some(event) = event.dyn_ref::<TouchEvent>() else {
                 return;
             };
-            if event.touches().length() > 1 {
+            let touch_count = event.touches().length();
+            let snapshot = core.snapshot();
+            if touch_count >= 2 {
+                view.touch_drag_gate.borrow_mut().take();
+                event.prevent_default();
+                if !snapshot.dragging_members.is_empty() {
+                    view.dispatch_action(CoreAction::DragEnd {
+                        touch_id: snapshot.drag_touch_id,
+                    });
+                }
+                if let (Some(touch_a), Some(touch_b)) =
+                    (event.touches().item(0), event.touches().item(1))
+                {
+                    let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
+                    let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.0 {
+                        *view.pinch_state.borrow_mut() = Some(PinchState {
+                            touch_a: touch_a.identifier(),
+                            touch_b: touch_b.identifier(),
+                            last_distance: distance,
+                        });
+                        if view.pan_state.borrow_mut().take().is_some() {
+                            core.settle_view();
+                        }
+                        let sync_view = sync_runtime::sync_view();
+                        view.update_canvas_class(&snapshot, &sync_view);
+                        event.prevent_default();
+                    }
+                }
                 return;
             }
-            let snapshot = core.snapshot();
-            let Some((view_x, view_y, touch_id)) =
-                touch_event_to_canvas_coords(event, &canvas_for_touch, snapshot.layout, None, true)
+            let touch = touch_from_event(event, None, true);
+            let Some(touch) = touch else {
+                return;
+            };
+            let screen_x = touch.client_x() as f32;
+            let screen_y = touch.client_y() as f32;
+            let Some((view_x, view_y)) =
+                screen_to_view_coords(screen_x, screen_y, &canvas_for_touch, snapshot.view)
             else {
                 return;
             };
-            if view.hit_credit(view_x, view_y) {
-                open_credit_url();
-                event.prevent_default();
-                return;
-            }
             let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
             if let Some(piece_id) = view.pick_piece(px, py, &snapshot) {
                 let sync_view = sync_runtime::sync_view();
                 if piece_owned_by_other(&snapshot, &sync_view, piece_id) {
                     return;
                 }
+                *view.touch_drag_gate.borrow_mut() = Some(TouchDragGate {
+                    touch_id: touch.identifier(),
+                    start_x: px,
+                    start_y: py,
+                    moved: false,
+                });
                 view.dispatch_action(CoreAction::BeginDrag {
                     piece_id,
                     x: px,
@@ -745,10 +913,26 @@ impl WgpuView {
                     shift_key: false,
                     rotate_mode: false,
                     right_click: false,
-                    touch_id: Some(touch_id),
+                    touch_id: Some(touch.identifier()),
                 });
                 event.prevent_default();
+                return;
             }
+            if view.hit_credit(view_x, view_y) {
+                open_credit_url();
+                event.prevent_default();
+                return;
+            }
+            *view.pan_state.borrow_mut() = Some(PanState {
+                last_x: screen_x,
+                last_y: screen_y,
+                touch_id: Some(touch.identifier()),
+            });
+            view.pinch_state.borrow_mut().take();
+            view.ui_credit_hovered.set(false);
+            let sync_view = sync_runtime::sync_view();
+            view.update_canvas_class(&snapshot, &sync_view);
+            event.prevent_default();
         },
         );
         listeners.push(listener);
@@ -769,16 +953,32 @@ impl WgpuView {
                     return;
                 };
                 let snapshot = core.snapshot();
-                if snapshot.dragging_members.is_empty() {
+                if !snapshot.dragging_members.is_empty() {
+                    let Some((view_x, view_y)) =
+                        event_to_canvas_coords(event, &canvas_for_drag, snapshot.view)
+                    else {
+                        return;
+                    };
+                    let (px, py) =
+                        workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                    view.dispatch_action(CoreAction::DragMove { x: px, y: py });
+                    event.prevent_default();
                     return;
                 }
-                let Some((view_x, view_y)) =
-                    event_to_canvas_coords(event, &canvas_for_drag, snapshot.layout)
-                else {
-                    return;
+                let delta = {
+                    let mut pan_state = view.pan_state.borrow_mut();
+                    let Some(pan) = pan_state.as_mut() else {
+                        return;
+                    };
+                    let dx = event.client_x() as f32 - pan.last_x;
+                    let dy = event.client_y() as f32 - pan.last_y;
+                    pan.last_x = event.client_x() as f32;
+                    pan.last_y = event.client_y() as f32;
+                    screen_delta_to_world(dx, dy, &canvas_for_drag, snapshot.view)
                 };
-                let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-                view.dispatch_action(CoreAction::DragMove { x: px, y: py });
+                if let Some((dx_world, dy_world)) = delta {
+                    core.pan_view(dx_world, dy_world);
+                }
                 event.prevent_default();
             },
         );
@@ -799,9 +999,20 @@ impl WgpuView {
                     return;
                 };
                 let snapshot = core.snapshot();
+                view.touch_drag_gate.borrow_mut().take();
+                let mut pan_cleared = false;
+                if view.pan_state.borrow().is_some() {
+                    view.pan_state.borrow_mut().take();
+                    pan_cleared = true;
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                }
+                if pan_cleared {
+                    core.settle_view();
+                }
                 if !snapshot.dragging_members.is_empty() {
                     if let Some((view_x, view_y)) =
-                        event_to_canvas_coords(event, &canvas_for_up, snapshot.layout)
+                        event_to_canvas_coords(event, &canvas_for_up, snapshot.view)
                     {
                         let (px, py) = workspace_to_puzzle_coords(
                             snapshot.layout.puzzle_scale,
@@ -816,7 +1027,7 @@ impl WgpuView {
                 if !snapshot.dragging_members.is_empty() {
                     return;
                 }
-                let hovered = event_to_canvas_coords(event, &canvas_for_up, snapshot.layout)
+                let hovered = event_to_canvas_coords(event, &canvas_for_up, snapshot.view)
                     .and_then(|(view_x, view_y)| {
                         let (px, py) = workspace_to_puzzle_coords(
                             snapshot.layout.puzzle_scale,
@@ -844,7 +1055,83 @@ impl WgpuView {
                 let Some(event) = event.dyn_ref::<TouchEvent>() else {
                     return;
                 };
+                let touch_count = event.touches().length();
+                if touch_count >= 2 {
+                    event.prevent_default();
+                }
                 let snapshot = core.snapshot();
+                let pinch_opt = { view.pinch_state.borrow_mut().take() };
+                if let Some(mut pinch) = pinch_opt {
+                    let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
+                    let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
+                    if let (Some(touch_a), Some(touch_b)) = (touch_a, touch_b) {
+                        let center_x =
+                            (touch_a.client_x() as f32 + touch_b.client_x() as f32) * 0.5;
+                        let center_y =
+                            (touch_a.client_y() as f32 + touch_b.client_y() as f32) * 0.5;
+                        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
+                        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+                        let distance = (dx * dx + dy * dy).sqrt();
+                        if distance > 0.0 {
+                            let factor = distance / pinch.last_distance;
+                            if factor.is_finite() && factor > 0.0 {
+                                if let Some((view_x, view_y)) = screen_to_view_coords(
+                                    center_x,
+                                    center_y,
+                                    &canvas_for_touch_move,
+                                    snapshot.view,
+                                ) {
+                                    core.zoom_view_at(factor, view_x, view_y);
+                                }
+                                pinch.last_distance = distance;
+                            }
+                        }
+                        if let Ok(mut slot) = view.pinch_state.try_borrow_mut() {
+                            *slot = Some(pinch);
+                        }
+                        event.prevent_default();
+                        return;
+                    }
+                }
+                if touch_count >= 2 {
+                    if let (Some(touch_a), Some(touch_b)) =
+                        (event.touches().item(0), event.touches().item(1))
+                    {
+                        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
+                        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+                        let distance = (dx * dx + dy * dy).sqrt();
+                        if distance > 0.0 {
+                            *view.pinch_state.borrow_mut() = Some(PinchState {
+                                touch_a: touch_a.identifier(),
+                                touch_b: touch_b.identifier(),
+                                last_distance: distance,
+                            });
+                        }
+                    }
+                    return;
+                }
+                let delta = {
+                    let mut pan_state = view.pan_state.borrow_mut();
+                    if let Some(pan) = pan_state.as_mut() {
+                        if let Some(touch) = touch_from_event(event, pan.touch_id, false) {
+                            let dx = touch.client_x() as f32 - pan.last_x;
+                            let dy = touch.client_y() as f32 - pan.last_y;
+                            pan.last_x = touch.client_x() as f32;
+                            pan.last_y = touch.client_y() as f32;
+                            screen_delta_to_world(dx, dy, &canvas_for_touch_move, snapshot.view)
+                        } else {
+                            pan_state.take();
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some((dx_world, dy_world)) = delta {
+                    core.pan_view(dx_world, dy_world);
+                    event.prevent_default();
+                    return;
+                }
                 if snapshot.dragging_members.is_empty() {
                     return;
                 }
@@ -854,13 +1141,38 @@ impl WgpuView {
                 let Some((view_x, view_y, _touch_id)) = touch_event_to_canvas_coords(
                     event,
                     &canvas_for_touch_move,
-                    snapshot.layout,
+                    snapshot.view,
                     snapshot.drag_touch_id,
                     false,
                 ) else {
                     return;
                 };
-                let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                let (px, py) =
+                    workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                if let Some(gate) = view.touch_drag_gate.borrow_mut().as_mut() {
+                    if let Some(drag_id) = snapshot.drag_touch_id {
+                        if gate.touch_id != drag_id {
+                            gate.moved = true;
+                        } else if !gate.moved {
+                            let click_tolerance =
+                                snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                            let slop = screen_slop_to_puzzle(
+                                TOUCH_DRAG_SLOP_PX,
+                                &canvas_for_touch_move,
+                                snapshot.view,
+                                snapshot.layout.puzzle_scale,
+                            );
+                            let drag_tolerance = click_tolerance.max(slop);
+                            let dx = px - gate.start_x;
+                            let dy = py - gate.start_y;
+                            if dx * dx + dy * dy < drag_tolerance * drag_tolerance {
+                                event.prevent_default();
+                                return;
+                            }
+                            gate.moved = true;
+                        }
+                    }
+                }
                 view.dispatch_action(CoreAction::DragMove { x: px, y: py });
                 event.prevent_default();
             },
@@ -881,21 +1193,46 @@ impl WgpuView {
                     return;
                 };
                 let snapshot = core.snapshot();
-                if snapshot.drag_touch_id.is_none() {
-                    return;
+                view.touch_drag_gate.borrow_mut().take();
+                let mut cleared = false;
+                if let Some(pinch) = view.pinch_state.borrow_mut().take() {
+                    let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
+                    let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
+                    if touch_a.is_some() && touch_b.is_some() {
+                        *view.pinch_state.borrow_mut() = Some(pinch);
+                    } else {
+                        cleared = true;
+                    }
                 }
-                if let Some(touch) = touch_from_event(event, None, true) {
-                    view.dispatch_action(CoreAction::DragEnd {
-                        touch_id: Some(touch.identifier()),
-                    });
-                } else {
-                    view.dispatch_action(CoreAction::DragEnd { touch_id: None });
+                {
+                    let mut pan_state = view.pan_state.borrow_mut();
+                    if let Some(pan) = pan_state.as_ref() {
+                        if touch_from_event(event, pan.touch_id, true).is_some() {
+                            pan_state.take();
+                            cleared = true;
+                        }
+                    }
+                }
+                if cleared {
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                    core.settle_view();
+                }
+                if snapshot.drag_touch_id.is_some() {
+                    if let Some(touch) = touch_from_event(event, None, true) {
+                        view.dispatch_action(CoreAction::DragEnd {
+                            touch_id: Some(touch.identifier()),
+                        });
+                    } else {
+                        view.dispatch_action(CoreAction::DragEnd { touch_id: None });
+                    }
                 }
             },
         );
         listeners.push(listener);
 
         let view = Rc::clone(self);
+        let core = self.core.clone();
         let listener = EventListener::new_with_options(
             &window,
             "touchcancel",
@@ -904,7 +1241,65 @@ impl WgpuView {
                 passive: false,
             },
             move |_event: &Event| {
+                view.pan_state.borrow_mut().take();
+                view.pinch_state.borrow_mut().take();
+                view.touch_drag_gate.borrow_mut().take();
+                let snapshot = core.snapshot();
+                let sync_view = sync_runtime::sync_view();
+                view.update_canvas_class(&snapshot, &sync_view);
+                core.settle_view();
                 view.dispatch_action(CoreAction::DragEnd { touch_id: None });
+            },
+        );
+        listeners.push(listener);
+
+        let view = Rc::clone(self);
+        let listener = EventListener::new(&window, "resize", move |_event: &Event| {
+            view.update_viewport_size();
+        });
+        listeners.push(listener);
+
+        let view = Rc::clone(self);
+        let listener = EventListener::new_with_options(
+            &window,
+            "gesturestart",
+            EventListenerOptions {
+                phase: EventListenerPhase::Capture,
+                passive: false,
+            },
+            move |event: &Event| {
+                view.pinch_state.borrow_mut().take();
+                view.pan_state.borrow_mut().take();
+                event.prevent_default();
+                event.stop_propagation();
+            },
+        );
+        listeners.push(listener);
+
+        let listener = EventListener::new_with_options(
+            &window,
+            "gesturechange",
+            EventListenerOptions {
+                phase: EventListenerPhase::Capture,
+                passive: false,
+            },
+            move |event: &Event| {
+                event.prevent_default();
+                event.stop_propagation();
+            },
+        );
+        listeners.push(listener);
+
+        let listener = EventListener::new_with_options(
+            &window,
+            "gestureend",
+            EventListenerOptions {
+                phase: EventListenerPhase::Capture,
+                passive: false,
+            },
+            move |event: &Event| {
+                event.prevent_default();
+                event.stop_propagation();
             },
         );
         listeners.push(listener);
@@ -929,12 +1324,21 @@ impl WgpuView {
         }
     }
 
+
     fn update_canvas_class(&self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
         let mut canvas_class = "puzzle-canvas".to_string();
+        let is_panning = self.pan_state.borrow().is_some();
+        if is_panning {
+            canvas_class.push_str(" panning");
+        }
         if !snapshot.dragging_members.is_empty() {
             canvas_class.push_str(" dragging");
-        } else if snapshot.hovered_id.is_some() {
-            canvas_class.push_str(" hover");
+        } else if !is_panning {
+            if snapshot.hovered_id.is_some() {
+                canvas_class.push_str(" hover");
+            } else if !self.ui_credit_hovered.get() {
+                canvas_class.push_str(" pan-ready");
+            }
         }
         if let Some(hovered_id) = snapshot.hovered_id {
             if piece_owned_by_other(snapshot, sync_view, hovered_id) {
@@ -966,20 +1370,88 @@ impl WgpuView {
         )
     }
 
-    fn render(self: &Rc<Self>) {
-        let snapshot = self.core.snapshot();
+    fn request_render(self: &Rc<Self>) {
+        self.queue_render_snapshot(self.core.snapshot());
+    }
+
+    fn queue_render_snapshot(self: &Rc<Self>, snapshot: AppSnapshot) {
+        *self.pending_snapshot.borrow_mut() = Some(snapshot);
+        self.idle_fps_rendered.set(false);
+        self.schedule_render();
+    }
+
+    fn schedule_render(self: &Rc<Self>) {
+        let now = now_ms();
+        let min_interval = (1000.0 / WGPU_FPS_CAP_DEFAULT).max(1.0);
+        let mut elapsed = now - self.last_render_ms.get();
+        if elapsed < 0.0 {
+            self.last_render_ms.set(now);
+            elapsed = min_interval;
+        }
+        if elapsed >= min_interval {
+            self.render_timer.borrow_mut().take();
+            self.perform_render(true);
+            return;
+        }
+        if self.render_timer.borrow().is_some() {
+            return;
+        }
+        let delay_ms = (min_interval - elapsed).max(0.0).ceil() as u32;
+        let view = Rc::clone(self);
+        *self.render_timer.borrow_mut() = Some(Timeout::new(delay_ms, move || {
+            view.render_timer.borrow_mut().take();
+            view.perform_render(true);
+        }));
+    }
+
+    fn perform_render(self: &Rc<Self>, schedule_idle: bool) {
+        let snapshot = self
+            .pending_snapshot
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| self.core.snapshot());
+        let show_fps = snapshot.wgpu_settings.show_fps;
         let sync_view = sync_runtime::sync_view();
+        self.last_render_ms.set(now_ms());
+        self.force_fps_fallback.set(!schedule_idle && show_fps);
         self.render_snapshot(&snapshot, &sync_view);
+        if schedule_idle {
+            self.schedule_idle_fps_reset(show_fps);
+        }
+    }
+
+    fn schedule_idle_fps_reset(self: &Rc<Self>, show_fps: bool) {
+        self.idle_fps_timer.borrow_mut().take();
+        if !show_fps {
+            return;
+        }
+        let view = Rc::clone(self);
+        let scheduled_at = self.last_render_ms.get();
+        *self.idle_fps_timer.borrow_mut() =
+            Some(Timeout::new(WGPU_FPS_IDLE_RESET_MS as u32, move || {
+                if view.last_render_ms.get() != scheduled_at {
+                    return;
+                }
+                if view.idle_fps_rendered.get() {
+                    return;
+                }
+                view.idle_fps_rendered.set(true);
+                view.perform_render(false);
+            }));
     }
 
     fn render_snapshot(self: &Rc<Self>, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
+        let force_fps_fallback = self.force_fps_fallback.get();
+        if force_fps_fallback {
+            self.force_fps_fallback.set(false);
+        }
         self.ensure_puzzle_image(snapshot);
         let disconnected =
             matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
         if disconnected {
-            self.root.set_class_name("app sync-disconnected");
+            self.root.set_class_name("app wgpu sync-disconnected");
         } else {
-            self.root.set_class_name("app");
+            self.root.set_class_name("app wgpu");
         }
         if let Some(preview) = self.preview.borrow().as_ref() {
             if let Some(info) = snapshot.puzzle_info.as_ref() {
@@ -1015,15 +1487,31 @@ impl WgpuView {
             *self.mask_atlas.borrow_mut() = Some(mask_atlas_data);
         }
         let layout = snapshot.layout;
+        let view_rect = snapshot.view;
         self.update_canvas_class(snapshot, sync_view);
-        let view_width = layout.view_width.max(1.0).round() as u32;
-        let view_height = layout.view_height.max(1.0).round() as u32;
+        let rect = self.canvas.get_bounding_client_rect();
+        let viewport_w = rect.width() as f32;
+        let viewport_h = rect.height() as f32;
+        if viewport_w <= 0.0 || viewport_h <= 0.0 {
+            return;
+        }
+        let dpr = web_sys::window()
+            .map(|window| window.device_pixel_ratio())
+            .unwrap_or(1.0) as f32;
+        let render_scale = snapshot.wgpu_settings.render_scale.max(WGPU_RENDER_SCALE_MIN);
+        let render_scale_px = render_scale * dpr;
+        let mut pixel_w = (viewport_w * render_scale_px).max(1.0).ceil() as u32;
+        let mut pixel_h = (viewport_h * render_scale_px).max(1.0).ceil() as u32;
+        if pixel_w > WGPU_CANVAS_MAX_PX || pixel_h > WGPU_CANVAS_MAX_PX {
+            pixel_w = pixel_w.min(WGPU_CANVAS_MAX_PX);
+            pixel_h = pixel_h.min(WGPU_CANVAS_MAX_PX);
+        }
         let last_size = self.last_view_size.get();
-        if last_size != (view_width, view_height) {
-            self.canvas.set_width(view_width);
-            self.canvas.set_height(view_height);
-            self.last_view_size.set((view_width, view_height));
-            self.renderer.borrow_mut().take();
+        if last_size != (pixel_w, pixel_h) {
+            self.last_view_size.set((pixel_w, pixel_h));
+            if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
+                renderer.resize(pixel_w, pixel_h);
+            }
         }
         let is_dark = is_dark_theme(snapshot.theme_mode);
         let (connections_label, border_connections_label) = if let Some(info) = snapshot.puzzle_info.as_ref() {
@@ -1063,7 +1551,10 @@ impl WgpuView {
         *self.ui_credit_hitbox.borrow_mut() = credit_hitbox;
 
         let mask_atlas = self.mask_atlas.borrow();
-        let mask_atlas = mask_atlas.as_ref().expect("mask atlas available");
+        let mask_atlas = match mask_atlas.as_ref() {
+            Some(mask_atlas) => mask_atlas,
+            None => return,
+        };
         let highlight_members = if snapshot.dragging_members.is_empty() {
             None
         } else {
@@ -1095,6 +1586,22 @@ impl WgpuView {
             sync_view.client_id(),
         );
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
+            if force_fps_fallback {
+                renderer.force_fps_fallback();
+            }
+            renderer.set_view(
+                view_rect.min_x,
+                view_rect.min_y,
+                view_rect.width,
+                view_rect.height,
+                layout.puzzle_scale,
+            );
+            renderer.set_workspace_rect(
+                layout.view_min_x,
+                layout.view_min_y,
+                layout.view_width,
+                layout.view_height,
+            );
             renderer.set_edge_aa(snapshot.wgpu_settings.edge_aa);
             renderer.set_show_fps(snapshot.wgpu_settings.show_fps);
             renderer.set_solved(snapshot.solved);
@@ -1116,12 +1623,22 @@ impl WgpuView {
         let grid = assets.grid;
         let piece_width = assets.piece_width;
         let piece_height = assets.piece_height;
-        let view_min_x = layout.view_min_x;
-        let view_min_y = layout.view_min_y;
-        let view_width = layout.view_width;
-        let view_height = layout.view_height;
+        let view_min_x = view_rect.min_x;
+        let view_min_y = view_rect.min_y;
+        let view_width = view_rect.width;
+        let view_height = view_rect.height;
+        let workspace_min_x = layout.view_min_x;
+        let workspace_min_y = layout.view_min_y;
+        let workspace_width = layout.view_width;
+        let workspace_height = layout.view_height;
         let puzzle_scale = layout.puzzle_scale;
-        let mask_atlas_data = self.mask_atlas.borrow().clone().expect("mask atlas ready");
+        let mask_atlas_data = match self.mask_atlas.borrow().clone() {
+            Some(atlas) => atlas,
+            None => {
+                self.creating.set(false);
+                return;
+            }
+        };
         let mask_pad = assets.mask_pad;
         let render_scale = snapshot.wgpu_settings.render_scale;
         let edge_aa = snapshot.wgpu_settings.edge_aa;
@@ -1143,10 +1660,16 @@ impl WgpuView {
                 view_min_y,
                 view_width,
                 view_height,
+                workspace_min_x,
+                workspace_min_y,
+                workspace_width,
+                workspace_height,
                 puzzle_scale,
                 mask_atlas_data,
                 mask_pad,
                 render_scale,
+                viewport_w,
+                viewport_h,
                 is_dark_theme,
             )
             .await
@@ -1155,6 +1678,9 @@ impl WgpuView {
                     if view.puzzle_epoch.get() != epoch {
                         view.creating.set(false);
                         return;
+                    }
+                    if force_fps_fallback {
+                        renderer.force_fps_fallback();
                     }
                     renderer.set_emboss_enabled(true);
                     renderer.set_font_bytes(FPS_FONT_BYTES.to_vec());
@@ -1200,16 +1726,22 @@ impl GameView for WgpuViewAdapter {
     }
 
     fn render(&mut self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
-        self.view.render_snapshot(snapshot, sync_view);
+        let _ = sync_view;
+        self.view.queue_render_snapshot(snapshot.clone());
     }
 
     fn shutdown(&mut self) {}
 }
 
-fn event_to_canvas_coords(
-    event: &MouseEvent,
+fn now_ms() -> f32 {
+    (Date::now() % 1_000_000.0) as f32
+}
+
+fn screen_to_view_coords(
+    screen_x: f32,
+    screen_y: f32,
     canvas: &HtmlCanvasElement,
-    layout: WorkspaceLayout,
+    view: ViewRect,
 ) -> Option<(f32, f32)> {
     let rect = canvas.get_bounding_client_rect();
     let rect_width = rect.width() as f32;
@@ -1219,9 +1751,58 @@ fn event_to_canvas_coords(
     }
     let rect_left = rect.left() as f32;
     let rect_top = rect.top() as f32;
-    let x = layout.view_min_x + (event.client_x() as f32 - rect_left) * layout.view_width / rect_width;
-    let y = layout.view_min_y + (event.client_y() as f32 - rect_top) * layout.view_height / rect_height;
+    let x = view.min_x + (screen_x - rect_left) * view.width / rect_width;
+    let y = view.min_y + (screen_y - rect_top) * view.height / rect_height;
     Some((x, y))
+}
+
+fn screen_delta_to_world(
+    dx_screen: f32,
+    dy_screen: f32,
+    canvas: &HtmlCanvasElement,
+    view: ViewRect,
+) -> Option<(f32, f32)> {
+    let rect = canvas.get_bounding_client_rect();
+    let rect_width = rect.width() as f32;
+    let rect_height = rect.height() as f32;
+    if rect_width <= 0.0 || rect_height <= 0.0 {
+        return None;
+    }
+    let scale_x = view.width / rect_width;
+    let scale_y = view.height / rect_height;
+    Some((-dx_screen * scale_x, -dy_screen * scale_y))
+}
+
+fn screen_slop_to_puzzle(
+    slop_px: f32,
+    canvas: &HtmlCanvasElement,
+    view: ViewRect,
+    puzzle_scale: f32,
+) -> f32 {
+    let rect = canvas.get_bounding_client_rect();
+    let rect_width = rect.width() as f32;
+    let rect_height = rect.height() as f32;
+    if rect_width <= 0.0 || rect_height <= 0.0 {
+        return 0.0;
+    }
+    let scale_x = view.width / rect_width;
+    let scale_y = view.height / rect_height;
+    let slop_view = slop_px * scale_x.max(scale_y);
+    let puzzle_scale = puzzle_scale.max(1.0e-4);
+    slop_view / puzzle_scale
+}
+
+fn event_to_canvas_coords(
+    event: &MouseEvent,
+    canvas: &HtmlCanvasElement,
+    view: ViewRect,
+) -> Option<(f32, f32)> {
+    screen_to_view_coords(
+        event.client_x() as f32,
+        event.client_y() as f32,
+        canvas,
+        view,
+    )
 }
 
 fn touch_from_event(event: &TouchEvent, touch_id: Option<i32>, use_changed: bool) -> Option<Touch> {
@@ -1243,21 +1824,17 @@ fn touch_from_event(event: &TouchEvent, touch_id: Option<i32>, use_changed: bool
 fn touch_event_to_canvas_coords(
     event: &TouchEvent,
     canvas: &HtmlCanvasElement,
-    layout: WorkspaceLayout,
+    view: ViewRect,
     touch_id: Option<i32>,
     use_changed: bool,
 ) -> Option<(f32, f32, i32)> {
-    let rect = canvas.get_bounding_client_rect();
-    let rect_width = rect.width() as f32;
-    let rect_height = rect.height() as f32;
-    if rect_width <= 0.0 || rect_height <= 0.0 {
-        return None;
-    }
     let touch = touch_from_event(event, touch_id, use_changed)?;
-    let rect_left = rect.left() as f32;
-    let rect_top = rect.top() as f32;
-    let x = layout.view_min_x + (touch.client_x() as f32 - rect_left) * layout.view_width / rect_width;
-    let y = layout.view_min_y + (touch.client_y() as f32 - rect_top) * layout.view_height / rect_height;
+    let (x, y) = screen_to_view_coords(
+        touch.client_x() as f32,
+        touch.client_y() as f32,
+        canvas,
+        view,
+    )?;
     Some((x, y, touch.identifier()))
 }
 

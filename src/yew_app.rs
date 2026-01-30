@@ -12,7 +12,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, Element, Event, HtmlCanvasElement, HtmlImageElement, HtmlInputElement,
-    HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent,
+    HtmlSelectElement, InputEvent, KeyboardEvent, Touch, TouchEvent, WheelEvent,
 };
 use yew::prelude::*;
 use taffy::prelude::*;
@@ -377,6 +377,20 @@ struct DragHandlers {
     on_touch_release: Option<Rc<dyn Fn(&TouchEvent)>>,
 }
 
+#[derive(Clone, Copy)]
+struct PanState {
+    last_x: f32,
+    last_y: f32,
+    touch_id: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+struct PinchState {
+    touch_a: i32,
+    touch_b: i32,
+    last_distance: f32,
+}
+
 #[derive(Clone, PartialEq)]
 struct HoverDeps {
     hovered_id: Option<usize>,
@@ -388,6 +402,7 @@ struct HoverDeps {
 #[derive(Clone, PartialEq)]
 struct WgpuRenderDeps {
     using_wgpu: bool,
+    show_svg: bool,
     puzzle_dims: Option<(u32, u32)>,
     grid: GridChoice,
     workspace_scale: f32,
@@ -1080,18 +1095,15 @@ fn event_to_svg_coords(
     view_width: f32,
     view_height: f32,
 ) -> Option<(f32, f32)> {
-    let svg = svg_ref.cast::<Element>()?;
-    let rect = svg.get_bounding_client_rect();
-    let rect_width = rect.width() as f32;
-    let rect_height = rect.height() as f32;
-    if rect_width <= 0.0 || rect_height <= 0.0 {
-        return None;
-    }
-    let rect_left = rect.left() as f32;
-    let rect_top = rect.top() as f32;
-    let x = view_min_x + (event.client_x() as f32 - rect_left) * view_width / rect_width;
-    let y = view_min_y + (event.client_y() as f32 - rect_top) * view_height / rect_height;
-    Some((x, y))
+    screen_to_svg_coords(
+        event.client_x() as f32,
+        event.client_y() as f32,
+        svg_ref,
+        view_min_x,
+        view_min_y,
+        view_width,
+        view_height,
+    )
 }
 
 fn touch_from_event(event: &TouchEvent, touch_id: Option<i32>, use_changed: bool) -> Option<Touch> {
@@ -1124,6 +1136,27 @@ fn touch_event_to_svg_coords(
     touch_id: Option<i32>,
     use_changed: bool,
 ) -> Option<(f32, f32)> {
+    let touch = touch_from_event(event, touch_id, use_changed)?;
+    screen_to_svg_coords(
+        touch.client_x() as f32,
+        touch.client_y() as f32,
+        svg_ref,
+        view_min_x,
+        view_min_y,
+        view_width,
+        view_height,
+    )
+}
+
+fn screen_to_svg_coords(
+    screen_x: f32,
+    screen_y: f32,
+    svg_ref: &NodeRef,
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+) -> Option<(f32, f32)> {
     let svg = svg_ref.cast::<Element>()?;
     let rect = svg.get_bounding_client_rect();
     let rect_width = rect.width() as f32;
@@ -1131,12 +1164,51 @@ fn touch_event_to_svg_coords(
     if rect_width <= 0.0 || rect_height <= 0.0 {
         return None;
     }
-    let touch = touch_from_event(event, touch_id, use_changed)?;
     let rect_left = rect.left() as f32;
     let rect_top = rect.top() as f32;
-    let x = view_min_x + (touch.client_x() as f32 - rect_left) * view_width / rect_width;
-    let y = view_min_y + (touch.client_y() as f32 - rect_top) * view_height / rect_height;
+    let x = view_min_x + (screen_x - rect_left) * view_width / rect_width;
+    let y = view_min_y + (screen_y - rect_top) * view_height / rect_height;
     Some((x, y))
+}
+
+fn screen_slop_to_puzzle(
+    slop_px: f32,
+    target_ref: &NodeRef,
+    view_width: f32,
+    view_height: f32,
+    puzzle_scale: f32,
+) -> Option<f32> {
+    let target = target_ref.cast::<Element>()?;
+    let rect = target.get_bounding_client_rect();
+    let rect_width = rect.width() as f32;
+    let rect_height = rect.height() as f32;
+    if rect_width <= 0.0 || rect_height <= 0.0 {
+        return None;
+    }
+    let scale_x = view_width / rect_width;
+    let scale_y = view_height / rect_height;
+    let slop_view = slop_px * scale_x.max(scale_y);
+    let puzzle_scale = puzzle_scale.max(1.0e-4);
+    Some(slop_view / puzzle_scale)
+}
+
+fn screen_delta_to_svg(
+    dx_screen: f32,
+    dy_screen: f32,
+    svg_ref: &NodeRef,
+    view_width: f32,
+    view_height: f32,
+) -> Option<(f32, f32)> {
+    let svg = svg_ref.cast::<Element>()?;
+    let rect = svg.get_bounding_client_rect();
+    let rect_width = rect.width() as f32;
+    let rect_height = rect.height() as f32;
+    if rect_width <= 0.0 || rect_height <= 0.0 {
+        return None;
+    }
+    let scale_x = view_width / rect_width;
+    let scale_y = view_height / rect_height;
+    Some((-dx_screen * scale_x, -dy_screen * scale_y))
 }
 
 fn workspace_to_puzzle_coords(scale: f32, x: f32, y: f32) -> (f32, f32) {
@@ -1767,6 +1839,10 @@ fn app(props: &AppProps) -> Html {
     let drag_handlers = use_mut_ref(DragHandlers::default);
     let svg_ref = use_node_ref();
     let canvas_ref = use_node_ref();
+    let pan_state = use_mut_ref(|| None::<PanState>);
+    let pinch_state = use_mut_ref(|| None::<PinchState>);
+    let is_panning = use_state(|| false);
+    let is_panning_value = *is_panning;
     let workspace_scale = use_state(|| WORKSPACE_SCALE_DEFAULT);
     let workspace_scale_value = *workspace_scale;
     let z_order = use_state(Vec::<usize>::new);
@@ -1848,6 +1924,43 @@ fn app(props: &AppProps) -> Html {
             }));
             Box::new(move || drop(subscription)) as Box<dyn FnOnce()>
         });
+    }
+
+    {
+        let app_core = app_core.clone();
+        let svg_ref = svg_ref.clone();
+        let show_svg = show_svg;
+        let puzzle_dims_value = puzzle_dims_value;
+        let workspace_scale_value = workspace_scale_value;
+        let image_max_dim = image_max_dim;
+        use_effect_with(
+            (show_svg, puzzle_dims_value, workspace_scale_value, image_max_dim),
+            move |(show_svg, _dims, _scale, _max_dim)| {
+                if !*show_svg {
+                    return Box::new(|| ()) as Box<dyn FnOnce()>;
+                }
+                let app_core = app_core.clone();
+                let svg_ref = svg_ref.clone();
+                let update = Rc::new(move || {
+                    let Some(svg) = svg_ref.cast::<Element>() else {
+                        return;
+                    };
+                    let rect = svg.get_bounding_client_rect();
+                    let width = rect.width() as f32;
+                    let height = rect.height() as f32;
+                    if width > 0.0 && height > 0.0 {
+                        app_core.set_viewport_size(width, height);
+                    }
+                });
+                update();
+                let window = web_sys::window().expect("window available");
+                let update_for_listener = update.clone();
+                let listener = EventListener::new(&window, "resize", move |_event| {
+                    update_for_listener();
+                });
+                Box::new(move || drop(listener)) as Box<dyn FnOnce()>
+            },
+        );
     }
     let svg_animations_enabled = svg_settings_value.animations;
     let svg_emboss_enabled = svg_settings_value.emboss;
@@ -3399,10 +3512,16 @@ fn app(props: &AppProps) -> Html {
                             view_min_y,
                             view_width,
                             view_height,
+                            view_min_x,
+                            view_min_y,
+                            view_width,
+                            view_height,
                             layout.puzzle_scale,
                             mask_atlas_data,
                             mask_pad,
                             render_scale_value,
+                            view_width,
+                            view_height,
                             is_dark_theme,
                         )
                         .await
@@ -3519,6 +3638,7 @@ fn app(props: &AppProps) -> Html {
         let local_snapshot = local_snapshot.clone();
         let wgpu_render_deps = WgpuRenderDeps {
             using_wgpu: yew_wgpu_enabled,
+            show_svg,
             puzzle_dims: puzzle_dims_value,
             grid,
             workspace_scale: workspace_scale_value,
@@ -3539,9 +3659,11 @@ fn app(props: &AppProps) -> Html {
                 let _ = deps.ui_revision;
                 let _ = deps.mask_atlas_revision;
                 if !deps.using_wgpu {
-                    *ui_credit_hitbox.borrow_mut() = None;
-                    if *ui_credit_hovered {
-                        ui_credit_hovered.set(false);
+                    if !deps.show_svg {
+                        *ui_credit_hitbox.borrow_mut() = None;
+                        if *ui_credit_hovered {
+                            ui_credit_hovered.set(false);
+                        }
                     }
                     return cleanup;
                 }
@@ -3848,6 +3970,230 @@ fn app(props: &AppProps) -> Html {
     }
 
     {
+        let app_core = app_core.clone();
+        let svg_ref = svg_ref.clone();
+        let pan_state = pan_state.clone();
+        let pinch_state = pinch_state.clone();
+        let is_panning = is_panning.clone();
+        let show_svg = show_svg;
+        use_effect_with(show_svg, move |show_svg| {
+            if !*show_svg {
+                return Box::new(|| ()) as Box<dyn FnOnce()>;
+            }
+            let window = web_sys::window().expect("window available");
+            let app_core_move = app_core.clone();
+            let svg_ref_move = svg_ref.clone();
+            let pan_state_move = pan_state.clone();
+            let move_listener = EventListener::new_with_options(
+                &window,
+                "mousemove",
+                EventListenerOptions {
+                    phase: EventListenerPhase::Capture,
+                    passive: false,
+                },
+                move |event: &Event| {
+                    let Some(event) = event.dyn_ref::<MouseEvent>() else {
+                        return;
+                    };
+                    let mut pan_state = pan_state_move.borrow_mut();
+                    let Some(pan) = pan_state.as_mut() else {
+                        return;
+                    };
+                    if pan.touch_id.is_some() {
+                        return;
+                    }
+                    let dx = event.client_x() as f32 - pan.last_x;
+                    let dy = event.client_y() as f32 - pan.last_y;
+                    pan.last_x = event.client_x() as f32;
+                    pan.last_y = event.client_y() as f32;
+                    let view = app_core_move.snapshot().view;
+                    if let Some((dx_world, dy_world)) =
+                        screen_delta_to_svg(dx, dy, &svg_ref_move, view.width, view.height)
+                    {
+                        app_core_move.pan_view(dx_world, dy_world);
+                        event.prevent_default();
+                    }
+                },
+            );
+            let app_core_up = app_core.clone();
+            let pan_state_up = pan_state.clone();
+            let is_panning_up = is_panning.clone();
+            let up_listener = EventListener::new_with_options(
+                &window,
+                "mouseup",
+                EventListenerOptions {
+                    phase: EventListenerPhase::Capture,
+                    passive: false,
+                },
+                move |event: &Event| {
+                    let Some(event) = event.dyn_ref::<MouseEvent>() else {
+                        return;
+                    };
+                    let mut pan_state = pan_state_up.borrow_mut();
+                    let Some(pan) = pan_state.as_ref() else {
+                        return;
+                    };
+                    if pan.touch_id.is_some() {
+                        return;
+                    }
+                    pan_state.take();
+                    if *is_panning_up {
+                        is_panning_up.set(false);
+                    }
+                    app_core_up.settle_view();
+                    event.prevent_default();
+                },
+            );
+            let app_core_touch = app_core.clone();
+            let svg_ref_touch = svg_ref.clone();
+            let pan_state_touch = pan_state.clone();
+            let pinch_state_touch = pinch_state.clone();
+            let touch_move_listener = EventListener::new_with_options(
+                &window,
+                "touchmove",
+                EventListenerOptions {
+                    phase: EventListenerPhase::Capture,
+                    passive: false,
+                },
+                move |event: &Event| {
+                    let Some(event) = event.dyn_ref::<TouchEvent>() else {
+                        return;
+                    };
+                    if let Some(mut pinch) = pinch_state_touch.borrow_mut().take() {
+                        let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
+                        let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
+                        if let (Some(touch_a), Some(touch_b)) = (touch_a, touch_b) {
+                            let center_x =
+                                (touch_a.client_x() as f32 + touch_b.client_x() as f32) * 0.5;
+                            let center_y =
+                                (touch_a.client_y() as f32 + touch_b.client_y() as f32) * 0.5;
+                            let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
+                            let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+                            let distance = (dx * dx + dy * dy).sqrt();
+                            if distance > 0.0 {
+                                let factor = distance / pinch.last_distance;
+                                if factor.is_finite() && factor > 0.0 {
+                                    let view = app_core_touch.snapshot().view;
+                                    if let Some((view_x, view_y)) = screen_to_svg_coords(
+                                        center_x,
+                                        center_y,
+                                        &svg_ref_touch,
+                                        view.min_x,
+                                        view.min_y,
+                                        view.width,
+                                        view.height,
+                                    ) {
+                                        app_core_touch.zoom_view_at(factor, view_x, view_y);
+                                    }
+                                    pinch.last_distance = distance;
+                                }
+                            }
+                            *pinch_state_touch.borrow_mut() = Some(pinch);
+                            event.prevent_default();
+                            return;
+                        }
+                    }
+                    let delta = {
+                        let mut pan_state = pan_state_touch.borrow_mut();
+                        if let Some(pan) = pan_state.as_mut() {
+                            if let Some(touch) = touch_from_event(event, pan.touch_id, false) {
+                                let dx = touch.client_x() as f32 - pan.last_x;
+                                let dy = touch.client_y() as f32 - pan.last_y;
+                                pan.last_x = touch.client_x() as f32;
+                                pan.last_y = touch.client_y() as f32;
+                                let view = app_core_touch.snapshot().view;
+                                screen_delta_to_svg(
+                                    dx,
+                                    dy,
+                                    &svg_ref_touch,
+                                    view.width,
+                                    view.height,
+                                )
+                            } else {
+                                pan_state.take();
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((dx_world, dy_world)) = delta {
+                        app_core_touch.pan_view(dx_world, dy_world);
+                        event.prevent_default();
+                    }
+                },
+            );
+            let app_core_touch_end = app_core.clone();
+            let pan_state_end = pan_state.clone();
+            let pinch_state_end = pinch_state.clone();
+            let is_panning_end = is_panning.clone();
+            let touch_end_listener = EventListener::new_with_options(
+                &window,
+                "touchend",
+                EventListenerOptions {
+                    phase: EventListenerPhase::Capture,
+                    passive: false,
+                },
+                move |event: &Event| {
+                    let Some(event) = event.dyn_ref::<TouchEvent>() else {
+                        return;
+                    };
+                    if let Some(mut pinch) = pinch_state_end.borrow_mut().take() {
+                        let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
+                        let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
+                        if touch_a.is_some() && touch_b.is_some() {
+                            *pinch_state_end.borrow_mut() = Some(pinch);
+                        }
+                    }
+                    let mut pan_cleared = false;
+                    {
+                        let mut pan_state = pan_state_end.borrow_mut();
+                        if let Some(pan) = pan_state.as_ref() {
+                            if touch_from_event(event, pan.touch_id, true).is_some() {
+                                pan_state.take();
+                                pan_cleared = true;
+                            }
+                        }
+                    }
+                    if pan_cleared {
+                        if *is_panning_end {
+                            is_panning_end.set(false);
+                        }
+                        app_core_touch_end.settle_view();
+                    }
+                },
+            );
+            let app_core_touch_cancel = app_core.clone();
+            let pan_state_cancel = pan_state.clone();
+            let pinch_state_cancel = pinch_state.clone();
+            let is_panning_cancel = is_panning.clone();
+            let touch_cancel_listener = EventListener::new_with_options(
+                &window,
+                "touchcancel",
+                EventListenerOptions {
+                    phase: EventListenerPhase::Capture,
+                    passive: false,
+                },
+                move |_event: &Event| {
+                    pan_state_cancel.borrow_mut().take();
+                    pinch_state_cancel.borrow_mut().take();
+                    if *is_panning_cancel {
+                        is_panning_cancel.set(false);
+                    }
+                    app_core_touch_cancel.settle_view();
+                },
+            );
+            Box::new(move || {
+                drop(move_listener);
+                drop(up_listener);
+                drop(touch_move_listener);
+                drop(touch_end_listener);
+                drop(touch_cancel_listener);
+            }) as Box<dyn FnOnce()>
+        });
+    }
+
+    {
         let image_element = image_element.clone();
         let image_revision = image_revision.clone();
         let show_svg = show_svg;
@@ -3984,21 +4330,21 @@ fn app(props: &AppProps) -> Html {
         if let Some((width, height)) = puzzle_dims_value {
         let width_f = width as f32;
         let height_f = height as f32;
-        let layout = compute_workspace_layout(
-            width_f,
-            height_f,
-            workspace_scale_value,
-            image_max_dim as f32,
-        );
-        let view_width = layout.view_width;
-        let view_height = layout.view_height;
-        let view_min_x = layout.view_min_x;
-        let view_min_y = layout.view_min_y;
+        let layout = app_snapshot_value.layout;
+        let workspace_width = layout.view_width;
+        let workspace_height = layout.view_height;
+        let workspace_min_x = layout.view_min_x;
+        let workspace_min_y = layout.view_min_y;
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
-        let puzzle_view_min_x = view_min_x / puzzle_scale;
-        let puzzle_view_min_y = view_min_y / puzzle_scale;
-        let puzzle_view_width = view_width / puzzle_scale;
-        let puzzle_view_height = view_height / puzzle_scale;
+        let view_rect = app_snapshot_value.view;
+        let view_width = view_rect.width;
+        let view_height = view_rect.height;
+        let view_min_x = view_rect.min_x;
+        let view_min_y = view_rect.min_y;
+        let puzzle_view_min_x = workspace_min_x / puzzle_scale;
+        let puzzle_view_min_y = workspace_min_y / puzzle_scale;
+        let puzzle_view_width = workspace_width / puzzle_scale;
+        let puzzle_view_height = workspace_height / puzzle_scale;
         let view_box = format!(
             "{} {} {} {}",
             fmt_f32(view_min_x),
@@ -4019,6 +4365,13 @@ fn app(props: &AppProps) -> Html {
             menu_visible_value,
             is_dark_theme,
         );
+        if show_svg {
+            let credit_hitbox = ui_specs
+                .iter()
+                .find(|spec| matches!(spec.id, UiTextId::Credit))
+                .map(|spec| ui_hitbox_for_spec(&mut measure_state, spec));
+            *ui_credit_hitbox.borrow_mut() = credit_hitbox;
+        }
         let piece_width = width_f / grid.cols as f32;
         let piece_height = height_f / grid.rows as f32;
         let max_depth = piece_width.max(piece_height) * depth_cap;
@@ -4636,6 +4989,8 @@ fn app(props: &AppProps) -> Html {
             let solved = solved.clone();
             let save_revision = save_revision.clone();
             let send_sync_action = send_sync_action.clone();
+            let svg_ref = svg_ref.clone();
+            let canvas_ref = canvas_ref.clone();
             let yew_wgpu_enabled = yew_wgpu_enabled;
             let allow_drag = allow_drag;
             Rc::new(move |coords: Option<(f32, f32)>| {
@@ -4670,7 +5025,25 @@ fn app(props: &AppProps) -> Html {
                     let cols = grid.cols as usize;
                     let rows = grid.rows as usize;
                     let snap_distance = piece_width.min(piece_height) * snap_distance_ratio_value;
-                    let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+                    let base_click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+                    let click_tolerance = if drag.touch_id.is_some() {
+                        let target_ref = if yew_wgpu_enabled {
+                            &canvas_ref
+                        } else {
+                            &svg_ref
+                        };
+                        let slop = screen_slop_to_puzzle(
+                            TOUCH_DRAG_SLOP_PX,
+                            target_ref,
+                            view_width,
+                            view_height,
+                            puzzle_scale,
+                        )
+                        .unwrap_or(0.0);
+                        base_click_tolerance.max(slop)
+                    } else {
+                        base_click_tolerance
+                    };
                     let start_group_animation = {
                         let apply_puzzle_state = apply_puzzle_state.clone();
                         let scramble_nonce = scramble_nonce.clone();
@@ -5315,6 +5688,11 @@ fn app(props: &AppProps) -> Html {
                                 let pivot_x = drag.start_x;
                                 let pivot_y = drag.start_y;
                                 let members = drag.members.clone();
+                                let anchor_id = if drag.anchor_id < next.len() {
+                                    drag.anchor_id
+                                } else {
+                                    *members.first().unwrap_or(&drag.primary_id)
+                                };
                                 let mut noise = 0.0;
                                 if rotation_noise_value > 0.0 {
                                     let noise_seed = splitmix32(
@@ -5341,6 +5719,7 @@ fn app(props: &AppProps) -> Html {
                                                     noise,
                                                     reverse: reverse_rotation,
                                                 });
+                                            send_sync_action(SyncAction::Release { anchor_id });
                                             dragging_members.set(Vec::new());
                                             active_id.set(None);
                                             *drag_state.borrow_mut() = None;
@@ -5367,6 +5746,7 @@ fn app(props: &AppProps) -> Html {
                                         rotation_snap_tolerance_value,
                                     )
                                 {
+                                    send_sync_action(SyncAction::Release { anchor_id });
                                     active_id.set(None);
                                     dragging_members.set(Vec::new());
                                     *drag_state.borrow_mut() = None;
@@ -5392,11 +5772,6 @@ fn app(props: &AppProps) -> Html {
                                     let rot = next_rotations.get(*member).copied().unwrap_or(0.0);
                                     start_rotations.push(rot);
                                 }
-                                let anchor_id = if drag.anchor_id < next.len() {
-                                    drag.anchor_id
-                                } else {
-                                    *members.first().unwrap_or(&drag.primary_id)
-                                };
                                 if anchor_id < next.len() && anchor_id < next_rotations.len() {
                                     let start_pos = next[anchor_id];
                                     let start_rot = next_rotations[anchor_id];
@@ -5419,6 +5794,7 @@ fn app(props: &AppProps) -> Html {
                                         rot_deg: next_rot,
                                     });
                                 }
+                                send_sync_action(SyncAction::Release { anchor_id });
                                 rotation_queue.borrow_mut().clear();
                                 start_group_animation(
                                     RotationAnimation {
@@ -6428,6 +6804,7 @@ fn app(props: &AppProps) -> Html {
                         );
                     }
                     event.prevent_default();
+                    event.stop_propagation();
                 })
             };
             let on_piece_touch = {
@@ -6454,6 +6831,7 @@ fn app(props: &AppProps) -> Html {
                             begin_drag(piece_id, x, y, false, false, false, touch_id);
                         }
                     }
+                    event.stop_propagation();
                 })
             };
             let on_piece_enter = {
@@ -6596,12 +6974,12 @@ fn app(props: &AppProps) -> Html {
                     return;
                 };
                 let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
-                let credit_hit = ui_credit_hitbox
-                    .borrow()
-                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
-                    .unwrap_or(false);
                 let mask_atlas_ref = mask_atlas.borrow();
                 let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
+                    let credit_hit = ui_credit_hitbox
+                        .borrow()
+                        .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                        .unwrap_or(false);
                     if credit_hit {
                         open_credit_url();
                         event.prevent_default();
@@ -6645,6 +7023,10 @@ fn app(props: &AppProps) -> Html {
                     event.prevent_default();
                     return;
                 }
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
                 if credit_hit {
                     open_credit_url();
                     event.prevent_default();
@@ -6685,12 +7067,12 @@ fn app(props: &AppProps) -> Html {
                     return;
                 };
                 let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
-                let credit_hit = ui_credit_hitbox
-                    .borrow()
-                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
-                    .unwrap_or(false);
                 let mask_atlas_ref = mask_atlas.borrow();
                 let Some(mask_atlas) = mask_atlas_ref.as_ref() else {
+                    let credit_hit = ui_credit_hitbox
+                        .borrow()
+                        .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                        .unwrap_or(false);
                     if credit_hit {
                         open_credit_url();
                         event.prevent_default();
@@ -6726,6 +7108,10 @@ fn app(props: &AppProps) -> Html {
                     event.prevent_default();
                     return;
                 }
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
                 if credit_hit {
                     open_credit_url();
                     event.prevent_default();
@@ -6828,6 +7214,159 @@ fn app(props: &AppProps) -> Html {
                 }
             })
         };
+        let on_svg_down = {
+            let svg_ref = svg_ref.clone();
+            let ui_credit_hitbox = ui_credit_hitbox.clone();
+            let pan_state = pan_state.clone();
+            let is_panning = is_panning.clone();
+            Callback::from(move |event: MouseEvent| {
+                if event.button() != 0 {
+                    return;
+                }
+                let Some((x, y)) = event_to_svg_coords(
+                    &event,
+                    &svg_ref,
+                    view_min_x,
+                    view_min_y,
+                    view_width,
+                    view_height,
+                ) else {
+                    return;
+                };
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
+                if credit_hit {
+                    return;
+                }
+                *pan_state.borrow_mut() = Some(PanState {
+                    last_x: event.client_x() as f32,
+                    last_y: event.client_y() as f32,
+                    touch_id: None,
+                });
+                if !*is_panning {
+                    is_panning.set(true);
+                }
+                event.prevent_default();
+            })
+        };
+        let on_svg_wheel = {
+            let app_core = app_core.clone();
+            let svg_ref = svg_ref.clone();
+            Callback::from(move |event: WheelEvent| {
+                let Some(svg) = svg_ref.cast::<Element>() else {
+                    return;
+                };
+                let snapshot = app_core.snapshot();
+                let view = snapshot.view;
+                let rect = svg.get_bounding_client_rect();
+                let rect_width = rect.width() as f32;
+                let rect_height = rect.height() as f32;
+                if rect_width <= 0.0 || rect_height <= 0.0 {
+                    return;
+                }
+                let mut delta_x = event.delta_x() as f32;
+                let mut delta_y = event.delta_y() as f32;
+                match event.delta_mode() {
+                    1 => {
+                        delta_x *= 16.0;
+                        delta_y *= 16.0;
+                    }
+                    2 => {
+                        delta_x *= rect_width;
+                        delta_y *= rect_height;
+                    }
+                    _ => {}
+                }
+                if event.ctrl_key() || event.meta_key() {
+                    let scale_x = view.width / rect_width;
+                    let scale_y = view.height / rect_height;
+                    let dx_world = -delta_x * scale_x;
+                    let dy_world = -delta_y * scale_y;
+                    app_core.pan_view(dx_world, dy_world);
+                } else {
+                    let rect_left = rect.left() as f32;
+                    let rect_top = rect.top() as f32;
+                    let view_x =
+                        view.min_x + (event.client_x() as f32 - rect_left) * view.width
+                            / rect_width;
+                    let view_y =
+                        view.min_y + (event.client_y() as f32 - rect_top) * view.height
+                            / rect_height;
+                    let zoom_factor = (-delta_y * 0.0015).exp();
+                    if zoom_factor.is_finite() && zoom_factor > 0.0 {
+                        app_core.zoom_view_at(zoom_factor, view_x, view_y);
+                    }
+                }
+                event.prevent_default();
+            })
+        };
+        let on_svg_touch = {
+            let svg_ref = svg_ref.clone();
+            let ui_credit_hitbox = ui_credit_hitbox.clone();
+            let pan_state = pan_state.clone();
+            let pinch_state = pinch_state.clone();
+            let is_panning = is_panning.clone();
+            let app_core = app_core.clone();
+            Callback::from(move |event: TouchEvent| {
+                if event.touches().length() >= 2 {
+                    if let (Some(touch_a), Some(touch_b)) =
+                        (event.touches().item(0), event.touches().item(1))
+                    {
+                        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
+                        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+                        let distance = (dx * dx + dy * dy).sqrt();
+                        if distance > 0.0 {
+                            *pinch_state.borrow_mut() = Some(PinchState {
+                                touch_a: touch_a.identifier(),
+                                touch_b: touch_b.identifier(),
+                                last_distance: distance,
+                            });
+                            if pan_state.borrow_mut().take().is_some() {
+                                is_panning.set(false);
+                                app_core.settle_view();
+                            }
+                            event.prevent_default();
+                        }
+                    }
+                    return;
+                }
+                let Some(touch) = touch_from_event(&event, None, true) else {
+                    return;
+                };
+                let touch_id = touch.identifier();
+                let Some((x, y)) = touch_event_to_svg_coords(
+                    &event,
+                    &svg_ref,
+                    view_min_x,
+                    view_min_y,
+                    view_width,
+                    view_height,
+                    Some(touch_id),
+                    true,
+                ) else {
+                    return;
+                };
+                let credit_hit = ui_credit_hitbox
+                    .borrow()
+                    .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
+                    .unwrap_or(false);
+                if credit_hit {
+                    return;
+                }
+                *pan_state.borrow_mut() = Some(PanState {
+                    last_x: touch.client_x() as f32,
+                    last_y: touch.client_y() as f32,
+                    touch_id: Some(touch_id),
+                });
+                if !*is_panning {
+                    is_panning.set(true);
+                }
+                pinch_state.borrow_mut().take();
+                event.prevent_default();
+            })
+        };
         let on_context_menu = Callback::from(|event: MouseEvent| {
             event.prevent_default();
         });
@@ -6857,10 +7396,10 @@ fn app(props: &AppProps) -> Html {
         let workspace_bounds = html! {
             <rect
                 class="workspace-bounds"
-                x={fmt_f32(view_min_x)}
-                y={fmt_f32(view_min_y)}
-                width={fmt_f32(view_width)}
-                height={fmt_f32(view_height)}
+                x={fmt_f32(workspace_min_x)}
+                y={fmt_f32(workspace_min_y)}
+                width={fmt_f32(workspace_width)}
+                height={fmt_f32(workspace_height)}
             />
         };
 
@@ -6877,6 +7416,9 @@ fn app(props: &AppProps) -> Html {
         }
         if solved_value {
             svg_class.push_str(" solved");
+        }
+        if is_panning_value {
+            svg_class.push_str(" panning");
         }
         let mut canvas_class = "puzzle-canvas".to_string();
         if active_id_value.is_some() {
@@ -7002,10 +7544,13 @@ fn app(props: &AppProps) -> Html {
                     xmlns="http://www.w3.org/2000/svg"
                     class={svg_class}
                     viewBox={view_box}
-                    width={fmt_f32(view_width)}
-                    height={fmt_f32(view_height)}
+                    width="100%"
+                    height="100%"
                     preserveAspectRatio="xMidYMid meet"
                     ref={svg_ref}
+                    onmousedown={on_svg_down}
+                    onwheel={on_svg_wheel}
+                    ontouchstart={on_svg_touch}
                     oncontextmenu={on_context_menu}
                 >
                     <defs>
@@ -8015,7 +8560,7 @@ fn app(props: &AppProps) -> Html {
         </>
     };
     if show_svg {
-        let mut app_class = "app".to_string();
+        let mut app_class = "app svg".to_string();
         if multiplayer_disconnected {
             app_class.push_str(" sync-disconnected");
         }

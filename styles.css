@@ -101,12 +101,52 @@ body {
   /*padding: 24px;*/
 }
 
+.app.wgpu {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  position: relative;
+  display: block;
+  overscroll-behavior: none;
+}
+
+.app.wgpu .puzzle-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  max-width: none;
+  touch-action: none;
+}
+
+.app.svg {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  position: relative;
+  display: block;
+  overscroll-behavior: none;
+}
+
+.app.svg .puzzle-image {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+}
+
 .puzzle-image {
   max-width: 100%;
   height: auto;
   display: block;
-  touch-action: manipulation;
+  touch-action: none;
   isolation: isolate;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.puzzle-image.panning {
+  cursor: move;
 }
 
 .ui-text {
@@ -161,7 +201,18 @@ body {
   height: auto;
   display: block;
   touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   cursor: default;
+}
+
+.puzzle-canvas.pan-ready {
+  cursor: default;
+}
+
+.puzzle-canvas.panning {
+  cursor: move;
 }
 
 .puzzle-canvas.hover {
