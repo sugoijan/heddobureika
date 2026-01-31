@@ -15,7 +15,7 @@ thread_local! {
 }
 
 pub(crate) fn run() {
-    if app_router::load_renderer_preference() != RendererKind::Svg {
+    if app_router::load_renderer_preference() != RendererKind::Yew {
         return;
     }
     let core = AppCore::shared();

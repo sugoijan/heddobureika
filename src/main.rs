@@ -20,6 +20,9 @@ mod renderer;
 #[cfg(target_arch = "wasm32")]
 mod wgpu_app;
 
+#[cfg(target_arch = "wasm32")]
+mod svg_app;
+
 #[cfg(any(feature = "backend-yew", feature = "dev-panel-yew"))]
 mod yew_app;
 

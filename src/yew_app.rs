@@ -17,7 +17,7 @@ use web_sys::{
 use yew::prelude::*;
 use taffy::prelude::*;
 
-use crate::app_core::AppCore;
+use crate::app_core::{AppCore, AppSnapshot};
 use crate::app_builder;
 use crate::app_router;
 use crate::app_runtime;
@@ -1894,24 +1894,58 @@ fn app(props: &AppProps) -> Html {
     let renderer_kind = render_settings_value.renderer;
     let svg_settings_value = render_settings_value.svg.clone();
     let wgpu_settings_value = render_settings_value.wgpu.clone();
-    let renderer_is_wgpu = renderer_kind == RendererKind::Wgpu;
-    let svg_enabled = renderer_kind == RendererKind::Svg;
+    let renderer_is_yew = renderer_kind == RendererKind::Yew;
+    let svg_enabled = renderer_is_yew;
+    let svg_settings_visible = matches!(renderer_kind, RendererKind::Svg | RendererKind::Yew);
     let yew_wgpu_enabled = false; // WGPU view now lives in `wgpu_app`, not the SVG Yew app.
     let show_svg = matches!(props.mode, AppMode::Svg) && svg_enabled;
+    let svg_snapshot_pending = use_mut_ref(|| None::<AppSnapshot>);
+    let svg_snapshot_frame = use_mut_ref(|| None::<AnimationFrame>);
+    let schedule_svg_snapshot: Rc<dyn Fn(AppSnapshot)> = {
+        let app_snapshot = app_snapshot.clone();
+        let svg_snapshot_pending = svg_snapshot_pending.clone();
+        let svg_snapshot_frame = svg_snapshot_frame.clone();
+        Rc::new(move |snapshot| {
+            *svg_snapshot_pending.borrow_mut() = Some(snapshot);
+            if svg_snapshot_frame.borrow().is_some() {
+                return;
+            }
+            let app_snapshot = app_snapshot.clone();
+            let svg_snapshot_pending = svg_snapshot_pending.clone();
+            let svg_snapshot_frame_cb = svg_snapshot_frame.clone();
+            let handle = request_animation_frame(move |_| {
+                svg_snapshot_frame_cb.borrow_mut().take();
+                if let Some(snapshot) = svg_snapshot_pending.borrow_mut().take() {
+                    app_snapshot.set(snapshot);
+                }
+            });
+            *svg_snapshot_frame.borrow_mut() = Some(handle);
+        })
+    };
     {
         let app_core = app_core.clone();
         let app_snapshot = app_snapshot.clone();
         let show_svg = show_svg;
+        let schedule_svg_snapshot = schedule_svg_snapshot.clone();
+        let svg_snapshot_pending = svg_snapshot_pending.clone();
+        let svg_snapshot_frame = svg_snapshot_frame.clone();
         use_effect_with(show_svg, move |show_svg| {
             if *show_svg {
                 #[cfg(feature = "backend-yew")]
                 {
-                    let app_snapshot_for_hook = app_snapshot.clone();
+                    let schedule_svg_snapshot = schedule_svg_snapshot.clone();
+                    let schedule_for_hook = schedule_svg_snapshot.clone();
+                    let svg_snapshot_pending = svg_snapshot_pending.clone();
+                    let svg_snapshot_frame = svg_snapshot_frame.clone();
                     svg_view::set_render_hook(Rc::new(move |snapshot| {
-                        app_snapshot_for_hook.set(snapshot);
+                        schedule_for_hook(snapshot);
                     }));
-                    app_snapshot.set(app_core.snapshot());
-                    return Box::new(|| svg_view::clear_render_hook()) as Box<dyn FnOnce()>;
+                    schedule_svg_snapshot(app_core.snapshot());
+                    return Box::new(move || {
+                        svg_view::clear_render_hook();
+                        svg_snapshot_frame.borrow_mut().take();
+                        svg_snapshot_pending.borrow_mut().take();
+                    }) as Box<dyn FnOnce()>;
                 }
                 #[cfg(not(feature = "backend-yew"))]
                 {
@@ -2738,7 +2772,11 @@ fn app(props: &AppProps) -> Html {
     }
     let mask_atlas_revision_value = *mask_atlas_revision;
     let preview_revealed_value = *preview_revealed;
-    let renderer_value = if renderer_is_wgpu { "wgpu" } else { "svg" };
+    let renderer_value = match renderer_kind {
+        RendererKind::Wgpu => "wgpu",
+        RendererKind::Svg => "svg",
+        RendererKind::Yew => "yew",
+    };
     let mode_value = if multiplayer_active { "online" } else { "local" };
     {
         let render_settings_value = render_settings_value.clone();
@@ -3153,6 +3191,7 @@ fn app(props: &AppProps) -> Html {
             let input: HtmlSelectElement = event.target_unchecked_into();
             let next_renderer = match input.value().as_str() {
                 "svg" => RendererKind::Svg,
+                "yew" => RendererKind::Yew,
                 "wgpu" => RendererKind::Wgpu,
                 _ => RendererKind::Wgpu,
             };
@@ -8044,6 +8083,9 @@ fn app(props: &AppProps) -> Html {
                     <option value="svg" selected={renderer_kind == RendererKind::Svg}>
                         { "SVG" }
                     </option>
+                    <option value="yew" selected={renderer_kind == RendererKind::Yew}>
+                        { "YEW" }
+                    </option>
                 </select>
             </div>
             <div class="control">
@@ -8061,7 +8103,7 @@ fn app(props: &AppProps) -> Html {
                     onchange={on_image_max_dim}
                 />
             </div>
-            { if renderer_kind == RendererKind::Svg {
+            { if svg_settings_visible {
                 html! {
                     <>
                         <div class="control">

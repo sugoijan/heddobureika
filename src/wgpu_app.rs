@@ -1522,8 +1522,8 @@ impl WgpuView {
                 let (connected, border_connected, total_expected, border_expected) =
                     count_connections(&snapshot.connections, cols, rows);
                 (
-                    format!("{}/{}", connected, total_expected),
-                    format!("{}/{}", border_connected, border_expected),
+                    format_progress(connected, total_expected),
+                    format_progress(border_connected, border_expected),
                 )
             } else {
                 ("--".to_string(), "--".to_string())

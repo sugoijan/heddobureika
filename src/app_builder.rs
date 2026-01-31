@@ -27,6 +27,9 @@ use crate::multiplayer_bridge;
 #[cfg(target_arch = "wasm32")]
 use crate::wgpu_app;
 
+#[cfg(target_arch = "wasm32")]
+use crate::svg_app;
+
 #[cfg(feature = "backend-yew")]
 use crate::svg_view;
 
@@ -349,8 +352,8 @@ pub(crate) fn run() {
     let (renderer, apply_fallback) = {
         #[cfg(not(feature = "backend-yew"))]
         {
-            if renderer == RendererKind::Svg {
-                (RendererKind::Wgpu, true)
+            if renderer == RendererKind::Yew {
+                (RendererKind::Svg, true)
             } else {
                 (renderer, false)
             }
@@ -360,7 +363,6 @@ pub(crate) fn run() {
             (renderer, false)
         }
     };
-
     if apply_fallback {
         render_settings.renderer = renderer;
         app_router::save_renderer_preference(renderer, &render_settings);
@@ -389,9 +391,19 @@ pub(crate) fn run() {
             }
         }
         RendererKind::Svg => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                svg_app::run();
+            }
+        }
+        RendererKind::Yew => {
             #[cfg(feature = "backend-yew")]
             {
                 svg_view::run();
+            }
+            #[cfg(all(target_arch = "wasm32", not(feature = "backend-yew")))]
+            {
+                svg_app::run();
             }
         }
     }
