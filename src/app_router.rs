@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use js_sys::encode_uri_component;
 use wasm_bindgen::JsValue;
 use web_sys::UrlSearchParams;
 
@@ -166,26 +165,6 @@ pub(crate) fn default_ws_base() -> Option<String> {
 pub(crate) fn build_room_ws_url(ws_base: &str, room_id: &str) -> String {
     let base = ws_base.trim_end_matches('/');
     format!("{base}/{room_id}")
-}
-
-pub(crate) fn build_room_admin_ws_url(
-    ws_base: &str,
-    room_id: &str,
-    admin_token: &str,
-) -> String {
-    let base = ws_base.trim_end_matches('/');
-    let token = admin_token.trim();
-    if token.is_empty() {
-        return format!("{base}/{room_id}");
-    }
-    if let Ok(params) = UrlSearchParams::new() {
-        params.append("admin_token", token);
-        return format!("{base}/{room_id}?{}", params.to_string());
-    }
-    let encoded = encode_uri_component(token)
-        .as_string()
-        .unwrap_or_else(|| token.to_string());
-    format!("{base}/{room_id}?admin_token={encoded}")
 }
 
 pub(crate) fn save_render_settings(settings: &RenderSettings) {

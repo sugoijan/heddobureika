@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
     apply_snaps_for_group, clear_piece_connections, collect_group, compute_workspace_layout,
@@ -9,15 +10,18 @@ use heddobureika_core::game::{
     FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
 };
 use heddobureika_core::{
-    AdminMsg, ClientMsg, GameRules, GameSnapshot, OwnershipReason, PuzzleInfo, PuzzleStateSnapshot,
-    RoomPersistence, RoomUpdate, ServerMsg, GAME_SNAPSHOT_VERSION,
+    AdminMsg, ClientId, ClientMsg, GameRules, GameSnapshot, OwnershipReason, PuzzleInfo,
+    PuzzleStateSnapshot, RoomPersistence, RoomUpdate, ServerMsg, GAME_SNAPSHOT_VERSION,
 };
 use heddobureika_core::{
     best_grid_for_count, logical_image_size, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
 };
 use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
 use js_sys::Date;
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rkyv::{Archive, Deserialize, Serialize};
+use serde::Deserialize as SerdeDeserialize;
+use sha2::{Digest, Sha256};
 use worker::*;
 
 const DEFAULT_ROOM_PATH_PREFIX: &str = "/ws/";
@@ -29,6 +33,10 @@ const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
 const FULL_STATE_INTERVAL_MS: i64 = 30 * 1000;
 const OWNERSHIP_TIMEOUT_MS: i64 = 5 * 1000;
 const SNAPSHOT_VERSION: u32 = GAME_SNAPSHOT_VERSION;
+const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
+const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
+const AUTH_WINDOW_MS: i64 = 5 * 60 * 1000;
+const DISCONNECT_GRACE_MS: i64 = 1000;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -88,21 +96,54 @@ fn now_ms() -> i64 {
     Date::now() as i64
 }
 
-fn admin_token_from_request(req: &Request) -> Result<Option<String>> {
-    let url = req.url()?;
-    for (key, value) in url.query_pairs() {
-        if key == "admin_token" {
-            return Ok(Some(value.into_owned()));
+fn auth_protocol_from_request(req: &Request) -> Result<Option<String>> {
+    let Some(raw) = req.headers().get("Sec-WebSocket-Protocol")? else {
+        return Ok(None);
+    };
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.starts_with(AUTH_PROTOCOL_PREFIX) {
+            return Ok(Some(trimmed.to_string()));
         }
     }
     Ok(None)
 }
 
-fn client_id_from_tags(tags: &[String]) -> Option<u64> {
+fn error_response(message: &str, status: u16) -> Response {
+    Response::error(message, status).unwrap_or_else(|_| {
+        Response::error("server error", 500).unwrap_or_else(|_| Response::error("error", 500).unwrap())
+    })
+}
+
+fn decode_base64_url(value: &str) -> Result<Vec<u8>, ()> {
+    URL_SAFE_NO_PAD.decode(value).map_err(|_| ())
+}
+
+fn auth_message(room_id: &str, ts: i64, nonce: &str) -> Vec<u8> {
+    format!("{room_id}\n{ts}\n{nonce}\n{AUTH_CONTEXT}").into_bytes()
+}
+
+fn derive_client_id(pubkey_spki: &[u8]) -> Result<ClientId, ()> {
+    let digest = Sha256::digest(pubkey_spki);
+    if digest.len() < 8 {
+        return Err(());
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    Ok(ClientId::from(u64::from_be_bytes(bytes)))
+}
+
+fn verify_signature(pubkey_spki: &[u8], message: &[u8], signature: &[u8]) -> Result<bool, ()> {
+    let verifying_key = VerifyingKey::from_sec1_bytes(pubkey_spki).map_err(|_| ())?;
+    let signature = Signature::from_slice(signature).map_err(|_| ())?;
+    Ok(verifying_key.verify(message, &signature).is_ok())
+}
+
+fn client_id_from_tags(tags: &[String]) -> Option<ClientId> {
     for tag in tags {
         if let Some(rest) = tag.strip_prefix("client:") {
             if let Ok(id) = rest.parse::<u64>() {
-                return Some(id);
+                return Some(ClientId::from(id));
             }
         }
     }
@@ -111,6 +152,24 @@ fn client_id_from_tags(tags: &[String]) -> Option<u64> {
 
 fn is_admin_from_tags(tags: &[String]) -> bool {
     tags.iter().any(|tag| tag == "admin")
+}
+
+#[derive(Debug, SerdeDeserialize)]
+struct AuthPayload {
+    v: u8,
+    client_id: String,
+    ts: i64,
+    nonce: String,
+    pubkey: String,
+    sig: String,
+    #[serde(default)]
+    admin_token: Option<String>,
+}
+
+struct AuthContext {
+    client_id: ClientId,
+    is_admin: bool,
+    protocol: String,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -136,7 +195,7 @@ impl Default for RoomMeta {
 
 #[derive(Debug, Clone, Copy)]
 struct Ownership {
-    owner_id: u64,
+    owner_id: ClientId,
     anchor_id: u32,
     since_ms: i64,
 }
@@ -146,8 +205,9 @@ struct RoomRuntime {
     meta: RoomMeta,
     snapshot: Option<GameSnapshot>,
     owners_by_anchor: HashMap<u32, Ownership>,
-    owner_by_client: HashMap<u64, u32>,
-    next_client_id: u64,
+    owner_by_client: HashMap<ClientId, u32>,
+    recent_nonces: HashMap<String, i64>,
+    pending_releases: HashMap<ClientId, i64>,
 }
 
 impl RoomRuntime {
@@ -158,7 +218,8 @@ impl RoomRuntime {
             snapshot: None,
             owners_by_anchor: HashMap::new(),
             owner_by_client: HashMap::new(),
-            next_client_id: 1,
+            recent_nonces: HashMap::new(),
+            pending_releases: HashMap::new(),
         }
     }
 }
@@ -189,26 +250,30 @@ impl DurableObject for Room {
             return Response::error("expected websocket", 400);
         }
 
-        let admin_token = admin_token_from_request(&req)?;
-        let is_admin = match admin_token {
-            Some(token) => {
-                let expected = self.admin_token()?;
-                if token != expected {
-                    return Response::error("invalid admin token", 403);
-                }
-                true
-            }
-            None => false,
-        };
+        let path = req.path();
+        let prefix = room_path_prefix(&self.env);
+        let room_id = extract_room_id(&path, &prefix).unwrap_or("unknown");
 
         self.ensure_loaded().await?;
+        let auth = match self.authenticate_request(&req, room_id).await {
+            Ok(auth) => auth,
+            Err(response) => return Ok(response),
+        };
+        let is_admin = auth.is_admin;
+        let client_id = auth.client_id;
 
         let activated = { self.inner.borrow().meta.activated };
         if !activated && !is_admin {
             return Response::error("room not activated", 403);
         }
 
-        let client_id = { self.next_client_id() };
+        if !is_admin && self.has_active_client(client_id, false) {
+            return Response::error("client already connected", 409);
+        }
+
+        if !is_admin {
+            self.clear_pending_release(client_id);
+        }
         let pair = WebSocketPair::new()?;
         let server = pair.server;
         let client_tag = format!("client:{client_id}");
@@ -225,14 +290,11 @@ impl DurableObject for Room {
                 let inner = self.inner.borrow();
                 (inner.meta.persistence, inner.snapshot.is_some())
             };
-            let path = req.path();
-            let prefix = room_path_prefix(&self.env);
-            let room_id = extract_room_id(&path, &prefix).unwrap_or("unknown");
             let welcome = ServerMsg::Welcome {
                 room_id: room_id.to_string(),
                 persistence,
                 initialized,
-                client_id: if is_admin { None } else { Some(client_id) },
+                client_id: Some(client_id),
             };
             let _ = self.send_server_msg(&server, &welcome);
 
@@ -249,7 +311,13 @@ impl DurableObject for Room {
             }
         }
 
-        Response::from_websocket(pair.client)
+        let headers = Headers::new();
+        let _ = headers.set("Sec-WebSocket-Protocol", &auth.protocol);
+        Ok(Response::builder()
+            .with_websocket(pair.client)
+            .with_status(101)
+            .with_headers(headers)
+            .empty())
     }
 
     async fn websocket_message(
@@ -353,8 +421,12 @@ impl DurableObject for Room {
         _was_clean: bool,
     ) -> Result<()> {
         let tags = self.state.get_tags(&ws);
+        let is_admin = is_admin_from_tags(&tags);
         if let Some(client_id) = client_id_from_tags(&tags) {
-            self.release_by_client(client_id, OwnershipReason::Released)?;
+            if !is_admin {
+                self.schedule_disconnect_release(client_id, now_ms());
+                self.schedule_alarm().await?;
+            }
         }
         Ok(())
     }
@@ -396,6 +468,7 @@ impl DurableObject for Room {
             }
         }
 
+        self.release_pending_disconnects(now)?;
         self.release_timeouts(now)?;
 
         if has_snapshot && has_clients {
@@ -437,13 +510,6 @@ impl Room {
         Ok(self.env.var("ADMIN_TOKEN")?.to_string())
     }
 
-    fn next_client_id(&self) -> u64 {
-        let mut inner = self.inner.borrow_mut();
-        let id = inner.next_client_id;
-        inner.next_client_id = inner.next_client_id.wrapping_add(1).max(1);
-        id
-    }
-
     async fn ensure_loaded(&self) -> Result<()> {
         let loaded = { self.inner.borrow().loaded };
         if loaded {
@@ -470,6 +536,145 @@ impl Room {
         Ok(())
     }
 
+    async fn authenticate_request(
+        &self,
+        req: &Request,
+        room_id: &str,
+    ) -> Result<AuthContext, Response> {
+        let protocol = match auth_protocol_from_request(req) {
+            Ok(Some(protocol)) => protocol,
+            Ok(None) => return Err(error_response("missing auth", 401)),
+            Err(_) => return Err(error_response("invalid auth", 401)),
+        };
+        let Some(payload_b64) = protocol.strip_prefix(AUTH_PROTOCOL_PREFIX) else {
+            return Err(error_response("invalid auth", 401));
+        };
+        let payload_bytes =
+            decode_base64_url(payload_b64).map_err(|_| error_response("invalid auth", 401))?;
+        let payload: AuthPayload =
+            serde_json::from_slice(&payload_bytes).map_err(|_| error_response("invalid auth", 401))?;
+        if payload.v != 1 {
+            return Err(error_response("invalid auth", 401));
+        }
+        let client_id = ClientId::from(
+            payload
+                .client_id
+                .parse::<u64>()
+                .map_err(|_| error_response("invalid client id", 401))?,
+        );
+        let now = now_ms();
+        let drift = if now >= payload.ts {
+            now - payload.ts
+        } else {
+            payload.ts - now
+        };
+        if drift > AUTH_WINDOW_MS {
+            return Err(error_response("auth expired", 401));
+        }
+        let pubkey_bytes =
+            decode_base64_url(&payload.pubkey).map_err(|_| error_response("invalid auth", 401))?;
+        let sig_bytes =
+            decode_base64_url(&payload.sig).map_err(|_| error_response("invalid auth", 401))?;
+        let derived_id =
+            derive_client_id(&pubkey_bytes).map_err(|_| error_response("invalid auth", 401))?;
+        if derived_id != client_id {
+            return Err(error_response("invalid auth", 401));
+        }
+        let message = auth_message(room_id, payload.ts, &payload.nonce);
+        let valid =
+            verify_signature(&pubkey_bytes, &message, &sig_bytes)
+                .map_err(|_| error_response("invalid auth", 401))?;
+        if !valid {
+            return Err(error_response("invalid auth", 401));
+        }
+        let nonce_key = format!("{client_id}:{}", payload.nonce);
+        if !self.record_nonce(&nonce_key, now) {
+            return Err(error_response("replay detected", 401));
+        }
+
+        let mut is_admin = false;
+        if let Some(token) = payload
+            .admin_token
+            .as_ref()
+            .map(|token| token.trim())
+            .filter(|token| !token.is_empty())
+        {
+            let expected = self
+                .admin_token()
+                .map_err(|_| error_response("invalid admin token", 403))?;
+            if token == expected {
+                is_admin = true;
+            } else {
+                return Err(error_response("invalid admin token", 403));
+            }
+        }
+
+        Ok(AuthContext {
+            client_id,
+            is_admin,
+            protocol,
+        })
+    }
+
+    fn record_nonce(&self, key: &str, now: i64) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .recent_nonces
+            .retain(|_, ts| now.saturating_sub(*ts) <= AUTH_WINDOW_MS);
+        if inner.recent_nonces.contains_key(key) {
+            return false;
+        }
+        inner.recent_nonces.insert(key.to_string(), now);
+        true
+    }
+
+    fn has_active_client(&self, client_id: ClientId, include_admin: bool) -> bool {
+        let tag = format!("client:{client_id}");
+        for socket in self.state.get_websockets() {
+            let tags = self.state.get_tags(&socket);
+            if tags.iter().any(|value| value == &tag) {
+                if include_admin || !is_admin_from_tags(&tags) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn clear_pending_release(&self, client_id: ClientId) {
+        let mut inner = self.inner.borrow_mut();
+        inner.pending_releases.remove(&client_id);
+    }
+
+    fn schedule_disconnect_release(&self, client_id: ClientId, now: i64) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .pending_releases
+            .insert(client_id, now + DISCONNECT_GRACE_MS);
+    }
+
+    fn release_pending_disconnects(&self, now: i64) -> Result<()> {
+        let due_clients = {
+            let mut inner = self.inner.borrow_mut();
+            let mut due = Vec::new();
+            inner.pending_releases.retain(|client_id, due_at| {
+                if now >= *due_at {
+                    due.push(*client_id);
+                    false
+                } else {
+                    true
+                }
+            });
+            due
+        };
+        for client_id in due_clients {
+            if !self.has_active_client(client_id, false) {
+                self.release_by_client(client_id, OwnershipReason::Released)?;
+            }
+        }
+        Ok(())
+    }
+
     fn geometry_for_snapshot(snapshot: &GameSnapshot) -> Option<RoomGeometry> {
         let cols = snapshot.puzzle.cols as usize;
         let rows = snapshot.puzzle.rows as usize;
@@ -486,8 +691,7 @@ impl Room {
         let layout = compute_workspace_layout(
             image_width,
             image_height,
-            snapshot.rules.workspace_scale,
-            snapshot.rules.image_max_dimension as f32,
+            snapshot.rules.workspace_padding_ratio,
         );
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
         let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
@@ -875,8 +1079,7 @@ impl Room {
         let layout = compute_workspace_layout(
             image_width,
             image_height,
-            rules.workspace_scale,
-            rules.image_max_dimension as f32,
+            rules.workspace_padding_ratio,
         );
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
         let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
@@ -950,7 +1153,7 @@ impl Room {
         })
     }
 
-    async fn handle_select(&self, client_id: u64, piece_id: u32) -> Result<()> {
+    async fn handle_select(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
         let now = now_ms();
         let (pending_updates, update_msg, group_order_update) = {
             let mut inner = self.inner.borrow_mut();
@@ -1065,7 +1268,7 @@ impl Room {
 
     async fn handle_move(
         &self,
-        client_id: u64,
+        client_id: ClientId,
         anchor_id: u32,
         pos: (f32, f32),
         client_seq: u64,
@@ -1195,7 +1398,7 @@ impl Room {
 
     async fn handle_transform(
         &self,
-        client_id: u64,
+        client_id: ClientId,
         anchor_id: u32,
         pos: (f32, f32),
         rot_deg: f32,
@@ -1318,7 +1521,7 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_flip(&self, client_id: u64, piece_id: u32, flipped: bool) -> Result<()> {
+    async fn handle_flip(&self, client_id: ClientId, piece_id: u32, flipped: bool) -> Result<()> {
         let now = now_ms();
         let updates = {
             let mut inner = self.inner.borrow_mut();
@@ -1438,14 +1641,14 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_rotate(&self, client_id: u64, anchor_id: u32, rot_deg: f32) -> Result<()> {
+    async fn handle_rotate(&self, client_id: ClientId, anchor_id: u32, rot_deg: f32) -> Result<()> {
         self.handle_finalize(client_id, anchor_id, None, Some(rot_deg))
             .await
     }
 
     async fn handle_place(
         &self,
-        client_id: u64,
+        client_id: ClientId,
         anchor_id: u32,
         pos: (f32, f32),
         rot_deg: f32,
@@ -1456,7 +1659,7 @@ impl Room {
 
     async fn handle_finalize(
         &self,
-        client_id: u64,
+        client_id: ClientId,
         anchor_id: u32,
         pos: Option<(f32, f32)>,
         rot_deg: Option<f32>,
@@ -1643,7 +1846,7 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_release(&self, client_id: u64, anchor_id: u32) -> Result<()> {
+    async fn handle_release(&self, client_id: ClientId, anchor_id: u32) -> Result<()> {
         let now = now_ms();
         let released = {
             let inner = self.inner.borrow();
@@ -1706,7 +1909,7 @@ impl Room {
         false
     }
 
-    fn release_by_client(&self, client_id: u64, reason: OwnershipReason) -> Result<()> {
+    fn release_by_client(&self, client_id: ClientId, reason: OwnershipReason) -> Result<()> {
         if let Some(anchor_id) = self.clear_ownership_for_client(client_id) {
             let seq = self.bump_seq_for_update();
             let msg = ServerMsg::Update {
@@ -1724,7 +1927,7 @@ impl Room {
         Ok(())
     }
 
-    fn clear_ownership_for_client(&self, client_id: u64) -> Option<u32> {
+    fn clear_ownership_for_client(&self, client_id: ClientId) -> Option<u32> {
         let mut inner = self.inner.borrow_mut();
         let anchor_id = inner.owner_by_client.remove(&client_id);
         if let Some(anchor_id) = anchor_id {
@@ -1833,13 +2036,14 @@ impl Room {
     async fn schedule_alarm(&self) -> Result<()> {
         let now = now_ms();
         let has_clients = !self.state.get_websockets().is_empty();
-        let (last_command_at, last_full_state_at, has_snapshot, ownerships) = {
+        let (last_command_at, last_full_state_at, has_snapshot, ownerships, pending_releases) = {
             let inner = self.inner.borrow();
             (
                 inner.meta.last_command_at,
                 inner.meta.last_full_state_at,
                 inner.snapshot.is_some(),
                 inner.owners_by_anchor.values().copied().collect::<Vec<_>>(),
+                inner.pending_releases.values().copied().collect::<Vec<_>>(),
             )
         };
 
@@ -1875,6 +2079,13 @@ impl Room {
             });
         }
 
+        for release_at in pending_releases {
+            next_at = Some(match next_at {
+                Some(current) => current.min(release_at),
+                None => release_at,
+            });
+        }
+
         if let Some(next_at) = next_at {
             let offset = (next_at - now).max(0);
             self.state.storage().set_alarm(offset).await?;
@@ -1893,6 +2104,8 @@ impl Room {
             inner.snapshot = None;
             inner.owners_by_anchor.clear();
             inner.owner_by_client.clear();
+            inner.pending_releases.clear();
+            inner.recent_nonces.clear();
         }
 
         self.persist_meta().await?;

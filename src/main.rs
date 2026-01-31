@@ -8,6 +8,7 @@ mod model;
 #[cfg(target_arch = "wasm32")]
 mod multiplayer_bridge;
 mod multiplayer_game_sync;
+mod multiplayer_identity;
 mod sync_runtime;
 mod multiplayer_sync;
 mod runtime;

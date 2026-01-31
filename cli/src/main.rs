@@ -1,12 +1,18 @@
 use clap::{Parser, Subcommand};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::codec::{decode_result, encode};
 use heddobureika_core::catalog::{puzzle_by_slug, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG};
 use heddobureika_core::protocol::{AdminMsg, RoomPersistence, ServerMsg};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand::Rng;
+use rand_core::{OsRng, RngCore};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 
 #[derive(Parser)]
@@ -95,7 +101,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
 
-                let (ws, _response) = tokio_tungstenite::connect_async(admin_url.as_str())
+                let auth_protocol = build_auth_protocol(&room_id, &admin_token)?;
+                let mut request = admin_url
+                    .as_str()
+                    .into_client_request()
+                    .map_err(|err| format!("failed to build websocket request: {err}"))?;
+                request
+                    .headers_mut()
+                    .append("Sec-WebSocket-Protocol", auth_protocol.parse()?);
+
+                let (ws, _response) = tokio_tungstenite::connect_async(request)
                     .await
                     .map_err(|err| format!("failed to connect to {admin_url}: {err}"))?;
                 let (mut write, mut read) = ws.split();
@@ -180,12 +195,8 @@ fn generate_room_id() -> String {
 }
 
 fn build_admin_url(base_url: &str, room_id: &str, token: &str) -> Result<Url, url::ParseError> {
-    let mut url = Url::parse(base_url)?;
-    let base_path = url.path().trim_end_matches('/');
-    let path = format!("{}/{}", base_path, room_id);
-    url.set_path(&path);
-    url.query_pairs_mut().append_pair("admin_token", token);
-    Ok(url)
+    let _ = token;
+    build_join_url(base_url, room_id)
 }
 
 fn build_join_url(base_url: &str, room_id: &str) -> Result<Url, url::ParseError> {
@@ -223,4 +234,64 @@ fn install_crypto_provider() -> Result<(), Box<dyn std::error::Error>> {
         // Another thread already installed a provider; continue.
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct AuthPayload {
+    v: u8,
+    client_id: String,
+    ts: i64,
+    nonce: String,
+    pubkey: String,
+    sig: String,
+    admin_token: String,
+}
+
+fn build_auth_protocol(room_id: &str, admin_token: &str) -> Result<String, Box<dyn std::error::Error>> {
+    const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
+    const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
+
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let public_key_sec1 = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let client_id = derive_client_id(&public_key_sec1);
+    let ts = now_ms();
+    let nonce = random_nonce();
+    let message = format!("{room_id}\n{ts}\n{nonce}\n{AUTH_CONTEXT}");
+    let signature: Signature = signing_key.sign(message.as_bytes());
+    let payload = AuthPayload {
+        v: 1,
+        client_id: client_id.to_string(),
+        ts,
+        nonce,
+        pubkey: URL_SAFE_NO_PAD.encode(&public_key_sec1),
+        sig: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        admin_token: admin_token.trim().to_string(),
+    };
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    Ok(format!(
+        "{AUTH_PROTOCOL_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(payload_bytes)
+    ))
+}
+
+fn derive_client_id(pubkey_sec1: &[u8]) -> u64 {
+    let digest = Sha256::digest(pubkey_sec1);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+fn random_nonce() -> String {
+    let mut bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

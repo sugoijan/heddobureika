@@ -1306,6 +1306,7 @@ impl SvgView {
                 UiTextId::Progress => "ui-text ui-progress",
                 UiTextId::Credit => "ui-text ui-credit",
                 UiTextId::Success => "ui-text ui-success",
+                UiTextId::Debug => "ui-text ui-debug",
                 UiTextId::MenuTitle => "ui-text ui-menu-title",
                 UiTextId::MenuSubtitle => "ui-text ui-menu-sub",
             };
@@ -1972,6 +1973,7 @@ fn apply_taffy_layout(
                 UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
                 UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
                 UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
+                UiTextId::Debug => (1, 2, false, JustifySelf::End, AlignSelf::Start),
                 UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
                     (2, 2, false, JustifySelf::Center, AlignSelf::Center)
                 }

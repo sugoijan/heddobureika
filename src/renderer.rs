@@ -76,6 +76,7 @@ pub(crate) enum UiTextId {
     Progress,
     Credit,
     Success,
+    Debug,
     MenuTitle,
     MenuSubtitle,
 }
@@ -537,6 +538,7 @@ fn now_ms() -> f32 {
 
 pub(crate) struct WgpuRenderer {
     _canvas: HtmlCanvasElement,
+    backend: wgpu::Backend,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -658,6 +660,7 @@ impl WgpuRenderer {
             .map_err(|err| {
                 wasm_bindgen::JsValue::from_str(&format!("request_adapter failed: {err:?}"))
             })?;
+        let backend = adapter.get_info().backend;
         let limits =
             wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
         let (device, queue) = adapter
@@ -1255,6 +1258,7 @@ impl WgpuRenderer {
 
         let renderer = Self {
             _canvas: canvas,
+            backend,
             surface,
             device,
             queue,
@@ -2100,6 +2104,17 @@ impl WgpuRenderer {
         } else {
             console::log_1(&JsValue::from_str("WGPU FPS: disabled"));
             self.fps_text.clear();
+        }
+    }
+
+    pub(crate) fn backend_label(&self) -> &'static str {
+        match self.backend {
+            wgpu::Backend::BrowserWebGpu => "WebGPU",
+            wgpu::Backend::Gl => "WebGL2",
+            wgpu::Backend::Vulkan => "Vulkan",
+            wgpu::Backend::Metal => "Metal",
+            wgpu::Backend::Dx12 => "D3D12",
+            wgpu::Backend::Noop => "Noop",
         }
     }
 

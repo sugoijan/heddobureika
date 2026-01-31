@@ -1,3 +1,5 @@
+use std::fmt;
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::snapshot::{GameRules, GameSnapshot, PuzzleInfo, PuzzleStateSnapshot};
@@ -7,6 +9,48 @@ use crate::snapshot::{GameRules, GameSnapshot, PuzzleInfo, PuzzleStateSnapshot};
 pub enum RoomPersistence {
     Durable,
     BestEffort,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Archive, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct ClientId(pub u64);
+
+impl ClientId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for ClientId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<ClientId> for u64 {
+    fn from(value: ClientId) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Debug for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = self.0;
+        write!(
+            f,
+            "cid:{:04x}_{:04x}_{:04x}_{:04x}",
+            (value >> 48) as u16,
+            (value >> 32) as u16,
+            (value >> 16) as u16,
+            value as u16
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -22,7 +66,7 @@ pub enum OwnershipReason {
 pub enum RoomUpdate {
     Ownership {
         anchor_id: u32,
-        owner: Option<u64>,
+        owner: Option<ClientId>,
         reason: OwnershipReason,
     },
     GroupTransform {
@@ -88,7 +132,7 @@ pub enum ServerMsg {
         room_id: String,
         persistence: RoomPersistence,
         initialized: bool,
-        client_id: Option<u64>,
+        client_id: Option<ClientId>,
     },
     AdminAck { room_id: String, persistence: RoomPersistence },
     NeedInit,
@@ -97,7 +141,7 @@ pub enum ServerMsg {
     Update {
         seq: u64,
         update: RoomUpdate,
-        source: Option<u64>,
+        source: Option<ClientId>,
         client_seq: Option<u64>,
     },
     Pong { nonce: Option<u64> },

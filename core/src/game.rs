@@ -17,9 +17,9 @@ pub const ROTATION_SOLVE_TOLERANCE_DEG: f32 = 1.5;
 
 pub const FLIP_CHANCE: f32 = 0.2;
 
-pub const WORKSPACE_SCALE_MIN: f32 = 0.5;
-pub const WORKSPACE_SCALE_MAX: f32 = 2.0;
-pub const WORKSPACE_SCALE_DEFAULT: f32 = 0.8;
+pub const WORKSPACE_PADDING_RATIO_MIN: f32 = 0.5;
+pub const WORKSPACE_PADDING_RATIO_MAX: f32 = 2.0;
+pub const WORKSPACE_PADDING_RATIO_DEFAULT: f32 = 0.8;
 
 pub const FRAME_SNAP_MIN: f32 = 0.4;
 pub const FRAME_SNAP_MAX: f32 = 3.0;
@@ -29,14 +29,6 @@ pub const COMPLETE_SNAP_MULTIPLIER: f32 = 2.0;
 pub const IMAGE_MAX_DIMENSION_MIN: u32 = 512;
 pub const IMAGE_MAX_DIMENSION_MAX: u32 = 4096;
 pub const IMAGE_MAX_DIMENSION_DEFAULT: u32 = 1280;
-
-pub const WORKSPACE_ASPECT_RATIO: f32 = 1.618034;
-pub const WORKSPACE_SLOT_WIDTH_FRAC: f32 = 0.76;
-pub const WORKSPACE_SLOT_HEIGHT_FRAC: f32 = 0.82;
-pub const WORKSPACE_SLOT_LEFT_FRAC: f32 = (1.0 - WORKSPACE_SLOT_WIDTH_FRAC) * 0.5;
-pub const WORKSPACE_SLOT_TOP_FRAC: f32 = (1.0 - WORKSPACE_SLOT_HEIGHT_FRAC) * 0.5;
-pub const WORKSPACE_SLOT_MARGIN_FRAC: f32 = 0.03;
-pub const WORKSPACE_SLOT_MARGIN_MIN: f32 = 6.0;
 
 pub const DIR_UP: usize = 0;
 pub const DIR_RIGHT: usize = 1;
@@ -54,31 +46,22 @@ pub struct WorkspaceLayout {
     pub puzzle_scale: f32,
 }
 
-pub fn compute_workspace_layout(width: f32, height: f32, scale: f32, max_dim: f32) -> WorkspaceLayout {
-    let max_dim = max_dim.max(1.0);
+pub fn compute_workspace_layout(width: f32, height: f32, padding_ratio: f32) -> WorkspaceLayout {
     let safe_width = width.max(1.0);
     let safe_height = height.max(1.0);
-    let min_height_for_slot = max_dim / WORKSPACE_SLOT_HEIGHT_FRAC;
-    let min_height_for_width = max_dim / (WORKSPACE_SLOT_WIDTH_FRAC * WORKSPACE_ASPECT_RATIO);
-    let base_height = min_height_for_slot.max(min_height_for_width);
-    let base_width = base_height * WORKSPACE_ASPECT_RATIO;
-    let workspace_width = base_width * scale;
-    let workspace_height = base_height * scale;
-    let slot_width = workspace_width * WORKSPACE_SLOT_WIDTH_FRAC;
-    let slot_height = workspace_height * WORKSPACE_SLOT_HEIGHT_FRAC;
-    let slot_origin_x = workspace_width * WORKSPACE_SLOT_LEFT_FRAC;
-    let slot_origin_y = workspace_height * WORKSPACE_SLOT_TOP_FRAC;
-    let slot_min = slot_width.min(slot_height).max(1.0);
-    let margin = (slot_min * WORKSPACE_SLOT_MARGIN_FRAC).max(WORKSPACE_SLOT_MARGIN_MIN);
-    let fit_width = (slot_width - margin * 2.0).max(1.0);
-    let fit_height = (slot_height - margin * 2.0).max(1.0);
-    let puzzle_scale = (fit_width / safe_width)
-        .min(fit_height / safe_height)
+    let min_dim = safe_width.min(safe_height).max(1.0);
+    let padding_ratio = padding_ratio.clamp(
+        WORKSPACE_PADDING_RATIO_MIN,
+        WORKSPACE_PADDING_RATIO_MAX,
+    );
+    let padding = (min_dim * padding_ratio).max(0.0);
+    let workspace_width = safe_width + padding;
+    let workspace_height = safe_height + padding;
+    let puzzle_scale = (workspace_width / safe_width)
+        .min(workspace_height / safe_height)
         .min(1.0);
-    let scaled_width = safe_width * puzzle_scale;
-    let scaled_height = safe_height * puzzle_scale;
-    let puzzle_offset_x = slot_origin_x + (slot_width - scaled_width) * 0.5;
-    let puzzle_offset_y = slot_origin_y + (slot_height - scaled_height) * 0.5;
+    let puzzle_offset_x = (workspace_width - safe_width) * 0.5;
+    let puzzle_offset_y = (workspace_height - safe_height) * 0.5;
     WorkspaceLayout {
         view_min_x: -puzzle_offset_x,
         view_min_y: -puzzle_offset_y,

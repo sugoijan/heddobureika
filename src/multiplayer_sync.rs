@@ -2,7 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gloo::timers::future::TimeoutFuture;
-use js_sys::{Math, Uint8Array};
+use js_sys::{Array, Math, Uint8Array};
+use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -18,6 +19,7 @@ pub(crate) struct WsHandlers {
     onclose: Closure<dyn FnMut(Event)>,
 }
 
+#[derive(Clone)]
 pub(crate) struct MultiplayerSyncAdapter {
     ws: Rc<RefCell<Option<WebSocket>>>,
     handlers: Rc<RefCell<Option<WsHandlers>>>,
@@ -106,7 +108,7 @@ impl MultiplayerSyncAdapter {
         on_server_msg: Rc<dyn Fn(ServerMsg)>,
         on_fail: Rc<dyn Fn()>,
     ) {
-        self.connect_with_open(url, on_server_msg, on_fail, None);
+        self.connect_with_open(url, on_server_msg, on_fail, None, None);
     }
 
     pub(crate) fn connect_with_open(
@@ -115,6 +117,7 @@ impl MultiplayerSyncAdapter {
         on_server_msg: Rc<dyn Fn(ServerMsg)>,
         on_fail: Rc<dyn Fn()>,
         on_open: Option<Rc<dyn Fn()>>,
+        protocols: Option<Vec<String>>,
     ) {
         self.disconnect();
         let closing = Rc::new(Cell::new(false));
@@ -125,7 +128,17 @@ impl MultiplayerSyncAdapter {
             return;
         }
 
-        let ws = match WebSocket::new(url) {
+        let ws = match protocols {
+            Some(protocols) if !protocols.is_empty() => {
+                let list = Array::new();
+                for protocol in protocols {
+                    list.push(&JsValue::from_str(&protocol));
+                }
+                WebSocket::new_with_str_sequence(url, &list.into())
+            }
+            _ => WebSocket::new(url),
+        };
+        let ws = match ws {
             Ok(ws) => ws,
             Err(_) => {
                 gloo::console::warn!("failed to open websocket", url);

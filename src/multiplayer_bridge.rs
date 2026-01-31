@@ -12,7 +12,7 @@ use crate::core::{
 use crate::multiplayer_game_sync::MultiplayerSyncCallbacks;
 use crate::sync_runtime;
 use heddobureika_core::{
-    angle_matches, apply_room_update_to_snapshot, ClientMsg, GameSnapshot, PuzzleInfo,
+    angle_matches, apply_room_update_to_snapshot, ClientId, ClientMsg, GameSnapshot, PuzzleInfo,
     PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
 };
 
@@ -21,12 +21,12 @@ const PENDING_ROT_EPS: f32 = 0.05;
 
 #[derive(Clone)]
 pub(crate) struct MultiplayerUiHooks {
-    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<u64>)>,
+    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<ClientId>)>,
     pub(crate) on_need_init: Rc<dyn Fn()>,
     pub(crate) on_warning: Rc<dyn Fn(u32)>,
     pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<u64>, Option<u64>)>,
-    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<u64>)>,
+    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
+    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<ClientId>)>,
     pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
     pub(crate) on_error: Rc<dyn Fn(String, String)>,
 }
@@ -213,7 +213,7 @@ impl MultiplayerBridgeState {
         room_id: String,
         persistence: RoomPersistence,
         initialized: bool,
-        client_id: Option<u64>,
+        client_id: Option<ClientId>,
     ) {
         self.init_pending.set(!initialized);
         if let Some(sync) = sync_runtime::multiplayer_handle() {
@@ -263,7 +263,7 @@ impl MultiplayerBridgeState {
         &self,
         update: RoomUpdate,
         seq: u64,
-        source: Option<u64>,
+        source: Option<ClientId>,
         client_seq: Option<u64>,
     ) {
         self.ack_pending_transform(&update, source, client_seq);
@@ -273,7 +273,7 @@ impl MultiplayerBridgeState {
         }
     }
 
-    fn handle_ownership(&self, anchor_id: u32, owner: Option<u64>) {
+    fn handle_ownership(&self, anchor_id: u32, owner: Option<ClientId>) {
         self.maybe_drop_drag_on_ownership(anchor_id, owner);
         for hooks in self.ui_hooks_snapshot() {
             (hooks.on_ownership)(anchor_id, owner);
@@ -319,7 +319,7 @@ impl MultiplayerBridgeState {
     fn ack_pending_transform(
         &self,
         update: &RoomUpdate,
-        source: Option<u64>,
+        source: Option<ClientId>,
         client_seq: Option<u64>,
     ) {
         let Some(client_seq) = client_seq else {
@@ -393,7 +393,7 @@ impl MultiplayerBridgeState {
         }
     }
 
-    fn maybe_drop_drag_on_ownership(&self, anchor_id: u32, owner: Option<u64>) {
+    fn maybe_drop_drag_on_ownership(&self, anchor_id: u32, owner: Option<ClientId>) {
         let snapshot = self.core.snapshot();
         let Some(drag_anchor) = snapshot.dragging_members.first().copied() else {
             return;

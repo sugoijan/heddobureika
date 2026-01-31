@@ -24,7 +24,7 @@ use crate::renderer::{
     UiTextId, UiTextSpec, WgpuRenderer,
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
-use heddobureika_core::PuzzleInfo;
+use heddobureika_core::{ClientId, PuzzleInfo};
 
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
@@ -39,6 +39,7 @@ const UI_MENU_TITLE_FONT_RATIO: f32 = 0.05;
 const UI_MENU_TITLE_ROTATION_DEG: f32 = -0.8;
 const UI_PROGRESS_FONT_RATIO: f32 = 0.032;
 const UI_PROGRESS_ROTATION_DEG: f32 = -89.6;
+const UI_DEBUG_FONT_RATIO: f32 = 0.02;
 const UI_SUCCESS_FONT_RATIO: f32 = 0.082;
 const UI_SUCCESS_OFFSET_RATIO: f32 = 0.03;
 const UI_SUCCESS_ROTATION_DEG: f32 = -1.3;
@@ -407,6 +408,7 @@ struct WgpuView {
     canvas: HtmlCanvasElement,
     image: RefCell<Option<HtmlImageElement>>,
     renderer: RefCell<Option<WgpuRenderer>>,
+    backend_label: RefCell<Option<String>>,
     creating: Cell<bool>,
     pending_instances: RefCell<Option<InstanceSet>>,
     pending_ui: RefCell<Option<Vec<UiTextSpec>>>,
@@ -441,6 +443,7 @@ impl WgpuView {
             canvas,
             image: RefCell::new(None),
             renderer: RefCell::new(None),
+            backend_label: RefCell::new(None),
             creating: Cell::new(false),
             pending_instances: RefCell::new(None),
             pending_ui: RefCell::new(None),
@@ -1531,6 +1534,24 @@ impl WgpuView {
         } else {
             ("--".to_string(), "--".to_string())
         };
+        let backend_label = if snapshot.show_debug {
+            let existing = self.backend_label.borrow().clone();
+            if existing.is_some() {
+                existing
+            } else {
+                let label = self
+                    .renderer
+                    .borrow()
+                    .as_ref()
+                    .map(|renderer| renderer.backend_label().to_string());
+                if let Some(ref label) = label {
+                    *self.backend_label.borrow_mut() = Some(label.clone());
+                }
+                label
+            }
+        } else {
+            None
+        };
         let mut measure_state = self.ui_measure.borrow_mut();
         let ui_specs = build_ui_specs(
             &mut measure_state,
@@ -1541,6 +1562,8 @@ impl WgpuView {
             snapshot.solved,
             connections_label.as_str(),
             border_connections_label.as_str(),
+            snapshot.show_debug,
+            backend_label.as_deref(),
             false,
             is_dark,
         );
@@ -1648,6 +1671,7 @@ impl WgpuView {
         let epoch = self.puzzle_epoch.get();
         let view = Rc::clone(self);
         spawn_local(async move {
+            let mut refresh_debug = false;
             match WgpuRenderer::new(
                 canvas,
                 image,
@@ -1682,6 +1706,9 @@ impl WgpuView {
                     if force_fps_fallback {
                         renderer.force_fps_fallback();
                     }
+                    let backend_label = renderer.backend_label().to_string();
+                    *view.backend_label.borrow_mut() = Some(backend_label);
+                    refresh_debug = view.core.snapshot().show_debug;
                     renderer.set_emboss_enabled(true);
                     renderer.set_font_bytes(FPS_FONT_BYTES.to_vec());
                     renderer.set_ui_font_bytes(FPS_FONT_BYTES.to_vec());
@@ -1702,6 +1729,9 @@ impl WgpuView {
                 }
             }
             view.creating.set(false);
+            if refresh_debug {
+                view.request_render();
+            }
         });
         *self.pending_instances.borrow_mut() = Some(instances);
         *self.pending_ui.borrow_mut() = Some(ui_specs);
@@ -1911,8 +1941,8 @@ fn build_wgpu_instances(
     highlighted_members: Option<&[usize]>,
     drag_origin: Option<(f32, f32)>,
     drag_dir: f32,
-    ownership_by_anchor: &HashMap<u32, u64>,
-    own_client_id: Option<u64>,
+    ownership_by_anchor: &HashMap<u32, ClientId>,
+    own_client_id: Option<ClientId>,
 ) -> InstanceSet {
     let total = cols * rows;
     if total == 0 {
@@ -2379,6 +2409,7 @@ fn apply_taffy_layout(
                 UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
                 UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
                 UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
+                UiTextId::Debug => (1, 2, false, JustifySelf::End, AlignSelf::Start),
                 UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
                     (2, 2, false, JustifySelf::Center, AlignSelf::Center)
                 }
@@ -2518,6 +2549,8 @@ fn build_ui_specs(
     solved: bool,
     connections_label: &str,
     border_connections_label: &str,
+    show_debug: bool,
+    backend_label: Option<&str>,
     menu_visible: bool,
     is_dark: bool,
 ) -> Vec<UiTextSpec> {
@@ -2609,6 +2642,22 @@ fn build_ui_specs(
                 font_size: success_size,
                 line_height: success_size * 1.1,
                 color: accent_color,
+            });
+        }
+    }
+    if show_debug && !menu_visible {
+        if let Some(label) = backend_label {
+            let debug_size = min_dim * UI_DEBUG_FONT_RATIO;
+            specs.push(UiTextSpec {
+                id: UiTextId::Debug,
+                text: format!("WGPU backend: {label}"),
+                pos: [0.0, 0.0],
+                rotation_deg: 0.0,
+                rotation_origin: UiRotationOrigin::Center,
+                rotation_offset: [0.0, 0.0],
+                font_size: debug_size,
+                line_height: debug_size * 1.08,
+                color: muted_color,
             });
         }
     }

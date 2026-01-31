@@ -16,6 +16,7 @@ const VIEW_ZOOM_MAX: f32 = 4.0;
 const VIEW_ZOOM_MIN: f32 = 0.2;
 const VIEW_ZOOM_MIN_FACTOR: f32 = 0.5;
 const VIEW_PAN_RUBBER_RATIO: f32 = 0.5;
+const VIEW_FIT_PADDING_RATIO: f32 = 0.02;
 
 pub(crate) struct AppCore {
     state: RefCell<AppState>,
@@ -130,7 +131,7 @@ struct AppState {
     show_debug: bool,
     scramble_nonce: u32,
     settings: ShapeSettings,
-    workspace_scale: f32,
+    workspace_padding_ratio: f32,
     image_max_dim: u32,
     rotation_enabled: bool,
     rotation_snap_tolerance: f32,
@@ -298,8 +299,7 @@ impl AppCore {
         state.layout = compute_workspace_layout(
             width as f32,
             height as f32,
-            state.workspace_scale,
-            state.image_max_dim as f32,
+            state.workspace_padding_ratio,
         );
         let layout = state.layout;
         state.view.reset_to_fit(layout);
@@ -947,19 +947,19 @@ impl AppCore {
         self.set_hovered(None);
     }
 
-    pub(crate) fn set_workspace_scale(&self, value: f32) {
+    pub(crate) fn set_workspace_padding_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
-        let value = value.clamp(WORKSPACE_SCALE_MIN, WORKSPACE_SCALE_MAX);
-        if (state.workspace_scale - value).abs() <= f32::EPSILON {
+        let value = value.clamp(WORKSPACE_PADDING_RATIO_MIN, WORKSPACE_PADDING_RATIO_MAX);
+        if (state.workspace_padding_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.workspace_scale = value;
+        state.workspace_padding_ratio = value;
         let (width, height) = state
             .puzzle_info
             .as_ref()
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
-        state.layout = compute_workspace_layout(width, height, value, state.image_max_dim as f32);
+        state.layout = compute_workspace_layout(width, height, value);
         let layout = state.layout;
         state.view.reset_to_fit(layout);
         drop(state);
@@ -978,7 +978,7 @@ impl AppCore {
             .as_ref()
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
-        state.layout = compute_workspace_layout(width, height, state.workspace_scale, value as f32);
+        state.layout = compute_workspace_layout(width, height, state.workspace_padding_ratio);
         let layout = state.layout;
         state.view.reset_to_fit(layout);
         drop(state);
@@ -1053,6 +1053,24 @@ impl AppCore {
         let mut state = self.state.borrow_mut();
         let layout = state.layout;
         state.view.reset_to_fit(layout);
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn fit_view_to_frame(&self) {
+        let mut state = self.state.borrow_mut();
+        let Some(info) = state.puzzle_info.as_ref() else {
+            return;
+        };
+        let layout = state.layout;
+        let frame_width = info.image_width as f32 * layout.puzzle_scale.max(1.0e-4);
+        let frame_height = info.image_height as f32 * layout.puzzle_scale.max(1.0e-4);
+        let fit_zoom = state.view.fit_zoom_for_size(frame_width, frame_height);
+        state.view.zoom = state.view.clamp_zoom(fit_zoom, layout);
+        state.view.center_x = frame_width * 0.5;
+        state.view.center_y = frame_height * 0.5;
+        state.view.mode = ViewMode::Manual;
+        state.view.clamp_to_layout(layout);
         drop(state);
         self.notify();
     }
@@ -1398,16 +1416,22 @@ impl ViewState {
     }
 
     fn fit_zoom(&self, layout: WorkspaceLayout) -> f32 {
+        self.fit_zoom_for_size(layout.view_width, layout.view_height)
+    }
+
+    fn fit_zoom_for_size(&self, width: f32, height: f32) -> f32 {
         let viewport_w = self.viewport_w.max(1.0);
         let viewport_h = self.viewport_h.max(1.0);
-        let workspace_w = layout.view_width.max(1.0);
-        let workspace_h = layout.view_height.max(1.0);
-        (viewport_w / workspace_w).min(viewport_h / workspace_h)
+        let target_w = width.max(1.0) * (1.0 + VIEW_FIT_PADDING_RATIO);
+        let target_h = height.max(1.0) * (1.0 + VIEW_FIT_PADDING_RATIO);
+        (viewport_w / target_w).min(viewport_h / target_h)
     }
 
     fn clamp_zoom(&self, zoom: f32, layout: WorkspaceLayout) -> f32 {
         let fit_zoom = self.fit_zoom(layout);
-        let min_zoom = (fit_zoom * VIEW_ZOOM_MIN_FACTOR).max(VIEW_ZOOM_MIN);
+        let min_zoom = (fit_zoom * VIEW_ZOOM_MIN_FACTOR)
+            .max(VIEW_ZOOM_MIN)
+            .min(VIEW_ZOOM_MAX);
         let max_zoom = VIEW_ZOOM_MAX;
         zoom.clamp(min_zoom, max_zoom)
     }
@@ -1427,25 +1451,8 @@ impl ViewState {
         let min_y = layout.view_min_y;
         let max_x = min_x + layout.view_width;
         let max_y = min_y + layout.view_height;
-        let workspace_center_x = min_x + layout.view_width * 0.5;
-        let workspace_center_y = min_y + layout.view_height * 0.5;
-        let fit_zoom = self.fit_zoom(layout);
-        let (min_cx, max_cx) = if self.zoom <= fit_zoom {
-            (
-                workspace_center_x - view.width * 0.5,
-                workspace_center_x + view.width * 0.5,
-            )
-        } else {
-            (min_x - view.width * 0.5, max_x + view.width * 0.5)
-        };
-        let (min_cy, max_cy) = if self.zoom <= fit_zoom {
-            (
-                workspace_center_y - view.height * 0.5,
-                workspace_center_y + view.height * 0.5,
-            )
-        } else {
-            (min_y - view.height * 0.5, max_y + view.height * 0.5)
-        };
+        let (min_cx, max_cx) = (min_x - view.width * 0.5, max_x + view.width * 0.5);
+        let (min_cy, max_cy) = (min_y - view.height * 0.5, max_y + view.height * 0.5);
         (min_cx, max_cx, min_cy, max_cy)
     }
 
@@ -1497,8 +1504,7 @@ impl AppState {
         let layout = compute_workspace_layout(
             1.0,
             1.0,
-            WORKSPACE_SCALE_DEFAULT,
-            IMAGE_MAX_DIMENSION_DEFAULT as f32,
+            WORKSPACE_PADDING_RATIO_DEFAULT,
         );
         let view = ViewState::new(layout);
         Self {
@@ -1526,7 +1532,7 @@ impl AppState {
             show_debug: false,
             scramble_nonce: 0,
             settings: ShapeSettings::default(),
-            workspace_scale: WORKSPACE_SCALE_DEFAULT,
+            workspace_padding_ratio: WORKSPACE_PADDING_RATIO_DEFAULT,
             image_max_dim: IMAGE_MAX_DIMENSION_DEFAULT,
             rotation_enabled: true,
             rotation_snap_tolerance: ROTATION_SNAP_TOLERANCE_DEFAULT_DEG,

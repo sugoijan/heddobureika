@@ -18,7 +18,7 @@ dev-vars:
 
 # Run the worker locally (no Cloudflare login required)
 wrangler-dev:
-    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --host 0.0.0.0 --persist-to .wrangler/state
+    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --host 0.0.0.0 --persist-to .wrangler/state --show-interactive-dev-session=false
 
 # Run the frontend locally (requires trunk)
 trunk-serve:
@@ -84,7 +84,7 @@ mp-test:
     @cargo test -p heddobureika-cli --test multiplayer_sync
 
 # Create/activate a room via the admin CLI
-room-create *args:
+create-room *args:
     @if [ -f .dev.vars ]; then \
       set -a; source .dev.vars; set +a; \
     fi; \
@@ -100,13 +100,3 @@ room-create *args:
     else \
       cargo run -p heddobureika-cli -- rooms create --admin-token "$token" --base-url "$base_url" "$@"; \
     fi
-
-# Alias
-worker-dev:
-    @just wrangler-dev
-
-web-dev:
-    @just trunk-serve
-
-create-room:
-    @just room-create

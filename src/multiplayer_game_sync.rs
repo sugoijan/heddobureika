@@ -3,21 +3,23 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gloo::console;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::app_router;
 use crate::runtime::{CoreAction, GameSync, SyncAction, SyncHooks, SyncView};
 use crate::core::InitMode;
+use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
-use heddobureika_core::{ClientMsg, GameSnapshot, RoomPersistence, RoomUpdate, ServerMsg};
+use heddobureika_core::{ClientId, ClientMsg, GameSnapshot, RoomPersistence, RoomUpdate, ServerMsg};
 
 #[derive(Clone)]
 pub(crate) struct MultiplayerSyncCallbacks {
-    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<u64>)>,
+    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<ClientId>)>,
     pub(crate) on_need_init: Rc<dyn Fn()>,
     pub(crate) on_warning: Rc<dyn Fn(u32)>,
     pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<u64>, Option<u64>)>,
-    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<u64>)>,
+    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
+    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<ClientId>)>,
     pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
     pub(crate) on_error: Rc<dyn Fn(String, String)>,
 }
@@ -30,11 +32,12 @@ pub(crate) struct MultiplayerGameSync {
     state_applied: Rc<Cell<bool>>,
     handler: RefCell<Option<Rc<dyn Fn(ServerMsg)>>>,
     connected: Rc<Cell<bool>>,
-    client_id: Rc<Cell<Option<u64>>>,
+    client_id: Rc<Cell<Option<ClientId>>>,
+    connect_seq: Rc<Cell<u64>>,
     init_required: Rc<Cell<bool>>,
     room_id: Rc<RefCell<Option<String>>>,
     persistence: Rc<Cell<Option<RoomPersistence>>>,
-    ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, u64>>>>,
+    ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, ClientId>>>>,
     ownership_seq_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
     local_transform_observer:
         Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>>>,
@@ -52,6 +55,7 @@ impl MultiplayerGameSync {
             handler: RefCell::new(None),
             connected: Rc::new(Cell::new(false)),
             client_id: Rc::new(Cell::new(None)),
+            connect_seq: Rc::new(Cell::new(0)),
             init_required: Rc::new(Cell::new(false)),
             room_id: Rc::new(RefCell::new(None)),
             persistence: Rc::new(Cell::new(None)),
@@ -83,10 +87,32 @@ impl MultiplayerGameSync {
         *self.room_id.borrow_mut() = Some(room_id.to_string());
         let url = app_router::build_room_ws_url(&ws_base, room_id);
         let handler = self.install_handler(callbacks);
-        self.adapter.connect(&url, handler, on_fail);
+        let mut adapter = self.adapter.clone();
+        let on_fail = on_fail.clone();
+        let room_id = room_id.to_string();
+        let url = url.clone();
+        let connect_seq = self.connect_seq.clone();
+        let seq = connect_seq.get().wrapping_add(1);
+        connect_seq.set(seq);
+        spawn_local(async move {
+            let protocol = match multiplayer_identity::build_auth_protocol(&room_id, None).await {
+                Ok(protocol) => protocol,
+                Err(err) => {
+                    console::warn!("multiplayer auth failed", err);
+                    on_fail();
+                    return;
+                }
+            };
+            if connect_seq.get() != seq {
+                return;
+            }
+            adapter.connect_with_open(&url, handler, on_fail, None, Some(vec![protocol]));
+        });
     }
 
     pub(crate) fn disconnect(&mut self) {
+        let next = self.connect_seq.get().wrapping_add(1);
+        self.connect_seq.set(next);
         self.adapter.disconnect();
         self.reset_state();
         self.handler.borrow_mut().take();

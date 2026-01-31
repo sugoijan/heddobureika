@@ -25,10 +25,11 @@ use crate::sync_runtime;
 use crate::core::*;
 use crate::model::*;
 use crate::multiplayer_bridge::{self, MultiplayerUiHooks};
+use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
 use crate::runtime::{CoreAction, SyncAction, SyncHooks};
 use heddobureika_core::{
-    logical_image_size, AdminMsg, GameSnapshot, PuzzleInfo, RoomUpdate, ServerMsg,
+    logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleInfo, RoomUpdate, ServerMsg,
 };
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
 use crate::renderer::{
@@ -160,22 +161,24 @@ impl LocalSnapshot {
 
 struct AdminSocket {
     adapter: Rc<RefCell<MultiplayerSyncAdapter>>,
-    url: Option<String>,
+    connect_key: Option<String>,
     connected: Rc<Cell<bool>>,
     pending: Rc<RefCell<Vec<AdminMsg>>>,
     status: Rc<Cell<AdminStatus>>,
     status_hook: Option<Rc<dyn Fn(AdminStatus)>>,
+    connect_seq: Rc<Cell<u64>>,
 }
 
 impl AdminSocket {
     fn new() -> Self {
         Self {
             adapter: Rc::new(RefCell::new(MultiplayerSyncAdapter::new())),
-            url: None,
+            connect_key: None,
             connected: Rc::new(Cell::new(false)),
             pending: Rc::new(RefCell::new(Vec::new())),
             status: Rc::new(Cell::new(AdminStatus::Idle)),
             status_hook: None,
+            connect_seq: Rc::new(Cell::new(0)),
         }
     }
 
@@ -185,41 +188,47 @@ impl AdminSocket {
 
     fn reset(&mut self) {
         self.adapter.borrow_mut().disconnect();
-        self.url = None;
+        self.connect_key = None;
         self.connected.set(false);
         self.pending.borrow_mut().clear();
         self.update_status(AdminStatus::Idle);
+        let next = self.connect_seq.get().wrapping_add(1);
+        self.connect_seq.set(next);
     }
 
-    fn send(&mut self, url: String, msg: AdminMsg) {
+    fn send(&mut self, ws_base: String, room_id: String, admin_token: String, msg: AdminMsg) {
         self.pending.borrow_mut().push(msg);
-        let url_changed = self.url.as_deref() != Some(url.as_str());
+        let url = app_router::build_room_ws_url(&ws_base, &room_id);
+        let connect_key = format!("{url}|{admin_token}");
+        let url_changed = self.connect_key.as_deref() != Some(connect_key.as_str());
         if url_changed {
-            self.url = Some(url.clone());
+            self.connect_key = Some(connect_key);
             self.connected.set(false);
             self.update_status(AdminStatus::Connecting);
-            self.connect(url);
+            self.connect(url, room_id, admin_token);
             return;
         }
         if self.connected.get() {
             self.flush();
         } else {
             self.update_status(AdminStatus::Connecting);
-            self.connect(url);
+            self.connect(url, room_id, admin_token);
         }
     }
 
-    fn ensure_connected(&mut self, url: String) {
-        if self.url.as_deref() == Some(url.as_str()) && self.connected.get() {
+    fn ensure_connected(&mut self, ws_base: String, room_id: String, admin_token: String) {
+        let url = app_router::build_room_ws_url(&ws_base, &room_id);
+        let connect_key = format!("{url}|{admin_token}");
+        if self.connect_key.as_deref() == Some(connect_key.as_str()) && self.connected.get() {
             return;
         }
-        self.url = Some(url.clone());
+        self.connect_key = Some(connect_key);
         self.connected.set(false);
         self.update_status(AdminStatus::Connecting);
-        self.connect(url);
+        self.connect(url, room_id, admin_token);
     }
 
-    fn connect(&mut self, url: String) {
+    fn connect(&mut self, url: String, room_id: String, admin_token: String) {
         let adapter = self.adapter.clone();
         let adapter_for_open = adapter.clone();
         let pending = self.pending.clone();
@@ -271,9 +280,30 @@ impl AdminSocket {
             }
             _ => {}
         });
-        adapter
-            .borrow_mut()
-            .connect_with_open(&url, on_server_msg, on_fail, Some(on_open));
+        let connect_seq = self.connect_seq.clone();
+        let seq = connect_seq.get().wrapping_add(1);
+        connect_seq.set(seq);
+        let url_for_connect = url.clone();
+        spawn_local(async move {
+            let protocol = match multiplayer_identity::build_auth_protocol(&room_id, Some(&admin_token)).await {
+                Ok(protocol) => protocol,
+                Err(err) => {
+                    gloo::console::warn!("admin auth failed", err);
+                    on_fail();
+                    return;
+                }
+            };
+            if connect_seq.get() != seq {
+                return;
+            }
+            adapter.borrow_mut().connect_with_open(
+                &url_for_connect,
+                on_server_msg,
+                on_fail,
+                Some(on_open),
+                Some(vec![protocol]),
+            );
+        });
     }
 
     fn flush(&self) {
@@ -405,7 +435,7 @@ struct WgpuRenderDeps {
     show_svg: bool,
     puzzle_dims: Option<(u32, u32)>,
     grid: GridChoice,
-    workspace_scale: f32,
+    workspace_padding_ratio: f32,
     image_max_dim: u32,
     theme_mode: ThemeMode,
     solved: bool,
@@ -415,8 +445,8 @@ struct WgpuRenderDeps {
     hover_deps: HoverDeps,
     mask_atlas_revision: u32,
     wgpu_settings: WgpuRenderSettings,
-    ownership_by_anchor: HashMap<u32, u64>,
-    mp_client_id: Option<u64>,
+    ownership_by_anchor: HashMap<u32, ClientId>,
+    mp_client_id: Option<ClientId>,
 }
 
 #[derive(Clone, Copy)]
@@ -616,6 +646,7 @@ fn apply_taffy_layout(
                 UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
                 UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
                 UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
+                UiTextId::Debug => (1, 2, false, JustifySelf::End, AlignSelf::Start),
                 UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
                     (2, 2, false, JustifySelf::Center, AlignSelf::Center)
                 }
@@ -1294,8 +1325,8 @@ fn build_wgpu_instances(
     highlighted_members: Option<&[usize]>,
     drag_origin: Option<(f32, f32)>,
     drag_dir: f32,
-    ownership_by_anchor: &HashMap<u32, u64>,
-    own_client_id: Option<u64>,
+    ownership_by_anchor: &HashMap<u32, ClientId>,
+    own_client_id: Option<ClientId>,
 ) -> InstanceSet {
     let total = cols * rows;
     if total == 0 {
@@ -1843,8 +1874,20 @@ fn app(props: &AppProps) -> Html {
     let pinch_state = use_mut_ref(|| None::<PinchState>);
     let is_panning = use_state(|| false);
     let is_panning_value = *is_panning;
-    let workspace_scale = use_state(|| WORKSPACE_SCALE_DEFAULT);
-    let workspace_scale_value = *workspace_scale;
+    let workspace_padding_ratio = use_state(|| WORKSPACE_PADDING_RATIO_DEFAULT);
+    let workspace_padding_ratio_value = *workspace_padding_ratio;
+    let workspace_padding_label = puzzle_dims_value
+        .map(|(width, height)| {
+            let min_dim = width.min(height).max(1) as f32;
+            let padding = min_dim * workspace_padding_ratio_value;
+            format!(
+                "{} (x{})",
+                fmt_f32(padding),
+                fmt_f32(workspace_padding_ratio_value)
+            )
+        })
+        .unwrap_or_else(|| fmt_f32(workspace_padding_ratio_value));
+    let view_controls_disabled = puzzle_dims_value.is_none();
     let z_order = use_state(Vec::<usize>::new);
     let _ = ui_revision_value;
     let rotation_enabled = use_state(|| true);
@@ -1965,10 +2008,10 @@ fn app(props: &AppProps) -> Html {
         let svg_ref = svg_ref.clone();
         let show_svg = show_svg;
         let puzzle_dims_value = puzzle_dims_value;
-        let workspace_scale_value = workspace_scale_value;
+        let workspace_padding_ratio_value = workspace_padding_ratio_value;
         let image_max_dim = image_max_dim;
         use_effect_with(
-            (show_svg, puzzle_dims_value, workspace_scale_value, image_max_dim),
+            (show_svg, puzzle_dims_value, workspace_padding_ratio_value, image_max_dim),
             move |(show_svg, _dims, _scale, _max_dim)| {
                 if !*show_svg {
                     return Box::new(|| ()) as Box<dyn FnOnce()>;
@@ -2136,8 +2179,9 @@ fn app(props: &AppProps) -> Html {
                 let Some(ws_base) = app_router::default_ws_base() else {
                     return cleanup;
                 };
-                let url = app_router::build_room_admin_ws_url(&ws_base, room_id, token);
-                admin_socket.borrow_mut().ensure_connected(url);
+                admin_socket
+                    .borrow_mut()
+                    .ensure_connected(ws_base, room_id.clone(), token.to_string());
                 cleanup
             },
         );
@@ -2167,7 +2211,7 @@ fn app(props: &AppProps) -> Html {
             let Some(ws_base) = app_router::default_ws_base() else {
                 return;
             };
-            let url = app_router::build_room_admin_ws_url(&ws_base, room_id, token);
+            let ws_base = ws_base;
             let entry = PUZZLE_ARTS
                 .get(admin_puzzle_index_value)
                 .copied()
@@ -2181,7 +2225,9 @@ fn app(props: &AppProps) -> Html {
             };
             let seed = parse_optional_seed(&admin_seed_value);
             admin_socket.borrow_mut().send(
-                url,
+                ws_base,
+                room_id.clone(),
+                token.to_string(),
                 AdminMsg::ChangePuzzle {
                     puzzle: entry.slug.to_string(),
                     pieces,
@@ -2206,11 +2252,10 @@ fn app(props: &AppProps) -> Html {
             let Some(ws_base) = app_router::default_ws_base() else {
                 return;
             };
-            let url = app_router::build_room_admin_ws_url(&ws_base, room_id, token);
             let seed = parse_optional_seed(&admin_seed_value);
             admin_socket
                 .borrow_mut()
-                .send(url, AdminMsg::Scramble { seed });
+                .send(ws_base, room_id.clone(), token.to_string(), AdminMsg::Scramble { seed });
         })
     };
     let save_revision = use_state(|| 0u32);
@@ -2610,7 +2655,7 @@ fn app(props: &AppProps) -> Html {
                 move |_room_id: String,
                       _persistence: heddobureika_core::RoomPersistence,
                       _initialized: bool,
-                      _client_id: Option<u64>| {
+                      _client_id: Option<ClientId>| {
                     bump_sync_revision();
                 },
             )
@@ -2632,7 +2677,7 @@ fn app(props: &AppProps) -> Html {
             let bump_sync_revision = bump_sync_revision.clone();
             #[cfg(test)]
             let puzzle_info = puzzle_info_store.clone();
-            Rc::new(move |_update: RoomUpdate, _seq: u64, _source: Option<u64>, _client_seq: Option<u64>| {
+            Rc::new(move |_update: RoomUpdate, _seq: u64, _source: Option<ClientId>, _client_seq: Option<u64>| {
                 #[cfg(test)]
                 {
                     if puzzle_info.get().is_none() {
@@ -2649,7 +2694,7 @@ fn app(props: &AppProps) -> Html {
             let drag_frame = drag_frame.clone();
             let dragging_members = dragging_members.clone();
             let active_id = active_id.clone();
-            Rc::new(move |anchor_id: u32, owner: Option<u64>| {
+            Rc::new(move |anchor_id: u32, owner: Option<ClientId>| {
                 if let Some(my_id) = sync_runtime::sync_view().client_id() {
                     if owner != Some(my_id) {
                         let should_cancel = drag_state
@@ -2979,16 +3024,58 @@ fn app(props: &AppProps) -> Html {
             save_ws_delay_value(WS_DELAY_JITTER_KEY, &value);
         })
     };
-    let on_workspace_scale = {
-        let workspace_scale = workspace_scale.clone();
+    let on_identity_reset = Callback::from(move |_: MouseEvent| {
+        spawn_local(async {
+            if let Err(err) = multiplayer_identity::reset_identity().await {
+                gloo::console::warn!("failed to reset identity", err);
+            }
+        });
+    });
+    let on_workspace_padding_ratio = {
+        let workspace_padding_ratio = workspace_padding_ratio.clone();
         let app_core = app_core.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
-                let value = value.clamp(WORKSPACE_SCALE_MIN, WORKSPACE_SCALE_MAX);
-                workspace_scale.set(value);
-                app_core.set_workspace_scale(value);
+                let value = value.clamp(
+                    WORKSPACE_PADDING_RATIO_MIN,
+                    WORKSPACE_PADDING_RATIO_MAX,
+                );
+                workspace_padding_ratio.set(value);
+                app_core.set_workspace_padding_ratio(value);
             }
+        })
+    };
+    let on_zoom_in = {
+        let app_core = app_core.clone();
+        let app_snapshot = app_snapshot.clone();
+        Callback::from(move |_: MouseEvent| {
+            let view = (*app_snapshot).view;
+            let center_x = view.min_x + view.width * 0.5;
+            let center_y = view.min_y + view.height * 0.5;
+            app_core.zoom_view_at(1.1, center_x, center_y);
+        })
+    };
+    let on_zoom_out = {
+        let app_core = app_core.clone();
+        let app_snapshot = app_snapshot.clone();
+        Callback::from(move |_: MouseEvent| {
+            let view = (*app_snapshot).view;
+            let center_x = view.min_x + view.width * 0.5;
+            let center_y = view.min_y + view.height * 0.5;
+            app_core.zoom_view_at(1.0 / 1.1, center_x, center_y);
+        })
+    };
+    let on_fit_workspace = {
+        let app_core = app_core.clone();
+        Callback::from(move |_: MouseEvent| {
+            app_core.reset_view_to_fit();
+        })
+    };
+    let on_fit_frame = {
+        let app_core = app_core.clone();
+        Callback::from(move |_: MouseEvent| {
+            app_core.fit_view_to_frame();
         })
     };
     let on_frame_snap = {
@@ -3415,7 +3502,7 @@ fn app(props: &AppProps) -> Html {
                 image_revision_value,
                 grid,
                 settings_value.clone(),
-                workspace_scale_value,
+                workspace_padding_ratio_value,
                 image_max_dim,
                 depth_cap,
                 curve_detail,
@@ -3429,8 +3516,8 @@ fn app(props: &AppProps) -> Html {
                 _image_revision_value,
                 grid,
                 settings_value,
-                workspace_scale_value,
-                image_max_dim,
+                workspace_padding_ratio_value,
+                _image_max_dim,
                 depth_cap,
                 curve_detail,
                 theme_mode_value,
@@ -3465,8 +3552,7 @@ fn app(props: &AppProps) -> Html {
                     let layout = compute_workspace_layout(
                         width_f,
                         height_f,
-                        *workspace_scale_value,
-                        *image_max_dim as f32,
+                        *workspace_padding_ratio_value,
                     );
                     let view_width = layout.view_width;
                     let view_height = layout.view_height;
@@ -3680,7 +3766,7 @@ fn app(props: &AppProps) -> Html {
             show_svg,
             puzzle_dims: puzzle_dims_value,
             grid,
-            workspace_scale: workspace_scale_value,
+            workspace_padding_ratio: workspace_padding_ratio_value,
             image_max_dim,
             theme_mode: theme_mode_value,
             solved: solved_value,
@@ -3721,8 +3807,7 @@ fn app(props: &AppProps) -> Html {
                 let layout = compute_workspace_layout(
                     width_f,
                     height_f,
-                    deps.workspace_scale,
-                    deps.image_max_dim as f32,
+                    deps.workspace_padding_ratio,
                 );
                 let cols = deps.grid.cols as usize;
                 let rows = deps.grid.rows as usize;
@@ -7523,6 +7608,7 @@ fn app(props: &AppProps) -> Html {
                         UiTextId::Progress => "ui-text ui-progress",
                         UiTextId::Credit => "ui-text ui-credit",
                         UiTextId::Success => "ui-text ui-success",
+                        UiTextId::Debug => "ui-text ui-debug",
                         UiTextId::MenuTitle => "ui-text ui-menu-title",
                         UiTextId::MenuSubtitle => "ui-text ui-menu-sub",
                     };
@@ -8055,6 +8141,15 @@ fn app(props: &AppProps) -> Html {
                     oninput={on_ws_delay_jitter_input}
                 />
             </div>
+            <div class="control">
+                <button
+                    class="control-button"
+                    type="button"
+                    onclick={on_identity_reset}
+                >
+                    { "Reset identity" }
+                </button>
+            </div>
         </>
     };
     let graphics_controls = html! {
@@ -8237,19 +8332,53 @@ fn app(props: &AppProps) -> Html {
     let rules_controls = html! {
         <>
             <div class="control">
-                <label for="workspace-scale">
-                    { "Workspace scale" }
-                    <span class="control-value">{ fmt_f32(workspace_scale_value) }</span>
+                <label for="workspace-padding">
+                    { "Workspace padding" }
+                    <span class="control-value">{ workspace_padding_label }</span>
                 </label>
                 <input
-                    id="workspace-scale"
+                    id="workspace-padding"
                     type="range"
-                    min={WORKSPACE_SCALE_MIN.to_string()}
-                    max={WORKSPACE_SCALE_MAX.to_string()}
+                    min={WORKSPACE_PADDING_RATIO_MIN.to_string()}
+                    max={WORKSPACE_PADDING_RATIO_MAX.to_string()}
                     step="0.05"
-                    value={workspace_scale_value.to_string()}
-                    oninput={on_workspace_scale}
+                    value={workspace_padding_ratio_value.to_string()}
+                    oninput={on_workspace_padding_ratio}
                 />
+            </div>
+            <div class="control">
+                <button
+                    class="control-button"
+                    type="button"
+                    onclick={on_zoom_in}
+                    disabled={view_controls_disabled}
+                >
+                    { "Zoom in" }
+                </button>
+                <button
+                    class="control-button"
+                    type="button"
+                    onclick={on_zoom_out}
+                    disabled={view_controls_disabled}
+                >
+                    { "Zoom out" }
+                </button>
+                <button
+                    class="control-button"
+                    type="button"
+                    onclick={on_fit_workspace}
+                    disabled={view_controls_disabled}
+                >
+                    { "Fit workspace" }
+                </button>
+                <button
+                    class="control-button"
+                    type="button"
+                    onclick={on_fit_frame}
+                    disabled={view_controls_disabled}
+                >
+                    { "Fit frame" }
+                </button>
             </div>
             <div class="control">
                 <label for="frame-snap">

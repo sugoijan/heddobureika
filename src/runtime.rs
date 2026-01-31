@@ -10,7 +10,7 @@ use crate::local_snapshot::{
     apply_game_snapshot_to_core, build_game_snapshot_from_app, load_local_snapshot,
     save_local_snapshot, ApplySnapshotResult,
 };
-use heddobureika_core::RoomPersistence;
+use heddobureika_core::{ClientId, RoomPersistence};
 
 #[derive(Clone, Debug)]
 pub enum SyncAction {
@@ -69,11 +69,11 @@ pub struct SyncHooks {
 pub trait GameSyncView {
     fn mode(&self) -> InitMode;
     fn connected(&self) -> bool;
-    fn client_id(&self) -> Option<u64>;
+    fn client_id(&self) -> Option<ClientId>;
     fn init_required(&self) -> bool;
     fn room_id(&self) -> Option<&str>;
     fn persistence(&self) -> Option<RoomPersistence>;
-    fn ownership_by_anchor(&self) -> Rc<HashMap<u32, u64>>;
+    fn ownership_by_anchor(&self) -> Rc<HashMap<u32, ClientId>>;
 }
 
 #[allow(dead_code)]
@@ -81,11 +81,11 @@ pub trait GameSyncView {
 pub struct SyncView {
     mode: InitMode,
     connected: bool,
-    client_id: Option<u64>,
+    client_id: Option<ClientId>,
     init_required: bool,
     room_id: Option<String>,
     persistence: Option<RoomPersistence>,
-    ownership_by_anchor: Rc<HashMap<u32, u64>>,
+    ownership_by_anchor: Rc<HashMap<u32, ClientId>>,
 }
 
 impl Default for SyncView {
@@ -107,11 +107,11 @@ impl SyncView {
     pub(crate) fn new(
         mode: InitMode,
         connected: bool,
-        client_id: Option<u64>,
+        client_id: Option<ClientId>,
         init_required: bool,
         room_id: Option<String>,
         persistence: Option<RoomPersistence>,
-        ownership_by_anchor: Rc<HashMap<u32, u64>>,
+        ownership_by_anchor: Rc<HashMap<u32, ClientId>>,
     ) -> Self {
         Self {
             mode,
@@ -132,7 +132,7 @@ impl SyncView {
         self.connected
     }
 
-    pub fn client_id(&self) -> Option<u64> {
+    pub fn client_id(&self) -> Option<ClientId> {
         self.client_id
     }
 
@@ -148,7 +148,7 @@ impl SyncView {
         self.persistence
     }
 
-    pub fn ownership_by_anchor(&self) -> Rc<HashMap<u32, u64>> {
+    pub fn ownership_by_anchor(&self) -> Rc<HashMap<u32, ClientId>> {
         self.ownership_by_anchor.clone()
     }
 }
@@ -162,7 +162,7 @@ impl GameSyncView for SyncView {
         self.connected()
     }
 
-    fn client_id(&self) -> Option<u64> {
+    fn client_id(&self) -> Option<ClientId> {
         self.client_id()
     }
 
@@ -178,7 +178,7 @@ impl GameSyncView for SyncView {
         self.persistence()
     }
 
-    fn ownership_by_anchor(&self) -> Rc<HashMap<u32, u64>> {
+    fn ownership_by_anchor(&self) -> Rc<HashMap<u32, ClientId>> {
         self.ownership_by_anchor()
     }
 }

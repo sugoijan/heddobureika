@@ -9,6 +9,7 @@ pub(crate) enum UiTextId {
     Progress,
     Credit,
     Success,
+    Debug,
     MenuTitle,
     MenuSubtitle,
 }
@@ -170,6 +171,10 @@ impl WgpuRenderer {
     }
 
     pub(crate) fn set_show_fps(&mut self, _value: bool) {}
+
+    pub(crate) fn backend_label(&self) -> &'static str {
+        "Unavailable"
+    }
 
     pub(crate) fn force_fps_fallback(&mut self) {}
 
