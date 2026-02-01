@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
+use gloo::render::{request_animation_frame, AnimationFrame};
 use gloo::timers::callback::Timeout;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
@@ -15,13 +16,13 @@ use web_sys::{
     MouseEvent, Touch, TouchEvent, WheelEvent,
 };
 
-use crate::app_core::{AppCore, AppSnapshot, ViewRect};
+use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
 use crate::sync_runtime;
 use crate::core::*;
 use crate::renderer::{
-    build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
-    UiTextId, UiTextSpec, WgpuRenderer,
+    build_mask_atlas, ui_icon_uv, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiIconId,
+    UiRotationOrigin, UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
 use heddobureika_core::{ClientId, PuzzleInfo};
@@ -56,6 +57,22 @@ const OUTLINE_KIND_OWNED: f32 = 2.0;
 const OUTLINE_KIND_DEBUG: f32 = 3.0;
 const WGPU_FPS_CAP_DEFAULT: f32 = 60.0;
 const WGPU_FPS_IDLE_RESET_MS: f32 = 800.0;
+const PREVIEW_BOX_WIDTH: f32 = 170.0;
+const PREVIEW_BOX_MIN_WIDTH: f32 = 120.0;
+const PREVIEW_BOX_MAX_FRAC: f32 = 0.28;
+const PREVIEW_BOX_PADDING: f32 = 8.0;
+const PREVIEW_BOX_MARGIN: f32 = 16.0;
+const PREVIEW_PANEL_RADIUS: f32 = 12.0;
+const PREVIEW_PANEL_BORDER: f32 = 1.0;
+const PREVIEW_TOGGLE_SIZE: f32 = 44.0;
+const PREVIEW_TOGGLE_ICON_SIZE: f32 = 24.0;
+const PREVIEW_ARROW_SIZE: f32 = 22.0;
+const PREVIEW_ARROW_ICON_SIZE: f32 = 12.0;
+const PREVIEW_ARROW_OFFSET: f32 = 8.0;
+const PREVIEW_HOVER_SCALE: f32 = 2.0;
+const PREVIEW_HIDDEN_BLUR_PX: f32 = 6.0;
+const PREVIEW_HIDDEN_OPACITY: f32 = 0.6;
+const PREVIEW_ANIM_SPEED: f32 = 12.0;
 
 #[derive(Clone, Copy)]
 struct UiHitbox {
@@ -83,6 +100,92 @@ struct TouchDragGate {
     moved: bool,
 }
 
+#[derive(Clone, Copy)]
+struct AutoPanRect {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+}
+
+impl AutoPanRect {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+}
+
+struct AutoPanZones {
+    outer: AutoPanRect,
+    inner: AutoPanRect,
+    outer_inset: f32,
+    inner_inset: f32,
+}
+
+struct AutoPanState {
+    active: bool,
+    seen_inner: bool,
+    has_pointer: bool,
+    last_screen_x: f32,
+    last_screen_y: f32,
+    last_tick_ms: Option<f64>,
+    frame: Option<AnimationFrame>,
+}
+
+impl AutoPanState {
+    fn new() -> Self {
+        Self {
+            active: false,
+            seen_inner: false,
+            has_pointer: false,
+            last_screen_x: 0.0,
+            last_screen_y: 0.0,
+            last_tick_ms: None,
+            frame: None,
+        }
+    }
+}
+
+struct DebugOverlay {
+    root: Element,
+    outer: Element,
+    inner: Element,
+}
+
+impl DebugOverlay {
+    fn new(document: &Document) -> Self {
+        let root = document
+            .create_element("div")
+            .expect("create debug overlay root");
+        root.set_class_name("debug-rect-overlay");
+        let outer = document
+            .create_element("div")
+            .expect("create debug outer rect");
+        outer.set_class_name("debug-rect debug-rect-outer");
+        let inner = document
+            .create_element("div")
+            .expect("create debug inner rect");
+        inner.set_class_name("debug-rect debug-rect-inner");
+        let _ = root.append_child(&outer);
+        let _ = root.append_child(&inner);
+        Self { root, outer, inner }
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            let _ = self.root.remove_attribute("style");
+        } else {
+            let _ = self.root.set_attribute("style", "display: none;");
+        }
+    }
+
+    fn set_insets(&self, outer_inset: f32, inner_inset: f32) {
+        let outer_style = format!("inset: {}px;", fmt_f32(outer_inset));
+        let inner_style = format!("inset: {}px;", fmt_f32(inner_inset));
+        let _ = self.outer.set_attribute("style", &outer_style);
+        let _ = self.inner.set_attribute("style", &inner_style);
+    }
+}
+
 struct GlyphonMeasureState {
     font_system: FontSystem,
 }
@@ -103,192 +206,70 @@ enum PreviewCorner {
     TopRight,
 }
 
-struct PreviewOverlay {
-    root: Element,
-    img: HtmlImageElement,
-    toggle: Element,
-    arrow_h: Element,
-    arrow_v: Element,
-    slash: Element,
-    corner: Cell<PreviewCorner>,
-    revealed: Cell<bool>,
-    listeners: RefCell<Vec<EventListener>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewHoverTarget {
+    None,
+    Box,
+    Toggle,
+    ArrowH,
+    ArrowV,
+    Image,
 }
 
-impl PreviewOverlay {
-    fn new(document: &Document) -> Rc<Self> {
-        let root = document
-            .create_element("aside")
-            .expect("create preview root");
-        let toggle = document
-            .create_element("button")
-            .expect("create preview toggle");
-        toggle.set_class_name("preview-toggle");
-        let _ = toggle.set_attribute("type", "button");
-        let _ = toggle.set_attribute("aria-label", "Show preview");
-        let _ = toggle.set_attribute("aria-pressed", "false");
-        toggle.set_inner_html(
-            r#"<svg class="preview-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
-  <path class="preview-toggle-eye" d="M2 12c2.4-4.2 5.8-6.4 10-6.4s7.6 2.2 10 6.4c-2.4 4.2-5.8 6.4-10 6.4S4.4 16.2 2 12z"/>
-  <circle class="preview-toggle-pupil" cx="12" cy="12" r="3.2"/>
-  <line class="preview-toggle-slash" x1="5" y1="19" x2="19" y2="5"/>
-</svg>"#,
-        );
-        let slash = toggle
-            .query_selector(".preview-toggle-slash")
-            .ok()
-            .flatten()
-            .expect("preview toggle slash");
-        let arrow_h = document
-            .create_element("button")
-            .expect("create preview arrow");
-        let _ = arrow_h.set_attribute("type", "button");
-        let _ = arrow_h.set_attribute("aria-label", "Move preview horizontally");
-        arrow_h.set_inner_html(
-            r#"<svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
-  <polyline points="4,2 8,6 4,10" />
-</svg>"#,
-        );
-        let arrow_v = document
-            .create_element("button")
-            .expect("create preview arrow");
-        let _ = arrow_v.set_attribute("type", "button");
-        let _ = arrow_v.set_attribute("aria-label", "Move preview vertically");
-        arrow_v.set_inner_html(
-            r#"<svg class="preview-arrow-icon" viewBox="0 0 12 12" aria-hidden="true">
-  <polyline points="4,2 8,6 4,10" />
-</svg>"#,
-        );
-        let img = HtmlImageElement::new().expect("create preview img");
-        img.set_alt("preview");
-        let _ = root.append_child(&toggle);
-        let _ = root.append_child(&arrow_h);
-        let _ = root.append_child(&arrow_v);
-        let _ = root.append_child(&img);
-        let overlay = Rc::new(Self {
-            root,
-            img,
-            toggle,
-            arrow_h,
-            arrow_v,
-            slash,
-            corner: Cell::new(PreviewCorner::BottomLeft),
-            revealed: Cell::new(false),
-            listeners: RefCell::new(Vec::new()),
-        });
-        overlay.update_classes();
-        overlay.install_listeners();
-        overlay
+#[derive(Clone, Copy, Debug)]
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl Rect {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
     }
 
-    fn install_listeners(self: &Rc<Self>) {
-        let mut listeners = Vec::new();
-        let overlay = Rc::clone(self);
-        listeners.push(EventListener::new(&self.toggle, "click", move |_event| {
-            overlay.toggle_revealed();
-        }));
-        let overlay = Rc::clone(self);
-        listeners.push(EventListener::new(&self.arrow_h, "click", move |_event| {
-            overlay.bump_horizontal();
-        }));
-        let overlay = Rc::clone(self);
-        listeners.push(EventListener::new(&self.arrow_v, "click", move |_event| {
-            overlay.bump_vertical();
-        }));
-        let overlay = Rc::clone(self);
-        listeners.push(EventListener::new(&self.img, "click", move |_event| {
-            overlay.hide_if_revealed();
-        }));
-        *self.listeners.borrow_mut() = listeners;
-    }
-
-    fn set_image_src(&self, src: &str) {
-        self.img.set_src(src);
-    }
-
-    fn set_visible(&self, visible: bool) {
-        if visible {
-            let _ = self.root.remove_attribute("style");
-        } else {
-            let _ = self.root.set_attribute("style", "display: none;");
+    fn inset(&self, inset: f32) -> Self {
+        let inset = inset.max(0.0);
+        let w = (self.w - inset * 2.0).max(0.0);
+        let h = (self.h - inset * 2.0).max(0.0);
+        Self {
+            x: self.x + inset,
+            y: self.y + inset,
+            w,
+            h,
         }
     }
 
-    fn toggle_revealed(&self) {
-        let next = !self.revealed.get();
-        self.revealed.set(next);
-        self.update_classes();
+    fn center(&self) -> [f32; 2] {
+        [self.x + self.w * 0.5, self.y + self.h * 0.5]
     }
+}
 
-    fn hide_if_revealed(&self) {
-        if self.revealed.get() {
-            self.revealed.set(false);
-            self.update_classes();
-        }
-    }
+struct PreviewLayout {
+    box_rect: Rect,
+    image_rect: Rect,
+    toggle_rect: Rect,
+    toggle_icon_rect: Rect,
+    arrow_h_rect: Rect,
+    arrow_h_icon_rect: Rect,
+    arrow_v_rect: Rect,
+    arrow_v_icon_rect: Rect,
+    arrow_h_rotation: f32,
+    arrow_v_rotation: f32,
+    scale: f32,
+    anchor: [f32; 2],
+}
 
-    fn bump_horizontal(&self) {
-        let next = match self.corner.get() {
-            PreviewCorner::BottomLeft => PreviewCorner::BottomRight,
-            PreviewCorner::BottomRight => PreviewCorner::BottomLeft,
-            PreviewCorner::TopLeft => PreviewCorner::TopRight,
-            PreviewCorner::TopRight => PreviewCorner::TopLeft,
-        };
-        self.corner.set(next);
-        self.update_classes();
-    }
-
-    fn bump_vertical(&self) {
-        let next = match self.corner.get() {
-            PreviewCorner::BottomLeft => PreviewCorner::TopLeft,
-            PreviewCorner::BottomRight => PreviewCorner::TopRight,
-            PreviewCorner::TopLeft => PreviewCorner::BottomLeft,
-            PreviewCorner::TopRight => PreviewCorner::BottomRight,
-        };
-        self.corner.set(next);
-        self.update_classes();
-    }
-
-    fn update_classes(&self) {
-        let (corner_class, arrow_h_class, arrow_v_class) = match self.corner.get() {
-            PreviewCorner::BottomLeft => (
-                "corner-bl",
-                "preview-arrow preview-arrow-right",
-                "preview-arrow preview-arrow-up",
-            ),
-            PreviewCorner::BottomRight => (
-                "corner-br",
-                "preview-arrow preview-arrow-left",
-                "preview-arrow preview-arrow-up",
-            ),
-            PreviewCorner::TopLeft => (
-                "corner-tl",
-                "preview-arrow preview-arrow-right",
-                "preview-arrow preview-arrow-down",
-            ),
-            PreviewCorner::TopRight => (
-                "corner-tr",
-                "preview-arrow preview-arrow-left",
-                "preview-arrow preview-arrow-down",
-            ),
-        };
-        let state_class = if self.revealed.get() {
-            "preview-revealed"
-        } else {
-            "preview-hidden"
-        };
-        self.root.set_class_name(&format!("preview-box {} {}", corner_class, state_class));
-        self.arrow_h.set_class_name(arrow_h_class);
-        self.arrow_v.set_class_name(arrow_v_class);
-        let (label, pressed, slash_display) = if self.revealed.get() {
-            ("Hide preview", "true", "block")
-        } else {
-            ("Show preview", "false", "none")
-        };
-        let _ = self.toggle.set_attribute("aria-label", label);
-        let _ = self.toggle.set_attribute("aria-pressed", pressed);
-        let _ = self.slash.set_attribute("style", &format!("display: {slash_display};"));
-    }
+struct PreviewColors {
+    panel_bg: [f32; 4],
+    panel_border: [f32; 4],
+    toggle_bg: [f32; 4],
+    toggle_border: [f32; 4],
+    toggle_icon: [f32; 4],
+    arrow_bg: [f32; 4],
+    arrow_border: [f32; 4],
+    arrow_icon: [f32; 4],
 }
 
 thread_local! {
@@ -362,9 +343,9 @@ pub(crate) fn run() {
         root.append_child(&sync_status).ok();
 
         let view = Rc::new(WgpuView::new(core.clone(), root.clone(), canvas));
-        let preview = PreviewOverlay::new(&document);
-        root.append_child(&preview.root).ok();
-        *view.preview.borrow_mut() = Some(preview);
+        let debug_overlay = DebugOverlay::new(&document);
+        root.append_child(&debug_overlay.root).ok();
+        *view.debug_overlay.borrow_mut() = Some(debug_overlay);
         *view.sync_hook.borrow_mut() = Some(sync_runtime::register_sync_view_hook(Rc::new(
             move || {
                 request_render();
@@ -418,6 +399,7 @@ struct WgpuView {
     pan_state: RefCell<Option<PanState>>,
     pinch_state: RefCell<Option<PinchState>>,
     touch_drag_gate: RefCell<Option<TouchDragGate>>,
+    auto_pan: RefCell<AutoPanState>,
     pending_snapshot: RefCell<Option<AppSnapshot>>,
     render_timer: RefCell<Option<Timeout>>,
     idle_fps_timer: RefCell<Option<Timeout>>,
@@ -432,7 +414,16 @@ struct WgpuView {
     last_puzzle: RefCell<Option<PuzzleKey>>,
     hooks: RefCell<Option<ViewHooks>>,
     sync_hook: RefCell<Option<sync_runtime::SyncViewHookHandle>>,
-    preview: RefCell<Option<Rc<PreviewOverlay>>>,
+    preview_corner: Cell<PreviewCorner>,
+    preview_revealed: Cell<bool>,
+    preview_hover: Cell<PreviewHoverTarget>,
+    preview_scale: Cell<f32>,
+    preview_target_scale: Cell<f32>,
+    preview_blur: Cell<f32>,
+    preview_target_blur: Cell<f32>,
+    preview_anim_last_ms: Cell<f32>,
+    pending_ui_overlay: RefCell<Option<Vec<UiSpriteSpec>>>,
+    debug_overlay: RefCell<Option<DebugOverlay>>,
 }
 
 impl WgpuView {
@@ -453,6 +444,7 @@ impl WgpuView {
             pan_state: RefCell::new(None),
             pinch_state: RefCell::new(None),
             touch_drag_gate: RefCell::new(None),
+            auto_pan: RefCell::new(AutoPanState::new()),
             pending_snapshot: RefCell::new(None),
             render_timer: RefCell::new(None),
             idle_fps_timer: RefCell::new(None),
@@ -467,7 +459,16 @@ impl WgpuView {
             last_puzzle: RefCell::new(None),
             hooks: RefCell::new(None),
             sync_hook: RefCell::new(None),
-            preview: RefCell::new(None),
+            preview_corner: Cell::new(PreviewCorner::BottomLeft),
+            preview_revealed: Cell::new(false),
+            preview_hover: Cell::new(PreviewHoverTarget::None),
+            preview_scale: Cell::new(1.0),
+            preview_target_scale: Cell::new(1.0),
+            preview_blur: Cell::new(PREVIEW_HIDDEN_BLUR_PX),
+            preview_target_blur: Cell::new(PREVIEW_HIDDEN_BLUR_PX),
+            preview_anim_last_ms: Cell::new(0.0),
+            pending_ui_overlay: RefCell::new(None),
+            debug_overlay: RefCell::new(None),
         }
     }
 
@@ -487,6 +488,7 @@ impl WgpuView {
         self.mask_atlas.borrow_mut().take();
         self.pending_instances.borrow_mut().take();
         self.pending_ui.borrow_mut().take();
+        self.pending_ui_overlay.borrow_mut().take();
         *self.image.borrow_mut() = None;
     }
 
@@ -665,6 +667,22 @@ impl WgpuView {
                 return;
             }
             let snapshot = core.snapshot();
+            let rect = canvas_for_down.get_bounding_client_rect();
+            let local_x = event.client_x() as f32 - rect.left() as f32;
+            let local_y = event.client_y() as f32 - rect.top() as f32;
+            if let Some(layout) = view.preview_layout(&snapshot, &rect) {
+                let target = view.preview_hit_test(&layout, local_x, local_y);
+                if target != PreviewHoverTarget::None {
+                    if view.set_preview_hover(target) {
+                        view.request_render();
+                    }
+                    view.handle_preview_action(target);
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                    event.prevent_default();
+                    return;
+                }
+            }
             let Some((view_x, view_y)) =
                 event_to_canvas_coords(event, &canvas_for_down, snapshot.view)
             else {
@@ -687,6 +705,8 @@ impl WgpuView {
                     right_click,
                     touch_id: None,
                 });
+                let drag_snapshot = view.core.snapshot();
+                view.update_auto_pan(event.client_x() as f32, event.client_y() as f32, &drag_snapshot);
                 event.prevent_default();
                 return;
             }
@@ -792,10 +812,33 @@ impl WgpuView {
                 return;
             };
             let snapshot = core.snapshot();
-            if !snapshot.dragging_members.is_empty() {
+            if !snapshot.dragging_members.is_empty() || view.pan_state.borrow().is_some() {
+                if view.set_preview_hover(PreviewHoverTarget::None) {
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                    view.request_render();
+                }
                 return;
             }
-            if view.pan_state.borrow().is_some() {
+            let rect = canvas_for_move.get_bounding_client_rect();
+            let local_x = event.client_x() as f32 - rect.left() as f32;
+            let local_y = event.client_y() as f32 - rect.top() as f32;
+            let mut preview_target = PreviewHoverTarget::None;
+            if let Some(layout) = view.preview_layout(&snapshot, &rect) {
+                preview_target = view.preview_hit_test(&layout, local_x, local_y);
+            }
+            if view.set_preview_hover(preview_target) {
+                let sync_view = sync_runtime::sync_view();
+                view.update_canvas_class(&snapshot, &sync_view);
+                view.request_render();
+            }
+            if preview_target != PreviewHoverTarget::None {
+                if view.ui_credit_hovered.get() {
+                    view.ui_credit_hovered.set(false);
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                }
+                view.dispatch_action(CoreAction::SetHovered { hovered: None });
                 return;
             }
             let Some((view_x, view_y)) =
@@ -833,6 +876,9 @@ impl WgpuView {
         let core_for_leave = self.core.clone();
         let listener = EventListener::new(&canvas, "mouseleave", move |_event: &Event| {
             view.ui_credit_hovered.set(false);
+            if view.set_preview_hover(PreviewHoverTarget::None) {
+                view.request_render();
+            }
             let snapshot = core_for_leave.snapshot();
             let sync_view = sync_runtime::sync_view();
             view.update_canvas_class(&snapshot, &sync_view);
@@ -892,6 +938,19 @@ impl WgpuView {
             };
             let screen_x = touch.client_x() as f32;
             let screen_y = touch.client_y() as f32;
+            let rect = canvas_for_touch.get_bounding_client_rect();
+            let local_x = screen_x - rect.left() as f32;
+            let local_y = screen_y - rect.top() as f32;
+            if let Some(layout) = view.preview_layout(&snapshot, &rect) {
+                let target = view.preview_hit_test(&layout, local_x, local_y);
+                if target != PreviewHoverTarget::None {
+                    view.handle_preview_action(target);
+                    let sync_view = sync_runtime::sync_view();
+                    view.update_canvas_class(&snapshot, &sync_view);
+                    event.prevent_default();
+                    return;
+                }
+            }
             let Some((view_x, view_y)) =
                 screen_to_view_coords(screen_x, screen_y, &canvas_for_touch, snapshot.view)
             else {
@@ -918,6 +977,12 @@ impl WgpuView {
                     right_click: false,
                     touch_id: Some(touch.identifier()),
                 });
+                let drag_snapshot = view.core.snapshot();
+                view.update_auto_pan(
+                    touch.client_x() as f32,
+                    touch.client_y() as f32,
+                    &drag_snapshot,
+                );
                 event.prevent_default();
                 return;
             }
@@ -957,6 +1022,7 @@ impl WgpuView {
                 };
                 let snapshot = core.snapshot();
                 if !snapshot.dragging_members.is_empty() {
+                    view.update_auto_pan(event.client_x() as f32, event.client_y() as f32, &snapshot);
                     let Some((view_x, view_y)) =
                         event_to_canvas_coords(event, &canvas_for_drag, snapshot.view)
                     else {
@@ -1003,6 +1069,7 @@ impl WgpuView {
                 };
                 let snapshot = core.snapshot();
                 view.touch_drag_gate.borrow_mut().take();
+                view.stop_auto_pan();
                 let mut pan_cleared = false;
                 if view.pan_state.borrow().is_some() {
                     view.pan_state.borrow_mut().take();
@@ -1176,6 +1243,13 @@ impl WgpuView {
                         }
                     }
                 }
+                if let Some(touch) = touch_from_event(event, snapshot.drag_touch_id, false) {
+                    view.update_auto_pan(
+                        touch.client_x() as f32,
+                        touch.client_y() as f32,
+                        &snapshot,
+                    );
+                }
                 view.dispatch_action(CoreAction::DragMove { x: px, y: py });
                 event.prevent_default();
             },
@@ -1197,6 +1271,7 @@ impl WgpuView {
                 };
                 let snapshot = core.snapshot();
                 view.touch_drag_gate.borrow_mut().take();
+                view.stop_auto_pan();
                 let mut cleared = false;
                 if let Some(pinch) = view.pinch_state.borrow_mut().take() {
                     let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
@@ -1247,6 +1322,7 @@ impl WgpuView {
                 view.pan_state.borrow_mut().take();
                 view.pinch_state.borrow_mut().take();
                 view.touch_drag_gate.borrow_mut().take();
+                view.stop_auto_pan();
                 let snapshot = core.snapshot();
                 let sync_view = sync_runtime::sync_view();
                 view.update_canvas_class(&snapshot, &sync_view);
@@ -1331,6 +1407,7 @@ impl WgpuView {
     fn update_canvas_class(&self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
         let mut canvas_class = "puzzle-canvas".to_string();
         let is_panning = self.pan_state.borrow().is_some();
+        let preview_hovered = self.preview_hover.get() != PreviewHoverTarget::None;
         if is_panning {
             canvas_class.push_str(" panning");
         }
@@ -1339,7 +1416,7 @@ impl WgpuView {
         } else if !is_panning {
             if snapshot.hovered_id.is_some() {
                 canvas_class.push_str(" hover");
-            } else if !self.ui_credit_hovered.get() {
+            } else if !self.ui_credit_hovered.get() && !preview_hovered {
                 canvas_class.push_str(" pan-ready");
             }
         }
@@ -1348,10 +1425,720 @@ impl WgpuView {
                 canvas_class.push_str(" owned-other");
             }
         }
-        if self.ui_credit_hovered.get() {
+        if self.ui_credit_hovered.get() || preview_hovered {
             canvas_class.push_str(" ui-link-hover");
         }
         self.canvas.set_class_name(&canvas_class);
+    }
+
+    fn update_preview_animation(&self, now_ms: f32) -> bool {
+        let target_scale = self.preview_target_scale.get();
+        let target_blur = self.preview_target_blur.get();
+        let mut scale = self.preview_scale.get();
+        let mut blur = self.preview_blur.get();
+        if (scale - target_scale).abs() <= 0.001 && (blur - target_blur).abs() <= 0.01 {
+            self.preview_scale.set(target_scale);
+            self.preview_blur.set(target_blur);
+            self.preview_anim_last_ms.set(now_ms);
+            return false;
+        }
+        let last = self.preview_anim_last_ms.get();
+        let dt = if last > 0.0 {
+            ((now_ms - last).max(0.0)) / 1000.0
+        } else {
+            0.0
+        };
+        self.preview_anim_last_ms.set(now_ms);
+        let t = 1.0 - (-PREVIEW_ANIM_SPEED * dt).exp();
+        if t.is_finite() && t > 0.0 {
+            scale += (target_scale - scale) * t;
+            blur += (target_blur - blur) * t;
+        }
+        if (scale - target_scale).abs() <= 0.001 {
+            scale = target_scale;
+        }
+        if (blur - target_blur).abs() <= 0.01 {
+            blur = target_blur;
+        }
+        self.preview_scale.set(scale);
+        self.preview_blur.set(blur);
+        (scale - target_scale).abs() > 0.001 || (blur - target_blur).abs() > 0.01
+    }
+
+    fn set_preview_hover(&self, target: PreviewHoverTarget) -> bool {
+        if self.preview_hover.get() == target {
+            return false;
+        }
+        self.preview_hover.set(target);
+        let next_scale = if target == PreviewHoverTarget::None {
+            1.0
+        } else {
+            PREVIEW_HOVER_SCALE
+        };
+        self.preview_target_scale.set(next_scale);
+        self.preview_anim_last_ms.set(0.0);
+        true
+    }
+
+    fn set_preview_revealed(self: &Rc<Self>, revealed: bool) {
+        if self.preview_revealed.get() == revealed {
+            return;
+        }
+        self.preview_revealed.set(revealed);
+        let target_blur = if revealed { 0.0 } else { PREVIEW_HIDDEN_BLUR_PX };
+        self.preview_target_blur.set(target_blur);
+        self.preview_anim_last_ms.set(0.0);
+        self.request_render();
+    }
+
+    fn bump_preview_horizontal(self: &Rc<Self>) {
+        let next = match self.preview_corner.get() {
+            PreviewCorner::BottomLeft => PreviewCorner::BottomRight,
+            PreviewCorner::BottomRight => PreviewCorner::BottomLeft,
+            PreviewCorner::TopLeft => PreviewCorner::TopRight,
+            PreviewCorner::TopRight => PreviewCorner::TopLeft,
+        };
+        self.preview_corner.set(next);
+        self.request_render();
+    }
+
+    fn bump_preview_vertical(self: &Rc<Self>) {
+        let next = match self.preview_corner.get() {
+            PreviewCorner::BottomLeft => PreviewCorner::TopLeft,
+            PreviewCorner::BottomRight => PreviewCorner::TopRight,
+            PreviewCorner::TopLeft => PreviewCorner::BottomLeft,
+            PreviewCorner::TopRight => PreviewCorner::BottomRight,
+        };
+        self.preview_corner.set(next);
+        self.request_render();
+    }
+
+    fn preview_layout(
+        &self,
+        snapshot: &AppSnapshot,
+        canvas_rect: &web_sys::DomRect,
+    ) -> Option<PreviewLayout> {
+        let info = snapshot.puzzle_info.as_ref()?;
+        let viewport_w = canvas_rect.width() as f32;
+        let viewport_h = canvas_rect.height() as f32;
+        if viewport_w <= 0.0 || viewport_h <= 0.0 {
+            return None;
+        }
+        let aspect = if info.image_width > 0 {
+            info.image_height as f32 / info.image_width as f32
+        } else {
+            1.0
+        };
+        let mut box_w = PREVIEW_BOX_WIDTH.min(viewport_w * PREVIEW_BOX_MAX_FRAC);
+        box_w = box_w.max(PREVIEW_BOX_MIN_WIDTH);
+        let max_box_w = (viewport_w - PREVIEW_BOX_MARGIN * 2.0).max(PREVIEW_BOX_MIN_WIDTH);
+        if box_w > max_box_w {
+            box_w = max_box_w;
+        }
+        let image_w = (box_w - PREVIEW_BOX_PADDING * 2.0).max(1.0);
+        let image_h = (image_w * aspect).max(1.0);
+        let box_h = image_h + PREVIEW_BOX_PADDING * 2.0;
+        let corner = self.preview_corner.get();
+        let base_x = match corner {
+            PreviewCorner::BottomLeft | PreviewCorner::TopLeft => PREVIEW_BOX_MARGIN,
+            PreviewCorner::BottomRight | PreviewCorner::TopRight => {
+                viewport_w - PREVIEW_BOX_MARGIN - box_w
+            }
+        };
+        let base_y = match corner {
+            PreviewCorner::BottomLeft | PreviewCorner::BottomRight => {
+                viewport_h - PREVIEW_BOX_MARGIN - box_h
+            }
+            PreviewCorner::TopLeft | PreviewCorner::TopRight => PREVIEW_BOX_MARGIN,
+        };
+        let base_box = Rect {
+            x: base_x,
+            y: base_y,
+            w: box_w,
+            h: box_h,
+        };
+        let anchor = preview_anchor(corner, base_box);
+        let scale = self.preview_scale.get().max(0.05);
+        let image_rect = Rect {
+            x: base_x + PREVIEW_BOX_PADDING,
+            y: base_y + PREVIEW_BOX_PADDING,
+            w: image_w,
+            h: image_h,
+        };
+        let toggle_rect = Rect {
+            x: base_x + (box_w - PREVIEW_TOGGLE_SIZE) * 0.5,
+            y: base_y + (box_h - PREVIEW_TOGGLE_SIZE) * 0.5,
+            w: PREVIEW_TOGGLE_SIZE,
+            h: PREVIEW_TOGGLE_SIZE,
+        };
+        let toggle_icon_rect = Rect {
+            x: toggle_rect.x + (PREVIEW_TOGGLE_SIZE - PREVIEW_TOGGLE_ICON_SIZE) * 0.5,
+            y: toggle_rect.y + (PREVIEW_TOGGLE_SIZE - PREVIEW_TOGGLE_ICON_SIZE) * 0.5,
+            w: PREVIEW_TOGGLE_ICON_SIZE,
+            h: PREVIEW_TOGGLE_ICON_SIZE,
+        };
+        let mid_x = base_x + box_w * 0.5;
+        let mid_y = base_y + box_h * 0.5;
+        let arrow_h_center_x = match corner {
+            PreviewCorner::BottomLeft | PreviewCorner::TopLeft => {
+                base_x + box_w + PREVIEW_ARROW_OFFSET
+            }
+            PreviewCorner::BottomRight | PreviewCorner::TopRight => base_x - PREVIEW_ARROW_OFFSET,
+        };
+        let arrow_v_center_y = match corner {
+            PreviewCorner::BottomLeft | PreviewCorner::BottomRight => base_y - PREVIEW_ARROW_OFFSET,
+            PreviewCorner::TopLeft | PreviewCorner::TopRight => base_y + box_h + PREVIEW_ARROW_OFFSET,
+        };
+        let arrow_h_rect = Rect {
+            x: arrow_h_center_x - PREVIEW_ARROW_SIZE * 0.5,
+            y: mid_y - PREVIEW_ARROW_SIZE * 0.5,
+            w: PREVIEW_ARROW_SIZE,
+            h: PREVIEW_ARROW_SIZE,
+        };
+        let arrow_v_rect = Rect {
+            x: mid_x - PREVIEW_ARROW_SIZE * 0.5,
+            y: arrow_v_center_y - PREVIEW_ARROW_SIZE * 0.5,
+            w: PREVIEW_ARROW_SIZE,
+            h: PREVIEW_ARROW_SIZE,
+        };
+        let arrow_h_icon_rect = Rect {
+            x: arrow_h_rect.x + (PREVIEW_ARROW_SIZE - PREVIEW_ARROW_ICON_SIZE) * 0.5,
+            y: arrow_h_rect.y + (PREVIEW_ARROW_SIZE - PREVIEW_ARROW_ICON_SIZE) * 0.5,
+            w: PREVIEW_ARROW_ICON_SIZE,
+            h: PREVIEW_ARROW_ICON_SIZE,
+        };
+        let arrow_v_icon_rect = Rect {
+            x: arrow_v_rect.x + (PREVIEW_ARROW_SIZE - PREVIEW_ARROW_ICON_SIZE) * 0.5,
+            y: arrow_v_rect.y + (PREVIEW_ARROW_SIZE - PREVIEW_ARROW_ICON_SIZE) * 0.5,
+            w: PREVIEW_ARROW_ICON_SIZE,
+            h: PREVIEW_ARROW_ICON_SIZE,
+        };
+        let (arrow_h_rotation, arrow_v_rotation) = match corner {
+            PreviewCorner::BottomLeft => (0.0, -90.0),
+            PreviewCorner::BottomRight => (180.0, -90.0),
+            PreviewCorner::TopLeft => (0.0, 90.0),
+            PreviewCorner::TopRight => (180.0, 90.0),
+        };
+        Some(PreviewLayout {
+            box_rect: scale_rect(base_box, anchor, scale),
+            image_rect: scale_rect(image_rect, anchor, scale),
+            toggle_rect: scale_rect(toggle_rect, anchor, scale),
+            toggle_icon_rect: scale_rect(toggle_icon_rect, anchor, scale),
+            arrow_h_rect: scale_rect(arrow_h_rect, anchor, scale),
+            arrow_h_icon_rect: scale_rect(arrow_h_icon_rect, anchor, scale),
+            arrow_v_rect: scale_rect(arrow_v_rect, anchor, scale),
+            arrow_v_icon_rect: scale_rect(arrow_v_icon_rect, anchor, scale),
+            arrow_h_rotation,
+            arrow_v_rotation,
+            scale,
+            anchor,
+        })
+    }
+
+    fn preview_hit_test(&self, layout: &PreviewLayout, x: f32, y: f32) -> PreviewHoverTarget {
+        let revealed = self.preview_revealed.get();
+        if !revealed && layout.toggle_rect.contains(x, y) {
+            return PreviewHoverTarget::Toggle;
+        }
+        if layout.arrow_h_rect.contains(x, y) {
+            return PreviewHoverTarget::ArrowH;
+        }
+        if layout.arrow_v_rect.contains(x, y) {
+            return PreviewHoverTarget::ArrowV;
+        }
+        if revealed && layout.image_rect.contains(x, y) {
+            return PreviewHoverTarget::Image;
+        }
+        if layout.box_rect.contains(x, y) {
+            return PreviewHoverTarget::Box;
+        }
+        PreviewHoverTarget::None
+    }
+
+    fn handle_preview_action(self: &Rc<Self>, target: PreviewHoverTarget) -> bool {
+        match target {
+            PreviewHoverTarget::Toggle => {
+                let next = !self.preview_revealed.get();
+                self.set_preview_revealed(next);
+                true
+            }
+            PreviewHoverTarget::ArrowH => {
+                self.bump_preview_horizontal();
+                true
+            }
+            PreviewHoverTarget::ArrowV => {
+                self.bump_preview_vertical();
+                true
+            }
+            PreviewHoverTarget::Image => {
+                if self.preview_revealed.get() {
+                    self.set_preview_revealed(false);
+                }
+                true
+            }
+            PreviewHoverTarget::Box => true,
+            PreviewHoverTarget::None => false,
+        }
+    }
+
+    fn build_preview_overlay_specs(
+        &self,
+        snapshot: &AppSnapshot,
+        assets: &PuzzleAssets,
+        _image: &HtmlImageElement,
+        canvas_rect: &web_sys::DomRect,
+        is_dark: bool,
+    ) -> Vec<UiSpriteSpec> {
+        let mut specs = Vec::new();
+        let Some(layout) = self.preview_layout(snapshot, canvas_rect) else {
+            return specs;
+        };
+        let view_rect = snapshot.view;
+        let view_scale_x = if canvas_rect.width() > 0.0 {
+            view_rect.width / canvas_rect.width() as f32
+        } else {
+            0.0
+        };
+        let view_scale_y = if canvas_rect.height() > 0.0 {
+            view_rect.height / canvas_rect.height() as f32
+        } else {
+            0.0
+        };
+        let view_scale = if view_scale_x > 0.0 && view_scale_y > 0.0 {
+            (view_scale_x + view_scale_y) * 0.5
+        } else {
+            0.0
+        };
+        let colors = preview_colors(is_dark);
+        let panel_radius_px = PREVIEW_PANEL_RADIUS * layout.scale;
+        let panel_border_px = PREVIEW_PANEL_BORDER * layout.scale;
+        let panel_rect_view = rect_to_view(layout.box_rect, view_rect, canvas_rect);
+        if panel_border_px > 0.0 {
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::SolidWhite,
+                panel_rect_view,
+                0.0,
+                1.0,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                colors.panel_border,
+                panel_radius_px * view_scale,
+                [0.0, 0.0],
+                0.0,
+            ));
+            let inner_rect = layout.box_rect.inset(panel_border_px);
+            let inner_view = rect_to_view(inner_rect, view_rect, canvas_rect);
+            let inner_radius = (panel_radius_px - panel_border_px).max(0.0) * view_scale;
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::SolidWhite,
+                inner_view,
+                0.0,
+                1.0,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                colors.panel_bg,
+                inner_radius,
+                [0.0, 0.0],
+                0.0,
+            ));
+        } else {
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::SolidWhite,
+                panel_rect_view,
+                0.0,
+                1.0,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                colors.panel_bg,
+                panel_radius_px * view_scale,
+                [0.0, 0.0],
+                0.0,
+            ));
+        }
+
+        let puzzle_width = assets.piece_width * assets.grid.cols as f32;
+        let puzzle_corner = preview_corner_radius(assets.piece_width, assets.piece_height);
+        let image_scale = if puzzle_width > 0.0 {
+            layout.image_rect.w / puzzle_width
+        } else {
+            0.0
+        };
+        let image_radius_px = puzzle_corner * image_scale;
+        let image_rect_view = rect_to_view(layout.image_rect, view_rect, canvas_rect);
+        let revealed = self.preview_revealed.get();
+        let base_opacity = if revealed { 1.0 } else { PREVIEW_HIDDEN_OPACITY };
+        let blur_norm = if PREVIEW_HIDDEN_BLUR_PX > 0.0 {
+            (self.preview_blur.get() / PREVIEW_HIDDEN_BLUR_PX).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if blur_norm > 0.0 {
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::PreviewBlur,
+                image_rect_view,
+                0.0,
+                base_opacity * blur_norm,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                image_radius_px * view_scale,
+                [0.0, 0.0],
+                0.2 * blur_norm,
+            ));
+        }
+        if blur_norm < 1.0 {
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::Preview,
+                image_rect_view,
+                0.0,
+                base_opacity * (1.0 - blur_norm),
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+                image_radius_px * view_scale,
+                [0.0, 0.0],
+                0.0,
+            ));
+        }
+
+        let toggle_opacity = if revealed { 0.0 } else { 1.0 };
+        let toggle_border_px = PREVIEW_PANEL_BORDER * layout.scale;
+        let toggle_rect_view = rect_to_view(layout.toggle_rect, view_rect, canvas_rect);
+        let toggle_radius = (layout.toggle_rect.w * 0.5) * view_scale;
+        if toggle_border_px > 0.0 {
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::SolidWhite,
+                toggle_rect_view,
+                0.0,
+                toggle_opacity,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                colors.toggle_border,
+                toggle_radius,
+                [0.0, 0.0],
+                0.0,
+            ));
+            let inner_rect = layout.toggle_rect.inset(toggle_border_px);
+            let inner_view = rect_to_view(inner_rect, view_rect, canvas_rect);
+            let inner_radius = (toggle_radius - toggle_border_px * view_scale).max(0.0);
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::SolidWhite,
+                inner_view,
+                0.0,
+                toggle_opacity,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                colors.toggle_bg,
+                inner_radius,
+                [0.0, 0.0],
+                0.0,
+            ));
+        } else {
+            specs.push(make_ui_sprite(
+                UiSpriteTexture::SolidWhite,
+                toggle_rect_view,
+                0.0,
+                toggle_opacity,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                colors.toggle_bg,
+                toggle_radius,
+                [0.0, 0.0],
+                0.0,
+            ));
+        }
+        let (icon_uv_min, icon_uv_max) = ui_icon_uv(if revealed {
+            UiIconId::EyeOpen
+        } else {
+            UiIconId::EyeOff
+        });
+        let toggle_icon_view = rect_to_view(layout.toggle_icon_rect, view_rect, canvas_rect);
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::IconAtlas,
+            toggle_icon_view,
+            0.0,
+            toggle_opacity,
+            icon_uv_min,
+            icon_uv_max,
+            colors.toggle_icon,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        ));
+
+        let arrow_opacity = if self.preview_hover.get() == PreviewHoverTarget::None {
+            0.0
+        } else {
+            0.85
+        };
+        let arrow_border_px = PREVIEW_PANEL_BORDER * layout.scale;
+        let arrow_radius = (layout.arrow_h_rect.w * 0.5) * view_scale;
+        let arrow_h_view = rect_to_view(layout.arrow_h_rect, view_rect, canvas_rect);
+        let arrow_v_view = rect_to_view(layout.arrow_v_rect, view_rect, canvas_rect);
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::SolidWhite,
+            arrow_h_view,
+            0.0,
+            arrow_opacity,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            colors.arrow_border,
+            arrow_radius,
+            [0.0, 0.0],
+            0.0,
+        ));
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::SolidWhite,
+            arrow_v_view,
+            0.0,
+            arrow_opacity,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            colors.arrow_border,
+            arrow_radius,
+            [0.0, 0.0],
+            0.0,
+        ));
+        let inner_h = layout.arrow_h_rect.inset(arrow_border_px);
+        let inner_v = layout.arrow_v_rect.inset(arrow_border_px);
+        let inner_h_view = rect_to_view(inner_h, view_rect, canvas_rect);
+        let inner_v_view = rect_to_view(inner_v, view_rect, canvas_rect);
+        let inner_radius = (arrow_radius - arrow_border_px * view_scale).max(0.0);
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::SolidWhite,
+            inner_h_view,
+            0.0,
+            arrow_opacity,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            colors.arrow_bg,
+            inner_radius,
+            [0.0, 0.0],
+            0.0,
+        ));
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::SolidWhite,
+            inner_v_view,
+            0.0,
+            arrow_opacity,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            colors.arrow_bg,
+            inner_radius,
+            [0.0, 0.0],
+            0.0,
+        ));
+        let (chev_uv_min, chev_uv_max) = ui_icon_uv(UiIconId::Chevron);
+        let arrow_h_icon_view = rect_to_view(layout.arrow_h_icon_rect, view_rect, canvas_rect);
+        let arrow_v_icon_view = rect_to_view(layout.arrow_v_icon_rect, view_rect, canvas_rect);
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::IconAtlas,
+            arrow_h_icon_view,
+            layout.arrow_h_rotation,
+            arrow_opacity,
+            chev_uv_min,
+            chev_uv_max,
+            colors.arrow_icon,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        ));
+        specs.push(make_ui_sprite(
+            UiSpriteTexture::IconAtlas,
+            arrow_v_icon_view,
+            layout.arrow_v_rotation,
+            arrow_opacity,
+            chev_uv_min,
+            chev_uv_max,
+            colors.arrow_icon,
+            0.0,
+            [0.0, 0.0],
+            0.0,
+        ));
+
+        specs
+    }
+
+    fn update_debug_overlay(&self, snapshot: &AppSnapshot) {
+        let overlay_ref = self.debug_overlay.borrow();
+        let Some(overlay) = overlay_ref.as_ref() else {
+            return;
+        };
+        if !snapshot.show_debug {
+            overlay.set_visible(false);
+            return;
+        }
+        let Some(zones) = self.compute_auto_pan_zones(snapshot) else {
+            overlay.set_visible(false);
+            return;
+        };
+        overlay.set_visible(true);
+        overlay.set_insets(zones.outer_inset, zones.inner_inset);
+    }
+
+    fn compute_auto_pan_zones(&self, snapshot: &AppSnapshot) -> Option<AutoPanZones> {
+        let rect = self.canvas.get_bounding_client_rect();
+        let width = rect.width() as f32;
+        let height = rect.height() as f32;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let min_dim = width.min(height);
+        let max_inset = min_dim * 0.45;
+        let outer_ratio = snapshot.auto_pan_outer_ratio.max(0.0);
+        let inner_ratio = snapshot.auto_pan_inner_ratio.max(outer_ratio);
+        let outer_inset = (outer_ratio * min_dim).min(max_inset);
+        let inner_inset = (inner_ratio * min_dim).min(max_inset).max(outer_inset);
+        let left = rect.left() as f32;
+        let top = rect.top() as f32;
+        let right = left + width;
+        let bottom = top + height;
+        let outer = AutoPanRect {
+            left: left + outer_inset,
+            right: right - outer_inset,
+            top: top + outer_inset,
+            bottom: bottom - outer_inset,
+        };
+        let inner = AutoPanRect {
+            left: left + inner_inset,
+            right: right - inner_inset,
+            top: top + inner_inset,
+            bottom: bottom - inner_inset,
+        };
+        Some(AutoPanZones {
+            outer,
+            inner,
+            outer_inset,
+            inner_inset,
+        })
+    }
+
+    fn update_auto_pan(self: &Rc<Self>, screen_x: f32, screen_y: f32, snapshot: &AppSnapshot) {
+        let zones = self.compute_auto_pan_zones(snapshot);
+        let mut should_start = false;
+        let mut should_stop = false;
+        {
+            let mut state = self.auto_pan.borrow_mut();
+            state.has_pointer = true;
+            state.last_screen_x = screen_x;
+            state.last_screen_y = screen_y;
+            if let Some(zones) = zones.as_ref() {
+                let inside_outer = zones.outer.contains(screen_x, screen_y);
+                let inside_inner = zones.inner.contains(screen_x, screen_y);
+                if inside_inner {
+                    state.seen_inner = true;
+                }
+                if state.active {
+                    if inside_inner {
+                        state.active = false;
+                        state.last_tick_ms = None;
+                        should_stop = true;
+                    }
+                } else if state.seen_inner && !inside_outer {
+                    state.active = true;
+                    state.last_tick_ms = None;
+                    should_start = true;
+                }
+            } else if state.active {
+                state.active = false;
+                state.last_tick_ms = None;
+                should_stop = true;
+            }
+        }
+        if should_start {
+            self.ensure_auto_pan_frame();
+        } else if should_stop {
+            self.clear_auto_pan_frame();
+        }
+    }
+
+    fn clear_auto_pan_frame(&self) {
+        self.auto_pan.borrow_mut().frame.take();
+    }
+
+    fn stop_auto_pan(&self) {
+        let mut state = self.auto_pan.borrow_mut();
+        state.active = false;
+        state.seen_inner = false;
+        state.has_pointer = false;
+        state.last_tick_ms = None;
+        state.frame.take();
+    }
+
+    fn ensure_auto_pan_frame(self: &Rc<Self>) {
+        let needs_frame = self.auto_pan.borrow().frame.is_none();
+        if !needs_frame {
+            return;
+        }
+        let view = Rc::clone(self);
+        let handle = request_animation_frame(move |timestamp| {
+            view.auto_pan_frame(timestamp);
+        });
+        self.auto_pan.borrow_mut().frame = Some(handle);
+    }
+
+    fn auto_pan_frame(self: &Rc<Self>, timestamp: f64) {
+        let (active, seen_inner, has_pointer, screen_x, screen_y, dt_sec) = {
+            let mut state = self.auto_pan.borrow_mut();
+            state.frame.take();
+            let dt_ms = match state.last_tick_ms {
+                Some(prev) => (timestamp - prev).max(0.0),
+                None => 0.0,
+            };
+            state.last_tick_ms = Some(timestamp);
+            (
+                state.active,
+                state.seen_inner,
+                state.has_pointer,
+                state.last_screen_x,
+                state.last_screen_y,
+                (dt_ms.min(50.0) / 1000.0) as f32,
+            )
+        };
+        if !active || !seen_inner || !has_pointer {
+            return;
+        }
+        let snapshot = self.core.snapshot();
+        if snapshot.dragging_members.is_empty() {
+            self.stop_auto_pan();
+            return;
+        }
+        let Some(zones) = self.compute_auto_pan_zones(&snapshot) else {
+            self.stop_auto_pan();
+            return;
+        };
+        let (dir_x, t_x) =
+            edge_intensity(screen_x, zones.inner.left, zones.inner.right, zones.inner_inset);
+        let (dir_y, t_y) =
+            edge_intensity(screen_y, zones.inner.top, zones.inner.bottom, zones.inner_inset);
+        let ease_x = smoothstep(t_x);
+        let ease_y = smoothstep(t_y);
+        let mut speed_ratio = snapshot.auto_pan_speed_ratio.max(0.0);
+        if let Some((view_x, view_y)) =
+            screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+        {
+            speed_ratio *= workspace_fade_scale(view_x, view_y, snapshot.layout, snapshot.view);
+        }
+        let dx_world = dir_x * ease_x * snapshot.view.width * speed_ratio * dt_sec;
+        let dy_world = dir_y * ease_y * snapshot.view.height * speed_ratio * dt_sec;
+        if dx_world != 0.0 || dy_world != 0.0 {
+            self.core.pan_view(dx_world, dy_world);
+            let snapshot = self.core.snapshot();
+            if snapshot.dragging_members.is_empty() {
+                self.stop_auto_pan();
+                return;
+            }
+            if let Some((view_x, view_y)) =
+                screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+            {
+                let (px, py) =
+                    workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+            }
+        }
+        if self.auto_pan.borrow().active {
+            self.ensure_auto_pan_frame();
+        }
     }
 
     fn pick_piece(&self, x: f32, y: f32, snapshot: &AppSnapshot) -> Option<usize> {
@@ -1415,11 +2202,16 @@ impl WgpuView {
             .unwrap_or_else(|| self.core.snapshot());
         let show_fps = snapshot.wgpu_settings.show_fps;
         let sync_view = sync_runtime::sync_view();
-        self.last_render_ms.set(now_ms());
+        let now = now_ms();
+        self.last_render_ms.set(now);
+        let animating_preview = self.update_preview_animation(now);
         self.force_fps_fallback.set(!schedule_idle && show_fps);
         self.render_snapshot(&snapshot, &sync_view);
         if schedule_idle {
             self.schedule_idle_fps_reset(show_fps);
+        }
+        if animating_preview {
+            self.request_render();
         }
     }
 
@@ -1456,14 +2248,6 @@ impl WgpuView {
         } else {
             self.root.set_class_name("app wgpu");
         }
-        if let Some(preview) = self.preview.borrow().as_ref() {
-            if let Some(info) = snapshot.puzzle_info.as_ref() {
-                preview.set_image_src(info.image_src.as_str());
-                preview.set_visible(true);
-            } else {
-                preview.set_visible(false);
-            }
-        }
         let assets = match self.core.assets() {
             Some(assets) => assets,
             None => return,
@@ -1492,6 +2276,10 @@ impl WgpuView {
         let layout = snapshot.layout;
         let view_rect = snapshot.view;
         self.update_canvas_class(snapshot, sync_view);
+        if snapshot.dragging_members.is_empty() {
+            self.stop_auto_pan();
+        }
+        self.update_debug_overlay(snapshot);
         let rect = self.canvas.get_bounding_client_rect();
         let viewport_w = rect.width() as f32;
         let viewport_h = rect.height() as f32;
@@ -1572,6 +2360,14 @@ impl WgpuView {
             .find(|spec| matches!(spec.id, UiTextId::Credit))
             .map(|spec| ui_hitbox_for_spec(&mut measure_state, spec));
         *self.ui_credit_hitbox.borrow_mut() = credit_hitbox;
+        if snapshot.puzzle_info.is_none() {
+            if self.set_preview_hover(PreviewHoverTarget::None) {
+                self.request_render();
+                self.update_canvas_class(snapshot, sync_view);
+            }
+        }
+        let preview_specs =
+            self.build_preview_overlay_specs(snapshot, &assets, &image, &rect, is_dark);
 
         let mask_atlas = self.mask_atlas.borrow();
         let mask_atlas = match mask_atlas.as_ref() {
@@ -1630,12 +2426,14 @@ impl WgpuView {
             renderer.set_solved(snapshot.solved);
             renderer.update_instances(instances);
             renderer.set_ui_texts(&ui_specs);
+            renderer.set_ui_overlay_sprites(&preview_specs);
             renderer.render();
             return;
         }
         if self.creating.get() {
             *self.pending_instances.borrow_mut() = Some(instances);
             *self.pending_ui.borrow_mut() = Some(ui_specs);
+            *self.pending_ui_overlay.borrow_mut() = Some(preview_specs);
             return;
         }
         self.creating.set(true);
@@ -1721,6 +2519,9 @@ impl WgpuView {
                     if let Some(specs) = view.pending_ui.borrow_mut().take() {
                         renderer.set_ui_texts(&specs);
                     }
+                    if let Some(specs) = view.pending_ui_overlay.borrow_mut().take() {
+                        renderer.set_ui_overlay_sprites(&specs);
+                    }
                     renderer.render();
                     *view.renderer.borrow_mut() = Some(renderer);
                 }
@@ -1735,6 +2536,7 @@ impl WgpuView {
         });
         *self.pending_instances.borrow_mut() = Some(instances);
         *self.pending_ui.borrow_mut() = Some(ui_specs);
+        *self.pending_ui_overlay.borrow_mut() = Some(preview_specs);
     }
 }
 
@@ -1765,6 +2567,57 @@ impl GameView for WgpuViewAdapter {
 
 fn now_ms() -> f32 {
     (Date::now() % 1_000_000.0) as f32
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn edge_intensity(pos: f32, inner_min: f32, inner_max: f32, inner_inset: f32) -> (f32, f32) {
+    if inner_inset <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if pos < inner_min {
+        let dist = (inner_min - pos).min(inner_inset);
+        (-1.0, dist / inner_inset)
+    } else if pos > inner_max {
+        let dist = (pos - inner_max).min(inner_inset);
+        (1.0, dist / inner_inset)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+fn workspace_fade_scale(x: f32, y: f32, layout: WorkspaceLayout, view: ViewRect) -> f32 {
+    let min_x = layout.view_min_x;
+    let min_y = layout.view_min_y;
+    let max_x = min_x + layout.view_width;
+    let max_y = min_y + layout.view_height;
+    let dx = if x < min_x {
+        min_x - x
+    } else if x > max_x {
+        x - max_x
+    } else {
+        0.0
+    };
+    let dy = if y < min_y {
+        min_y - y
+    } else if y > max_y {
+        y - max_y
+    } else {
+        0.0
+    };
+    let dist = dx.max(dy);
+    if dist <= 0.0 {
+        return 1.0;
+    }
+    let falloff = view.width.max(view.height) * 0.2;
+    if falloff <= 0.0 {
+        return 0.0;
+    }
+    let t = (dist / falloff).clamp(0.0, 1.0);
+    1.0 - smoothstep(t)
 }
 
 fn screen_to_view_coords(
@@ -2664,6 +3517,115 @@ fn build_ui_specs(
 
     apply_taffy_layout(measure, layout, width, height, menu_visible, &mut specs);
     specs
+}
+
+fn preview_anchor(corner: PreviewCorner, rect: Rect) -> [f32; 2] {
+    match corner {
+        PreviewCorner::BottomLeft => [rect.x, rect.y + rect.h],
+        PreviewCorner::BottomRight => [rect.x + rect.w, rect.y + rect.h],
+        PreviewCorner::TopLeft => [rect.x, rect.y],
+        PreviewCorner::TopRight => [rect.x + rect.w, rect.y],
+    }
+}
+
+fn scale_rect(rect: Rect, anchor: [f32; 2], scale: f32) -> Rect {
+    let scale = scale.max(0.0);
+    Rect {
+        x: anchor[0] + (rect.x - anchor[0]) * scale,
+        y: anchor[1] + (rect.y - anchor[1]) * scale,
+        w: rect.w * scale,
+        h: rect.h * scale,
+    }
+}
+
+fn rect_to_view(rect: Rect, view: ViewRect, canvas_rect: &web_sys::DomRect) -> Rect {
+    let scale_x = if canvas_rect.width() > 0.0 {
+        view.width / canvas_rect.width() as f32
+    } else {
+        0.0
+    };
+    let scale_y = if canvas_rect.height() > 0.0 {
+        view.height / canvas_rect.height() as f32
+    } else {
+        0.0
+    };
+    Rect {
+        x: view.min_x + rect.x * scale_x,
+        y: view.min_y + rect.y * scale_y,
+        w: rect.w * scale_x,
+        h: rect.h * scale_y,
+    }
+}
+
+fn preview_corner_radius(piece_width: f32, piece_height: f32) -> f32 {
+    let mut corner_radius = piece_width.min(piece_height) * CORNER_RADIUS_RATIO;
+    let max_corner = piece_width.min(piece_height) * 0.45;
+    if corner_radius > max_corner {
+        corner_radius = max_corner;
+    }
+    corner_radius
+}
+
+fn rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
+    [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a,
+    ]
+}
+
+fn preview_colors(is_dark: bool) -> PreviewColors {
+    if is_dark {
+        PreviewColors {
+            panel_bg: rgba(28, 28, 28, 0.92),
+            panel_border: rgba(255, 255, 255, 0.12),
+            toggle_bg: rgba(32, 32, 32, 0.92),
+            toggle_border: rgba(255, 255, 255, 0.22),
+            toggle_icon: rgba(255, 255, 255, 0.86),
+            arrow_bg: rgba(34, 34, 34, 0.9),
+            arrow_border: rgba(255, 255, 255, 0.22),
+            arrow_icon: rgba(255, 255, 255, 0.85),
+        }
+    } else {
+        PreviewColors {
+            panel_bg: rgba(255, 255, 255, 0.9),
+            panel_border: rgba(0, 0, 0, 0.12),
+            toggle_bg: rgba(255, 255, 255, 0.9),
+            toggle_border: rgba(0, 0, 0, 0.25),
+            toggle_icon: rgba(20, 20, 20, 0.85),
+            arrow_bg: rgba(255, 255, 255, 0.85),
+            arrow_border: rgba(0, 0, 0, 0.25),
+            arrow_icon: rgba(30, 30, 30, 0.85),
+        }
+    }
+}
+
+fn make_ui_sprite(
+    texture: UiSpriteTexture,
+    rect: Rect,
+    rotation_deg: f32,
+    opacity: f32,
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    color: [f32; 4],
+    radius: f32,
+    blur_uv: [f32; 2],
+    desaturate: f32,
+) -> UiSpriteSpec {
+    UiSpriteSpec {
+        texture,
+        pos: rect.center(),
+        size: [rect.w, rect.h],
+        rotation_deg,
+        opacity,
+        uv_min,
+        uv_max,
+        color,
+        radius,
+        blur_uv,
+        desaturate,
+    }
 }
 
 fn is_dark_theme(mode: ThemeMode) -> bool {

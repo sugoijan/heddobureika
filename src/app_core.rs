@@ -74,6 +74,9 @@ pub(crate) struct AppSnapshot {
     pub(crate) theme_mode: ThemeMode,
     pub(crate) show_debug: bool,
     pub(crate) scramble_nonce: u32,
+    pub(crate) auto_pan_outer_ratio: f32,
+    pub(crate) auto_pan_inner_ratio: f32,
+    pub(crate) auto_pan_speed_ratio: f32,
 }
 
 #[derive(Clone)]
@@ -137,6 +140,9 @@ struct AppState {
     rotation_snap_tolerance: f32,
     snap_distance_ratio: f32,
     frame_snap_ratio: f32,
+    auto_pan_outer_ratio: f32,
+    auto_pan_inner_ratio: f32,
+    auto_pan_speed_ratio: f32,
 }
 
 impl AppCore {
@@ -194,6 +200,9 @@ impl AppCore {
             theme_mode: state.theme_mode,
             show_debug: state.show_debug,
             scramble_nonce: state.scramble_nonce,
+            auto_pan_outer_ratio: state.auto_pan_outer_ratio,
+            auto_pan_inner_ratio: state.auto_pan_inner_ratio,
+            auto_pan_speed_ratio: state.auto_pan_speed_ratio,
         }
     }
 
@@ -1189,6 +1198,45 @@ impl AppCore {
         self.notify();
     }
 
+    pub(crate) fn set_auto_pan_outer_ratio(&self, value: f32) {
+        let mut state = self.state.borrow_mut();
+        let value = value.clamp(AUTO_PAN_OUTER_RATIO_MIN, AUTO_PAN_OUTER_RATIO_MAX);
+        if (state.auto_pan_outer_ratio - value).abs() <= f32::EPSILON {
+            return;
+        }
+        state.auto_pan_outer_ratio = value;
+        if state.auto_pan_inner_ratio < value {
+            state.auto_pan_inner_ratio = value;
+        }
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn set_auto_pan_inner_ratio(&self, value: f32) {
+        let mut state = self.state.borrow_mut();
+        let mut value = value.clamp(AUTO_PAN_INNER_RATIO_MIN, AUTO_PAN_INNER_RATIO_MAX);
+        if value < state.auto_pan_outer_ratio {
+            value = state.auto_pan_outer_ratio;
+        }
+        if (state.auto_pan_inner_ratio - value).abs() <= f32::EPSILON {
+            return;
+        }
+        state.auto_pan_inner_ratio = value;
+        drop(state);
+        self.notify();
+    }
+
+    pub(crate) fn set_auto_pan_speed_ratio(&self, value: f32) {
+        let mut state = self.state.borrow_mut();
+        let value = value.clamp(AUTO_PAN_SPEED_RATIO_MIN, AUTO_PAN_SPEED_RATIO_MAX);
+        if (state.auto_pan_speed_ratio - value).abs() <= f32::EPSILON {
+            return;
+        }
+        state.auto_pan_speed_ratio = value;
+        drop(state);
+        self.notify();
+    }
+
     pub(crate) fn set_rotation_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         if state.rotation_enabled == enabled {
@@ -1538,6 +1586,9 @@ impl AppState {
             rotation_snap_tolerance: ROTATION_SNAP_TOLERANCE_DEFAULT_DEG,
             snap_distance_ratio: SNAP_DISTANCE_RATIO_DEFAULT,
             frame_snap_ratio: FRAME_SNAP_DEFAULT,
+            auto_pan_outer_ratio: AUTO_PAN_OUTER_RATIO_DEFAULT,
+            auto_pan_inner_ratio: AUTO_PAN_INNER_RATIO_DEFAULT,
+            auto_pan_speed_ratio: AUTO_PAN_SPEED_RATIO_DEFAULT,
         }
     }
 }

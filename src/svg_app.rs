@@ -67,6 +67,92 @@ struct PinchState {
     last_distance: f32,
 }
 
+#[derive(Clone, Copy)]
+struct AutoPanRect {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+}
+
+impl AutoPanRect {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+}
+
+struct AutoPanZones {
+    outer: AutoPanRect,
+    inner: AutoPanRect,
+    outer_inset: f32,
+    inner_inset: f32,
+}
+
+struct AutoPanState {
+    active: bool,
+    seen_inner: bool,
+    has_pointer: bool,
+    last_screen_x: f32,
+    last_screen_y: f32,
+    last_tick_ms: Option<f64>,
+    frame: Option<AnimationFrame>,
+}
+
+impl AutoPanState {
+    fn new() -> Self {
+        Self {
+            active: false,
+            seen_inner: false,
+            has_pointer: false,
+            last_screen_x: 0.0,
+            last_screen_y: 0.0,
+            last_tick_ms: None,
+            frame: None,
+        }
+    }
+}
+
+struct DebugOverlay {
+    root: Element,
+    outer: Element,
+    inner: Element,
+}
+
+impl DebugOverlay {
+    fn new(document: &Document) -> Self {
+        let root = document
+            .create_element("div")
+            .expect("create debug overlay root");
+        root.set_class_name("debug-rect-overlay");
+        let outer = document
+            .create_element("div")
+            .expect("create debug outer rect");
+        outer.set_class_name("debug-rect debug-rect-outer");
+        let inner = document
+            .create_element("div")
+            .expect("create debug inner rect");
+        inner.set_class_name("debug-rect debug-rect-inner");
+        let _ = root.append_child(&outer);
+        let _ = root.append_child(&inner);
+        Self { root, outer, inner }
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            let _ = self.root.remove_attribute("style");
+        } else {
+            let _ = self.root.set_attribute("style", "display: none;");
+        }
+    }
+
+    fn set_insets(&self, outer_inset: f32, inner_inset: f32) {
+        let outer_style = format!("inset: {}px;", fmt_f32(outer_inset));
+        let inner_style = format!("inset: {}px;", fmt_f32(inner_inset));
+        let _ = self.outer.set_attribute("style", &outer_style);
+        let _ = self.inner.set_attribute("style", &inner_style);
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct PuzzleKey {
     src: String,
@@ -120,6 +206,7 @@ struct SvgView {
     ui_credit_hovered: Cell<bool>,
     pan_state: RefCell<Option<PanState>>,
     pinch_state: RefCell<Option<PinchState>>,
+    auto_pan: RefCell<AutoPanState>,
     subscription: RefCell<Option<crate::app_core::AppSubscription>>,
     sync_hook: RefCell<Option<sync_runtime::SyncViewHookHandle>>,
     listeners: RefCell<Vec<EventListener>>,
@@ -133,6 +220,7 @@ struct SvgView {
     viewport_frame: RefCell<Option<AnimationFrame>>,
     viewport_retry: Cell<bool>,
     preview: RefCell<Option<Rc<PreviewOverlay>>>,
+    debug_overlay: RefCell<Option<DebugOverlay>>,
 }
 
 fn drag_angle_for_group(count: usize) -> f32 {
@@ -199,6 +287,9 @@ pub(crate) fn run() {
         let preview = PreviewOverlay::new(&document);
         let _ = root.append_child(&preview.root);
         *view.preview.borrow_mut() = Some(preview);
+        let debug_overlay = DebugOverlay::new(&document);
+        let _ = root.append_child(&debug_overlay.root);
+        *view.debug_overlay.borrow_mut() = Some(debug_overlay);
         *view.sync_hook.borrow_mut() = Some(sync_runtime::register_sync_view_hook(Rc::new({
             let view = Rc::clone(&view);
             move || {
@@ -259,6 +350,7 @@ impl SvgView {
             ui_credit_hovered: Cell::new(false),
             pan_state: RefCell::new(None),
             pinch_state: RefCell::new(None),
+            auto_pan: RefCell::new(AutoPanState::new()),
             subscription: RefCell::new(None),
             sync_hook: RefCell::new(None),
             listeners: RefCell::new(Vec::new()),
@@ -272,6 +364,7 @@ impl SvgView {
             viewport_frame: RefCell::new(None),
             viewport_retry: Cell::new(false),
             preview: RefCell::new(None),
+            debug_overlay: RefCell::new(None),
         }
     }
 
@@ -363,6 +456,12 @@ impl SvgView {
                         right_click,
                         touch_id: None,
                     });
+                    let drag_snapshot = view.core.snapshot();
+                    view.update_auto_pan(
+                        event.client_x() as f32,
+                        event.client_y() as f32,
+                        &drag_snapshot,
+                    );
                     event.prevent_default();
                     return;
                 }
@@ -580,6 +679,8 @@ impl SvgView {
                         right_click: false,
                         touch_id: Some(touch.identifier()),
                     });
+                    let drag_snapshot = view.core.snapshot();
+                    view.update_auto_pan(screen_x, screen_y, &drag_snapshot);
                     event.prevent_default();
                     return;
                 }
@@ -618,6 +719,11 @@ impl SvgView {
                 };
                 let snapshot = core.snapshot();
                 if !snapshot.dragging_members.is_empty() {
+                    view.update_auto_pan(
+                        event.client_x() as f32,
+                        event.client_y() as f32,
+                        &snapshot,
+                    );
                     let Some((view_x, view_y)) =
                         event_to_svg_coords(event, &svg_for_drag, snapshot.view)
                     else {
@@ -663,6 +769,7 @@ impl SvgView {
                     return;
                 };
                 let snapshot = core.snapshot();
+                view.stop_auto_pan();
                 let mut pan_cleared = false;
                 if view.pan_state.borrow().is_some() {
                     view.pan_state.borrow_mut().take();
@@ -784,6 +891,11 @@ impl SvgView {
                     ) else {
                         return;
                     };
+                    view.update_auto_pan(
+                        touch.client_x() as f32,
+                        touch.client_y() as f32,
+                        &snapshot,
+                    );
                     let (px, py) =
                         workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
                     view.dispatch_action(CoreAction::DragMove { x: px, y: py });
@@ -808,6 +920,7 @@ impl SvgView {
                     return;
                 };
                 let snapshot = core.snapshot();
+                view.stop_auto_pan();
                 if let Some(pinch) = view.pinch_state.borrow_mut().take() {
                     let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
                     let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
@@ -864,6 +977,7 @@ impl SvgView {
                 let snapshot = core.snapshot();
                 view.pan_state.borrow_mut().take();
                 view.pinch_state.borrow_mut().take();
+                view.stop_auto_pan();
                 view.update_svg_class(&snapshot);
                 core.settle_view();
                 view.dispatch_action(CoreAction::DragEnd {
@@ -908,6 +1022,188 @@ impl SvgView {
         let _ = self.svg.set_attribute("class", &class);
     }
 
+    fn update_debug_overlay(&self, snapshot: &AppSnapshot) {
+        let overlay_ref = self.debug_overlay.borrow();
+        let Some(overlay) = overlay_ref.as_ref() else {
+            return;
+        };
+        if !snapshot.show_debug {
+            overlay.set_visible(false);
+            return;
+        }
+        let Some(zones) = self.compute_auto_pan_zones(snapshot) else {
+            overlay.set_visible(false);
+            return;
+        };
+        overlay.set_visible(true);
+        overlay.set_insets(zones.outer_inset, zones.inner_inset);
+    }
+
+    fn compute_auto_pan_zones(&self, snapshot: &AppSnapshot) -> Option<AutoPanZones> {
+        let rect = self.svg.get_bounding_client_rect();
+        let width = rect.width() as f32;
+        let height = rect.height() as f32;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let min_dim = width.min(height);
+        let max_inset = min_dim * 0.45;
+        let outer_ratio = snapshot.auto_pan_outer_ratio.max(0.0);
+        let inner_ratio = snapshot.auto_pan_inner_ratio.max(outer_ratio);
+        let outer_inset = (outer_ratio * min_dim).min(max_inset);
+        let inner_inset = (inner_ratio * min_dim).min(max_inset).max(outer_inset);
+        let left = rect.left() as f32;
+        let top = rect.top() as f32;
+        let right = left + width;
+        let bottom = top + height;
+        let outer = AutoPanRect {
+            left: left + outer_inset,
+            right: right - outer_inset,
+            top: top + outer_inset,
+            bottom: bottom - outer_inset,
+        };
+        let inner = AutoPanRect {
+            left: left + inner_inset,
+            right: right - inner_inset,
+            top: top + inner_inset,
+            bottom: bottom - inner_inset,
+        };
+        Some(AutoPanZones {
+            outer,
+            inner,
+            outer_inset,
+            inner_inset,
+        })
+    }
+
+    fn update_auto_pan(self: &Rc<Self>, screen_x: f32, screen_y: f32, snapshot: &AppSnapshot) {
+        let zones = self.compute_auto_pan_zones(snapshot);
+        let mut should_start = false;
+        let mut should_stop = false;
+        {
+            let mut state = self.auto_pan.borrow_mut();
+            state.has_pointer = true;
+            state.last_screen_x = screen_x;
+            state.last_screen_y = screen_y;
+            if let Some(zones) = zones.as_ref() {
+                let inside_outer = zones.outer.contains(screen_x, screen_y);
+                let inside_inner = zones.inner.contains(screen_x, screen_y);
+                if inside_inner {
+                    state.seen_inner = true;
+                }
+                if state.active {
+                    if inside_inner {
+                        state.active = false;
+                        state.last_tick_ms = None;
+                        should_stop = true;
+                    }
+                } else if state.seen_inner && !inside_outer {
+                    state.active = true;
+                    state.last_tick_ms = None;
+                    should_start = true;
+                }
+            } else if state.active {
+                state.active = false;
+                state.last_tick_ms = None;
+                should_stop = true;
+            }
+        }
+        if should_start {
+            self.ensure_auto_pan_frame();
+        } else if should_stop {
+            self.clear_auto_pan_frame();
+        }
+    }
+
+    fn clear_auto_pan_frame(&self) {
+        self.auto_pan.borrow_mut().frame.take();
+    }
+
+    fn stop_auto_pan(&self) {
+        let mut state = self.auto_pan.borrow_mut();
+        state.active = false;
+        state.seen_inner = false;
+        state.has_pointer = false;
+        state.last_tick_ms = None;
+        state.frame.take();
+    }
+
+    fn ensure_auto_pan_frame(self: &Rc<Self>) {
+        let needs_frame = self.auto_pan.borrow().frame.is_none();
+        if !needs_frame {
+            return;
+        }
+        let view = Rc::clone(self);
+        let handle = request_animation_frame(move |timestamp| {
+            view.auto_pan_frame(timestamp);
+        });
+        self.auto_pan.borrow_mut().frame = Some(handle);
+    }
+
+    fn auto_pan_frame(self: &Rc<Self>, timestamp: f64) {
+        let (active, seen_inner, has_pointer, screen_x, screen_y, dt_sec) = {
+            let mut state = self.auto_pan.borrow_mut();
+            state.frame.take();
+            let dt_ms = match state.last_tick_ms {
+                Some(prev) => (timestamp - prev).max(0.0),
+                None => 0.0,
+            };
+            state.last_tick_ms = Some(timestamp);
+            (
+                state.active,
+                state.seen_inner,
+                state.has_pointer,
+                state.last_screen_x,
+                state.last_screen_y,
+                (dt_ms.min(50.0) / 1000.0) as f32,
+            )
+        };
+        if !active || !seen_inner || !has_pointer {
+            return;
+        }
+        let snapshot = self.core.snapshot();
+        if snapshot.dragging_members.is_empty() {
+            self.stop_auto_pan();
+            return;
+        }
+        let Some(zones) = self.compute_auto_pan_zones(&snapshot) else {
+            self.stop_auto_pan();
+            return;
+        };
+        let (dir_x, t_x) =
+            edge_intensity(screen_x, zones.inner.left, zones.inner.right, zones.inner_inset);
+        let (dir_y, t_y) =
+            edge_intensity(screen_y, zones.inner.top, zones.inner.bottom, zones.inner_inset);
+        let ease_x = smoothstep(t_x);
+        let ease_y = smoothstep(t_y);
+        let mut speed_ratio = snapshot.auto_pan_speed_ratio.max(0.0);
+        if let Some((view_x, view_y)) =
+            screen_to_view_coords(screen_x, screen_y, &self.svg, snapshot.view)
+        {
+            speed_ratio *= workspace_fade_scale(view_x, view_y, snapshot.layout, snapshot.view);
+        }
+        let dx_world = dir_x * ease_x * snapshot.view.width * speed_ratio * dt_sec;
+        let dy_world = dir_y * ease_y * snapshot.view.height * speed_ratio * dt_sec;
+        if dx_world != 0.0 || dy_world != 0.0 {
+            self.core.pan_view(dx_world, dy_world);
+            let snapshot = self.core.snapshot();
+            if snapshot.dragging_members.is_empty() {
+                self.stop_auto_pan();
+                return;
+            }
+            if let Some((view_x, view_y)) =
+                screen_to_view_coords(screen_x, screen_y, &self.svg, snapshot.view)
+            {
+                let (px, py) =
+                    workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+            }
+        }
+        if self.auto_pan.borrow().active {
+            self.ensure_auto_pan_frame();
+        }
+    }
+
     fn render_snapshot(self: &Rc<Self>, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
         if snapshot.view.width <= 0.0 || snapshot.view.height <= 0.0 {
             self.ensure_viewport_size();
@@ -933,6 +1229,10 @@ impl SvgView {
         };
         self.ensure_scene(snapshot, assets.clone());
         self.update_svg_class(snapshot);
+        if snapshot.dragging_members.is_empty() {
+            self.stop_auto_pan();
+        }
+        self.update_debug_overlay(snapshot);
         self.render_view(snapshot, &assets);
         self.render_ui(snapshot, sync_view);
         self.render_pieces(snapshot, &assets, sync_view);
@@ -2321,6 +2621,57 @@ fn update_debug_label(document: &Document, label: &Element, x: f32, y: f32, text
         tspan.set_text_content(Some(line));
         let _ = label.append_child(&tspan);
     }
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn edge_intensity(pos: f32, inner_min: f32, inner_max: f32, inner_inset: f32) -> (f32, f32) {
+    if inner_inset <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if pos < inner_min {
+        let dist = (inner_min - pos).min(inner_inset);
+        (-1.0, dist / inner_inset)
+    } else if pos > inner_max {
+        let dist = (pos - inner_max).min(inner_inset);
+        (1.0, dist / inner_inset)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+fn workspace_fade_scale(x: f32, y: f32, layout: WorkspaceLayout, view: ViewRect) -> f32 {
+    let min_x = layout.view_min_x;
+    let min_y = layout.view_min_y;
+    let max_x = min_x + layout.view_width;
+    let max_y = min_y + layout.view_height;
+    let dx = if x < min_x {
+        min_x - x
+    } else if x > max_x {
+        x - max_x
+    } else {
+        0.0
+    };
+    let dy = if y < min_y {
+        min_y - y
+    } else if y > max_y {
+        y - max_y
+    } else {
+        0.0
+    };
+    let dist = dx.max(dy);
+    if dist <= 0.0 {
+        return 1.0;
+    }
+    let falloff = view.width.max(view.height) * 0.2;
+    if falloff <= 0.0 {
+        return 0.0;
+    }
+    let t = (dist / falloff).clamp(0.0, 1.0);
+    1.0 - smoothstep(t)
 }
 
 fn screen_to_view_coords(

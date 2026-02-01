@@ -104,6 +104,65 @@ pub(crate) struct UiTextSpec {
     pub(crate) color: [u8; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UiIconId {
+    EyeOpen,
+    EyeOff,
+    Chevron,
+}
+
+pub(crate) const UI_ICON_ATLAS_CELL_PX: u32 = 64;
+pub(crate) const UI_ICON_ATLAS_COLS: u32 = 2;
+pub(crate) const UI_ICON_ATLAS_ROWS: u32 = 2;
+pub(crate) const UI_ICON_ATLAS_WIDTH: u32 = UI_ICON_ATLAS_CELL_PX * UI_ICON_ATLAS_COLS;
+pub(crate) const UI_ICON_ATLAS_HEIGHT: u32 = UI_ICON_ATLAS_CELL_PX * UI_ICON_ATLAS_ROWS;
+const UI_ICON_ATLAS_INSET_PX: f32 = 0.5;
+const UI_PREVIEW_BLUR_MAX_DIM: u32 = 192;
+const UI_PREVIEW_BLUR_FILTER_PX: f64 = 6.0;
+
+pub(crate) fn ui_icon_uv(id: UiIconId) -> ([f32; 2], [f32; 2]) {
+    let (col, row) = match id {
+        UiIconId::EyeOpen => (0, 0),
+        UiIconId::EyeOff => (1, 0),
+        UiIconId::Chevron => (0, 1),
+    };
+    let x = col as f32 * UI_ICON_ATLAS_CELL_PX as f32;
+    let y = row as f32 * UI_ICON_ATLAS_CELL_PX as f32;
+    let w = UI_ICON_ATLAS_WIDTH as f32;
+    let h = UI_ICON_ATLAS_HEIGHT as f32;
+    let inset = UI_ICON_ATLAS_INSET_PX;
+    (
+        [(x + inset) / w, (y + inset) / h],
+        [
+            (x + UI_ICON_ATLAS_CELL_PX as f32 - inset) / w,
+            (y + UI_ICON_ATLAS_CELL_PX as f32 - inset) / h,
+        ],
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiSpriteTexture {
+    Preview,
+    PreviewBlur,
+    IconAtlas,
+    SolidWhite,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UiSpriteSpec {
+    pub(crate) texture: UiSpriteTexture,
+    pub(crate) pos: [f32; 2],
+    pub(crate) size: [f32; 2],
+    pub(crate) rotation_deg: f32,
+    pub(crate) opacity: f32,
+    pub(crate) uv_min: [f32; 2],
+    pub(crate) uv_max: [f32; 2],
+    pub(crate) color: [f32; 4],
+    pub(crate) radius: f32,
+    pub(crate) blur_uv: [f32; 2],
+    pub(crate) desaturate: f32,
+}
+
 impl Instance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -198,6 +257,10 @@ struct UiInstance {
     pivot: [f32; 2],
     rotation: f32,
     opacity: f32,
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    color: [f32; 4],
+    radius_blur: [f32; 4],
 }
 
 impl UiInstance {
@@ -230,6 +293,26 @@ impl UiInstance {
                     format: wgpu::VertexFormat::Float32,
                     offset: 28,
                     shader_location: 5,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 32,
+                    shader_location: 6,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 40,
+                    shader_location: 7,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 48,
+                    shader_location: 8,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 64,
+                    shader_location: 9,
                 },
             ],
         }
@@ -272,7 +355,9 @@ struct FrameGlobals {
 struct UiGlobals {
     view_min: [f32; 2],
     view_size: [f32; 2],
-    _pad: [f32; 4],
+    viewport_px: [f32; 2],
+    output_gamma: f32,
+    _pad: f32,
 }
 
 struct FrameSegment {
@@ -532,6 +617,19 @@ struct UiSprite {
     instance_buffer: wgpu::Buffer,
 }
 
+struct UiOverlaySprite {
+    texture: UiSpriteTexture,
+    bind_group: Rc<wgpu::BindGroup>,
+    instance: UiInstance,
+    instance_buffer: wgpu::Buffer,
+}
+
+struct IconAtlas {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: Rc<wgpu::BindGroup>,
+}
+
 fn now_ms() -> f32 {
     (Date::now() % 1_000_000.0) as f32
 }
@@ -579,6 +677,11 @@ pub(crate) struct WgpuRenderer {
     ui_sampler: wgpu::Sampler,
     ui_sprites: Vec<UiSprite>,
     ui_text_state: Option<UiTextState>,
+    ui_overlay_sprites: Vec<UiOverlaySprite>,
+    ui_white_bind_group: Rc<wgpu::BindGroup>,
+    ui_preview_bind_group: Option<Rc<wgpu::BindGroup>>,
+    ui_preview_blur_bind_group: Option<Rc<wgpu::BindGroup>>,
+    ui_icon_atlas: Option<IconAtlas>,
     show_frame: bool,
     frame_clear_color: wgpu::Color,
     frame_dash_color: [f32; 4],
@@ -790,6 +893,17 @@ impl WgpuRenderer {
             art_height,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             "art-texture",
+        )?;
+        let (blur_pixels, blur_width, blur_height) =
+            image_to_rgba_scaled(&image, UI_PREVIEW_BLUR_MAX_DIM, UI_PREVIEW_BLUR_FILTER_PX)?;
+        let preview_blur_view = create_texture_view_from_pixels(
+            &device,
+            &queue,
+            &blur_pixels,
+            blur_width,
+            blur_height,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "preview-blur-texture",
         )?;
         let mask_view = create_texture_view_from_pixels(
             &device,
@@ -1041,7 +1155,9 @@ impl WgpuRenderer {
         let ui_globals = UiGlobals {
             view_min: [view_min_x, view_min_y],
             view_size: [view_width, view_height],
-            _pad: [0.0; 4],
+            viewport_px: [config.width as f32, config.height as f32],
+            output_gamma,
+            _pad: 0.0,
         };
         let ui_globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ui-globals-buffer"),
@@ -1102,6 +1218,60 @@ impl WgpuRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let white_view = create_texture_view_from_pixels(
+            &device,
+            &queue,
+            &[255, 255, 255, 255],
+            1,
+            1,
+            config.format,
+            "ui-white",
+        )?;
+        let ui_white_bind_group = Rc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui-white-bind-group"),
+            layout: &ui_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&white_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&ui_sampler),
+                },
+            ],
+        }));
+        let ui_icon_atlas =
+            build_icon_atlas(&device, &queue, config.format, &ui_texture_bind_group_layout, &ui_sampler)?;
+        let ui_preview_bind_group = Rc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui-preview-bind-group"),
+            layout: &ui_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&art_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&ui_sampler),
+                },
+            ],
+        }));
+        let ui_preview_blur_bind_group =
+            Rc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ui-preview-blur-bind-group"),
+                layout: &ui_texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&preview_blur_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&ui_sampler),
+                    },
+                ],
+            }));
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ui-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("wgpu_ui.wgsl").into()),
@@ -1299,6 +1469,11 @@ impl WgpuRenderer {
             ui_sampler,
             ui_sprites: Vec::new(),
             ui_text_state: None,
+            ui_overlay_sprites: Vec::new(),
+            ui_white_bind_group,
+            ui_preview_bind_group: Some(ui_preview_bind_group),
+            ui_preview_blur_bind_group: Some(ui_preview_blur_bind_group),
+            ui_icon_atlas: Some(ui_icon_atlas),
             show_frame: true,
             frame_clear_color,
             frame_dash_color: dash_color,
@@ -1474,6 +1649,38 @@ impl WgpuRenderer {
                 render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
                 render_pass.set_vertex_buffer(1, slice);
                 render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+            }
+        }
+
+        if !self.ui_overlay_sprites.is_empty() {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_pipeline(&self.ui_pipeline);
+            render_pass.set_bind_group(0, &self.ui_globals_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass
+                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            for sprite in &self.ui_overlay_sprites {
+                if sprite.instance.opacity <= f32::EPSILON {
+                    continue;
+                }
+                render_pass.set_bind_group(1, sprite.bind_group.as_ref(), &[]);
+                render_pass.set_vertex_buffer(1, sprite.instance_buffer.slice(..));
+                render_pass.draw_indexed(0..self.index_count, 0, 0..1);
             }
         }
 
@@ -1716,6 +1923,10 @@ impl WgpuRenderer {
                     pivot: spec.rotation_offset,
                     rotation: spec.rotation_deg,
                     opacity: 1.0,
+                    uv_min: [0.0, 0.0],
+                    uv_max: [1.0, 1.0],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    radius_blur: [0.0, 0.0, 0.0, 0.0],
                 };
                 let instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("ui-instance-buffer"),
@@ -1901,6 +2112,99 @@ impl WgpuRenderer {
             sprite.instance.pivot = spec.rotation_offset;
             sprite.instance.rotation = spec.rotation_deg;
             sprite.instance.opacity = 1.0;
+            sprite.instance.uv_min = [0.0, 0.0];
+            sprite.instance.uv_max = [1.0, 1.0];
+            sprite.instance.color = [1.0, 1.0, 1.0, 1.0];
+            sprite.instance.radius_blur = [0.0, 0.0, 0.0, 0.0];
+            self.queue.write_buffer(
+                &sprite.instance_buffer,
+                0,
+                bytemuck::cast_slice(&[sprite.instance]),
+            );
+        }
+    }
+
+    pub(crate) fn set_ui_overlay_sprites(&mut self, specs: &[UiSpriteSpec]) {
+        let mut filtered: Vec<(UiSpriteSpec, Rc<wgpu::BindGroup>)> = Vec::new();
+        for spec in specs {
+            let bind_group = match spec.texture {
+                UiSpriteTexture::Preview => match self.ui_preview_bind_group.as_ref() {
+                    Some(bind_group) => bind_group.clone(),
+                    None => continue,
+                },
+                UiSpriteTexture::PreviewBlur => match self.ui_preview_blur_bind_group.as_ref() {
+                    Some(bind_group) => bind_group.clone(),
+                    None => continue,
+                },
+                UiSpriteTexture::IconAtlas => match self.ui_icon_atlas.as_ref() {
+                    Some(atlas) => atlas.bind_group.clone(),
+                    None => continue,
+                },
+                UiSpriteTexture::SolidWhite => self.ui_white_bind_group.clone(),
+            };
+            filtered.push((spec.clone(), bind_group));
+        }
+        if filtered.is_empty() {
+            self.ui_overlay_sprites.clear();
+            return;
+        }
+        if self.ui_overlay_sprites.len() != filtered.len() {
+            self.ui_overlay_sprites.clear();
+            for (spec, bind_group) in &filtered {
+                let instance = UiInstance {
+                    pos: spec.pos,
+                    size: spec.size,
+                    pivot: [0.0, 0.0],
+                    rotation: spec.rotation_deg,
+                    opacity: spec.opacity,
+                    uv_min: spec.uv_min,
+                    uv_max: spec.uv_max,
+                    color: spec.color,
+                    radius_blur: [
+                        spec.radius,
+                        spec.blur_uv[0],
+                        spec.blur_uv[1],
+                        spec.desaturate,
+                    ],
+                };
+                let instance_buffer = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("ui-overlay-instance-buffer"),
+                        contents: bytemuck::cast_slice(&[instance]),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
+                self.ui_overlay_sprites.push(UiOverlaySprite {
+                    texture: spec.texture,
+                    bind_group: bind_group.clone(),
+                    instance,
+                    instance_buffer,
+                });
+            }
+        }
+        for (sprite, (spec, bind_group)) in
+            self.ui_overlay_sprites.iter_mut().zip(filtered.iter())
+        {
+            if sprite.texture != spec.texture {
+                sprite.texture = spec.texture;
+                sprite.bind_group = bind_group.clone();
+            }
+            sprite.instance = UiInstance {
+                pos: spec.pos,
+                size: spec.size,
+                pivot: [0.0, 0.0],
+                rotation: spec.rotation_deg,
+                opacity: spec.opacity,
+                uv_min: spec.uv_min,
+                uv_max: spec.uv_max,
+                color: spec.color,
+                radius_blur: [
+                    spec.radius,
+                    spec.blur_uv[0],
+                    spec.blur_uv[1],
+                    spec.desaturate,
+                ],
+            };
             self.queue.write_buffer(
                 &sprite.instance_buffer,
                 0,
@@ -1920,6 +2224,15 @@ impl WgpuRenderer {
         self._canvas.set_width(width);
         self._canvas.set_height(height);
         self.surface.configure(&self.device, &self._config);
+        let ui_globals = UiGlobals {
+            view_min: self.globals.view_min,
+            view_size: self.globals.view_size,
+            viewport_px: [self._config.width as f32, self._config.height as f32],
+            output_gamma: self.globals.output_gamma,
+            _pad: 0.0,
+        };
+        self.queue
+            .write_buffer(&self._ui_globals_buffer, 0, bytemuck::bytes_of(&ui_globals));
     }
 
     pub(crate) fn set_view(
@@ -1994,7 +2307,9 @@ impl WgpuRenderer {
         let ui_globals = UiGlobals {
             view_min: [view_min_x, view_min_y],
             view_size: [view_width, view_height],
-            _pad: [0.0; 4],
+            viewport_px: [self._config.width as f32, self._config.height as f32],
+            output_gamma: self.globals.output_gamma,
+            _pad: 0.0,
         };
         self.queue
             .write_buffer(&self._ui_globals_buffer, 0, bytemuck::bytes_of(&ui_globals));
@@ -2187,6 +2502,173 @@ fn image_to_rgba(
     ctx.draw_image_with_html_image_element(image, 0.0, 0.0)?;
     let data = ctx.get_image_data(0.0, 0.0, width as f64, height as f64)?;
     Ok((data.data().to_vec(), width, height))
+}
+
+fn image_to_rgba_scaled(
+    image: &HtmlImageElement,
+    max_dim: u32,
+    blur_px: f64,
+) -> Result<(Vec<u8>, u32, u32), wasm_bindgen::JsValue> {
+    let width = image.natural_width().max(1);
+    let height = image.natural_height().max(1);
+    let max_src = width.max(height);
+    let scale = if max_src > max_dim {
+        max_dim as f64 / max_src as f64
+    } else {
+        1.0
+    };
+    let target_w = ((width as f64) * scale).round().max(1.0) as u32;
+    let target_h = ((height as f64) * scale).round().max(1.0) as u32;
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| wasm_bindgen::JsValue::from_str("no document"))?;
+    let canvas = document
+        .create_element("canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+    canvas.set_width(target_w);
+    canvas.set_height(target_h);
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| wasm_bindgen::JsValue::from_str("no 2d context"))?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+    if blur_px > 0.0 {
+        ctx.set_filter(&format!("blur({:.1}px)", blur_px));
+    }
+    ctx.draw_image_with_html_image_element_and_dw_and_dh(
+        image,
+        0.0,
+        0.0,
+        target_w as f64,
+        target_h as f64,
+    )?;
+    if blur_px > 0.0 {
+        ctx.set_filter("none");
+    }
+    let data = ctx.get_image_data(0.0, 0.0, target_w as f64, target_h as f64)?;
+    Ok((data.data().to_vec(), target_w, target_h))
+}
+
+fn build_icon_atlas(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+) -> Result<IconAtlas, wasm_bindgen::JsValue> {
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| wasm_bindgen::JsValue::from_str("no document"))?;
+    let canvas = document
+        .create_element("canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+    canvas.set_width(UI_ICON_ATLAS_WIDTH);
+    canvas.set_height(UI_ICON_ATLAS_HEIGHT);
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| wasm_bindgen::JsValue::from_str("no 2d context"))?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+    ctx.set_stroke_style_str("white");
+    ctx.set_fill_style_str("white");
+    ctx.set_line_join("round");
+    ctx.set_line_cap("round");
+
+    let cell = UI_ICON_ATLAS_CELL_PX as f64;
+    draw_icon_eye(&ctx, 0.0, 0.0, cell, false)?;
+    draw_icon_eye(&ctx, cell, 0.0, cell, true)?;
+    draw_icon_chevron(&ctx, 0.0, cell, cell)?;
+
+    let data = ctx.get_image_data(
+        0.0,
+        0.0,
+        UI_ICON_ATLAS_WIDTH as f64,
+        UI_ICON_ATLAS_HEIGHT as f64,
+    )?;
+    let pixels = data.data().to_vec();
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("ui-icon-atlas"),
+            size: wgpu::Extent3d {
+                width: UI_ICON_ATLAS_WIDTH,
+                height: UI_ICON_ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &pixels,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = Rc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ui-icon-bind-group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    }));
+    Ok(IconAtlas {
+        _texture: texture,
+        view,
+        bind_group,
+    })
+}
+
+fn draw_icon_eye(
+    ctx: &CanvasRenderingContext2d,
+    x: f64,
+    y: f64,
+    size: f64,
+    slashed: bool,
+) -> Result<(), wasm_bindgen::JsValue> {
+    ctx.save();
+    ctx.translate(x, y)?;
+    let scale = size / 24.0;
+    ctx.scale(scale, scale)?;
+    ctx.set_line_width(2.0);
+    let outline = Path2d::new_with_path_string(
+        "M2 12c2.4-4.2 5.8-6.4 10-6.4s7.6 2.2 10 6.4c-2.4 4.2-5.8 6.4-10 6.4S4.4 16.2 2 12z",
+    )?;
+    ctx.stroke_with_path(&outline);
+    ctx.begin_path();
+    ctx.arc(12.0, 12.0, 3.2, 0.0, std::f64::consts::TAU)?;
+    ctx.fill();
+    if slashed {
+        ctx.begin_path();
+        ctx.move_to(5.0, 19.0);
+        ctx.line_to(19.0, 5.0);
+        ctx.stroke();
+    }
+    ctx.restore();
+    Ok(())
+}
+
+fn draw_icon_chevron(
+    ctx: &CanvasRenderingContext2d,
+    x: f64,
+    y: f64,
+    size: f64,
+) -> Result<(), wasm_bindgen::JsValue> {
+    ctx.save();
+    ctx.translate(x, y)?;
+    let scale = size / 24.0;
+    ctx.scale(scale, scale)?;
+    ctx.set_line_width(2.0);
+    let path = Path2d::new_with_path_string("M9 18l6-6-6-6")?;
+    ctx.stroke_with_path(&path);
+    ctx.restore();
+    Ok(())
 }
 
 pub(crate) fn build_mask_atlas(

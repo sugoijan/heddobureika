@@ -2271,6 +2271,12 @@ fn app(props: &AppProps) -> Html {
     let ui_credit_hovered_value = *ui_credit_hovered;
     let show_debug = use_state(|| false);
     let show_debug_value = *show_debug;
+    let auto_pan_outer_ratio = use_state(|| AUTO_PAN_OUTER_RATIO_DEFAULT);
+    let auto_pan_outer_ratio_value = *auto_pan_outer_ratio;
+    let auto_pan_inner_ratio = use_state(|| AUTO_PAN_INNER_RATIO_DEFAULT);
+    let auto_pan_inner_ratio_value = *auto_pan_inner_ratio;
+    let auto_pan_speed_ratio = use_state(|| AUTO_PAN_SPEED_RATIO_DEFAULT);
+    let auto_pan_speed_ratio_value = *auto_pan_speed_ratio;
     let app_snapshot_value = (*app_snapshot).clone();
     let local_active_id = *active_id;
     let local_dragging_members = (*dragging_members).clone();
@@ -3436,6 +3442,51 @@ fn app(props: &AppProps) -> Html {
             app_core.set_show_debug(enabled);
         })
     };
+    let on_auto_pan_outer_ratio = {
+        let auto_pan_outer_ratio = auto_pan_outer_ratio.clone();
+        let auto_pan_inner_ratio = auto_pan_inner_ratio.clone();
+        let app_core = app_core.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value = value.clamp(AUTO_PAN_OUTER_RATIO_MIN, AUTO_PAN_OUTER_RATIO_MAX);
+                auto_pan_outer_ratio.set(value);
+                app_core.set_auto_pan_outer_ratio(value);
+                let inner_value = (*auto_pan_inner_ratio).max(value);
+                if (inner_value - *auto_pan_inner_ratio).abs() > f32::EPSILON {
+                    auto_pan_inner_ratio.set(inner_value);
+                    app_core.set_auto_pan_inner_ratio(inner_value);
+                }
+            }
+        })
+    };
+    let on_auto_pan_inner_ratio = {
+        let auto_pan_outer_ratio = auto_pan_outer_ratio.clone();
+        let auto_pan_inner_ratio = auto_pan_inner_ratio.clone();
+        let app_core = app_core.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let min_value = (*auto_pan_outer_ratio).max(AUTO_PAN_INNER_RATIO_MIN);
+                let value = value
+                    .clamp(min_value, AUTO_PAN_INNER_RATIO_MAX);
+                auto_pan_inner_ratio.set(value);
+                app_core.set_auto_pan_inner_ratio(value);
+            }
+        })
+    };
+    let on_auto_pan_speed_ratio = {
+        let auto_pan_speed_ratio = auto_pan_speed_ratio.clone();
+        let app_core = app_core.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value = value.clamp(AUTO_PAN_SPEED_RATIO_MIN, AUTO_PAN_SPEED_RATIO_MAX);
+                auto_pan_speed_ratio.set(value);
+                app_core.set_auto_pan_speed_ratio(value);
+            }
+        })
+    };
     let on_menu_toggle = {
         let menu_visible = menu_visible.clone();
         Callback::from(move |event: Event| {
@@ -4262,7 +4313,7 @@ fn app(props: &AppProps) -> Html {
                     let Some(event) = event.dyn_ref::<TouchEvent>() else {
                         return;
                     };
-                    if let Some(mut pinch) = pinch_state_end.borrow_mut().take() {
+                    if let Some(pinch) = pinch_state_end.borrow_mut().take() {
                         let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
                         let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
                         if touch_a.is_some() && touch_b.is_some() {
@@ -8152,6 +8203,7 @@ fn app(props: &AppProps) -> Html {
             </div>
         </>
     };
+    let auto_pan_inner_min = auto_pan_outer_ratio_value.max(AUTO_PAN_INNER_RATIO_MIN);
     let graphics_controls = html! {
         <>
             <div class="control">
@@ -8326,6 +8378,51 @@ fn app(props: &AppProps) -> Html {
                         onchange={on_debug_toggle}
                     />
                 </label>
+            </div>
+            <div class="control">
+                <label for="auto-pan-outer">
+                    { "Auto-pan outer" }
+                    <span class="control-value">{ fmt_f32(auto_pan_outer_ratio_value) }</span>
+                </label>
+                <input
+                    id="auto-pan-outer"
+                    type="range"
+                    min={AUTO_PAN_OUTER_RATIO_MIN.to_string()}
+                    max={AUTO_PAN_OUTER_RATIO_MAX.to_string()}
+                    step="0.005"
+                    value={auto_pan_outer_ratio_value.to_string()}
+                    oninput={on_auto_pan_outer_ratio}
+                />
+            </div>
+            <div class="control">
+                <label for="auto-pan-inner">
+                    { "Auto-pan inner" }
+                    <span class="control-value">{ fmt_f32(auto_pan_inner_ratio_value) }</span>
+                </label>
+                <input
+                    id="auto-pan-inner"
+                    type="range"
+                    min={auto_pan_inner_min.to_string()}
+                    max={AUTO_PAN_INNER_RATIO_MAX.to_string()}
+                    step="0.005"
+                    value={auto_pan_inner_ratio_value.to_string()}
+                    oninput={on_auto_pan_inner_ratio}
+                />
+            </div>
+            <div class="control">
+                <label for="auto-pan-speed">
+                    { "Auto-pan speed" }
+                    <span class="control-value">{ fmt_f32(auto_pan_speed_ratio_value) }</span>
+                </label>
+                <input
+                    id="auto-pan-speed"
+                    type="range"
+                    min={AUTO_PAN_SPEED_RATIO_MIN.to_string()}
+                    max={AUTO_PAN_SPEED_RATIO_MAX.to_string()}
+                    step="0.05"
+                    value={auto_pan_speed_ratio_value.to_string()}
+                    oninput={on_auto_pan_speed_ratio}
+                />
             </div>
         </>
     };
