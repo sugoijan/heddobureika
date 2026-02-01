@@ -2531,9 +2531,6 @@ fn image_to_rgba_scaled(
         .get_context("2d")?
         .ok_or_else(|| wasm_bindgen::JsValue::from_str("no 2d context"))?
         .dyn_into::<CanvasRenderingContext2d>()?;
-    if blur_px > 0.0 {
-        ctx.set_filter(&format!("blur({:.1}px)", blur_px));
-    }
     ctx.draw_image_with_html_image_element_and_dw_and_dh(
         image,
         0.0,
@@ -2541,11 +2538,81 @@ fn image_to_rgba_scaled(
         target_w as f64,
         target_h as f64,
     )?;
-    if blur_px > 0.0 {
-        ctx.set_filter("none");
-    }
     let data = ctx.get_image_data(0.0, 0.0, target_w as f64, target_h as f64)?;
-    Ok((data.data().to_vec(), target_w, target_h))
+    let mut pixels = data.data().to_vec();
+    if blur_px > 0.0 {
+        // TODO: consider moving preview blur to the GPU to avoid CPU cost.
+        let sigma = blur_px as f32;
+        let radius = (sigma * 3.0).ceil().max(1.0) as usize;
+        gaussian_blur_rgba(&mut pixels, target_w, target_h, radius, sigma);
+    }
+    Ok((pixels, target_w, target_h))
+}
+
+fn gaussian_blur_rgba(pixels: &mut [u8], width: u32, height: u32, radius: usize, sigma: f32) {
+    if radius == 0 || width == 0 || height == 0 || !sigma.is_finite() || sigma <= 0.0 {
+        return;
+    }
+    let w = width as i32;
+    let h = height as i32;
+    let r = radius as i32;
+    let stride = (width * 4) as usize;
+    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut sum = 0.0f32;
+    for i in -r..=r {
+        let x = i as f32;
+        let v = (-0.5 * (x * x) / (sigma * sigma)).exp();
+        kernel.push(v);
+        sum += v;
+    }
+    if sum > 0.0 {
+        for v in &mut kernel {
+            *v /= sum;
+        }
+    }
+
+    let mut temp = vec![0f32; pixels.len()];
+    for y in 0..h {
+        let row = (y as usize) * stride;
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for k in -r..=r {
+                let sx = (x + k).clamp(0, w - 1) as usize;
+                let idx = row + sx * 4;
+                let weight = kernel[(k + r) as usize];
+                acc[0] += pixels[idx] as f32 * weight;
+                acc[1] += pixels[idx + 1] as f32 * weight;
+                acc[2] += pixels[idx + 2] as f32 * weight;
+                acc[3] += pixels[idx + 3] as f32 * weight;
+            }
+            let out_idx = row + (x as usize) * 4;
+            temp[out_idx] = acc[0];
+            temp[out_idx + 1] = acc[1];
+            temp[out_idx + 2] = acc[2];
+            temp[out_idx + 3] = acc[3];
+        }
+    }
+
+    for y in 0..h {
+        let row = (y as usize) * stride;
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for k in -r..=r {
+                let sy = (y + k).clamp(0, h - 1) as usize;
+                let idx = sy * stride + (x as usize) * 4;
+                let weight = kernel[(k + r) as usize];
+                acc[0] += temp[idx] * weight;
+                acc[1] += temp[idx + 1] * weight;
+                acc[2] += temp[idx + 2] * weight;
+                acc[3] += temp[idx + 3] * weight;
+            }
+            let out_idx = row + (x as usize) * 4;
+            pixels[out_idx] = acc[0].round().clamp(0.0, 255.0) as u8;
+            pixels[out_idx + 1] = acc[1].round().clamp(0.0, 255.0) as u8;
+            pixels[out_idx + 2] = acc[2].round().clamp(0.0, 255.0) as u8;
+            pixels[out_idx + 3] = acc[3].round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 fn build_icon_atlas(

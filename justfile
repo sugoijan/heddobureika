@@ -4,7 +4,9 @@ set shell := ["zsh", "-cu"]
 ADMIN_TOKEN := env_var_or_default("ADMIN_TOKEN", env_var_or_default("ROOM_ADMIN_TOKEN", ""))
 #ROOM_WS_BASE_URL := env_var_or_default("ROOM_WS_BASE_URL", "ws://127.0.0.1:8787/ws")
 WRANGLER_LOG_PATH := env_var_or_default("WRANGLER_LOG_PATH", ".wrangler/logs")
+WRANGLER_PORT := env_var_or_default("WRANGLER_PORT", "8787")
 TRUNK_PORT := env_var_or_default("TRUNK_PORT", "8081")
+CADDY_PUBLIC_PORT := env_var_or_default("CADDY_PUBLIC_PORT", "8080")
 CADDY_CONFIG := env_var_or_default("CADDY_CONFIG", "Caddyfile.dev")
 
 # Show available tasks
@@ -18,16 +20,16 @@ dev-vars:
 
 # Run the worker locally (no Cloudflare login required)
 wrangler-dev:
-    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --host 0.0.0.0 --persist-to .wrangler/state --show-interactive-dev-session=false
+    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" npx --no-install wrangler dev --local --host 0.0.0.0 --port {{WRANGLER_PORT}} --persist-to .wrangler/state --show-interactive-dev-session=false
 
 # Run the frontend locally (requires trunk)
 trunk-serve:
     @mkdir -p .wrangler
     @trunk serve --port {{TRUNK_PORT}}
 
-# Run Caddy dev proxy (serves on :8080 by default)
+# Run Caddy dev proxy (serves on CADDY_PUBLIC_PORT)
 caddy-run:
-    @caddy run --config {{CADDY_CONFIG}}
+    @CADDY_PUBLIC_PORT="{{CADDY_PUBLIC_PORT}}" TRUNK_PORT="{{TRUNK_PORT}}" WRANGLER_PORT="{{WRANGLER_PORT}}" caddy run --config {{CADDY_CONFIG}}
 
 # Run worker + frontend + proxy together
 [parallel]
@@ -93,7 +95,7 @@ create-room *args:
       echo "Missing admin token. Set ADMIN_TOKEN (or ROOM_ADMIN_TOKEN) or use .dev.vars."; \
       exit 1; \
     fi; \
-    base_url="${ROOM_WS_BASE_URL:-ws://127.0.0.1:8787/ws}"; \
+    base_url="${ROOM_WS_BASE_URL:-ws://127.0.0.1:{{WRANGLER_PORT}}/ws}"; \
     set -- {{args}}; \
     if printf ' %s ' "$@" | grep -q -- ' --base-url '; then \
       cargo run -p heddobureika-cli -- rooms create --admin-token "$token" "$@"; \

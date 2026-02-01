@@ -2,8 +2,8 @@
     auto_https off
 }
 
-:8080 {
+:{$CADDY_PUBLIC_PORT} {
     @ws path /ws/*
-    reverse_proxy @ws 127.0.0.1:8787
-    reverse_proxy 127.0.0.1:8081
+    reverse_proxy @ws 127.0.0.1:{$WRANGLER_PORT}
+    reverse_proxy 127.0.0.1:{$TRUNK_PORT}
 }

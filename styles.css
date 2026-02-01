@@ -233,6 +233,30 @@ body {
   cursor: pointer;
 }
 
+.puzzle-canvas.preview-grab {
+  cursor: grab;
+}
+
+.puzzle-canvas.preview-resize-ew {
+  cursor: ew-resize;
+}
+
+.puzzle-canvas.preview-resize-ns {
+  cursor: ns-resize;
+}
+
+.puzzle-canvas.preview-resize-nwse {
+  cursor: nwse-resize;
+}
+
+.puzzle-canvas.preview-resize-nesw {
+  cursor: nesw-resize;
+}
+
+.puzzle-canvas.preview-dragging {
+  cursor: grabbing;
+}
+
 .workspace-bounds {
   fill: var(--workspace-fill);
   stroke: var(--workspace-stroke);
