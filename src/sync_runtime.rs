@@ -5,9 +5,9 @@ use gloo::timers::callback::Timeout;
 
 use crate::app_core::{AppCore, AppSnapshot, AppSubscription};
 use crate::app_router::{self, MultiplayerConfig};
-use crate::core::InitMode;
+use crate::core::{collect_group, InitMode};
 use crate::local_snapshot::{apply_game_snapshot_to_core, ApplySnapshotResult};
-use crate::multiplayer_game_sync::{MultiplayerGameSync, MultiplayerSyncCallbacks};
+use crate::multiplayer_game_sync::MultiplayerGameSync;
 use crate::runtime::{CoreAction, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,14 +18,15 @@ enum ActiveSync {
 
 struct SyncRuntimeState {
     local_sync: Option<LocalSyncAdapter>,
-    hooks: Option<SyncHooks>,
+    ui_hooks: SyncHooks,
+    system_hooks: SyncHooks,
     core: Option<Rc<AppCore>>,
     core_subscription: Option<AppSubscription>,
     last_snapshot: Option<AppSnapshot>,
+    last_sync_view: SyncView,
     multiplayer: Option<Rc<RefCell<MultiplayerGameSync>>>,
     active: ActiveSync,
     config: Option<MultiplayerConfig>,
-    callbacks: Option<MultiplayerSyncCallbacks>,
     on_fail: Rc<dyn Fn()>,
     active_room: Option<String>,
     retry_attempts: u32,
@@ -41,14 +42,15 @@ impl SyncRuntimeState {
     fn new() -> Self {
         Self {
             local_sync: None,
-            hooks: None,
+            ui_hooks: SyncHooks::empty(),
+            system_hooks: SyncHooks::empty(),
             core: None,
             core_subscription: None,
             last_snapshot: None,
+            last_sync_view: SyncView::default(),
             multiplayer: None,
             active: ActiveSync::Local,
             config: None,
-            callbacks: None,
             on_fail: default_on_fail(),
             active_room: None,
             retry_attempts: 0,
@@ -66,6 +68,9 @@ impl SyncRuntimeState {
             self.active = ActiveSync::Multiplayer;
             if self.multiplayer.is_none() {
                 self.multiplayer = Some(Rc::new(RefCell::new(MultiplayerGameSync::new())));
+            }
+            if let Some(sync) = self.multiplayer.as_ref() {
+                sync.borrow_mut().init(self.combined_hooks());
             }
             if let (Some(sync), Some(observer)) =
                 (self.multiplayer.as_ref(), self.mp_local_transform_observer.as_ref())
@@ -93,11 +98,50 @@ impl SyncRuntimeState {
         self.retry_timer.take();
         if self.local_sync.is_none() {
             let mut local_sync = LocalSyncAdapter::new();
-            if let Some(hooks) = self.hooks.clone() {
-                local_sync.init(hooks);
-            }
+            local_sync.init(self.combined_hooks());
             self.local_sync = Some(local_sync);
         }
+    }
+}
+
+fn merge_hooks(primary: &SyncHooks, secondary: &SyncHooks) -> SyncHooks {
+    let on_remote_action_a = primary.on_remote_action.clone();
+    let on_remote_action_b = secondary.on_remote_action.clone();
+    let on_snapshot_a = primary.on_snapshot.clone();
+    let on_snapshot_b = secondary.on_snapshot.clone();
+    let on_remote_snapshot_a = primary.on_remote_snapshot.clone();
+    let on_remote_snapshot_b = secondary.on_remote_snapshot.clone();
+    let on_remote_update_a = primary.on_remote_update.clone();
+    let on_remote_update_b = secondary.on_remote_update.clone();
+    let on_event_a = primary.on_event.clone();
+    let on_event_b = secondary.on_event.clone();
+    SyncHooks {
+        on_remote_action: Rc::new(move |action| {
+            on_remote_action_a(action.clone());
+            on_remote_action_b(action);
+        }),
+        on_snapshot: Rc::new(move |snapshot| {
+            on_snapshot_a(snapshot.clone());
+            on_snapshot_b(snapshot);
+        }),
+        on_remote_snapshot: Rc::new(move |snapshot, seq| {
+            on_remote_snapshot_a(snapshot.clone(), seq);
+            on_remote_snapshot_b(snapshot, seq);
+        }),
+        on_remote_update: Rc::new(move |update, seq, source, client_seq| {
+            on_remote_update_a(update.clone(), seq, source, client_seq);
+            on_remote_update_b(update, seq, source, client_seq);
+        }),
+        on_event: Rc::new(move |event| {
+            on_event_a(event.clone());
+            on_event_b(event);
+        }),
+    }
+}
+
+impl SyncRuntimeState {
+    fn combined_hooks(&self) -> SyncHooks {
+        merge_hooks(&self.system_hooks, &self.ui_hooks)
     }
 }
 
@@ -210,7 +254,7 @@ fn handle_local_snapshot(snapshot: AppSnapshot, core: Rc<AppCore>) {
         } else {
             None
         };
-        let hook = state.hooks.as_ref().map(|hooks| hooks.on_snapshot.clone());
+        let hook = state.combined_hooks().on_snapshot;
         (allow_persist, hook, pending)
     });
 
@@ -241,9 +285,7 @@ fn handle_local_snapshot(snapshot: AppSnapshot, core: Rc<AppCore>) {
         }
     }
 
-    if let Some(hook) = hook {
-        hook(snapshot);
-    }
+    hook(snapshot);
 }
 
 fn default_on_fail() -> Rc<dyn Fn()> {
@@ -269,16 +311,12 @@ fn connect_if_ready(state: &mut SyncRuntimeState) {
         }
         return;
     };
-    let Some(callbacks) = state.callbacks.clone() else {
-        return;
-    };
     if state.active_room.as_deref() == Some(config.room_id.as_str()) {
         return;
     }
     sync.borrow_mut().disconnect();
     sync.borrow_mut().connect(
         &config.room_id,
-        callbacks,
         Rc::new(move || {
             schedule_multiplayer_retry();
         }),
@@ -321,43 +359,13 @@ pub(crate) fn attach_core(core: Rc<AppCore>) {
     handle_local_snapshot(snapshot, core);
 }
 
-pub(crate) fn set_callbacks(callbacks: MultiplayerSyncCallbacks) {
-    let on_welcome_inner = callbacks.on_welcome.clone();
-    let on_error_inner = callbacks.on_error.clone();
-    let callbacks = MultiplayerSyncCallbacks {
-        on_welcome: Rc::new(move |room_id, persistence, initialized, client_id| {
-            reset_multiplayer_retry();
-            (on_welcome_inner)(room_id, persistence, initialized, client_id);
-        }),
-        on_need_init: callbacks.on_need_init.clone(),
-        on_warning: callbacks.on_warning.clone(),
-        on_state: callbacks.on_state.clone(),
-        on_update: callbacks.on_update.clone(),
-        on_ownership: callbacks.on_ownership.clone(),
-        on_drop_not_ready: callbacks.on_drop_not_ready.clone(),
-        on_error: Rc::new(move |code, message| {
-            (on_error_inner)(code, message);
-            fail_multiplayer_now();
-        }),
-    };
+pub(crate) fn set_system_hooks(hooks: SyncHooks) {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
-        state.callbacks = Some(callbacks);
+        state.system_hooks = hooks;
         state.ensure_backend();
-        connect_if_ready(&mut state);
-    });
-}
-
-#[allow(dead_code)]
-pub(crate) fn clear_callbacks() {
-    STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.callbacks = None;
         if let Some(sync) = state.multiplayer.as_ref() {
-            if state.active_room.is_some() {
-                sync.borrow_mut().disconnect();
-                state.active_room = None;
-            }
+            sync.borrow_mut().init(state.combined_hooks());
         }
     });
 }
@@ -374,12 +382,16 @@ pub(crate) fn set_state_applied(value: bool) {
     });
 }
 
-pub(crate) fn init_local_hooks(hooks: SyncHooks) {
+pub(crate) fn set_sync_hooks(hooks: SyncHooks) {
     let (snapshot, core) = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
-        state.hooks = Some(hooks.clone());
+        state.ui_hooks = hooks;
+        let hooks = state.combined_hooks();
         if let Some(sync) = state.local_sync.as_mut() {
-            sync.init(hooks);
+            sync.init(hooks.clone());
+        }
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow_mut().init(hooks);
         }
         (state.last_snapshot.clone(), state.core.clone())
     });
@@ -418,32 +430,57 @@ pub(crate) fn set_multiplayer_local_flip_observer(observer: Option<Rc<dyn Fn(u32
     });
 }
 
-pub(crate) fn shutdown_local_hooks() {
+pub(crate) fn clear_sync_hooks() {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
-        state.hooks = None;
+        state.ui_hooks = SyncHooks::empty();
         if let Some(sync) = state.local_sync.as_mut() {
             sync.shutdown();
+        }
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow_mut().init(state.combined_hooks());
         }
     });
 }
 
 pub(crate) fn handle_local_action(action: &CoreAction) {
-    STATE.with(|slot| {
+    enum SyncHandle {
+        Local(LocalSyncAdapter),
+        Multiplayer(Rc<RefCell<MultiplayerGameSync>>),
+        None,
+    }
+
+    let handle = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         match state.active {
-            ActiveSync::Local => {
-                if let Some(sync) = state.local_sync.as_mut() {
-                    sync.handle_local_action(action);
-                }
-            }
-            ActiveSync::Multiplayer => {
-                if let Some(sync) = state.multiplayer.as_ref() {
-                    sync.borrow_mut().handle_local_action(action);
-                }
-            }
+            ActiveSync::Local => state
+                .local_sync
+                .take()
+                .map(SyncHandle::Local)
+                .unwrap_or(SyncHandle::None),
+            ActiveSync::Multiplayer => state
+                .multiplayer
+                .clone()
+                .map(SyncHandle::Multiplayer)
+                .unwrap_or(SyncHandle::None),
         }
     });
+
+    match handle {
+        SyncHandle::Local(mut sync) => {
+            sync.handle_local_action(action);
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                if state.active == ActiveSync::Local && state.local_sync.is_none() {
+                    state.local_sync = Some(sync);
+                }
+            });
+        }
+        SyncHandle::Multiplayer(sync) => {
+            sync.borrow_mut().handle_local_action(action);
+        }
+        SyncHandle::None => {}
+    }
 }
 
 fn should_block_actions() -> bool {
@@ -460,8 +497,60 @@ fn should_block_actions() -> bool {
     })
 }
 
+fn anchor_for_piece(snapshot: &AppSnapshot, piece_id: usize) -> Option<usize> {
+    let cols = snapshot.grid.cols as usize;
+    let rows = snapshot.grid.rows as usize;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let total = cols * rows;
+    if piece_id >= total {
+        return None;
+    }
+    if snapshot.core.connections.len() < total {
+        return None;
+    }
+    let mut members = collect_group(&snapshot.core.connections, piece_id, cols, rows);
+    if members.is_empty() {
+        members.push(piece_id);
+    }
+    members.into_iter().min()
+}
+
+fn should_block_owned_action(core: &AppCore, action: &CoreAction) -> bool {
+    let CoreAction::BeginDrag { piece_id, .. } = action else {
+        return false;
+    };
+    let snapshot = core.snapshot();
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        if state.active != ActiveSync::Multiplayer {
+            return false;
+        }
+        let Some(sync) = state.multiplayer.as_ref() else {
+            return false;
+        };
+        let sync_view = sync.borrow().sync_view();
+        let ownership = sync_view.ownership_by_anchor();
+        if ownership.is_empty() {
+            return false;
+        }
+        let Some(anchor_id) = anchor_for_piece(&snapshot, *piece_id) else {
+            return false;
+        };
+        if let Some(owner_id) = ownership.get(&(anchor_id as u32)) {
+            Some(*owner_id) != sync_view.client_id()
+        } else {
+            false
+        }
+    })
+}
+
 pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_core: bool) {
     if should_block_actions() && !matches!(action, CoreAction::SetHovered { .. }) {
+        return;
+    }
+    if should_block_owned_action(core, &action) {
         return;
     }
     let mut drag_anchor_before = None;
@@ -473,7 +562,7 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
             drag_anchor_before = snapshot.dragging_members.first().copied();
             drag_primary_before = snapshot.drag_primary_id;
             if let Some(id) = drag_primary_before {
-                flip_before = snapshot.flips.get(id).copied();
+                flip_before = snapshot.core.flips.get(id).copied();
             }
         }
         core.apply_action(action.clone());
@@ -488,22 +577,22 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
             let Some(anchor_id) = snapshot.dragging_members.first().copied() else {
                 return;
             };
-            if anchor_id >= snapshot.positions.len() {
+            if anchor_id >= snapshot.core.positions.len() {
                 return;
             }
             if snapshot.drag_rotate_mode {
-                if anchor_id >= snapshot.rotations.len() {
+                if anchor_id >= snapshot.core.rotations.len() {
                     return;
                 }
-                let pos = snapshot.positions[anchor_id];
-                let rot_deg = snapshot.rotations[anchor_id];
+                let pos = snapshot.core.positions[anchor_id];
+                let rot_deg = snapshot.core.rotations[anchor_id];
                 handle_local_action(&CoreAction::Sync(SyncAction::Transform {
                     anchor_id,
                     pos,
                     rot_deg,
                 }));
             } else {
-                let pos = snapshot.positions[anchor_id];
+                let pos = snapshot.core.positions[anchor_id];
                 handle_local_action(&CoreAction::Sync(SyncAction::Move { anchor_id, pos }));
             }
         }
@@ -516,7 +605,7 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
                 return;
             }
             if let (Some(primary_id), Some(before_flip)) = (drag_primary_before, flip_before) {
-                if let Some(after_flip) = snapshot.flips.get(primary_id).copied() {
+                if let Some(after_flip) = snapshot.core.flips.get(primary_id).copied() {
                     if after_flip != before_flip {
                         handle_local_action(&CoreAction::Sync(SyncAction::Flip {
                             piece_id: primary_id,
@@ -526,11 +615,11 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
                     }
                 }
             }
-            if anchor_id >= snapshot.positions.len() || anchor_id >= snapshot.rotations.len() {
+            if anchor_id >= snapshot.core.positions.len() || anchor_id >= snapshot.core.rotations.len() {
                 return;
             }
-            let pos = snapshot.positions[anchor_id];
-            let rot_deg = snapshot.rotations[anchor_id];
+            let pos = snapshot.core.positions[anchor_id];
+            let rot_deg = snapshot.core.rotations[anchor_id];
             handle_local_action(&CoreAction::Sync(SyncAction::Place {
                 anchor_id,
                 pos,
@@ -541,20 +630,46 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
     }
 }
 
+pub(crate) fn clear_local_snapshot() {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if let Some(sync) = state.local_sync.as_mut() {
+            sync.clear_saved_snapshot();
+        } else {
+            LocalSyncAdapter::clear_storage();
+        }
+    });
+}
+
 pub(crate) fn sync_view() -> SyncView {
     STATE.with(|slot| {
-        let state = slot.borrow();
+        let mut state = slot.borrow_mut();
         match state.active {
-            ActiveSync::Local => state
-                .local_sync
-                .as_ref()
-                .map(|sync| sync.sync_view())
-                .unwrap_or_default(),
-            ActiveSync::Multiplayer => state
-                .multiplayer
-                .as_ref()
-                .map(|sync| sync.borrow().sync_view())
-                .unwrap_or_default(),
+            ActiveSync::Local => {
+                let view = state
+                    .local_sync
+                    .as_ref()
+                    .map(|sync| sync.sync_view())
+                    .unwrap_or_default();
+                state.last_sync_view = view.clone();
+                view
+            }
+            ActiveSync::Multiplayer => {
+                let multiplayer = state.multiplayer.clone();
+                let Some(sync) = multiplayer else {
+                    return state.last_sync_view.clone();
+                };
+                let view = match sync.try_borrow() {
+                    Ok(sync) => Some(sync.sync_view()),
+                    Err(_) => None,
+                };
+                if let Some(view) = view {
+                    state.last_sync_view = view.clone();
+                    view
+                } else {
+                    state.last_sync_view.clone()
+                }
+            }
         }
     })
 }
@@ -591,11 +706,11 @@ pub(crate) fn register_sync_view_hook(hook: Rc<dyn Fn()>) -> SyncViewHookHandle 
 
 #[cfg(test)]
 pub(crate) fn install_test_handler(
-    callbacks: MultiplayerSyncCallbacks,
+    hooks: SyncHooks,
 ) -> Rc<dyn Fn(heddobureika_core::ServerMsg)> {
     STATE.with(|slot| {
         if let Some(sync) = slot.borrow().multiplayer.as_ref() {
-            sync.borrow_mut().install_handler(callbacks)
+            sync.borrow_mut().install_handler(hooks)
         } else {
             Rc::new(|_msg: heddobureika_core::ServerMsg| {})
         }

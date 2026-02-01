@@ -3,6 +3,8 @@
 /.dev.vars
 /.env.local
 /node_modules
+/.pnpm-debug.log
+/.pnpm-store
 /.wrangler
 /puzzles/catalog.local.toml
 /.env

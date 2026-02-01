@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 
 use crate::core::*;
 use crate::runtime::CoreAction;
-use heddobureika_core::PuzzleInfo;
+use heddobureika_core::{CoreSnapshot, CoreState, GameRules, PuzzleInfo};
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
 
@@ -20,6 +20,7 @@ const VIEW_FIT_PADDING_RATIO: f32 = 0.02;
 
 pub(crate) struct AppCore {
     state: RefCell<AppState>,
+    snapshots: RefCell<SnapshotBuffer>,
     subscribers: Rc<RefCell<Vec<AppSubscriber>>>,
 }
 
@@ -50,13 +51,11 @@ struct ViewState {
 #[derive(Clone)]
 pub(crate) struct AppSnapshot {
     pub(crate) puzzle_info: Option<PuzzleInfo>,
+    pub(crate) rules: GameRules,
+    pub(crate) core: CoreSnapshot,
     pub(crate) grid: GridChoice,
     pub(crate) piece_width: f32,
     pub(crate) piece_height: f32,
-    pub(crate) positions: Vec<(f32, f32)>,
-    pub(crate) rotations: Vec<f32>,
-    pub(crate) flips: Vec<bool>,
-    pub(crate) connections: Vec<[bool; 4]>,
     pub(crate) z_order: Vec<usize>,
     pub(crate) hovered_id: Option<usize>,
     pub(crate) active_id: Option<usize>,
@@ -69,14 +68,72 @@ pub(crate) struct AppSnapshot {
     pub(crate) solved: bool,
     pub(crate) layout: WorkspaceLayout,
     pub(crate) view: ViewRect,
-    pub(crate) svg_settings: SvgRenderSettings,
-    pub(crate) wgpu_settings: WgpuRenderSettings,
+    pub(crate) app_settings: AppSettings,
+    pub(crate) view_settings: ViewSettings,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AppSettings {
     pub(crate) theme_mode: ThemeMode,
     pub(crate) show_debug: bool,
-    pub(crate) scramble_nonce: u32,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme_mode: ThemeMode::System,
+            show_debug: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ViewSettings {
     pub(crate) auto_pan_outer_ratio: f32,
     pub(crate) auto_pan_inner_ratio: f32,
     pub(crate) auto_pan_speed_ratio: f32,
+    pub(crate) shape: ShapeSettings,
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self {
+            auto_pan_outer_ratio: AUTO_PAN_OUTER_RATIO_DEFAULT,
+            auto_pan_inner_ratio: AUTO_PAN_INNER_RATIO_DEFAULT,
+            auto_pan_speed_ratio: AUTO_PAN_SPEED_RATIO_DEFAULT,
+            shape: ShapeSettings::default(),
+        }
+    }
+}
+
+
+struct SnapshotBuffer {
+    front: AppSnapshot,
+    back: AppSnapshot,
+}
+
+impl SnapshotBuffer {
+    fn new(state: &AppState) -> Self {
+        let snapshot = build_snapshot_from_state(state);
+        Self {
+            front: snapshot.clone(),
+            back: snapshot,
+        }
+    }
+
+    fn refresh_from_state(&mut self, state: &AppState) {
+        fill_snapshot_from_state(state, &mut self.back);
+        std::mem::swap(&mut self.front, &mut self.back);
+    }
+
+    fn mutate_from_front<F>(&mut self, mutator: F)
+    where
+        F: FnOnce(&mut AppSnapshot),
+    {
+        self.back.clone_from(&self.front);
+        mutator(&mut self.back);
+        std::mem::swap(&mut self.front, &mut self.back);
+    }
 }
 
 #[derive(Clone)]
@@ -110,51 +167,28 @@ struct DragState {
 }
 
 struct AppState {
-    puzzle_info: Option<PuzzleInfo>,
+    core: CoreState,
     assets: Option<Rc<PuzzleAssets>>,
-    grid: GridChoice,
-    piece_width: f32,
-    piece_height: f32,
-    positions: Vec<(f32, f32)>,
-    rotations: Vec<f32>,
-    flips: Vec<bool>,
-    connections: Vec<[bool; 4]>,
     z_order: Vec<usize>,
     hovered_id: Option<usize>,
     active_id: Option<usize>,
     dragging_members: Vec<usize>,
     drag_state: Option<DragState>,
-    solved: bool,
-    layout: WorkspaceLayout,
     view: ViewState,
-    wgpu_settings: WgpuRenderSettings,
+    app_settings: AppSettings,
+    view_settings: ViewSettings,
     renderer_kind: RendererKind,
-    svg_settings: SvgRenderSettings,
-    theme_mode: ThemeMode,
-    show_debug: bool,
-    scramble_nonce: u32,
-    settings: ShapeSettings,
-    workspace_padding_ratio: f32,
-    image_max_dim: u32,
-    rotation_enabled: bool,
-    rotation_snap_tolerance: f32,
-    snap_distance_ratio: f32,
-    frame_snap_ratio: f32,
-    auto_pan_outer_ratio: f32,
-    auto_pan_inner_ratio: f32,
-    auto_pan_speed_ratio: f32,
 }
 
 impl AppCore {
     pub(crate) fn new() -> Rc<Self> {
+        let state = AppState::new();
+        let snapshots = SnapshotBuffer::new(&state);
         Rc::new(Self {
-            state: RefCell::new(AppState::new()),
+            state: RefCell::new(state),
+            snapshots: RefCell::new(snapshots),
             subscribers: Rc::new(RefCell::new(Vec::new())),
         })
-    }
-
-    pub(crate) fn shared() -> Rc<Self> {
-        SHARED_CORE.with(|core| core.clone())
     }
 
     pub(crate) fn subscribe(&self, subscriber: AppSubscriber) -> AppSubscription {
@@ -166,44 +200,40 @@ impl AppCore {
     }
 
     fn notify(&self) {
+        self.refresh_snapshot_from_state();
+        self.notify_subscribers();
+    }
+
+    fn notify_subscribers(&self) {
         let subscribers = self.subscribers.borrow().clone();
         for subscriber in subscribers {
             (subscriber)();
         }
     }
 
-    pub(crate) fn snapshot(&self) -> AppSnapshot {
+    fn notify_snapshot_only(&self) {
+        self.notify_subscribers();
+    }
+
+    fn refresh_snapshot_from_state(&self) {
         let state = self.state.borrow();
-        AppSnapshot {
-            puzzle_info: state.puzzle_info.clone(),
-            grid: state.grid,
-            piece_width: state.piece_width,
-            piece_height: state.piece_height,
-            positions: state.positions.clone(),
-            rotations: state.rotations.clone(),
-            flips: state.flips.clone(),
-            connections: state.connections.clone(),
-            z_order: state.z_order.clone(),
-            hovered_id: state.hovered_id,
-            active_id: state.active_id,
-            dragging_members: state.dragging_members.clone(),
-            drag_cursor: state.drag_state.as_ref().map(|drag| (drag.cursor_x, drag.cursor_y)),
-            drag_touch_id: state.drag_state.as_ref().and_then(|drag| drag.touch_id),
-            drag_rotate_mode: state.drag_state.as_ref().map(|drag| drag.rotate_mode).unwrap_or(false),
-            drag_right_click: state.drag_state.as_ref().map(|drag| drag.right_click).unwrap_or(false),
-            drag_primary_id: state.drag_state.as_ref().map(|drag| drag.primary_id),
-            solved: state.solved,
-            layout: state.layout,
-            view: state.view.view_rect(),
-            svg_settings: state.svg_settings.clone(),
-            wgpu_settings: state.wgpu_settings.clone(),
-            theme_mode: state.theme_mode,
-            show_debug: state.show_debug,
-            scramble_nonce: state.scramble_nonce,
-            auto_pan_outer_ratio: state.auto_pan_outer_ratio,
-            auto_pan_inner_ratio: state.auto_pan_inner_ratio,
-            auto_pan_speed_ratio: state.auto_pan_speed_ratio,
+        let mut snapshots = self.snapshots.borrow_mut();
+        snapshots.refresh_from_state(&state);
+    }
+
+    pub(crate) fn snapshot(&self) -> AppSnapshot {
+        self.snapshots.borrow().front.clone()
+    }
+
+    pub(crate) fn mutate_snapshot<F>(&self, mutator: F)
+    where
+        F: FnOnce(&mut AppSnapshot),
+    {
+        {
+            let mut snapshots = self.snapshots.borrow_mut();
+            snapshots.mutate_from_front(mutator);
         }
+        self.notify_snapshot_only();
     }
 
     pub(crate) fn assets(&self) -> Option<Rc<PuzzleAssets>> {
@@ -254,17 +284,17 @@ impl AppCore {
         };
         let piece_width = width as f32 / grid.cols as f32;
         let piece_height = height as f32 / grid.rows as f32;
-        let depth_cap = state.settings.tab_depth_cap.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-        let curve_detail = state.settings.curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
+        let depth_cap = state.view_settings.shape.tab_depth_cap.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+        let curve_detail = state.view_settings.shape.curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
         let pieces = build_pieces(grid.rows, grid.cols);
-        let (horizontal, vertical) = build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &state.settings);
+        let (horizontal, vertical) = build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &state.view_settings.shape);
         let (horizontal_waves, vertical_waves) = build_line_waves(
             grid.rows,
             grid.cols,
             PUZZLE_SEED,
             piece_width,
             piece_height,
-            state.settings.line_bend_ratio,
+            state.view_settings.shape.line_bend_ratio,
         );
         let warp_field = WarpField {
             width: width as f32,
@@ -300,32 +330,32 @@ impl AppCore {
             piece_height,
             mask_pad,
         });
-        state.puzzle_info = Some(info);
+        state.core.puzzle_info = Some(info);
         state.assets = Some(assets);
-        state.grid = grid;
-        state.piece_width = piece_width;
-        state.piece_height = piece_height;
-        state.layout = compute_workspace_layout(
+        state.core.grid = grid;
+        state.core.piece_width = piece_width;
+        state.core.piece_height = piece_height;
+        state.core.layout = compute_workspace_layout(
             width as f32,
             height as f32,
-            state.workspace_padding_ratio,
+            state.core.rules.workspace_padding_ratio,
         );
-        let layout = state.layout;
+        let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         let cols = grid.cols as usize;
         let rows = grid.rows as usize;
         let total = cols * rows;
-        let view_width = state.layout.view_width;
-        let view_height = state.layout.view_height;
-        let view_min_x = state.layout.view_min_x;
-        let view_min_y = state.layout.view_min_y;
-        let puzzle_scale = state.layout.puzzle_scale.max(1.0e-4);
+        let view_width = state.core.layout.view_width;
+        let view_height = state.core.layout.view_height;
+        let view_min_x = state.core.layout.view_min_x;
+        let view_min_y = state.core.layout.view_min_y;
+        let puzzle_scale = state.core.layout.puzzle_scale.max(1.0e-4);
         let puzzle_view_min_x = view_min_x / puzzle_scale;
         let puzzle_view_min_y = view_min_y / puzzle_scale;
         let puzzle_view_width = view_width / puzzle_scale;
         let puzzle_view_height = view_height / puzzle_scale;
         let margin = piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
-        let nonce = scramble_nonce.unwrap_or_else(|| time_nonce(state.scramble_nonce));
+        let nonce = scramble_nonce.unwrap_or_else(|| time_nonce(state.core.scramble_nonce));
         let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
@@ -341,7 +371,7 @@ impl AppCore {
             puzzle_view_height,
             margin,
         );
-        let rotations = scramble_rotations(rotation_seed, total, state.rotation_enabled);
+        let rotations = scramble_rotations(rotation_seed, total, state.core.rules.rotation_enabled);
         let flips = scramble_flips(flip_seed, total, 0.0);
         let connections = vec![[false; 4]; total];
         let (
@@ -362,17 +392,17 @@ impl AppCore {
             piece_height,
             Some(&order),
         );
-        state.scramble_nonce = nonce;
-        state.positions = derived_positions;
-        state.rotations = derived_rotations;
-        state.flips = flips;
-        state.connections = connections;
+        state.core.scramble_nonce = nonce;
+        state.core.positions = derived_positions;
+        state.core.rotations = derived_rotations;
+        state.core.flips = flips;
+        state.core.connections = connections;
         state.z_order = piece_order;
         state.hovered_id = None;
         state.active_id = None;
         state.dragging_members.clear();
         state.drag_state = None;
-        state.solved = false;
+        state.core.solved = false;
         drop(state);
         self.notify();
     }
@@ -388,17 +418,17 @@ impl AppCore {
         touch_id: Option<i32>,
     ) {
         let mut state = self.state.borrow_mut();
-        let total = (state.grid.cols as usize) * (state.grid.rows as usize);
+        let total = (state.core.grid.cols as usize) * (state.core.grid.rows as usize);
         if total == 0 || piece_id >= total {
             return;
         }
-        let cols = state.grid.cols as usize;
-        let rows = state.grid.rows as usize;
+        let cols = state.core.grid.cols as usize;
+        let rows = state.core.grid.rows as usize;
         if shift_key {
-            clear_piece_connections(&mut state.connections, piece_id, cols, rows);
+            clear_piece_connections(&mut state.core.connections, piece_id, cols, rows);
         }
         let mut members = collect_group(
-            &state.connections,
+            &state.core.connections,
             piece_id,
             cols,
             rows,
@@ -410,23 +440,24 @@ impl AppCore {
         let mut start_positions = Vec::with_capacity(members.len());
         let mut start_rotations = Vec::with_capacity(members.len());
         for id in &members {
-            if let Some(pos) = state.positions.get(*id).copied() {
+            if let Some(pos) = state.core.positions.get(*id).copied() {
                 start_positions.push(pos);
             } else {
                 start_positions.push((0.0, 0.0));
             }
-            let rot = state.rotations.get(*id).copied().unwrap_or(0.0);
+            let rot = state.core.rotations.get(*id).copied().unwrap_or(0.0);
             start_rotations.push(rot);
         }
-        let piece_width = state.piece_width;
-        let piece_height = state.piece_height;
+        let piece_width = state.core.piece_width;
+        let piece_height = state.core.piece_height;
         let base_pos = state
+            .core
             .positions
             .get(piece_id)
             .copied()
             .unwrap_or((
-                (piece_id % state.grid.cols as usize) as f32 * piece_width,
-                (piece_id / state.grid.cols as usize) as f32 * piece_height,
+                (piece_id % state.core.grid.cols as usize) as f32 * piece_width,
+                (piece_id / state.core.grid.cols as usize) as f32 * piece_height,
             ));
         let pivot_x = base_pos.0 + piece_width * 0.5;
         let pivot_y = base_pos.1 + piece_height * 0.5;
@@ -464,24 +495,24 @@ impl AppCore {
         drag.cursor_x = x;
         drag.cursor_y = y;
         if drag.rotate_mode {
-            let piece_width = state.piece_width;
-            let piece_height = state.piece_height;
+            let piece_width = state.core.piece_width;
+            let piece_height = state.core.piece_height;
             let pivot_x = drag.pivot_x;
             let pivot_y = drag.pivot_y;
             let current_angle = (y - pivot_y).atan2(x - pivot_x);
             let delta_deg = (current_angle - drag.start_angle).to_degrees();
             let anchor_id = drag.members.first().copied().unwrap_or(0);
-            let flipped = state.flips.get(anchor_id).copied().unwrap_or(false);
+            let flipped = state.core.flips.get(anchor_id).copied().unwrap_or(false);
             let rotation_delta = if flipped { -delta_deg } else { delta_deg };
             for (idx, id) in drag.members.iter().enumerate() {
                 let start_pos = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
                 let center_x = start_pos.0 + piece_width * 0.5;
                 let center_y = start_pos.1 + piece_height * 0.5;
                 let (rx, ry) = rotate_point(center_x, center_y, pivot_x, pivot_y, delta_deg);
-                if let Some(pos) = state.positions.get_mut(*id) {
+                if let Some(pos) = state.core.positions.get_mut(*id) {
                     *pos = (rx - piece_width * 0.5, ry - piece_height * 0.5);
                 }
-                if let Some(rot) = state.rotations.get_mut(*id) {
+                if let Some(rot) = state.core.rotations.get_mut(*id) {
                     let start_rot = drag.start_rotations.get(idx).copied().unwrap_or(*rot);
                     *rot = normalize_angle(start_rot + rotation_delta);
                 }
@@ -492,9 +523,9 @@ impl AppCore {
             let mut dx = dx;
             let mut dy = dy;
             if !drag.start_positions.is_empty() {
-                let piece_width = state.piece_width;
-                let piece_height = state.piece_height;
-                let layout = state.layout;
+                let piece_width = state.core.piece_width;
+                let piece_height = state.core.piece_height;
+                let layout = state.core.layout;
                 let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
                 let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
                 let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
@@ -568,7 +599,7 @@ impl AppCore {
                 }
             }
             for (idx, id) in drag.members.iter().enumerate() {
-                if let Some(pos) = state.positions.get_mut(*id) {
+                if let Some(pos) = state.core.positions.get_mut(*id) {
                     let start = drag.start_positions.get(idx).copied().unwrap_or(*pos);
                     *pos = (start.0 + dx, start.1 + dy);
                 }
@@ -592,8 +623,8 @@ impl AppCore {
             state.drag_state = Some(drag);
             return;
         }
-        let cols = state.grid.cols as usize;
-        let rows = state.grid.rows as usize;
+        let cols = state.core.grid.cols as usize;
+        let rows = state.core.grid.rows as usize;
         let total = cols * rows;
         if total == 0 {
             state.drag_state = None;
@@ -603,9 +634,9 @@ impl AppCore {
             self.notify();
             return;
         }
-        let piece_width = state.piece_width;
-        let piece_height = state.piece_height;
-        let layout = state.layout;
+        let piece_width = state.core.piece_width;
+        let piece_height = state.core.piece_height;
+        let layout = state.core.layout;
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
         let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
         let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
@@ -621,12 +652,12 @@ impl AppCore {
         if center_max_y < center_min_y {
             center_max_y = center_min_y;
         }
-        let snap_distance = piece_width.min(piece_height) * state.snap_distance_ratio;
-        let complete_snap = !state.solved;
-        let flips = state.flips.clone();
-        let frame_snap_ratio = state.frame_snap_ratio;
-        let rotation_snap_tolerance = state.rotation_snap_tolerance;
-        let rotation_enabled = state.rotation_enabled;
+        let snap_distance = piece_width.min(piece_height) * state.core.rules.snap_distance_ratio;
+        let complete_snap = !state.core.solved;
+        let flips = state.core.flips.clone();
+        let frame_snap_ratio = state.core.rules.frame_snap_ratio;
+        let rotation_snap_tolerance = state.core.rules.rotation_snap_tolerance_deg;
+        let rotation_enabled = state.core.rules.rotation_enabled;
         let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
         let click_tolerance_sq = click_tolerance * click_tolerance;
         let dx = drag.cursor_x - drag.start_x;
@@ -640,7 +671,7 @@ impl AppCore {
             .enumerate()
             .any(|(idx, id)| {
                 let start = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
-                let current = state.positions.get(*id).copied().unwrap_or(start);
+                let current = state.core.positions.get(*id).copied().unwrap_or(start);
                 let dx = current.0 - start.0;
                 let dy = current.1 - start.1;
                 dx * dx + dy * dy > click_tolerance_sq
@@ -648,12 +679,12 @@ impl AppCore {
         let is_click =
             !moved && ((dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS) || quick_click);
         let click_id = drag.primary_id;
-        let was_flipped = state.flips.get(click_id).copied().unwrap_or(false);
+        let was_flipped = state.core.flips.get(click_id).copied().unwrap_or(false);
         if is_click && drag.rotate_mode {
-            if let Some(flip) = state.flips.get_mut(click_id) {
+            if let Some(flip) = state.core.flips.get_mut(click_id) {
                 *flip = !*flip;
             }
-            clear_piece_connections(&mut state.connections, click_id, cols, rows);
+            clear_piece_connections(&mut state.core.connections, click_id, cols, rows);
             let order_snapshot = if state.z_order.len() == total {
                 Some(state.z_order.as_slice())
             } else {
@@ -668,28 +699,28 @@ impl AppCore {
                 derived_rotations,
                 piece_order,
             ) = rebuild_group_state(
-                &state.positions,
-                &state.rotations,
-                &state.connections,
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.connections,
                 cols,
                 rows,
                 piece_width,
                 piece_height,
                 order_snapshot,
             );
-            state.positions = derived_positions;
-            state.rotations = derived_rotations;
+            state.core.positions = derived_positions;
+            state.core.rotations = derived_rotations;
             state.z_order = piece_order;
-            state.solved = is_solved(
-                &state.positions,
-                &state.rotations,
-                &state.flips,
-                &state.connections,
+            state.core.solved = is_solved(
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.flips,
+                &state.core.connections,
                 cols,
                 rows,
                 piece_width,
                 piece_height,
-                state.rotation_enabled,
+                state.core.rules.rotation_enabled,
             );
             state.drag_state = None;
             state.dragging_members.clear();
@@ -699,10 +730,10 @@ impl AppCore {
             return;
         }
         if is_click && was_flipped {
-            if let Some(flip) = state.flips.get_mut(click_id) {
+            if let Some(flip) = state.core.flips.get_mut(click_id) {
                 *flip = false;
             }
-            clear_piece_connections(&mut state.connections, click_id, cols, rows);
+            clear_piece_connections(&mut state.core.connections, click_id, cols, rows);
             let order_snapshot = if state.z_order.len() == total {
                 Some(state.z_order.as_slice())
             } else {
@@ -717,28 +748,28 @@ impl AppCore {
                 derived_rotations,
                 piece_order,
             ) = rebuild_group_state(
-                &state.positions,
-                &state.rotations,
-                &state.connections,
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.connections,
                 cols,
                 rows,
                 piece_width,
                 piece_height,
                 order_snapshot,
             );
-            state.positions = derived_positions;
-            state.rotations = derived_rotations;
+            state.core.positions = derived_positions;
+            state.core.rotations = derived_rotations;
             state.z_order = piece_order;
-            state.solved = is_solved(
-                &state.positions,
-                &state.rotations,
-                &state.flips,
-                &state.connections,
+            state.core.solved = is_solved(
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.flips,
+                &state.core.connections,
                 cols,
                 rows,
                 piece_width,
                 piece_height,
-                state.rotation_enabled,
+                state.core.rules.rotation_enabled,
             );
             state.drag_state = None;
             state.dragging_members.clear();
@@ -752,7 +783,7 @@ impl AppCore {
             let group_size = members.len();
             let rotation_locked = group_size == total || group_size > ROTATION_LOCK_THRESHOLD_DEFAULT;
             let anchor_id = members[0];
-            let current_angle = state.rotations.get(anchor_id).copied().unwrap_or(0.0);
+            let current_angle = state.core.rotations.get(anchor_id).copied().unwrap_or(0.0);
             if group_size > 1
                 && rotation_locked
                 && angle_matches(current_angle, 0.0, rotation_snap_tolerance)
@@ -773,10 +804,10 @@ impl AppCore {
                 let center_x = start_pos.0 + piece_width * 0.5;
                 let center_y = start_pos.1 + piece_height * 0.5;
                 let (rx, ry) = rotate_point(center_x, center_y, drag.start_x, drag.start_y, delta);
-                if let Some(pos) = state.positions.get_mut(*id) {
+                if let Some(pos) = state.core.positions.get_mut(*id) {
                     *pos = (rx - piece_width * 0.5, ry - piece_height * 0.5);
                 }
-                if let Some(rot) = state.rotations.get_mut(*id) {
+                if let Some(rot) = state.core.rotations.get_mut(*id) {
                     let base = drag.start_rotations.get(idx).copied().unwrap_or(*rot);
                     *rot = normalize_angle(base + delta);
                 }
@@ -784,7 +815,7 @@ impl AppCore {
             {
                 let (positions, rotations, connections) = {
                     let state = &mut *state;
-                    (&mut state.positions, &mut state.rotations, &mut state.connections)
+                    (&mut state.core.positions, &mut state.core.rotations, &mut state.core.connections)
                 };
                 apply_snaps_for_group(
                     &members,
@@ -825,28 +856,28 @@ impl AppCore {
                 derived_rotations,
                 piece_order,
             ) = rebuild_group_state(
-                &state.positions,
-                &state.rotations,
-                &state.connections,
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.connections,
                 cols,
                 rows,
                 piece_width,
                 piece_height,
                 order_snapshot,
             );
-            state.positions = derived_positions;
-            state.rotations = derived_rotations;
+            state.core.positions = derived_positions;
+            state.core.rotations = derived_rotations;
             state.z_order = piece_order;
-            state.solved = is_solved(
-                &state.positions,
-                &state.rotations,
-                &state.flips,
-                &state.connections,
+            state.core.solved = is_solved(
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.flips,
+                &state.core.connections,
                 cols,
                 rows,
                 piece_width,
                 piece_height,
-                state.rotation_enabled,
+                state.core.rules.rotation_enabled,
             );
             state.drag_state = None;
             state.dragging_members.clear();
@@ -858,7 +889,7 @@ impl AppCore {
         {
             let (positions, rotations, connections) = {
                 let state = &mut *state;
-                (&mut state.positions, &mut state.rotations, &mut state.connections)
+                (&mut state.core.positions, &mut state.core.rotations, &mut state.core.connections)
             };
             apply_snaps_for_group(
                 &drag.members,
@@ -899,28 +930,28 @@ impl AppCore {
             derived_rotations,
             piece_order,
         ) = rebuild_group_state(
-            &state.positions,
-            &state.rotations,
-            &state.connections,
+            &state.core.positions,
+            &state.core.rotations,
+            &state.core.connections,
             cols,
             rows,
             piece_width,
             piece_height,
             order_snapshot,
         );
-        state.positions = derived_positions;
-        state.rotations = derived_rotations;
+        state.core.positions = derived_positions;
+        state.core.rotations = derived_rotations;
         state.z_order = piece_order;
-        state.solved = is_solved(
-            &state.positions,
-            &state.rotations,
-            &state.flips,
-            &state.connections,
+        state.core.solved = is_solved(
+            &state.core.positions,
+            &state.core.rotations,
+            &state.core.flips,
+            &state.core.connections,
             cols,
             rows,
             piece_width,
             piece_height,
-            state.rotation_enabled,
+            state.core.rules.rotation_enabled,
         );
         state.drag_state = None;
         state.dragging_members.clear();
@@ -959,17 +990,18 @@ impl AppCore {
     pub(crate) fn set_workspace_padding_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(WORKSPACE_PADDING_RATIO_MIN, WORKSPACE_PADDING_RATIO_MAX);
-        if (state.workspace_padding_ratio - value).abs() <= f32::EPSILON {
+        if (state.core.rules.workspace_padding_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.workspace_padding_ratio = value;
+        state.core.rules.workspace_padding_ratio = value;
         let (width, height) = state
+            .core
             .puzzle_info
             .as_ref()
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
-        state.layout = compute_workspace_layout(width, height, value);
-        let layout = state.layout;
+        state.core.layout = compute_workspace_layout(width, height, value);
+        let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         drop(state);
         self.notify();
@@ -978,17 +1010,18 @@ impl AppCore {
     pub(crate) fn set_image_max_dim(&self, value: u32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
-        if state.image_max_dim == value {
+        if state.core.rules.image_max_dimension == value {
             return;
         }
-        state.image_max_dim = value;
+        state.core.rules.image_max_dimension = value;
         let (width, height) = state
+            .core
             .puzzle_info
             .as_ref()
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
-        state.layout = compute_workspace_layout(width, height, state.workspace_padding_ratio);
-        let layout = state.layout;
+        state.core.layout = compute_workspace_layout(width, height, state.core.rules.workspace_padding_ratio);
+        let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         drop(state);
         self.notify();
@@ -1008,7 +1041,7 @@ impl AppCore {
         }
         state.view.viewport_w = width;
         state.view.viewport_h = height;
-        let layout = state.layout;
+        let layout = state.core.layout;
         match state.view.mode {
             ViewMode::Fit => state.view.reset_to_fit(layout),
             ViewMode::Manual => {
@@ -1028,7 +1061,7 @@ impl AppCore {
         state.view.mode = ViewMode::Manual;
         state.view.center_x += dx_world;
         state.view.center_y += dy_world;
-        let layout = state.layout;
+        let layout = state.core.layout;
         state.view.zoom = state.view.clamp_zoom(state.view.zoom, layout);
         state.view.clamp_to_layout_elastic(layout);
         drop(state);
@@ -1041,7 +1074,7 @@ impl AppCore {
         }
         let mut state = self.state.borrow_mut();
         let old_zoom = state.view.zoom.max(1.0e-4);
-        let layout = state.layout;
+        let layout = state.core.layout;
         let new_zoom = state.view.clamp_zoom(old_zoom * factor, layout);
         if (new_zoom - old_zoom).abs() <= f32::EPSILON {
             return;
@@ -1060,7 +1093,7 @@ impl AppCore {
 
     pub(crate) fn reset_view_to_fit(&self) {
         let mut state = self.state.borrow_mut();
-        let layout = state.layout;
+        let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         drop(state);
         self.notify();
@@ -1068,10 +1101,10 @@ impl AppCore {
 
     pub(crate) fn fit_view_to_frame(&self) {
         let mut state = self.state.borrow_mut();
-        let Some(info) = state.puzzle_info.as_ref() else {
+        let Some(info) = state.core.puzzle_info.as_ref() else {
             return;
         };
-        let layout = state.layout;
+        let layout = state.core.layout;
         let frame_width = info.image_width as f32 * layout.puzzle_scale.max(1.0e-4);
         let frame_height = info.image_height as f32 * layout.puzzle_scale.max(1.0e-4);
         let fit_zoom = state.view.fit_zoom_for_size(frame_width, frame_height);
@@ -1086,46 +1119,14 @@ impl AppCore {
 
     pub(crate) fn settle_view(&self) {
         let mut state = self.state.borrow_mut();
-        let layout = state.layout;
+        let layout = state.core.layout;
         state.view.clamp_to_layout(layout);
         drop(state);
         self.notify();
     }
 
     pub(crate) fn image_max_dim(&self) -> u32 {
-        self.state.borrow().image_max_dim
-    }
-
-    pub(crate) fn set_wgpu_show_fps(&self, enabled: bool) {
-        let mut state = self.state.borrow_mut();
-        if state.wgpu_settings.show_fps == enabled {
-            return;
-        }
-        state.wgpu_settings.show_fps = enabled;
-        drop(state);
-        self.notify();
-    }
-
-    pub(crate) fn set_wgpu_edge_aa(&self, value: f32) {
-        let mut state = self.state.borrow_mut();
-        let value = value.clamp(WGPU_EDGE_AA_MIN, WGPU_EDGE_AA_MAX);
-        if (state.wgpu_settings.edge_aa - value).abs() <= f32::EPSILON {
-            return;
-        }
-        state.wgpu_settings.edge_aa = value;
-        drop(state);
-        self.notify();
-    }
-
-    pub(crate) fn set_wgpu_render_scale(&self, value: f32) {
-        let mut state = self.state.borrow_mut();
-        let value = value.clamp(WGPU_RENDER_SCALE_MIN, WGPU_RENDER_SCALE_MAX);
-        if (state.wgpu_settings.render_scale - value).abs() <= f32::EPSILON {
-            return;
-        }
-        state.wgpu_settings.render_scale = value;
-        drop(state);
-        self.notify();
+        self.state.borrow().core.rules.image_max_dimension
     }
 
     pub(crate) fn set_renderer_kind(&self, kind: RendererKind) {
@@ -1138,62 +1139,22 @@ impl AppCore {
         self.notify();
     }
 
-    pub(crate) fn set_svg_animations(&self, enabled: bool) {
-        let mut state = self.state.borrow_mut();
-        if state.svg_settings.animations == enabled {
-            return;
-        }
-        state.svg_settings.animations = enabled;
-        drop(state);
-        self.notify();
-    }
-
-    pub(crate) fn set_svg_emboss(&self, enabled: bool) {
-        let mut state = self.state.borrow_mut();
-        if state.svg_settings.emboss == enabled {
-            return;
-        }
-        state.svg_settings.emboss = enabled;
-        drop(state);
-        self.notify();
-    }
-
-    pub(crate) fn set_svg_fast_render(&self, enabled: bool) {
-        let mut state = self.state.borrow_mut();
-        if state.svg_settings.fast_render == enabled {
-            return;
-        }
-        state.svg_settings.fast_render = enabled;
-        drop(state);
-        self.notify();
-    }
-
-    pub(crate) fn set_svg_fast_filter(&self, enabled: bool) {
-        let mut state = self.state.borrow_mut();
-        if state.svg_settings.fast_filter == enabled {
-            return;
-        }
-        state.svg_settings.fast_filter = enabled;
-        drop(state);
-        self.notify();
-    }
-
     pub(crate) fn set_theme_mode(&self, mode: ThemeMode) {
         let mut state = self.state.borrow_mut();
-        if state.theme_mode == mode {
+        if state.app_settings.theme_mode == mode {
             return;
         }
-        state.theme_mode = mode;
+        state.app_settings.theme_mode = mode;
         drop(state);
         self.notify();
     }
 
     pub(crate) fn set_show_debug(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
-        if state.show_debug == enabled {
+        if state.app_settings.show_debug == enabled {
             return;
         }
-        state.show_debug = enabled;
+        state.app_settings.show_debug = enabled;
         drop(state);
         self.notify();
     }
@@ -1201,12 +1162,12 @@ impl AppCore {
     pub(crate) fn set_auto_pan_outer_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(AUTO_PAN_OUTER_RATIO_MIN, AUTO_PAN_OUTER_RATIO_MAX);
-        if (state.auto_pan_outer_ratio - value).abs() <= f32::EPSILON {
+        if (state.view_settings.auto_pan_outer_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.auto_pan_outer_ratio = value;
-        if state.auto_pan_inner_ratio < value {
-            state.auto_pan_inner_ratio = value;
+        state.view_settings.auto_pan_outer_ratio = value;
+        if state.view_settings.auto_pan_inner_ratio < value {
+            state.view_settings.auto_pan_inner_ratio = value;
         }
         drop(state);
         self.notify();
@@ -1215,13 +1176,13 @@ impl AppCore {
     pub(crate) fn set_auto_pan_inner_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let mut value = value.clamp(AUTO_PAN_INNER_RATIO_MIN, AUTO_PAN_INNER_RATIO_MAX);
-        if value < state.auto_pan_outer_ratio {
-            value = state.auto_pan_outer_ratio;
+        if value < state.view_settings.auto_pan_outer_ratio {
+            value = state.view_settings.auto_pan_outer_ratio;
         }
-        if (state.auto_pan_inner_ratio - value).abs() <= f32::EPSILON {
+        if (state.view_settings.auto_pan_inner_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.auto_pan_inner_ratio = value;
+        state.view_settings.auto_pan_inner_ratio = value;
         drop(state);
         self.notify();
     }
@@ -1229,31 +1190,35 @@ impl AppCore {
     pub(crate) fn set_auto_pan_speed_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(AUTO_PAN_SPEED_RATIO_MIN, AUTO_PAN_SPEED_RATIO_MAX);
-        if (state.auto_pan_speed_ratio - value).abs() <= f32::EPSILON {
+        if (state.view_settings.auto_pan_speed_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.auto_pan_speed_ratio = value;
+        state.view_settings.auto_pan_speed_ratio = value;
         drop(state);
         self.notify();
     }
 
     pub(crate) fn set_rotation_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
-        if state.rotation_enabled == enabled {
+        if state.core.rules.rotation_enabled == enabled {
             return;
         }
-        state.rotation_enabled = enabled;
+        state.core.rules.rotation_enabled = enabled;
         drop(state);
         self.notify();
+    }
+
+    pub(crate) fn rotation_enabled(&self) -> bool {
+        self.state.borrow().core.rules.rotation_enabled
     }
 
     pub(crate) fn set_rotation_snap_tolerance(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(ROTATION_SNAP_TOLERANCE_MIN_DEG, ROTATION_SNAP_TOLERANCE_MAX_DEG);
-        if (state.rotation_snap_tolerance - value).abs() <= f32::EPSILON {
+        if (state.core.rules.rotation_snap_tolerance_deg - value).abs() <= f32::EPSILON {
             return;
         }
-        state.rotation_snap_tolerance = value;
+        state.core.rules.rotation_snap_tolerance_deg = value;
         drop(state);
         self.notify();
     }
@@ -1261,10 +1226,10 @@ impl AppCore {
     pub(crate) fn set_snap_distance_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(SNAP_DISTANCE_RATIO_MIN, SNAP_DISTANCE_RATIO_MAX);
-        if (state.snap_distance_ratio - value).abs() <= f32::EPSILON {
+        if (state.core.rules.snap_distance_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.snap_distance_ratio = value;
+        state.core.rules.snap_distance_ratio = value;
         drop(state);
         self.notify();
     }
@@ -1272,39 +1237,39 @@ impl AppCore {
     pub(crate) fn set_frame_snap_ratio(&self, value: f32) {
         let mut state = self.state.borrow_mut();
         let value = value.clamp(FRAME_SNAP_MIN, FRAME_SNAP_MAX);
-        if (state.frame_snap_ratio - value).abs() <= f32::EPSILON {
+        if (state.core.rules.frame_snap_ratio - value).abs() <= f32::EPSILON {
             return;
         }
-        state.frame_snap_ratio = value;
+        state.core.rules.frame_snap_ratio = value;
         drop(state);
         self.notify();
     }
 
     pub(crate) fn set_shape_settings(&self, settings: ShapeSettings) {
         let mut state = self.state.borrow_mut();
-        if state.settings == settings {
+        if state.view_settings.shape == settings {
             return;
         }
-        state.settings = settings;
-        let Some(info) = state.puzzle_info.clone() else {
+        state.view_settings.shape = settings;
+        let Some(info) = state.core.puzzle_info.clone() else {
             drop(state);
             self.notify();
             return;
         };
-        let grid = state.grid;
+        let grid = state.core.grid;
         let piece_width = info.image_width as f32 / grid.cols as f32;
         let piece_height = info.image_height as f32 / grid.rows as f32;
-        let depth_cap = state.settings.tab_depth_cap.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-        let curve_detail = state.settings.curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
+        let depth_cap = state.view_settings.shape.tab_depth_cap.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+        let curve_detail = state.view_settings.shape.curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
         let pieces = build_pieces(grid.rows, grid.cols);
-        let (horizontal, vertical) = build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &state.settings);
+        let (horizontal, vertical) = build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &state.view_settings.shape);
         let (horizontal_waves, vertical_waves) = build_line_waves(
             grid.rows,
             grid.cols,
             PUZZLE_SEED,
             piece_width,
             piece_height,
-            state.settings.line_bend_ratio,
+            state.view_settings.shape.line_bend_ratio,
         );
         let warp_field = WarpField {
             width: info.image_width as f32,
@@ -1340,8 +1305,8 @@ impl AppCore {
             piece_height,
             mask_pad,
         }));
-        state.piece_width = piece_width;
-        state.piece_height = piece_height;
+        state.core.piece_width = piece_width;
+        state.core.piece_height = piece_height;
         drop(state);
         self.notify();
     }
@@ -1377,28 +1342,28 @@ impl AppCore {
         preserve_drag: bool,
     ) {
         let mut state = self.state.borrow_mut();
-        state.positions = positions;
-        state.rotations = rotations;
-        state.flips = flips;
-        state.connections = connections;
+        state.core.positions = positions;
+        state.core.rotations = rotations;
+        state.core.flips = flips;
+        state.core.connections = connections;
         state.z_order = z_order;
-        state.scramble_nonce = scramble_nonce;
-        let cols = state.grid.cols as usize;
-        let rows = state.grid.rows as usize;
+        state.core.scramble_nonce = scramble_nonce;
+        let cols = state.core.grid.cols as usize;
+        let rows = state.core.grid.rows as usize;
         if cols > 0 && rows > 0 {
-            state.solved = is_solved(
-                &state.positions,
-                &state.rotations,
-                &state.flips,
-                &state.connections,
+            state.core.solved = is_solved(
+                &state.core.positions,
+                &state.core.rotations,
+                &state.core.flips,
+                &state.core.connections,
                 cols,
                 rows,
-                state.piece_width,
-                state.piece_height,
-                state.rotation_enabled,
+                state.core.piece_width,
+                state.core.piece_height,
+                state.core.rules.rotation_enabled,
             );
         } else {
-            state.solved = false;
+            state.core.solved = false;
         }
         if !preserve_drag {
             state.drag_state = None;
@@ -1435,6 +1400,126 @@ impl AppCore {
         }
     }
 
+}
+
+fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
+    let mut snapshot = AppSnapshot {
+        puzzle_info: None,
+        rules: state.core.rules,
+        core: CoreSnapshot {
+            positions: Vec::new(),
+            rotations: Vec::new(),
+            flips: Vec::new(),
+            connections: Vec::new(),
+            group_order: Vec::new(),
+            scramble_nonce: 0,
+        },
+        grid: state.core.grid,
+        piece_width: state.core.piece_width,
+        piece_height: state.core.piece_height,
+        z_order: Vec::new(),
+        hovered_id: None,
+        active_id: None,
+        dragging_members: Vec::new(),
+        drag_cursor: None,
+        drag_touch_id: None,
+        drag_rotate_mode: false,
+        drag_right_click: false,
+        drag_primary_id: None,
+        solved: false,
+        layout: state.core.layout,
+        view: state.view.view_rect(),
+        app_settings: state.app_settings,
+        view_settings: state.view_settings.clone(),
+    };
+    fill_snapshot_from_state(state, &mut snapshot);
+    snapshot
+}
+
+fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
+    snapshot.puzzle_info = state.core.puzzle_info.clone();
+    snapshot.rules = state.core.rules;
+    fill_core_snapshot(state, &mut snapshot.core);
+    snapshot.grid = state.core.grid;
+    snapshot.piece_width = state.core.piece_width;
+    snapshot.piece_height = state.core.piece_height;
+    snapshot.z_order.clone_from(&state.z_order);
+    snapshot.hovered_id = state.hovered_id;
+    snapshot.active_id = state.active_id;
+    snapshot
+        .dragging_members
+        .clone_from(&state.dragging_members);
+    snapshot.drag_cursor = state
+        .drag_state
+        .as_ref()
+        .map(|drag| (drag.cursor_x, drag.cursor_y));
+    snapshot.drag_touch_id = state.drag_state.as_ref().and_then(|drag| drag.touch_id);
+    snapshot.drag_rotate_mode = state
+        .drag_state
+        .as_ref()
+        .map(|drag| drag.rotate_mode)
+        .unwrap_or(false);
+    snapshot.drag_right_click = state
+        .drag_state
+        .as_ref()
+        .map(|drag| drag.right_click)
+        .unwrap_or(false);
+    snapshot.drag_primary_id = state.drag_state.as_ref().map(|drag| drag.primary_id);
+    snapshot.solved = state.core.solved;
+    snapshot.layout = state.core.layout;
+    snapshot.view = state.view.view_rect();
+    snapshot.app_settings = state.app_settings;
+    snapshot.view_settings = state.view_settings.clone();
+}
+
+fn fill_core_snapshot(state: &AppState, snapshot: &mut CoreSnapshot) {
+    snapshot.positions.clone_from(&state.core.positions);
+    snapshot.rotations.clone_from(&state.core.rotations);
+    snapshot.flips.clone_from(&state.core.flips);
+    snapshot.connections.clone_from(&state.core.connections);
+    snapshot.scramble_nonce = state.core.scramble_nonce;
+    snapshot.group_order.clear();
+    if let Some(info) = state.core.puzzle_info.as_ref() {
+        let cols = info.cols as usize;
+        let rows = info.rows as usize;
+        let total = cols.saturating_mul(rows);
+        if total > 0
+            && state.core.positions.len() == total
+            && state.core.rotations.len() == total
+            && state.core.flips.len() == total
+            && state.core.connections.len() == total
+        {
+            let piece_order = if state.z_order.len() == total {
+                state.z_order.clone()
+            } else {
+                (0..total).collect()
+            };
+            let anchor_of = anchor_of_from_connections(&state.core.connections, cols, rows);
+            snapshot.group_order.extend(
+                build_group_order_from_piece_order(&piece_order, &anchor_of)
+                    .into_iter()
+                    .filter_map(|id| u32::try_from(id).ok()),
+            );
+        }
+    }
+}
+
+fn anchor_of_from_connections(connections: &[[bool; 4]], cols: usize, rows: usize) -> Vec<usize> {
+    let total = cols.saturating_mul(rows);
+    let mut anchor_of = vec![0usize; total];
+    let groups = groups_from_connections(connections, cols, rows);
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+        let anchor = group[0];
+        for id in group {
+            if id < total {
+                anchor_of[id] = anchor;
+            }
+        }
+    }
+    anchor_of
 }
 
 impl ViewState {
@@ -1531,10 +1616,6 @@ impl ViewState {
     }
 }
 
-thread_local! {
-    static SHARED_CORE: Rc<AppCore> = AppCore::new();
-}
-
 pub(crate) struct AppSubscription {
     subscriber: AppSubscriber,
     subscribers: Rc<RefCell<Vec<AppSubscriber>>>,
@@ -1549,46 +1630,20 @@ impl Drop for AppSubscription {
 
 impl AppState {
     fn new() -> Self {
-        let layout = compute_workspace_layout(
-            1.0,
-            1.0,
-            WORKSPACE_PADDING_RATIO_DEFAULT,
-        );
-        let view = ViewState::new(layout);
+        let core = CoreState::new();
+        let view = ViewState::new(core.layout);
         Self {
-            puzzle_info: None,
+            core,
             assets: None,
-            grid: FALLBACK_GRID,
-            piece_width: 0.0,
-            piece_height: 0.0,
-            positions: Vec::new(),
-            rotations: Vec::new(),
-            flips: Vec::new(),
-            connections: Vec::new(),
             z_order: Vec::new(),
             hovered_id: None,
             active_id: None,
             dragging_members: Vec::new(),
             drag_state: None,
-            solved: false,
-            layout,
             view,
-            wgpu_settings: WgpuRenderSettings::default(),
+            app_settings: AppSettings::default(),
+            view_settings: ViewSettings::default(),
             renderer_kind: RendererKind::Wgpu,
-            svg_settings: SvgRenderSettings::default(),
-            theme_mode: ThemeMode::System,
-            show_debug: false,
-            scramble_nonce: 0,
-            settings: ShapeSettings::default(),
-            workspace_padding_ratio: WORKSPACE_PADDING_RATIO_DEFAULT,
-            image_max_dim: IMAGE_MAX_DIMENSION_DEFAULT,
-            rotation_enabled: true,
-            rotation_snap_tolerance: ROTATION_SNAP_TOLERANCE_DEFAULT_DEG,
-            snap_distance_ratio: SNAP_DISTANCE_RATIO_DEFAULT,
-            frame_snap_ratio: FRAME_SNAP_DEFAULT,
-            auto_pan_outer_ratio: AUTO_PAN_OUTER_RATIO_DEFAULT,
-            auto_pan_inner_ratio: AUTO_PAN_INNER_RATIO_DEFAULT,
-            auto_pan_speed_ratio: AUTO_PAN_SPEED_RATIO_DEFAULT,
         }
     }
 }

@@ -6,9 +6,7 @@ use crate::core::{
     build_group_order_from_piece_order, build_piece_order_from_groups, groups_from_connections,
     LOCAL_GAME_KEY,
 };
-use heddobureika_core::{
-    decode, encode, GameRules, GameSnapshot, PuzzleStateSnapshot, GAME_SNAPSHOT_VERSION,
-};
+use heddobureika_core::{decode, encode, GameSnapshot, PuzzleStateSnapshot, GAME_SNAPSHOT_VERSION};
 
 pub(crate) fn build_game_snapshot_from_app(snapshot: &AppSnapshot) -> Option<GameSnapshot> {
     let info = snapshot.puzzle_info.as_ref()?.clone();
@@ -18,10 +16,10 @@ pub(crate) fn build_game_snapshot_from_app(snapshot: &AppSnapshot) -> Option<Gam
     if total == 0 {
         return None;
     }
-    if snapshot.positions.len() != total
-        || snapshot.rotations.len() != total
-        || snapshot.flips.len() != total
-        || snapshot.connections.len() != total
+    if snapshot.core.positions.len() != total
+        || snapshot.core.rotations.len() != total
+        || snapshot.core.flips.len() != total
+        || snapshot.core.connections.len() != total
     {
         return None;
     }
@@ -30,24 +28,24 @@ pub(crate) fn build_game_snapshot_from_app(snapshot: &AppSnapshot) -> Option<Gam
     } else {
         (0..total).collect()
     };
-    let anchor_of = anchor_of_from_connections(&snapshot.connections, cols, rows);
+    let anchor_of = anchor_of_from_connections(&snapshot.core.connections, cols, rows);
     let group_order = build_group_order_from_piece_order(&piece_order, &anchor_of);
     let group_order_u32: Vec<u32> = group_order
         .into_iter()
         .filter_map(|id| u32::try_from(id).ok())
         .collect();
     let state = PuzzleStateSnapshot {
-        positions: snapshot.positions.clone(),
-        rotations: snapshot.rotations.clone(),
-        flips: snapshot.flips.clone(),
-        connections: snapshot.connections.clone(),
+        positions: snapshot.core.positions.clone(),
+        rotations: snapshot.core.rotations.clone(),
+        flips: snapshot.core.flips.clone(),
+        connections: snapshot.core.connections.clone(),
         group_order: group_order_u32,
-        scramble_nonce: snapshot.scramble_nonce,
+        scramble_nonce: snapshot.core.scramble_nonce,
     };
     Some(GameSnapshot {
         version: GAME_SNAPSHOT_VERSION,
         seq: 0,
-        rules: GameRules::default(),
+        rules: snapshot.rules,
         puzzle: info,
         state,
     })

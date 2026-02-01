@@ -222,7 +222,6 @@ impl Default for InitMode {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RendererKind {
     Svg,
-    Yew,
     Wgpu,
 }
 

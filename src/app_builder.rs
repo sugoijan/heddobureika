@@ -6,7 +6,7 @@ use crate::core::{
     RendererKind, RenderSettings, GridChoice, InitMode, PUZZLE_SELECTION_KEY,
     PUZZLE_SELECTION_VERSION,
 };
-use crate::local_snapshot::{clear_local_snapshot, load_local_snapshot};
+use crate::local_snapshot::load_local_snapshot;
 use serde::{Deserialize, Serialize};
 use web_sys::window;
 use js_sys::decode_uri_component;
@@ -29,9 +29,6 @@ use crate::wgpu_app;
 
 #[cfg(target_arch = "wasm32")]
 use crate::svg_app;
-
-#[cfg(feature = "backend-yew")]
-use crate::svg_view;
 
 #[cfg(feature = "dev-panel-yew")]
 use crate::yew_app;
@@ -333,7 +330,7 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
     };
     if selection.force_new {
         clear_saved_puzzle_selection();
-        clear_local_snapshot();
+        sync_runtime::clear_local_snapshot();
     }
     if selection.clear_hash {
         app_router::clear_location_hash();
@@ -344,32 +341,14 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
 pub(crate) fn run() {
     let init = app_router::load_init_config();
     app_runtime::set_init_config(init.clone());
-    let core = AppCore::shared();
+    let core = AppCore::new();
     sync_runtime::attach_core(core.clone());
     #[cfg(target_arch = "wasm32")]
     {
         multiplayer_bridge::install(core.clone());
     }
-    let mut render_settings = app_router::load_render_settings_with_init();
+    let render_settings = app_router::load_render_settings_with_init();
     let renderer = init.renderer;
-    let (renderer, apply_fallback) = {
-        #[cfg(not(feature = "backend-yew"))]
-        {
-            if renderer == RendererKind::Yew {
-                (RendererKind::Svg, true)
-            } else {
-                (renderer, false)
-            }
-        }
-        #[cfg(feature = "backend-yew")]
-        {
-            (renderer, false)
-        }
-    };
-    if apply_fallback {
-        render_settings.renderer = renderer;
-        app_router::save_renderer_preference(renderer, &render_settings);
-    }
 
     core.set_renderer_kind(renderer);
     let render_settings_for_fallback = render_settings.clone();
@@ -390,29 +369,19 @@ pub(crate) fn run() {
         RendererKind::Wgpu => {
             #[cfg(target_arch = "wasm32")]
             {
-                wgpu_app::run();
+                wgpu_app::run(core.clone());
             }
         }
         RendererKind::Svg => {
             #[cfg(target_arch = "wasm32")]
             {
-                svg_app::run();
-            }
-        }
-        RendererKind::Yew => {
-            #[cfg(feature = "backend-yew")]
-            {
-                svg_view::run();
-            }
-            #[cfg(all(target_arch = "wasm32", not(feature = "backend-yew")))]
-            {
-                svg_app::run();
+                svg_app::run(core.clone());
             }
         }
     }
 
     #[cfg(feature = "dev-panel-yew")]
     {
-        yew_app::run_dev_panel();
+        yew_app::run_dev_panel(core.clone());
     }
 }

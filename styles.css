@@ -545,53 +545,50 @@ body {
 }
 
 .preview-box {
-  position: fixed;
+  position: absolute;
   z-index: 9;
-  width: 170px;
-  max-width: 28vw;
-  min-width: 120px;
+  left: 0;
+  top: 0;
   padding: 8px;
   border-radius: 12px;
+  box-sizing: border-box;
   background: var(--preview-bg);
   border: 1px solid var(--preview-border);
   box-shadow: var(--preview-shadow);
   pointer-events: auto;
-  transform-origin: bottom left;
-  transition: transform 160ms ease, box-shadow 160ms ease;
-}
-
-.preview-box.corner-bl {
-  bottom: 16px;
-  left: 16px;
-  transform-origin: bottom left;
-}
-
-.preview-box.corner-br {
-  bottom: 16px;
-  right: 16px;
-  transform-origin: bottom right;
-}
-
-.preview-box.corner-tl {
-  top: 16px;
-  left: 16px;
-  transform-origin: top left;
-}
-
-.preview-box.corner-tr {
-  top: 16px;
-  right: 16px;
-  transform-origin: top right;
-}
-
-.preview-box:hover {
-  transform: scale(2.00);
-  box-shadow: var(--preview-shadow-hover);
+  touch-action: none;
+  user-select: none;
+  transform-origin: center;
+  transition: box-shadow 160ms ease;
 }
 
 .preview-box.preview-hidden img {
   filter: blur(6px) saturate(0.8);
   opacity: 0.6;
+}
+
+.preview-box.preview-grab {
+  cursor: grab;
+}
+
+.preview-box.preview-resize-ew {
+  cursor: ew-resize;
+}
+
+.preview-box.preview-resize-ns {
+  cursor: ns-resize;
+}
+
+.preview-box.preview-resize-nwse {
+  cursor: nwse-resize;
+}
+
+.preview-box.preview-resize-nesw {
+  cursor: nesw-resize;
+}
+
+.preview-box.preview-dragging {
+  cursor: grabbing;
 }
 
 .preview-toggle {
@@ -628,7 +625,7 @@ body {
   pointer-events: none;
 }
 .preview-box.preview-revealed img {
-  cursor: pointer;
+  cursor: inherit;
 }
 
 .preview-toggle-icon {
@@ -745,8 +742,9 @@ body {
 .preview-box img {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
   border-radius: 8px;
+  object-fit: contain;
 }
 
 .controls h2 {

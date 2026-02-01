@@ -7,83 +7,52 @@ use gloo::console;
 use crate::app_core::{AppCore, AppSubscription};
 use crate::core::{
     build_group_order_from_piece_order, build_grid_choices, build_piece_order_from_groups,
-    clear_piece_connections, grid_choice_index, groups_from_connections, GridChoice, FALLBACK_GRID,
+    clear_piece_connections, grid_choice_index, groups_from_connections, is_solved, GridChoice,
+    FALLBACK_GRID,
 };
-use crate::multiplayer_game_sync::MultiplayerSyncCallbacks;
 use crate::sync_runtime;
+use crate::runtime::{SyncEvent, SyncHooks};
 use heddobureika_core::{
-    angle_matches, apply_room_update_to_snapshot, ClientId, ClientMsg, GameSnapshot, PuzzleInfo,
-    PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
+    angle_matches, apply_room_update_to_snapshot, ClientId, ClientMsg, CoreSnapshot, GameSnapshot,
+    PuzzleInfo, PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
 };
 
 const PENDING_POS_EPS: f32 = 0.02;
 const PENDING_ROT_EPS: f32 = 0.05;
 
-#[derive(Clone)]
-pub(crate) struct MultiplayerUiHooks {
-    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<ClientId>)>,
-    pub(crate) on_need_init: Rc<dyn Fn()>,
-    pub(crate) on_warning: Rc<dyn Fn(u32)>,
-    pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
-    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<ClientId>)>,
-    pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
-    pub(crate) on_error: Rc<dyn Fn(String, String)>,
-}
-
 #[derive(Clone, Debug)]
 struct LocalSnapshot {
-    positions: Vec<(f32, f32)>,
-    rotations: Vec<f32>,
-    flips: Vec<bool>,
-    connections: Vec<[bool; 4]>,
-    group_order: Vec<u32>,
-    scramble_nonce: u32,
+    core: CoreSnapshot,
 }
 
 impl LocalSnapshot {
     fn empty() -> Self {
         Self {
-            positions: Vec::new(),
-            rotations: Vec::new(),
-            flips: Vec::new(),
-            connections: Vec::new(),
-            group_order: Vec::new(),
-            scramble_nonce: 0,
+            core: CoreSnapshot {
+                positions: Vec::new(),
+                rotations: Vec::new(),
+                flips: Vec::new(),
+                connections: Vec::new(),
+                group_order: Vec::new(),
+                scramble_nonce: 0,
+            },
         }
     }
 
     fn from_room(snapshot: &GameSnapshot) -> Self {
         Self {
-            positions: snapshot.state.positions.clone(),
-            rotations: snapshot.state.rotations.clone(),
-            flips: snapshot.state.flips.clone(),
-            connections: snapshot.state.connections.clone(),
-            group_order: snapshot.state.group_order.clone(),
-            scramble_nonce: snapshot.state.scramble_nonce,
+            core: snapshot.state.clone(),
         }
     }
 
-    fn from_state(snapshot: PuzzleStateSnapshot) -> Self {
+    fn from_state(snapshot: CoreSnapshot) -> Self {
         Self {
-            positions: snapshot.positions,
-            rotations: snapshot.rotations,
-            flips: snapshot.flips,
-            connections: snapshot.connections,
-            group_order: snapshot.group_order,
-            scramble_nonce: snapshot.scramble_nonce,
+            core: snapshot,
         }
     }
 
     fn to_state_snapshot(&self) -> PuzzleStateSnapshot {
-        PuzzleStateSnapshot {
-            positions: self.positions.clone(),
-            rotations: self.rotations.clone(),
-            flips: self.flips.clone(),
-            connections: self.connections.clone(),
-            group_order: self.group_order.clone(),
-            scramble_nonce: self.scramble_nonce,
-        }
+        self.core.clone()
     }
 }
 
@@ -100,8 +69,6 @@ struct MultiplayerBridgeState {
     pending_by_anchor: RefCell<HashMap<u32, PendingTransform>>,
     pending_flips: RefCell<HashMap<u32, bool>>,
     init_pending: Cell<bool>,
-    ui_hooks: RefCell<Vec<(u64, MultiplayerUiHooks)>>,
-    next_ui_hook_id: Cell<u64>,
     subscription: RefCell<Option<AppSubscription>>,
 }
 
@@ -113,15 +80,13 @@ impl MultiplayerBridgeState {
             pending_by_anchor: RefCell::new(HashMap::new()),
             pending_flips: RefCell::new(HashMap::new()),
             init_pending: Cell::new(false),
-            ui_hooks: RefCell::new(Vec::new()),
-            next_ui_hook_id: Cell::new(0),
             subscription: RefCell::new(None),
         }
     }
 
     fn install(self: &Rc<Self>) {
-        let callbacks = self.build_callbacks();
-        sync_runtime::set_callbacks(callbacks);
+        let hooks = self.build_hooks();
+        sync_runtime::set_system_hooks(hooks);
         let state = Rc::clone(self);
         sync_runtime::set_multiplayer_local_transform_observer(Some(Rc::new(
             move |anchor_id, pos, rot_deg, client_seq| {
@@ -141,79 +106,53 @@ impl MultiplayerBridgeState {
         *self.subscription.borrow_mut() = Some(subscription);
     }
 
-    fn build_callbacks(self: &Rc<Self>) -> MultiplayerSyncCallbacks {
+    fn build_hooks(self: &Rc<Self>) -> SyncHooks {
         let state = Rc::clone(self);
-        let on_welcome = Rc::new(move |room_id, persistence, initialized, client_id| {
-            state.handle_welcome(room_id, persistence, initialized, client_id);
+        let on_event = Rc::new(move |event: SyncEvent| match event {
+            SyncEvent::Connected {
+                room_id,
+                persistence,
+                initialized,
+                client_id,
+            } => {
+                let Some(room_id) = room_id else {
+                    return;
+                };
+                let Some(persistence) = persistence else {
+                    return;
+                };
+                state.handle_welcome(room_id, persistence, initialized, client_id);
+            }
+            SyncEvent::NeedInit => state.handle_need_init(),
+            SyncEvent::Warning { minutes_idle } => state.handle_warning(minutes_idle),
+            SyncEvent::Ownership { anchor_id, owner } => state.handle_ownership(anchor_id, owner),
+            SyncEvent::DropNotReady => state.handle_drop_not_ready(),
+            SyncEvent::Error { code, message } => state.handle_error(code, message),
+            SyncEvent::Disconnected => {}
         });
         let state = Rc::clone(self);
-        let on_need_init = Rc::new(move || {
-            state.handle_need_init();
-        });
-        let state = Rc::clone(self);
-        let on_warning = Rc::new(move |minutes_idle| {
-            state.handle_warning(minutes_idle);
-        });
-        let state = Rc::clone(self);
-        let on_state = Rc::new(move |snapshot, seq| {
+        let on_remote_snapshot = Rc::new(move |snapshot, seq| {
             state.handle_state(snapshot, seq);
         });
         let state = Rc::clone(self);
-        let on_update = Rc::new(move |update, seq, source, client_seq| {
+        let on_remote_update = Rc::new(move |update, seq, source, client_seq| {
             state.handle_update(update, seq, source, client_seq);
         });
-        let state = Rc::clone(self);
-        let on_ownership = Rc::new(move |anchor_id, owner| {
-            state.handle_ownership(anchor_id, owner);
-        });
-        let state = Rc::clone(self);
-        let on_drop_not_ready = Rc::new(move || {
-            state.handle_drop_not_ready();
-        });
-        let state = Rc::clone(self);
-        let on_error = Rc::new(move |code, message| {
-            state.handle_error(code, message);
-        });
-        MultiplayerSyncCallbacks {
-            on_welcome,
-            on_need_init,
-            on_warning,
-            on_state,
-            on_update,
-            on_ownership,
-            on_drop_not_ready,
-            on_error,
+        SyncHooks {
+            on_remote_action: Rc::new(|_| {}),
+            on_snapshot: Rc::new(|_| {}),
+            on_remote_snapshot,
+            on_remote_update,
+            on_event,
         }
-    }
-
-    fn ui_hooks_snapshot(&self) -> Vec<MultiplayerUiHooks> {
-        self.ui_hooks
-            .borrow()
-            .iter()
-            .map(|(_, hooks)| hooks.clone())
-            .collect()
-    }
-
-    fn register_ui_hooks(self: &Rc<Self>, hooks: MultiplayerUiHooks) -> UiHooksHandle {
-        let id = self.next_ui_hook_id.get();
-        self.next_ui_hook_id.set(id.wrapping_add(1));
-        self.ui_hooks.borrow_mut().push((id, hooks));
-        UiHooksHandle {
-            id,
-            state: Rc::clone(self),
-        }
-    }
-
-    fn remove_ui_hooks(&self, id: u64) {
-        self.ui_hooks.borrow_mut().retain(|(hook_id, _)| *hook_id != id);
     }
 
     fn handle_welcome(
         &self,
-        room_id: String,
-        persistence: RoomPersistence,
+        _room_id: String,
+        _persistence: RoomPersistence,
         initialized: bool,
-        client_id: Option<ClientId>,
+        _client_id: Option<ClientId>,
     ) {
         self.init_pending.set(!initialized);
         if let Some(sync) = sync_runtime::multiplayer_handle() {
@@ -225,9 +164,6 @@ impl MultiplayerBridgeState {
         if !initialized {
             self.try_send_init();
         }
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_welcome)(room_id.clone(), persistence, initialized, client_id);
-        }
     }
 
     fn handle_need_init(&self) {
@@ -235,18 +171,12 @@ impl MultiplayerBridgeState {
         self.pending_by_anchor.borrow_mut().clear();
         self.pending_flips.borrow_mut().clear();
         self.try_send_init();
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_need_init)();
-        }
     }
 
-    fn handle_warning(&self, minutes_idle: u32) {
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_warning)(minutes_idle);
-        }
+    fn handle_warning(&self, _minutes_idle: u32) {
     }
 
-    fn handle_state(&self, snapshot: GameSnapshot, seq: u64) {
+    fn handle_state(&self, snapshot: GameSnapshot, _seq: u64) {
         let applied = self.apply_room_snapshot(&snapshot);
         if applied {
             self.init_pending.set(false);
@@ -254,42 +184,27 @@ impl MultiplayerBridgeState {
                 sync.borrow().set_state_applied(true);
             }
         }
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_state)(snapshot.clone(), seq);
-        }
     }
 
     fn handle_update(
         &self,
         update: RoomUpdate,
-        seq: u64,
+        _seq: u64,
         source: Option<ClientId>,
         client_seq: Option<u64>,
     ) {
         self.ack_pending_transform(&update, source, client_seq);
         self.apply_room_update(&update);
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_update)(update.clone(), seq, source, client_seq);
-        }
     }
 
     fn handle_ownership(&self, anchor_id: u32, owner: Option<ClientId>) {
         self.maybe_drop_drag_on_ownership(anchor_id, owner);
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_ownership)(anchor_id, owner);
-        }
     }
 
     fn handle_drop_not_ready(&self) {
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_drop_not_ready)();
-        }
     }
 
-    fn handle_error(&self, code: String, message: String) {
-        for hooks in self.ui_hooks_snapshot() {
-            (hooks.on_error)(code.clone(), message.clone());
-        }
+    fn handle_error(&self, _code: String, _message: String) {
     }
 
     fn record_pending_transform(
@@ -310,10 +225,13 @@ impl MultiplayerBridgeState {
             client_seq,
         };
         pending.insert(anchor_id, pending_entry);
+        drop(pending);
+        let _ = self.apply_predicted_state(true);
     }
 
     fn record_pending_flip(&self, piece_id: u32, flipped: bool) {
         self.pending_flips.borrow_mut().insert(piece_id, flipped);
+        let _ = self.apply_predicted_state(true);
     }
 
     fn ack_pending_transform(
@@ -422,10 +340,10 @@ impl MultiplayerBridgeState {
         let rows = snapshot.grid.rows as usize;
         let total = cols * rows;
         let local = self.local_snapshot.borrow();
-        if total == 0 || local.connections.len() != total {
+        if total == 0 || local.core.connections.len() != total {
             return;
         }
-        let anchor_of = anchor_of_from_connections(&local.connections, cols, rows);
+        let anchor_of = anchor_of_from_connections(&local.core.connections, cols, rows);
         let mut pending = self.pending_flips.borrow_mut();
         pending.retain(|piece_id, _| {
             let idx = *piece_id as usize;
@@ -447,10 +365,10 @@ impl MultiplayerBridgeState {
         if total == 0 {
             return;
         }
-        if snapshot.positions.len() != total
-            || snapshot.rotations.len() != total
-            || snapshot.flips.len() != total
-            || snapshot.connections.len() != total
+        if snapshot.core.positions.len() != total
+            || snapshot.core.rotations.len() != total
+            || snapshot.core.flips.len() != total
+            || snapshot.core.connections.len() != total
         {
             return;
         }
@@ -459,7 +377,7 @@ impl MultiplayerBridgeState {
         } else {
             (0..total).collect()
         };
-        let anchor_of = anchor_of_from_connections(&snapshot.connections, cols, rows);
+        let anchor_of = anchor_of_from_connections(&snapshot.core.connections, cols, rows);
         let group_order =
             build_group_order_from_piece_order(&piece_order, &anchor_of);
         let group_order_u32: Vec<u32> = group_order
@@ -467,12 +385,12 @@ impl MultiplayerBridgeState {
             .filter_map(|id| u32::try_from(id).ok())
             .collect();
         let state = PuzzleStateSnapshot {
-            positions: snapshot.positions.clone(),
-            rotations: snapshot.rotations.clone(),
-            flips: snapshot.flips.clone(),
-            connections: snapshot.connections.clone(),
+            positions: snapshot.core.positions.clone(),
+            rotations: snapshot.core.rotations.clone(),
+            flips: snapshot.core.flips.clone(),
+            connections: snapshot.core.connections.clone(),
             group_order: group_order_u32,
-            scramble_nonce: snapshot.scramble_nonce,
+            scramble_nonce: snapshot.core.scramble_nonce,
         };
         let msg = ClientMsg::Init {
             puzzle,
@@ -574,15 +492,48 @@ impl MultiplayerBridgeState {
         let group_order = filter_group_order(&state_snapshot.group_order, total);
         let anchor_of = anchor_of_from_connections(&state_snapshot.connections, cols, rows);
         let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
-        self.core.apply_snapshot_with_drag(
-            state_snapshot.positions.clone(),
-            state_snapshot.rotations.clone(),
-            state_snapshot.flips.clone(),
-            state_snapshot.connections.clone(),
-            piece_order,
-            state_snapshot.scramble_nonce,
-            preserve_drag,
+        let group_order_u32: Vec<u32> = group_order
+            .iter()
+            .filter_map(|id| u32::try_from(*id).ok())
+            .collect();
+        let piece_width = info.image_width as f32 / info.cols as f32;
+        let piece_height = info.image_height as f32 / info.rows as f32;
+        let rotation_enabled = self.core.rotation_enabled();
+        let solved = is_solved(
+            &state_snapshot.positions,
+            &state_snapshot.rotations,
+            &state_snapshot.flips,
+            &state_snapshot.connections,
+            cols,
+            rows,
+            piece_width,
+            piece_height,
+            rotation_enabled,
         );
+        let positions = state_snapshot.positions;
+        let rotations = state_snapshot.rotations;
+        let flips = state_snapshot.flips;
+        let connections = state_snapshot.connections;
+        let scramble_nonce = state_snapshot.scramble_nonce;
+        self.core.mutate_snapshot(move |snapshot| {
+            snapshot.core.positions = positions;
+            snapshot.core.rotations = rotations;
+            snapshot.core.flips = flips;
+            snapshot.core.connections = connections;
+            snapshot.core.group_order = group_order_u32;
+            snapshot.core.scramble_nonce = scramble_nonce;
+            snapshot.z_order = piece_order;
+            snapshot.solved = solved;
+            if !preserve_drag {
+                snapshot.dragging_members.clear();
+                snapshot.active_id = None;
+                snapshot.drag_cursor = None;
+                snapshot.drag_touch_id = None;
+                snapshot.drag_rotate_mode = false;
+                snapshot.drag_right_click = false;
+                snapshot.drag_primary_id = None;
+            }
+        });
         true
     }
 
@@ -683,10 +634,10 @@ impl MultiplayerBridgeState {
         let piece_width = info.image_width as f32 / info.cols as f32;
         let piece_height = info.image_height as f32 / info.rows as f32;
         let local = self.local_snapshot.borrow().clone();
-        if local.positions.len() != total
-            || local.rotations.len() != total
-            || local.flips.len() != total
-            || local.connections.len() != total
+        if local.core.positions.len() != total
+            || local.core.rotations.len() != total
+            || local.core.flips.len() != total
+            || local.core.connections.len() != total
         {
             console::warn!("multiplayer update dropped (state size mismatch)");
             return;
@@ -710,17 +661,6 @@ impl MultiplayerBridgeState {
     }
 }
 
-pub(crate) struct UiHooksHandle {
-    id: u64,
-    state: Rc<MultiplayerBridgeState>,
-}
-
-impl Drop for UiHooksHandle {
-    fn drop(&mut self) {
-        self.state.remove_ui_hooks(self.id);
-    }
-}
-
 thread_local! {
     static BRIDGE_STATE: RefCell<Option<Rc<MultiplayerBridgeState>>> = RefCell::new(None);
 }
@@ -741,15 +681,10 @@ pub(crate) fn install(core: Rc<AppCore>) {
     let _ = install_with_core(core);
 }
 
-pub(crate) fn register_ui_hooks(hooks: MultiplayerUiHooks) -> UiHooksHandle {
-    let state = install_with_core(AppCore::shared());
-    state.register_ui_hooks(hooks)
-}
-
 #[cfg(test)]
-pub(crate) fn callbacks_for_tests(core: Rc<AppCore>) -> MultiplayerSyncCallbacks {
+pub(crate) fn hooks_for_tests(core: Rc<AppCore>) -> SyncHooks {
     let state = install_with_core(core);
-    state.build_callbacks()
+    state.build_hooks()
 }
 
 fn filter_group_order(group_order: &[u32], total: usize) -> Vec<usize> {

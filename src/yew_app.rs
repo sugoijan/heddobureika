@@ -17,17 +17,19 @@ use web_sys::{
 use yew::prelude::*;
 use taffy::prelude::*;
 
-use crate::app_core::{AppCore, AppSnapshot};
+use crate::app_core::AppCore;
 use crate::app_builder;
 use crate::app_router;
 use crate::app_runtime;
 use crate::sync_runtime;
+use crate::view_runtime;
 use crate::core::*;
 use crate::model::*;
-use crate::multiplayer_bridge::{self, MultiplayerUiHooks};
+#[cfg(test)]
+use crate::multiplayer_bridge;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
-use crate::runtime::{CoreAction, SyncAction, SyncHooks};
+use crate::runtime::{CoreAction, SyncAction, SyncEvent, SyncHooks};
 use heddobureika_core::{
     logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleInfo, RoomUpdate, ServerMsg,
 };
@@ -36,15 +38,6 @@ use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
     UiTextId, UiTextSpec, WgpuRenderer,
 };
-#[cfg(feature = "backend-yew")]
-use crate::svg_view;
-
-#[derive(Clone, Copy, PartialEq)]
-enum AppMode {
-    Svg,
-    DevPanel,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdminStatus {
     Idle,
@@ -53,14 +46,14 @@ enum AdminStatus {
     Failed,
 }
 
-#[derive(Properties, PartialEq)]
+#[derive(Properties)]
 struct AppProps {
-    mode: AppMode,
+    core: Rc<AppCore>,
 }
 
-impl Default for AppProps {
-    fn default() -> Self {
-        Self { mode: AppMode::Svg }
+impl PartialEq for AppProps {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.core, &other.core)
     }
 }
 
@@ -131,31 +124,6 @@ impl PuzzleInfoStore {
     #[allow(dead_code)]
     fn view(&self) -> Option<PuzzleInfo> {
         (*self.state).clone()
-    }
-}
-
-#[derive(Clone, Debug)]
-struct LocalSnapshot {
-    positions: Vec<(f32, f32)>,
-    rotations: Vec<f32>,
-    flips: Vec<bool>,
-    connections: Vec<[bool; 4]>,
-    group_order: Vec<u32>,
-    z_order: Vec<usize>,
-    scramble_nonce: u32,
-}
-
-impl LocalSnapshot {
-    fn empty() -> Self {
-        Self {
-            positions: Vec::new(),
-            rotations: Vec::new(),
-            flips: Vec::new(),
-            connections: Vec::new(),
-            group_order: Vec::new(),
-            z_order: Vec::new(),
-            scramble_nonce: 0,
-        }
     }
 }
 
@@ -920,7 +888,7 @@ fn load_theme_mode() -> Option<ThemeMode> {
 }
 
 fn clear_saved_game() {
-    crate::local_snapshot::clear_local_snapshot();
+    crate::sync_runtime::clear_local_snapshot();
 }
 
 fn save_theme_mode(mode: ThemeMode) {
@@ -1643,9 +1611,9 @@ fn prefers_dark_mode() -> bool {
 fn app(props: &AppProps) -> Html {
     #[cfg(test)]
     gloo::console::log!("app render");
-    let app_core = AppCore::shared();
+    let app_core = props.core.clone();
     let app_snapshot = use_state(|| app_core.snapshot());
-    let show_dev_panel = matches!(props.mode, AppMode::DevPanel);
+    let show_dev_panel = true;
     let puzzle_info = use_state(|| None::<PuzzleInfo>);
     let puzzle_info_live = use_mut_ref(|| None::<PuzzleInfo>);
     let puzzle_info_store = PuzzleInfoStore::new(puzzle_info.clone(), puzzle_info_live.clone());
@@ -1844,7 +1812,6 @@ fn app(props: &AppProps) -> Html {
             ui_revision.set(ui_revision.wrapping_add(1));
         })
     };
-    let local_snapshot = use_mut_ref(LocalSnapshot::empty);
     let group_anchor = use_state(Vec::<usize>::new);
     let group_pos = use_state(Vec::<(f32, f32)>::new);
     let group_rot = use_state(Vec::<f32>::new);
@@ -1937,69 +1904,19 @@ fn app(props: &AppProps) -> Html {
     let renderer_kind = render_settings_value.renderer;
     let svg_settings_value = render_settings_value.svg.clone();
     let wgpu_settings_value = render_settings_value.wgpu.clone();
-    let renderer_is_yew = renderer_kind == RendererKind::Yew;
-    let svg_enabled = renderer_is_yew;
-    let svg_settings_visible = matches!(renderer_kind, RendererKind::Svg | RendererKind::Yew);
+    let svg_settings_visible = matches!(renderer_kind, RendererKind::Svg);
     let yew_wgpu_enabled = false; // WGPU view now lives in `wgpu_app`, not the SVG Yew app.
-    let show_svg = matches!(props.mode, AppMode::Svg) && svg_enabled;
-    let svg_snapshot_pending = use_mut_ref(|| None::<AppSnapshot>);
-    let svg_snapshot_frame = use_mut_ref(|| None::<AnimationFrame>);
-    let schedule_svg_snapshot: Rc<dyn Fn(AppSnapshot)> = {
-        let app_snapshot = app_snapshot.clone();
-        let svg_snapshot_pending = svg_snapshot_pending.clone();
-        let svg_snapshot_frame = svg_snapshot_frame.clone();
-        Rc::new(move |snapshot| {
-            *svg_snapshot_pending.borrow_mut() = Some(snapshot);
-            if svg_snapshot_frame.borrow().is_some() {
-                return;
-            }
-            let app_snapshot = app_snapshot.clone();
-            let svg_snapshot_pending = svg_snapshot_pending.clone();
-            let svg_snapshot_frame_cb = svg_snapshot_frame.clone();
-            let handle = request_animation_frame(move |_| {
-                svg_snapshot_frame_cb.borrow_mut().take();
-                if let Some(snapshot) = svg_snapshot_pending.borrow_mut().take() {
-                    app_snapshot.set(snapshot);
-                }
-            });
-            *svg_snapshot_frame.borrow_mut() = Some(handle);
-        })
-    };
+    let svg_enabled = false;
+    let show_svg = false;
     {
         let app_core = app_core.clone();
         let app_snapshot = app_snapshot.clone();
-        let show_svg = show_svg;
-        let schedule_svg_snapshot = schedule_svg_snapshot.clone();
-        let svg_snapshot_pending = svg_snapshot_pending.clone();
-        let svg_snapshot_frame = svg_snapshot_frame.clone();
-        use_effect_with(show_svg, move |show_svg| {
-            if *show_svg {
-                #[cfg(feature = "backend-yew")]
-                {
-                    let schedule_svg_snapshot = schedule_svg_snapshot.clone();
-                    let schedule_for_hook = schedule_svg_snapshot.clone();
-                    let svg_snapshot_pending = svg_snapshot_pending.clone();
-                    let svg_snapshot_frame = svg_snapshot_frame.clone();
-                    svg_view::set_render_hook(Rc::new(move |snapshot| {
-                        schedule_for_hook(snapshot);
-                    }));
-                    schedule_svg_snapshot(app_core.snapshot());
-                    return Box::new(move || {
-                        svg_view::clear_render_hook();
-                        svg_snapshot_frame.borrow_mut().take();
-                        svg_snapshot_pending.borrow_mut().take();
-                    }) as Box<dyn FnOnce()>;
-                }
-                #[cfg(not(feature = "backend-yew"))]
-                {
-                    return Box::new(|| ()) as Box<dyn FnOnce()>;
-                }
-            }
+        use_effect_with((), move |_| {
             let app_core_for_cb = app_core.clone();
             let subscription = app_core.subscribe(Rc::new(move || {
                 app_snapshot.set(app_core_for_cb.snapshot());
             }));
-            Box::new(move || drop(subscription)) as Box<dyn FnOnce()>
+            move || drop(subscription)
         });
     }
 
@@ -2294,33 +2211,11 @@ fn app(props: &AppProps) -> Html {
     let animating_members_value = (*animating_members).clone();
     let mp_client_id_value = sync_view.client_id();
     let ownership_by_anchor_value = sync_view.ownership_by_anchor();
-    let local_snapshot_value = (*local_snapshot.borrow()).clone();
-    let use_local_snapshot = multiplayer_active || !dragging_members_value.is_empty();
-    let render_positions = if use_local_snapshot {
-        local_snapshot_value.positions.clone()
-    } else {
-        app_snapshot_value.positions.clone()
-    };
-    let render_rotations = if use_local_snapshot {
-        local_snapshot_value.rotations.clone()
-    } else {
-        app_snapshot_value.rotations.clone()
-    };
-    let render_flips = if use_local_snapshot {
-        local_snapshot_value.flips.clone()
-    } else {
-        app_snapshot_value.flips.clone()
-    };
-    let render_connections = if use_local_snapshot {
-        local_snapshot_value.connections.clone()
-    } else {
-        app_snapshot_value.connections.clone()
-    };
-    let render_z_order = if use_local_snapshot {
-        local_snapshot_value.z_order.clone()
-    } else {
-        app_snapshot_value.z_order.clone()
-    };
+    let render_positions = app_snapshot_value.core.positions.clone();
+    let render_rotations = app_snapshot_value.core.rotations.clone();
+    let render_flips = app_snapshot_value.core.flips.clone();
+    let render_connections = app_snapshot_value.core.connections.clone();
+    let render_z_order = app_snapshot_value.z_order.clone();
     let positions_len = render_positions.len();
     let rotations_len = render_rotations.len();
     let flips_len = render_flips.len();
@@ -2338,7 +2233,6 @@ fn app(props: &AppProps) -> Html {
         show_debug: show_debug_value,
     };
     let apply_puzzle_state: Rc<dyn Fn(PuzzleState, usize, f32, f32)> = {
-        let local_snapshot = local_snapshot.clone();
         let bump_ui_revision = bump_ui_revision.clone();
         let z_order = z_order.clone();
         let group_anchor = group_anchor.clone();
@@ -2354,20 +2248,6 @@ fn app(props: &AppProps) -> Html {
             let next_flips = next_state.flips.clone();
             let next_connections = next_state.connections.clone();
             let next_scramble = next_state.scramble_nonce;
-            {
-                let mut snapshot = local_snapshot.borrow_mut();
-                snapshot.positions = derived.positions.clone();
-                snapshot.rotations = derived.rotations.clone();
-                snapshot.flips = next_flips.clone();
-                snapshot.connections = next_connections.clone();
-                snapshot.group_order = next_state
-                    .group_order
-                    .iter()
-                    .filter_map(|id| u32::try_from(*id).ok())
-                    .collect();
-                snapshot.z_order = derived.z_order.clone();
-                snapshot.scramble_nonce = next_scramble;
-            }
             log_state_update("positions", derived.positions.len(), "apply_puzzle_state");
             log_state_update("rotations", derived.rotations.len(), "apply_puzzle_state");
             log_state_update("flips", next_flips.len(), "apply_puzzle_state");
@@ -2393,9 +2273,45 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
+    let bump_sync_revision: Rc<dyn Fn()> = {
+        let sync_revision = sync_revision.clone();
+        Rc::new(move || {
+            sync_revision.set(sync_revision.wrapping_add(1));
+        })
+    };
+    let on_remote_snapshot = {
+        let bump_sync_revision = bump_sync_revision.clone();
+        Rc::new(move |_snapshot: GameSnapshot, _seq: u64| {
+            bump_sync_revision();
+        })
+    };
+    let on_remote_update = {
+        let bump_sync_revision = bump_sync_revision.clone();
+        #[cfg(test)]
+        let puzzle_info = puzzle_info_store.clone();
+        Rc::new(
+            move |_update: RoomUpdate,
+                  _seq: u64,
+                  _source: Option<ClientId>,
+                  _client_seq: Option<u64>| {
+                #[cfg(test)]
+                {
+                    if puzzle_info.get().is_none() {
+                        record_mp_warn("puzzle info not ready");
+                    }
+                }
+                bump_sync_revision();
+            },
+        )
+    };
+    let on_event = {
+        let bump_sync_revision = bump_sync_revision.clone();
+        Rc::new(move |_event: SyncEvent| {
+            bump_sync_revision();
+        })
+    };
     {
         let app_core = app_core.clone();
-        let local_snapshot = local_snapshot.clone();
         let puzzle_state = puzzle_state.clone();
         let group_anchor = group_anchor.clone();
         let group_pos = group_pos.clone();
@@ -2444,21 +2360,13 @@ fn app(props: &AppProps) -> Html {
                 let rows = snapshot.grid.rows as usize;
                 let total = cols * rows;
                 if total == 0
-                    || snapshot.positions.len() != total
-                    || snapshot.rotations.len() != total
-                    || snapshot.flips.len() != total
-                    || snapshot.connections.len() != total
+                    || snapshot.core.positions.len() != total
+                    || snapshot.core.rotations.len() != total
+                    || snapshot.core.flips.len() != total
+                    || snapshot.core.connections.len() != total
                 {
-                    let mut local = local_snapshot.borrow_mut();
-                    local.positions = snapshot.positions.clone();
-                    local.rotations = snapshot.rotations.clone();
-                    local.flips = snapshot.flips.clone();
-                    local.connections = snapshot.connections.clone();
-                    local.z_order = snapshot.z_order.clone();
-                    local.group_order.clear();
-                    local.scramble_nonce = snapshot.scramble_nonce;
-                    z_order.set(local.z_order.clone());
-                    scramble_nonce.set(snapshot.scramble_nonce);
+                    z_order.set(snapshot.z_order.clone());
+                    scramble_nonce.set(snapshot.core.scramble_nonce);
                     solved.set(snapshot.solved);
                     puzzle_state.set(PuzzleState::empty());
                     bump_ui_revision();
@@ -2470,14 +2378,14 @@ fn app(props: &AppProps) -> Html {
                     (0..total).collect()
                 };
                 let next_state = PuzzleState::rebuild_from_piece_state(
-                    &snapshot.positions,
-                    &snapshot.rotations,
-                    &snapshot.flips,
-                    &snapshot.connections,
+                    &snapshot.core.positions,
+                    &snapshot.core.rotations,
+                    &snapshot.core.flips,
+                    &snapshot.core.connections,
                     cols,
                     rows,
                     Some(piece_order.as_slice()),
-                    snapshot.scramble_nonce,
+                    snapshot.core.scramble_nonce,
                 );
                 let derived = derive_ui_state_from_puzzle(
                     &next_state,
@@ -2485,27 +2393,12 @@ fn app(props: &AppProps) -> Html {
                     snapshot.piece_width,
                     snapshot.piece_height,
                 );
-                let group_order_u32: Vec<u32> = derived
-                    .group_order
-                    .iter()
-                    .filter_map(|id| u32::try_from(*id).ok())
-                    .collect();
-                {
-                    let mut local = local_snapshot.borrow_mut();
-                    local.positions = derived.positions.clone();
-                    local.rotations = derived.rotations.clone();
-                    local.flips = snapshot.flips.clone();
-                    local.connections = snapshot.connections.clone();
-                    local.group_order = group_order_u32;
-                    local.z_order = derived.z_order.clone();
-                    local.scramble_nonce = snapshot.scramble_nonce;
-                }
                 group_anchor.set(derived.anchor_of.clone());
                 group_pos.set(derived.group_pos.clone());
                 group_rot.set(derived.group_rot.clone());
                 group_order.set(derived.group_order.clone());
                 z_order.set(derived.z_order.clone());
-                scramble_nonce.set(snapshot.scramble_nonce);
+                scramble_nonce.set(snapshot.core.scramble_nonce);
                 solved.set(snapshot.solved);
                 puzzle_state.set(next_state);
                 *positions_live.borrow_mut() = derived.positions;
@@ -2518,20 +2411,23 @@ fn app(props: &AppProps) -> Html {
                 }
             });
             let app_core_for_action = app_core.clone();
-            sync_runtime::init_local_hooks(SyncHooks {
+            sync_runtime::set_sync_hooks(SyncHooks {
                 on_snapshot: on_snapshot.clone(),
                 on_remote_action: Rc::new(move |action| {
                     app_core_for_action.apply_action(action);
                 }),
+                on_remote_snapshot: on_remote_snapshot.clone(),
+                on_remote_update: on_remote_update.clone(),
+                on_event: on_event.clone(),
             });
             move || {
-                sync_runtime::shutdown_local_hooks();
+                sync_runtime::clear_sync_hooks();
             }
         });
     }
     let _render_wgpu_now: Rc<dyn Fn()> = {
         let puzzle_info = puzzle_info_store.clone();
-        let local_snapshot = local_snapshot.clone();
+        let app_snapshot = app_snapshot.clone();
         let wgpu_renderer = wgpu_renderer.clone();
         let mask_atlas = mask_atlas.clone();
         let z_order = z_order.clone();
@@ -2566,19 +2462,19 @@ fn app(props: &AppProps) -> Html {
                 None => return,
             };
             let (positions_value, rotations_value, flips_value, connections_value, z_order_snapshot) = {
-                let snapshot = local_snapshot.borrow();
-                if snapshot.positions.len() != total
-                    || snapshot.rotations.len() != total
-                    || snapshot.flips.len() != total
-                    || snapshot.connections.len() != total
+                let snapshot = (*app_snapshot).clone();
+                if snapshot.core.positions.len() != total
+                    || snapshot.core.rotations.len() != total
+                    || snapshot.core.flips.len() != total
+                    || snapshot.core.connections.len() != total
                 {
                     return;
                 }
                 (
-                    snapshot.positions.clone(),
-                    snapshot.rotations.clone(),
-                    snapshot.flips.clone(),
-                    snapshot.connections.clone(),
+                    snapshot.core.positions.clone(),
+                    snapshot.core.rotations.clone(),
+                    snapshot.core.flips.clone(),
+                    snapshot.core.connections.clone(),
                     snapshot.z_order.clone(),
                 )
             };
@@ -2648,103 +2544,6 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
-    let bump_sync_revision: Rc<dyn Fn()> = {
-        let sync_revision = sync_revision.clone();
-        Rc::new(move || {
-            sync_revision.set(sync_revision.wrapping_add(1));
-        })
-    };
-    let multiplayer_ui_hooks = {
-        let on_welcome = {
-            let bump_sync_revision = bump_sync_revision.clone();
-            Rc::new(
-                move |_room_id: String,
-                      _persistence: heddobureika_core::RoomPersistence,
-                      _initialized: bool,
-                      _client_id: Option<ClientId>| {
-                    bump_sync_revision();
-                },
-            )
-        };
-        let on_need_init = {
-            let bump_sync_revision = bump_sync_revision.clone();
-            Rc::new(move || {
-                bump_sync_revision();
-            })
-        };
-        let on_warning = Rc::new(|_minutes_idle| {});
-        let on_state = {
-            let bump_sync_revision = bump_sync_revision.clone();
-            Rc::new(move |_snapshot: GameSnapshot, _seq: u64| {
-                bump_sync_revision();
-            })
-        };
-        let on_update = {
-            let bump_sync_revision = bump_sync_revision.clone();
-            #[cfg(test)]
-            let puzzle_info = puzzle_info_store.clone();
-            Rc::new(move |_update: RoomUpdate, _seq: u64, _source: Option<ClientId>, _client_seq: Option<u64>| {
-                #[cfg(test)]
-                {
-                    if puzzle_info.get().is_none() {
-                        record_mp_warn("puzzle info not ready");
-                    }
-                }
-                bump_sync_revision();
-            })
-        };
-        let on_ownership = {
-            let bump_sync_revision = bump_sync_revision.clone();
-            let drag_state = drag_state.clone();
-            let drag_pending = drag_pending.clone();
-            let drag_frame = drag_frame.clone();
-            let dragging_members = dragging_members.clone();
-            let active_id = active_id.clone();
-            Rc::new(move |anchor_id: u32, owner: Option<ClientId>| {
-                if let Some(my_id) = sync_runtime::sync_view().client_id() {
-                    if owner != Some(my_id) {
-                        let should_cancel = drag_state
-                            .borrow()
-                            .as_ref()
-                            .map(|drag| drag.anchor_id as u32 == anchor_id)
-                            .unwrap_or(false);
-                        if should_cancel {
-                            dragging_members.set(Vec::new());
-                            *drag_state.borrow_mut() = None;
-                            drag_pending.borrow_mut().take();
-                            drag_frame.borrow_mut().take();
-                            active_id.set(None);
-                        }
-                    }
-                }
-                bump_sync_revision();
-            })
-        };
-        let on_drop_not_ready = Rc::new(move || {
-            #[cfg(test)]
-            record_mp_warn("not ready");
-        });
-        let on_error = Rc::new(|_code: String, _message: String| {});
-        MultiplayerUiHooks {
-            on_welcome,
-            on_need_init,
-            on_warning,
-            on_state,
-            on_update,
-            on_ownership,
-            on_drop_not_ready,
-            on_error,
-        }
-    };
-    {
-        let multiplayer_ui_hooks = multiplayer_ui_hooks.clone();
-        let bump_sync_revision = bump_sync_revision.clone();
-        use_effect_with((), move |_| {
-            let handle = multiplayer_bridge::register_ui_hooks(multiplayer_ui_hooks);
-            bump_sync_revision();
-            || drop(handle)
-        });
-    }
     {
         let bump_sync_revision = bump_sync_revision.clone();
         let show_svg = show_svg;
@@ -2780,9 +2579,8 @@ fn app(props: &AppProps) -> Html {
     #[cfg(test)]
     {
         let send_msg = {
-            let multiplayer_callbacks =
-                multiplayer_bridge::callbacks_for_tests(app_core.clone());
-            sync_runtime::install_test_handler(multiplayer_callbacks)
+            let multiplayer_hooks = multiplayer_bridge::hooks_for_tests(app_core.clone());
+            sync_runtime::install_test_handler(multiplayer_hooks)
         };
         let set_puzzle_info = {
             let puzzle_info = puzzle_info_store.clone();
@@ -2826,7 +2624,6 @@ fn app(props: &AppProps) -> Html {
     let renderer_value = match renderer_kind {
         RendererKind::Wgpu => "wgpu",
         RendererKind::Svg => "svg",
-        RendererKind::Yew => "yew",
     };
     let mode_value = if multiplayer_active { "online" } else { "local" };
     {
@@ -2835,13 +2632,7 @@ fn app(props: &AppProps) -> Html {
         use_effect_with(render_settings_value, move |settings| {
             app_router::save_render_settings(settings);
             app_core.set_renderer_kind(settings.renderer);
-            app_core.set_svg_animations(settings.svg.animations);
-            app_core.set_svg_emboss(settings.svg.emboss);
-            app_core.set_svg_fast_render(settings.svg.fast_render);
-            app_core.set_svg_fast_filter(settings.svg.fast_filter);
-            app_core.set_wgpu_show_fps(settings.wgpu.show_fps);
-            app_core.set_wgpu_edge_aa(settings.wgpu.edge_aa);
-            app_core.set_wgpu_render_scale(settings.wgpu.render_scale);
+            view_runtime::apply_render_settings(settings);
             app_core.set_image_max_dim(settings.image_max_dim);
             || ()
         });
@@ -3113,7 +2904,7 @@ fn app(props: &AppProps) -> Html {
     };
     let on_rotation_toggle = {
         let rotation_enabled = rotation_enabled.clone();
-        let local_snapshot = local_snapshot.clone();
+        let app_snapshot = app_snapshot.clone();
         let z_order = z_order.clone();
         let apply_puzzle_state = apply_puzzle_state.clone();
         let scramble_nonce = scramble_nonce.clone();
@@ -3127,18 +2918,18 @@ fn app(props: &AppProps) -> Html {
             rotation_enabled.set(enabled);
             app_core.set_rotation_enabled(enabled);
             let (positions_snapshot, rotations_snapshot, flips_snapshot, connections_snapshot) = {
-                let snapshot = local_snapshot.borrow();
-                let total = snapshot.positions.len();
+                let snapshot = &*app_snapshot;
+                let total = snapshot.core.positions.len();
                 let rotations_snapshot = if enabled {
-                    snapshot.rotations.clone()
+                    snapshot.core.rotations.clone()
                 } else {
                     vec![0.0; total]
                 };
                 (
-                    snapshot.positions.clone(),
+                    snapshot.core.positions.clone(),
                     rotations_snapshot,
-                    snapshot.flips.clone(),
-                    snapshot.connections.clone(),
+                    snapshot.core.flips.clone(),
+                    snapshot.core.connections.clone(),
                 )
             };
             if let Some(info) = puzzle_info.get() {
@@ -3223,12 +3014,13 @@ fn app(props: &AppProps) -> Html {
     };
     let on_rotation_lock_threshold = {
         let rotation_lock_threshold = rotation_lock_threshold.clone();
-        let local_snapshot = local_snapshot.clone();
+        let app_snapshot = app_snapshot.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
-                let snapshot = local_snapshot.borrow();
+                let snapshot = &*app_snapshot;
                 let max_value = snapshot
+                    .core
                     .positions
                     .len()
                     .max(ROTATION_LOCK_THRESHOLD_MIN);
@@ -3284,7 +3076,6 @@ fn app(props: &AppProps) -> Html {
             let input: HtmlSelectElement = event.target_unchecked_into();
             let next_renderer = match input.value().as_str() {
                 "svg" => RendererKind::Svg,
-                "yew" => RendererKind::Yew,
                 "wgpu" => RendererKind::Wgpu,
                 _ => RendererKind::Wgpu,
             };
@@ -3308,14 +3099,12 @@ fn app(props: &AppProps) -> Html {
         let rotation_anim = rotation_anim.clone();
         let rotation_anim_handle = rotation_anim_handle.clone();
         let rotation_queue = rotation_queue.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
             let mut next = (*render_settings).clone();
             next.svg.animations = enabled;
             render_settings.set(next);
-            app_core.set_svg_animations(enabled);
             if !enabled {
                 animating_members.set(Vec::new());
                 *rotation_anim.borrow_mut() = None;
@@ -3326,31 +3115,26 @@ fn app(props: &AppProps) -> Html {
     };
     let on_emboss_toggle = {
         let render_settings = render_settings.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
             let mut next = (*render_settings).clone();
             next.svg.emboss = enabled;
             render_settings.set(next);
-            app_core.set_svg_emboss(enabled);
         })
     };
     let on_wgpu_fps_toggle = {
         let render_settings = render_settings.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
             let mut next = (*render_settings).clone();
             next.wgpu.show_fps = enabled;
             render_settings.set(next);
-            app_core.set_wgpu_show_fps(enabled);
         })
     };
     let on_wgpu_edge_aa = {
         let render_settings = render_settings.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
@@ -3358,7 +3142,6 @@ fn app(props: &AppProps) -> Html {
                 let mut next = (*render_settings).clone();
                 next.wgpu.edge_aa = value;
                 render_settings.set(next);
-                app_core.set_wgpu_edge_aa(value);
             }
         })
     };
@@ -3379,7 +3162,6 @@ fn app(props: &AppProps) -> Html {
     };
     let on_wgpu_render_scale = {
         let render_settings = render_settings.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
@@ -3387,7 +3169,6 @@ fn app(props: &AppProps) -> Html {
                 let mut next = (*render_settings).clone();
                 next.wgpu.render_scale = value;
                 render_settings.set(next);
-                app_core.set_wgpu_render_scale(value);
             }
         })
     };
@@ -3410,26 +3191,22 @@ fn app(props: &AppProps) -> Html {
     };
     let on_fast_render_toggle = {
         let render_settings = render_settings.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
             let mut next = (*render_settings).clone();
             next.svg.fast_render = enabled;
             render_settings.set(next);
-            app_core.set_svg_fast_render(enabled);
         })
     };
     let on_fast_filter_toggle = {
         let render_settings = render_settings.clone();
-        let app_core = app_core.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let enabled = input.checked();
             let mut next = (*render_settings).clone();
             next.svg.fast_filter = enabled;
             render_settings.set(next);
-            app_core.set_svg_fast_filter(enabled);
         })
     };
     let on_debug_toggle = {
@@ -3535,7 +3312,7 @@ fn app(props: &AppProps) -> Html {
         let mask_atlas = mask_atlas.clone();
         let mask_atlas_revision = mask_atlas_revision.clone();
         let set_hovered = set_hovered.clone();
-        let local_snapshot = local_snapshot.clone();
+        let app_snapshot = app_snapshot.clone();
         let z_order = z_order.clone();
         let dragging_members = dragging_members.clone();
         let active_id = active_id.clone();
@@ -3719,11 +3496,11 @@ fn app(props: &AppProps) -> Html {
                                     }
                                     renderer.render();
                                 } else {
-                                    let snapshot = local_snapshot.borrow();
-                                    let positions_snapshot = snapshot.positions.clone();
-                                    let rotations_snapshot = snapshot.rotations.clone();
-                                    let flips_snapshot = snapshot.flips.clone();
-                                    let connections_snapshot = snapshot.connections.clone();
+                                    let snapshot = &*app_snapshot;
+                                    let positions_snapshot = snapshot.core.positions.clone();
+                                    let rotations_snapshot = snapshot.core.rotations.clone();
+                                    let flips_snapshot = snapshot.core.flips.clone();
+                                    let connections_snapshot = snapshot.core.connections.clone();
                                     let z_order_snapshot = if snapshot.z_order.len() == total {
                                         snapshot.z_order.clone()
                                     } else {
@@ -3811,7 +3588,7 @@ fn app(props: &AppProps) -> Html {
         let ui_credit_hovered = ui_credit_hovered.clone();
         let mask_atlas = mask_atlas.clone();
         let drag_state = drag_state.clone();
-        let local_snapshot = local_snapshot.clone();
+        let app_snapshot = app_snapshot.clone();
         let wgpu_render_deps = WgpuRenderDeps {
             using_wgpu: yew_wgpu_enabled,
             show_svg,
@@ -3865,11 +3642,11 @@ fn app(props: &AppProps) -> Html {
                 let piece_width = width as f32 / deps.grid.cols as f32;
                 let piece_height = height as f32 / deps.grid.rows as f32;
                 let total = cols * rows;
-                let snapshot = local_snapshot.borrow();
-                let positions_value = snapshot.positions.clone();
-                let rotations_value = snapshot.rotations.clone();
-                let flips_value = snapshot.flips.clone();
-                let connections_value = snapshot.connections.clone();
+                let snapshot = (*app_snapshot).clone();
+                let positions_value = snapshot.core.positions.clone();
+                let rotations_value = snapshot.core.rotations.clone();
+                let flips_value = snapshot.core.flips.clone();
+                let connections_value = snapshot.core.connections.clone();
                 let z_order_value = if snapshot.z_order.len() == total {
                     snapshot.z_order.clone()
                 } else {
@@ -4707,7 +4484,7 @@ fn app(props: &AppProps) -> Html {
             (*z_order).clone()
         };
         let drag_move_common: Rc<dyn Fn(f32, f32) -> bool> = {
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let bump_ui_revision = bump_ui_revision.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
@@ -4752,9 +4529,9 @@ fn app(props: &AppProps) -> Html {
                         let sync_view = sync_runtime::sync_view();
                         let ownership_by_anchor_value = sync_view.ownership_by_anchor();
                         let mp_client_id_value = sync_view.client_id();
-                        let snapshot = local_snapshot.borrow();
-                        let flips_snapshot = snapshot.flips.as_slice();
-                        let connections_snapshot = snapshot.connections.as_slice();
+                        let snapshot = &*app_snapshot;
+                        let flips_snapshot = snapshot.core.flips.as_slice();
+                        let connections_snapshot = snapshot.core.connections.as_slice();
                         let z_order_snapshot = if snapshot.z_order.len() == cols * rows {
                             snapshot.z_order.as_slice()
                         } else {
@@ -4793,8 +4570,9 @@ fn app(props: &AppProps) -> Html {
                         let current_angle = (y - drag.pivot_y).atan2(x - drag.pivot_x);
                         let delta_deg = (current_angle - drag.start_angle).to_degrees();
                         let anchor_id = drag.anchor_id;
-                        let flipped = local_snapshot
-                            .borrow()
+                        let snapshot = &*app_snapshot;
+                        let flipped = snapshot
+                            .core
                             .flips
                             .get(anchor_id)
                             .copied()
@@ -4886,9 +4664,10 @@ fn app(props: &AppProps) -> Html {
                                     "drag_rotate",
                                 );
                                 {
-                                    let mut snapshot = local_snapshot.borrow_mut();
-                                    snapshot.positions = derived_positions;
-                                    snapshot.rotations = derived_rotations;
+                                    let mut positions_ref = positions_live.borrow_mut();
+                                    let mut rotations_ref = rotations_live.borrow_mut();
+                                    *positions_ref = derived_positions;
+                                    *rotations_ref = derived_rotations;
                                 }
                                 bump_ui_revision();
                             }
@@ -5022,9 +4801,10 @@ fn app(props: &AppProps) -> Html {
                                     "drag_move",
                                 );
                                 {
-                                    let mut snapshot = local_snapshot.borrow_mut();
-                                    snapshot.positions = derived_positions;
-                                    snapshot.rotations = derived_rotations;
+                                    let mut positions_ref = positions_live.borrow_mut();
+                                    let mut rotations_ref = rotations_live.borrow_mut();
+                                    *positions_ref = derived_positions;
+                                    *rotations_ref = derived_rotations;
                                 }
                                 bump_ui_revision();
                             }
@@ -5140,7 +4920,7 @@ fn app(props: &AppProps) -> Html {
             }
         };
         let drag_release_common: Rc<dyn Fn(Option<(f32, f32)>) -> bool> = {
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let bump_ui_revision = bump_ui_revision.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
@@ -5182,18 +4962,13 @@ fn app(props: &AppProps) -> Html {
                 if let Some(drag) = drag {
                     let ctrl_flip = drag.rotate_mode;
                     let reverse_rotation = drag.right_click;
-                    let (mut next, mut next_rotations) = if yew_wgpu_enabled {
-                        (
-                            positions_live.borrow().clone(),
-                            rotations_live.borrow().clone(),
-                        )
-                    } else {
-                        let snapshot = local_snapshot.borrow();
-                        (snapshot.positions.clone(), snapshot.rotations.clone())
-                    };
+                    let (mut next, mut next_rotations) = (
+                        positions_live.borrow().clone(),
+                        rotations_live.borrow().clone(),
+                    );
                     let (mut next_flips, mut next_connections) = {
-                        let snapshot = local_snapshot.borrow();
-                        (snapshot.flips.clone(), snapshot.connections.clone())
+                        let snapshot = &*app_snapshot;
+                        (snapshot.core.flips.clone(), snapshot.core.connections.clone())
                     };
                     let start_positions_all = next.clone();
                     let start_rotations_all = next_rotations.clone();
@@ -5222,7 +4997,9 @@ fn app(props: &AppProps) -> Html {
                     let start_group_animation = {
                         let apply_puzzle_state = apply_puzzle_state.clone();
                         let scramble_nonce = scramble_nonce.clone();
-                        let local_snapshot = local_snapshot.clone();
+                        let app_snapshot = app_snapshot.clone();
+                        let positions_live = positions_live.clone();
+                        let rotations_live = rotations_live.clone();
                         let bump_ui_revision = bump_ui_revision.clone();
                         let group_anchor = group_anchor.clone();
                         let group_pos = group_pos.clone();
@@ -5259,14 +5036,14 @@ fn app(props: &AppProps) -> Html {
                                 rotation_queue.borrow_mut().clear();
                                 let (mut next_positions, mut next_rotations, mut connections_snapshot, flips_snapshot) =
                                     {
-                                        let snapshot = local_snapshot.borrow();
-                                        let next_positions = snapshot.positions.clone();
-                                        let next_rotations = snapshot.rotations.clone();
+                                        let snapshot = &*app_snapshot;
+                                        let next_positions = snapshot.core.positions.clone();
+                                        let next_rotations = snapshot.core.rotations.clone();
                                         let connections_snapshot = connections_override
                                             .as_ref()
                                             .map(|snapshot| (**snapshot).clone())
-                                            .unwrap_or_else(|| snapshot.connections.clone());
-                                        let flips_snapshot = snapshot.flips.clone();
+                                            .unwrap_or_else(|| snapshot.core.connections.clone());
+                                        let flips_snapshot = snapshot.core.flips.clone();
                                         (
                                             next_positions,
                                             next_rotations,
@@ -5435,7 +5212,9 @@ fn app(props: &AppProps) -> Html {
                             *rotation_anim.borrow_mut() = Some(anim);
                             animating_members.set(members);
                             rotation_anim_handle.borrow_mut().take();
-                            let local_snapshot = local_snapshot.clone();
+                            let app_snapshot = app_snapshot.clone();
+                            let positions_live = positions_live.clone();
+                            let rotations_live = rotations_live.clone();
                             let bump_ui_revision = bump_ui_revision.clone();
                             let solved = solved.clone();
                             let rotation_anim = rotation_anim.clone();
@@ -5461,10 +5240,10 @@ fn app(props: &AppProps) -> Html {
                                     t = 1.0;
                                 }
                                 let eased = t * t * (3.0 - 2.0 * t);
-                                let (mut next_positions, mut next_rotations) = {
-                                    let snapshot = local_snapshot.borrow();
-                                    (snapshot.positions.clone(), snapshot.rotations.clone())
-                                };
+                                let (mut next_positions, mut next_rotations) = (
+                                    positions_live.borrow().clone(),
+                                    rotations_live.borrow().clone(),
+                                );
                                 match &anim.kind {
                                     AnimationKind::Pivot {
                                         pivot_x,
@@ -5552,9 +5331,10 @@ fn app(props: &AppProps) -> Html {
                                     "animation_step",
                                 );
                                 {
-                                    let mut snapshot = local_snapshot.borrow_mut();
-                                    snapshot.positions = next_positions.clone();
-                                    snapshot.rotations = next_rotations.clone();
+                                    let mut positions_ref = positions_live.borrow_mut();
+                                    let mut rotations_ref = rotations_live.borrow_mut();
+                                    *positions_ref = next_positions.clone();
+                                    *rotations_ref = next_rotations.clone();
                                 }
                                 bump_ui_revision();
                                 log_state_update(
@@ -5629,12 +5409,12 @@ fn app(props: &AppProps) -> Html {
                                     let mut snapped_positions = next_positions.clone();
                                     let mut snapped_rotations = next_rotations.clone();
                                     let (mut connections_snapshot, flips_snapshot) = {
-                                        let snapshot = local_snapshot.borrow();
+                                        let snapshot = &*app_snapshot;
                                         let connections_snapshot = connections_override
                                             .as_ref()
                                             .map(|snapshot| (**snapshot).clone())
-                                            .unwrap_or_else(|| snapshot.connections.clone());
-                                        let flips_snapshot = snapshot.flips.clone();
+                                            .unwrap_or_else(|| snapshot.core.connections.clone());
+                                        let flips_snapshot = snapshot.core.flips.clone();
                                         (connections_snapshot, flips_snapshot)
                                     };
                                     if should_snap {
@@ -6127,12 +5907,6 @@ fn app(props: &AppProps) -> Html {
                     );
                     if let Some(anim) = pending_animation {
                         let connections_snapshot = next_state.connections.clone();
-                        let group_order_snapshot: Vec<u32> = next_state
-                            .group_order
-                            .iter()
-                            .filter_map(|id| u32::try_from(*id).ok())
-                            .collect();
-                        let scramble_nonce_snapshot = next_state.scramble_nonce;
                         let (group_pos_now, group_rot_now) = group_transforms_from_anchor(
                             &anchor_of,
                             &start_positions_all,
@@ -6143,7 +5917,6 @@ fn app(props: &AppProps) -> Html {
                         group_pos.set(group_pos_now);
                         group_rot.set(group_rot_now);
                         group_order.set(group_order_value);
-                        let piece_order_snapshot = piece_order.clone();
                         z_order.set(piece_order);
                         log_state_update(
                             "connections",
@@ -6151,14 +5924,6 @@ fn app(props: &AppProps) -> Html {
                             "drag_finalize",
                         );
                         log_state_update("flips", next_flips.len(), "drag_finalize");
-                        {
-                            let mut snapshot = local_snapshot.borrow_mut();
-                            snapshot.connections = connections_snapshot.clone();
-                            snapshot.flips = next_flips.clone();
-                            snapshot.group_order = group_order_snapshot;
-                            snapshot.z_order = piece_order_snapshot;
-                            snapshot.scramble_nonce = scramble_nonce_snapshot;
-                        }
                         bump_ui_revision();
                         start_group_animation(anim, Some(connections_snapshot));
                         active_id.set(None);
@@ -6388,7 +6153,7 @@ fn app(props: &AppProps) -> Html {
             })
         };
         let on_solve_rotation = {
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let z_order = z_order.clone();
             let apply_puzzle_state = apply_puzzle_state.clone();
             let dragging_members = dragging_members.clone();
@@ -6407,11 +6172,11 @@ fn app(props: &AppProps) -> Html {
                     return;
                 }
                 let (positions_snapshot, flips_snapshot, connections_snapshot) = {
-                    let snapshot = local_snapshot.borrow();
+                    let snapshot = &*app_snapshot;
                     (
-                        snapshot.positions.clone(),
-                        snapshot.flips.clone(),
-                        snapshot.connections.clone(),
+                        snapshot.core.positions.clone(),
+                        snapshot.core.flips.clone(),
+                        snapshot.core.connections.clone(),
                     )
                 };
                 let zeroed = vec![0.0; total];
@@ -6459,7 +6224,7 @@ fn app(props: &AppProps) -> Html {
             })
         };
         let on_unflip = {
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let z_order = z_order.clone();
             let apply_puzzle_state = apply_puzzle_state.clone();
             let dragging_members = dragging_members.clone();
@@ -6478,11 +6243,11 @@ fn app(props: &AppProps) -> Html {
                     return;
                 }
                 let (positions_snapshot, rotations_snapshot, connections_snapshot) = {
-                    let snapshot = local_snapshot.borrow();
+                    let snapshot = &*app_snapshot;
                     (
-                        snapshot.positions.clone(),
-                        snapshot.rotations.clone(),
-                        snapshot.connections.clone(),
+                        snapshot.core.positions.clone(),
+                        snapshot.core.rotations.clone(),
+                        snapshot.core.connections.clone(),
                     )
                 };
                 let cleared = vec![false; total];
@@ -6635,7 +6400,7 @@ fn app(props: &AppProps) -> Html {
             .collect();
 
         let begin_drag: Rc<dyn Fn(usize, f32, f32, bool, bool, bool, Option<i32>)> = {
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let positions_live = positions_live.clone();
             let rotations_live = rotations_live.clone();
             let group_pos_live = group_pos_live.clone();
@@ -6662,12 +6427,12 @@ fn app(props: &AppProps) -> Html {
                     return;
                 }
                 let (positions_snapshot, rotations_snapshot, flips_snapshot, mut connections_snapshot) = {
-                    let snapshot = local_snapshot.borrow();
+                    let snapshot = &*app_snapshot;
                     (
-                        snapshot.positions.clone(),
-                        snapshot.rotations.clone(),
-                        snapshot.flips.clone(),
-                        snapshot.connections.clone(),
+                        positions_live.borrow().clone(),
+                        rotations_live.borrow().clone(),
+                        snapshot.core.flips.clone(),
+                        snapshot.core.connections.clone(),
                     )
                 };
                 if !ownership_by_anchor_value.is_empty() {
@@ -7129,7 +6894,7 @@ fn app(props: &AppProps) -> Html {
             let canvas_ref = canvas_ref.clone();
             let ui_credit_hitbox = ui_credit_hitbox.clone();
             let ui_credit_hovered = ui_credit_hovered.clone();
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let begin_drag = begin_drag.clone();
@@ -7167,13 +6932,13 @@ fn app(props: &AppProps) -> Html {
                     order = (0..total).collect();
                 }
                 let piece_hit = {
-                    let snapshot = local_snapshot.borrow();
+                    let snapshot = &*app_snapshot;
                     pick_piece_at(
                         px,
                         py,
-                        snapshot.positions.as_slice(),
-                        snapshot.rotations.as_slice(),
-                        snapshot.flips.as_slice(),
+                        snapshot.core.positions.as_slice(),
+                        snapshot.core.rotations.as_slice(),
+                        snapshot.core.flips.as_slice(),
                         &order,
                         mask_atlas,
                         cols,
@@ -7214,7 +6979,7 @@ fn app(props: &AppProps) -> Html {
             let canvas_ref = canvas_ref.clone();
             let ui_credit_hitbox = ui_credit_hitbox.clone();
             let ui_credit_hovered = ui_credit_hovered.clone();
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let begin_drag = begin_drag.clone();
@@ -7260,13 +7025,13 @@ fn app(props: &AppProps) -> Html {
                     order = (0..total).collect();
                 }
                 let piece_hit = {
-                    let snapshot = local_snapshot.borrow();
+                    let snapshot = &*app_snapshot;
                     pick_piece_at(
                         px,
                         py,
-                        snapshot.positions.as_slice(),
-                        snapshot.rotations.as_slice(),
-                        snapshot.flips.as_slice(),
+                        snapshot.core.positions.as_slice(),
+                        snapshot.core.rotations.as_slice(),
+                        snapshot.core.flips.as_slice(),
                         &order,
                         mask_atlas,
                         cols,
@@ -7297,7 +7062,7 @@ fn app(props: &AppProps) -> Html {
         };
         let on_canvas_move = {
             let canvas_ref = canvas_ref.clone();
-            let local_snapshot = local_snapshot.clone();
+            let app_snapshot = app_snapshot.clone();
             let z_order = z_order.clone();
             let mask_atlas = mask_atlas.clone();
             let set_hovered = set_hovered.clone();
@@ -7329,10 +7094,10 @@ fn app(props: &AppProps) -> Html {
                 let (px, py) = workspace_to_puzzle_coords(puzzle_scale, x, y);
                 let mut piece_hit = None;
                 if let Some(mask_atlas) = mask_atlas.borrow().as_ref() {
-                    let snapshot = local_snapshot.borrow();
-                    let positions_snapshot = snapshot.positions.as_slice();
-                    let rotations_snapshot = snapshot.rotations.as_slice();
-                    let flips_snapshot = snapshot.flips.as_slice();
+                    let snapshot = &*app_snapshot;
+                    let positions_snapshot = snapshot.core.positions.as_slice();
+                    let rotations_snapshot = snapshot.core.rotations.as_slice();
+                    let flips_snapshot = snapshot.core.flips.as_slice();
                     let order_snapshot = &*z_order;
                     let total = cols * rows;
                     let fallback_order = if order_snapshot.len() == total {
@@ -8230,9 +7995,6 @@ fn app(props: &AppProps) -> Html {
                     <option value="svg" selected={renderer_kind == RendererKind::Svg}>
                         { "SVG" }
                     </option>
-                    <option value="yew" selected={renderer_kind == RendererKind::Yew}>
-                        { "YEW" }
-                    </option>
                 </select>
             </div>
             <div class="control">
@@ -8846,21 +8608,7 @@ fn app(props: &AppProps) -> Html {
     }
 }
 
-pub(crate) fn run_svg() {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(document) = window.document() else {
-        return;
-    };
-    let Some(root) = document.get_element_by_id("svg-root") else {
-        return;
-    };
-    let _app_handle =
-        yew::Renderer::<App>::with_root_and_props(root, AppProps { mode: AppMode::Svg }).render();
-}
-
-pub(crate) fn run_dev_panel() {
+pub(crate) fn run_dev_panel(core: Rc<AppCore>) {
     let Some(window) = web_sys::window() else {
         return;
     };
@@ -8870,9 +8618,13 @@ pub(crate) fn run_dev_panel() {
     let Some(root) = document.get_element_by_id("dev-panel-root") else {
         return;
     };
-    let _app_handle =
-        yew::Renderer::<App>::with_root_and_props(root, AppProps { mode: AppMode::DevPanel })
-            .render();
+    let _app_handle = yew::Renderer::<App>::with_root_and_props(
+        root,
+        AppProps {
+            core,
+        },
+    )
+    .render();
 }
 
 #[cfg(test)]

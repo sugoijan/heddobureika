@@ -51,6 +51,8 @@ pub struct PuzzleStateSnapshot {
     pub scramble_nonce: u32,
 }
 
+pub type CoreSnapshot = PuzzleStateSnapshot;
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct GameSnapshot {
     pub version: u32,

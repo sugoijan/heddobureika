@@ -22,9 +22,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-      - name: Install npm deps
-        run: npm ci
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.28.2"
+          cache: true
+      - name: Install pnpm deps
+        run: pnpm install --frozen-lockfile
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

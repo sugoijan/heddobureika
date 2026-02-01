@@ -2,6 +2,7 @@ mod app_builder;
 mod app_core;
 mod app_router;
 mod app_runtime;
+mod view_runtime;
 mod core;
 mod local_snapshot;
 mod model;
@@ -24,11 +25,8 @@ mod wgpu_app;
 #[cfg(target_arch = "wasm32")]
 mod svg_app;
 
-#[cfg(any(feature = "backend-yew", feature = "dev-panel-yew"))]
+#[cfg(feature = "dev-panel-yew")]
 mod yew_app;
-
-#[cfg(feature = "backend-yew")]
-mod svg_view;
 
 fn main() {
     #[cfg(target_arch = "wasm32")]

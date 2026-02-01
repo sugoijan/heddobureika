@@ -21,16 +21,16 @@ getrandom = { version = "0.2", features = ["js"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = "0.6"
 sha2 = "0.10"
-web-sys = { version = "0.3", features = ["BinaryType", "CanvasRenderingContext2d", "CloseEvent", "Document", "DomRect", "Element", "ErrorEvent", "Event", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "HtmlSelectElement", "IdbDatabase", "IdbFactory", "IdbObjectStore", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbVersionChangeEvent", "ImageData", "InputEvent", "KeyboardEvent", "MessageEvent", "Path2d", "Response", "Storage", "Touch", "TouchEvent", "TouchList", "UrlSearchParams", "WebSocket", "WheelEvent", "Window"] }
+web-sys = { version = "0.3", features = ["BinaryType", "CanvasRenderingContext2d", "CloseEvent", "Document", "DomRect", "Element", "ErrorEvent", "Event", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "HtmlSelectElement", "IdbDatabase", "IdbFactory", "IdbObjectStore", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbVersionChangeEvent", "ImageData", "InputEvent", "KeyboardEvent", "MessageEvent", "Path2d", "Response", "Storage", "Touch", "TouchEvent", "TouchList", "UrlSearchParams", "WebGl2RenderingContext", "WebGlProgram", "WebGlShader", "WebSocket", "WheelEvent", "Window"] }
 heddobureika-core = { path = "core" }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 console_error_panic_hook = "0.1"
+naga = { version = "28", features = ["wgsl-in", "glsl-out"] }
 
 [features]
-default = ["backend-yew", "dev-panel-yew"]
-backend-yew = ["yew"]
+default = ["dev-panel-yew"]
 dev-panel-yew = ["yew"]
 
 [profile.release]

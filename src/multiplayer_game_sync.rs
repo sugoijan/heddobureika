@@ -6,23 +6,11 @@ use gloo::console;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app_router;
-use crate::runtime::{CoreAction, GameSync, SyncAction, SyncHooks, SyncView};
+use crate::runtime::{CoreAction, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView};
 use crate::core::InitMode;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
-use heddobureika_core::{ClientId, ClientMsg, GameSnapshot, RoomPersistence, RoomUpdate, ServerMsg};
-
-#[derive(Clone)]
-pub(crate) struct MultiplayerSyncCallbacks {
-    pub(crate) on_welcome: Rc<dyn Fn(String, RoomPersistence, bool, Option<ClientId>)>,
-    pub(crate) on_need_init: Rc<dyn Fn()>,
-    pub(crate) on_warning: Rc<dyn Fn(u32)>,
-    pub(crate) on_state: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub(crate) on_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
-    pub(crate) on_ownership: Rc<dyn Fn(u32, Option<ClientId>)>,
-    pub(crate) on_drop_not_ready: Rc<dyn Fn()>,
-    pub(crate) on_error: Rc<dyn Fn(String, String)>,
-}
+use heddobureika_core::{ClientId, ClientMsg, RoomPersistence, RoomUpdate, ServerMsg};
 
 pub(crate) struct MultiplayerGameSync {
     adapter: MultiplayerSyncAdapter,
@@ -39,6 +27,7 @@ pub(crate) struct MultiplayerGameSync {
     persistence: Rc<Cell<Option<RoomPersistence>>>,
     ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, ClientId>>>>,
     ownership_seq_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
+    hooks: RefCell<SyncHooks>,
     local_transform_observer:
         Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>>>,
     local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool)>>>>,
@@ -61,6 +50,7 @@ impl MultiplayerGameSync {
             persistence: Rc::new(Cell::new(None)),
             ownership_by_anchor: Rc::new(RefCell::new(Rc::new(HashMap::new()))),
             ownership_seq_by_anchor: Rc::new(RefCell::new(HashMap::new())),
+            hooks: RefCell::new(SyncHooks::empty()),
             local_transform_observer: Rc::new(RefCell::new(None)),
             local_flip_observer: Rc::new(RefCell::new(None)),
         }
@@ -69,7 +59,6 @@ impl MultiplayerGameSync {
     pub(crate) fn connect(
         &mut self,
         room_id: &str,
-        callbacks: MultiplayerSyncCallbacks,
         on_fail: Rc<dyn Fn()>,
     ) {
         self.reset_state();
@@ -86,7 +75,8 @@ impl MultiplayerGameSync {
         };
         *self.room_id.borrow_mut() = Some(room_id.to_string());
         let url = app_router::build_room_ws_url(&ws_base, room_id);
-        let handler = self.install_handler(callbacks);
+        let hooks = self.hooks.borrow().clone();
+        let handler = self.install_handler(hooks);
         let mut adapter = self.adapter.clone();
         let on_fail = on_fail.clone();
         let room_id = room_id.to_string();
@@ -148,9 +138,9 @@ impl MultiplayerGameSync {
 
     pub(crate) fn install_handler(
         &mut self,
-        callbacks: MultiplayerSyncCallbacks,
+        hooks: SyncHooks,
     ) -> Rc<dyn Fn(ServerMsg)> {
-        let handler = self.build_handler(callbacks);
+        let handler = self.build_handler(hooks);
         *self.handler.borrow_mut() = Some(handler.clone());
         handler
     }
@@ -176,7 +166,7 @@ impl MultiplayerGameSync {
         self.ownership_seq_by_anchor.borrow_mut().clear();
     }
 
-    fn build_handler(&self, callbacks: MultiplayerSyncCallbacks) -> Rc<dyn Fn(ServerMsg)> {
+    fn build_handler(&self, hooks: SyncHooks) -> Rc<dyn Fn(ServerMsg)> {
         let last_seq = Rc::clone(&self.last_seq);
         let state_applied = Rc::clone(&self.state_applied);
         let connected_cell = Rc::clone(&self.connected);
@@ -186,6 +176,9 @@ impl MultiplayerGameSync {
         let persistence_cell = Rc::clone(&self.persistence);
         let ownership_by_anchor = Rc::clone(&self.ownership_by_anchor);
         let ownership_seq_by_anchor = Rc::clone(&self.ownership_seq_by_anchor);
+        let on_event = hooks.on_event.clone();
+        let on_remote_snapshot = hooks.on_remote_snapshot.clone();
+        let on_remote_update = hooks.on_remote_update.clone();
         Rc::new(move |msg: ServerMsg| match msg {
             ServerMsg::Welcome {
                 room_id,
@@ -206,9 +199,14 @@ impl MultiplayerGameSync {
                 *room_id_cell.borrow_mut() = Some(room_id.clone());
                 persistence_cell.set(Some(persistence));
                 *ownership_by_anchor.borrow_mut() = Rc::new(HashMap::new());
-                (callbacks.on_welcome)(room_id, persistence, initialized, client_id);
+                (on_event)(SyncEvent::Connected {
+                    room_id: Some(room_id),
+                    persistence: Some(persistence),
+                    initialized,
+                    client_id,
+                });
                 if !initialized {
-                    (callbacks.on_need_init)();
+                    (on_event)(SyncEvent::NeedInit);
                 }
             }
             ServerMsg::AdminAck { room_id, persistence } => {
@@ -217,11 +215,11 @@ impl MultiplayerGameSync {
             }
             ServerMsg::NeedInit => {
                 init_required_cell.set(true);
-                (callbacks.on_need_init)();
+                (on_event)(SyncEvent::NeedInit);
             }
             ServerMsg::Warning { minutes_idle } => {
                 console::warn!("room idle for", minutes_idle, "minutes");
-                (callbacks.on_warning)(minutes_idle);
+                (on_event)(SyncEvent::Warning { minutes_idle });
             }
             ServerMsg::State { seq, snapshot } => {
                 console::log!(
@@ -232,7 +230,7 @@ impl MultiplayerGameSync {
                 );
                 last_seq.set(seq);
                 init_required_cell.set(false);
-                (callbacks.on_state)(snapshot, seq);
+                (on_remote_snapshot)(snapshot, seq);
             }
             ServerMsg::Update {
                 seq,
@@ -281,7 +279,10 @@ impl MultiplayerGameSync {
                     {
                         crate::wgpu_app::request_render();
                     }
-                    (callbacks.on_ownership)(*anchor_id, *owner);
+                    (on_event)(SyncEvent::Ownership {
+                        anchor_id: *anchor_id,
+                        owner: *owner,
+                    });
                     return;
                 }
                 let last = last_seq.get();
@@ -292,22 +293,24 @@ impl MultiplayerGameSync {
                 last_seq.set(seq);
                 if !state_applied.get() {
                     console::warn!("multiplayer update dropped (not ready)", seq, kind);
-                    (callbacks.on_drop_not_ready)();
+                    (on_event)(SyncEvent::DropNotReady);
                     return;
                 }
-                (callbacks.on_update)(update, seq, source, client_seq);
+                (on_remote_update)(update, seq, source, client_seq);
             }
             ServerMsg::Pong { .. } => {}
             ServerMsg::Error { code, message } => {
                 console::warn!("server error", code.clone(), message.clone());
-                (callbacks.on_error)(code, message);
+                (on_event)(SyncEvent::Error { code, message });
             }
         })
     }
 }
 
 impl GameSync for MultiplayerGameSync {
-    fn init(&mut self, _hooks: SyncHooks) {}
+    fn init(&mut self, hooks: SyncHooks) {
+        *self.hooks.borrow_mut() = hooks;
+    }
 
     fn handle_local_action(&mut self, action: &CoreAction) {
         match action {

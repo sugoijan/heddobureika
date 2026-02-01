@@ -1,17 +1,21 @@
 pub mod codec;
 pub mod game;
 pub mod catalog;
+pub mod action;
 pub mod grid;
 pub mod protocol;
 pub mod snapshot;
+pub mod state;
 pub mod room;
 pub mod room_id;
 
 pub use codec::{decode, encode};
+pub use action::{CoreAction, SyncAction};
 pub use catalog::*;
 pub use game::*;
 pub use grid::*;
 pub use protocol::*;
 pub use snapshot::*;
+pub use state::CoreState;
 pub use room::apply_room_update_to_snapshot;
 pub use room_id::{is_valid_room_id, RoomId, RoomIdError, ROOM_ID_ALPHABET, ROOM_ID_LEN};

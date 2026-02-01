@@ -7,51 +7,11 @@ use std::collections::hash_map::DefaultHasher;
 use crate::app_core::{AppCore, AppSnapshot};
 use crate::core::InitMode;
 use crate::local_snapshot::{
-    apply_game_snapshot_to_core, build_game_snapshot_from_app, load_local_snapshot,
-    save_local_snapshot, ApplySnapshotResult,
+    apply_game_snapshot_to_core, build_game_snapshot_from_app, clear_local_snapshot,
+    load_local_snapshot, save_local_snapshot, ApplySnapshotResult,
 };
-use heddobureika_core::{ClientId, RoomPersistence};
-
-#[derive(Clone, Debug)]
-pub enum SyncAction {
-    Move { anchor_id: usize, pos: (f32, f32) },
-    Transform {
-        anchor_id: usize,
-        pos: (f32, f32),
-        rot_deg: f32,
-    },
-    Place {
-        anchor_id: usize,
-        pos: (f32, f32),
-        rot_deg: f32,
-    },
-    Flip { piece_id: usize, flipped: bool },
-    Release { anchor_id: usize },
-}
-
-#[derive(Clone, Debug)]
-pub enum CoreAction {
-    BeginDrag {
-        piece_id: usize,
-        x: f32,
-        y: f32,
-        shift_key: bool,
-        rotate_mode: bool,
-        right_click: bool,
-        touch_id: Option<i32>,
-    },
-    DragMove {
-        x: f32,
-        y: f32,
-    },
-    DragEnd {
-        touch_id: Option<i32>,
-    },
-    SetHovered {
-        hovered: Option<usize>,
-    },
-    Sync(SyncAction),
-}
+pub use heddobureika_core::{CoreAction, SyncAction};
+use heddobureika_core::{ClientId, GameSnapshot, RoomPersistence, RoomUpdate};
 
 #[derive(Clone)]
 pub struct ViewHooks {
@@ -63,6 +23,37 @@ pub struct SyncHooks {
     #[allow(dead_code)]
     pub on_remote_action: Rc<dyn Fn(CoreAction)>,
     pub on_snapshot: Rc<dyn Fn(AppSnapshot)>,
+    pub on_remote_snapshot: Rc<dyn Fn(GameSnapshot, u64)>,
+    pub on_remote_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
+    pub on_event: Rc<dyn Fn(SyncEvent)>,
+}
+
+impl SyncHooks {
+    pub fn empty() -> Self {
+        Self {
+            on_remote_action: Rc::new(|_| {}),
+            on_snapshot: Rc::new(|_| {}),
+            on_remote_snapshot: Rc::new(|_, _| {}),
+            on_remote_update: Rc::new(|_, _, _, _| {}),
+            on_event: Rc::new(|_| {}),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum SyncEvent {
+    Connected {
+        room_id: Option<String>,
+        persistence: Option<RoomPersistence>,
+        initialized: bool,
+        client_id: Option<ClientId>,
+    },
+    Disconnected,
+    NeedInit,
+    Warning { minutes_idle: u32 },
+    Ownership { anchor_id: u32, owner: Option<ClientId> },
+    DropNotReady,
+    Error { code: String, message: String },
 }
 
 #[allow(dead_code)]
@@ -234,6 +225,17 @@ impl LocalSyncAdapter {
         self.maybe_save(snapshot);
     }
 
+    pub fn clear_saved_snapshot(&mut self) {
+        clear_local_snapshot();
+        self.pending_snapshot = None;
+        self.pending_loaded = true;
+        self.last_saved_fingerprint = None;
+    }
+
+    pub fn clear_storage() {
+        clear_local_snapshot();
+    }
+
     #[allow(dead_code)]
     pub fn with_observer(observer: Rc<dyn Fn(&CoreAction)>) -> Self {
         Self {
@@ -316,10 +318,10 @@ fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
     if total == 0 {
         return None;
     }
-    if snapshot.positions.len() != total
-        || snapshot.rotations.len() != total
-        || snapshot.flips.len() != total
-        || snapshot.connections.len() != total
+    if snapshot.core.positions.len() != total
+        || snapshot.core.rotations.len() != total
+        || snapshot.core.flips.len() != total
+        || snapshot.core.connections.len() != total
     {
         return None;
     }
@@ -331,18 +333,18 @@ fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
     info.shape_seed.hash(&mut hasher);
     info.image_width.hash(&mut hasher);
     info.image_height.hash(&mut hasher);
-    snapshot.scramble_nonce.hash(&mut hasher);
-    for (x, y) in &snapshot.positions {
+    snapshot.core.scramble_nonce.hash(&mut hasher);
+    for (x, y) in &snapshot.core.positions {
         x.to_bits().hash(&mut hasher);
         y.to_bits().hash(&mut hasher);
     }
-    for rot in &snapshot.rotations {
+    for rot in &snapshot.core.rotations {
         rot.to_bits().hash(&mut hasher);
     }
-    for flip in &snapshot.flips {
+    for flip in &snapshot.core.flips {
         flip.hash(&mut hasher);
     }
-    for conn in &snapshot.connections {
+    for conn in &snapshot.core.connections {
         conn.hash(&mut hasher);
     }
     for id in &snapshot.z_order {
