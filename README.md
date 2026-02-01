@@ -12,6 +12,8 @@ Current puzzles:
 - `zoe-samurai`: [source art here](https://x.com/zoe_IRIAM/status/1907209022752878958)
 - `raora-by-noy`: [source art here](https://x.com/Ururuka_Noy/status/1880853322875421148)
 
+Catalog lives in `puzzles/catalog.toml`. Override it by setting `PUZZLE_CATALOG_PATH` in `.env.local`.
+
 ## Dev
 
 Requirements:
@@ -35,6 +37,10 @@ Frontend multiplayer config (optional):
 
 - Add `#room=ROOM_ID` to the URL to auto-join a room.
 - Canonical dev config: set `TRUNK_PUBLIC_HEDDOBUREIKA_WS_BASE` in `.env` (default in this repo). It must end with `/ws`.
+
+Local deploy config (optional):
+
+- Add `.env.local` with `DEPLOY_PUBLIC_URL` and `DEPLOY_RSYNC_DEST` to enable `just deploy`.
 
 ## Disclaimer
 

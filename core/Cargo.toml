@@ -3,6 +3,12 @@ name = "heddobureika-core"
 version = "0.1.0"
 edition = "2021"
 license = "CC-BY-NC-SA-4.0"
+build = "build.rs"
 
 [dependencies]
 rkyv = "0.8.14"
+
+[build-dependencies]
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
