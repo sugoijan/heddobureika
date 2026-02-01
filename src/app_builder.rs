@@ -12,7 +12,7 @@ use web_sys::window;
 use js_sys::decode_uri_component;
 use heddobureika_core::catalog::{
     logical_image_size, puzzle_by_label, puzzle_by_slug, puzzle_by_src, PuzzleCatalogEntry,
-    PUZZLE_CATALOG,
+    DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG,
 };
 use crate::core::{
     best_grid_for_count, build_grid_choices, grid_choice_index, DEFAULT_TARGET_COUNT,
@@ -279,13 +279,16 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
             });
         }
     }
-    PUZZLE_CATALOG.first().copied().map(|entry| BootSelection {
-        entry,
-        grid_override: None,
-        seed: None,
-        clear_hash,
-        force_new: false,
-    })
+    puzzle_by_slug(DEFAULT_PUZZLE_SLUG)
+        .or_else(|| PUZZLE_CATALOG.first())
+        .copied()
+        .map(|entry| BootSelection {
+            entry,
+            grid_override: None,
+            seed: None,
+            clear_hash,
+            force_new: false,
+        })
 }
 
 fn apply_selection(core: Rc<AppCore>, image_max_dim: u32, selection: BootSelection) {

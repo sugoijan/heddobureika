@@ -100,3 +100,14 @@ create-room *args:
     else \
       cargo run -p heddobureika-cli -- rooms create --admin-token "$token" --base-url "$base_url" "$@"; \
     fi
+
+deploy:
+    @if [ -f .env.local ]; then \
+      set -a; source .env.local; set +a; \
+    fi; \
+    if [ -z "${DEPLOY_PUBLIC_URL:-}" ] || [ -z "${DEPLOY_RSYNC_DEST:-}" ]; then \
+      echo "Missing DEPLOY_PUBLIC_URL or DEPLOY_RSYNC_DEST. Set them in .env.local."; \
+      exit 1; \
+    fi; \
+    trunk build --release --public-url "$DEPLOY_PUBLIC_URL"; \
+    rsync --progress -av --delete dist/ "$DEPLOY_RSYNC_DEST"

@@ -7,32 +7,7 @@ pub struct PuzzleCatalogEntry {
     pub height: u32,
 }
 
-pub const DEFAULT_PUZZLE_SLUG: &str = "zoe-samurai";
-pub const DEFAULT_PUZZLE_SRC: &str = "puzzles/zoe-samurai.jpg";
-
-pub const PUZZLE_CATALOG: &[PuzzleCatalogEntry] = &[
-    PuzzleCatalogEntry {
-        label: "Zoe Samurai",
-        slug: "zoe-samurai",
-        src: DEFAULT_PUZZLE_SRC,
-        width: 4096,
-        height: 2194,
-    },
-    PuzzleCatalogEntry {
-        label: "Zoe Potter",
-        slug: "zoe-potter",
-        src: "puzzles/zoe-potter.jpg",
-        width: 1200,
-        height: 840,
-    },
-    PuzzleCatalogEntry {
-        label: "Raora by Noy",
-        slug: "raora-by-noy",
-        src: "puzzles/raora-by-noy.avif",
-        width: 2429,
-        height: 2833,
-    },
-];
+include!(concat!(env!("OUT_DIR"), "/puzzle_catalog.rs"));
 
 pub fn puzzle_by_slug(slug: &str) -> Option<&'static PuzzleCatalogEntry> {
     let trimmed = slug.trim();

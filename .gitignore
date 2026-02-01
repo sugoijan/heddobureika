@@ -1,5 +1,7 @@
 /dist/
 /target/
 /.dev.vars
+/.env.local
 /node_modules
 /.wrangler
+/puzzles/catalog.local.toml
