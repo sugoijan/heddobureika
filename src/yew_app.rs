@@ -21,6 +21,7 @@ use crate::app_core::AppCore;
 use crate::app_builder;
 use crate::app_router;
 use crate::app_runtime;
+use crate::boot_runtime::{self, BootState};
 use crate::sync_runtime;
 use crate::view_runtime;
 use crate::core::*;
@@ -29,6 +30,7 @@ use crate::model::*;
 use crate::multiplayer_bridge;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
+use crate::persisted_store;
 use crate::runtime::{CoreAction, SyncAction, SyncEvent, SyncHooks};
 use heddobureika_core::{
     logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleInfo, RoomUpdate, ServerMsg,
@@ -877,10 +879,7 @@ fn initial_render_settings() -> RenderSettings {
 }
 
 fn load_theme_mode() -> Option<ThemeMode> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let raw = storage.get_item(THEME_MODE_KEY).ok()??;
-    serde_json::from_str(&raw).ok()
+    Some(persisted_store::settings_blob().theme_mode)
 }
 
 fn clear_saved_game() {
@@ -888,87 +887,78 @@ fn clear_saved_game() {
 }
 
 fn save_theme_mode(mode: ThemeMode) {
-    let Ok(raw) = serde_json::to_string(&mode) else {
-        return;
-    };
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let _ = storage.set_item(THEME_MODE_KEY, &raw);
+    persisted_store::update_settings_blob(|settings| {
+        settings.theme_mode = mode;
+    });
 }
 
 fn load_admin_token() -> Option<String> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let raw = storage.get_item(ADMIN_TOKEN_KEY).ok()??;
-    let token = raw.trim().to_string();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    persisted_store::settings_blob()
+        .admin_token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
 fn save_admin_token(token: &str) {
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let token = token.trim();
-    if token.is_empty() {
-        let _ = storage.remove_item(ADMIN_TOKEN_KEY);
-        return;
-    }
-    let _ = storage.set_item(ADMIN_TOKEN_KEY, token);
+    let token = token.trim().to_string();
+    persisted_store::update_settings_blob(|settings| {
+        settings.admin_token = if token.is_empty() { None } else { Some(token.clone()) };
+    });
 }
 
 fn load_ws_delay_value(key: &str) -> String {
-    let Some(window) = web_sys::window() else {
-        return String::new();
+    let ws_delay = persisted_store::settings_blob().ws_delay;
+    let value = match key {
+        WS_DELAY_IN_KEY => ws_delay.inbound_ms,
+        WS_DELAY_OUT_KEY => ws_delay.outbound_ms,
+        WS_DELAY_JITTER_KEY => ws_delay.jitter_ms,
+        _ => None,
     };
-    let Ok(Some(storage)) = window.local_storage() else {
-        return String::new();
-    };
-    storage.get_item(key).ok().flatten().unwrap_or_default()
+    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn save_ws_delay_value(key: &str, raw: &str) {
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        let _ = storage.remove_item(key);
-        return;
-    }
-    if trimmed.parse::<u32>().is_ok() {
-        let _ = storage.set_item(key, trimmed);
+    let value = if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<u32>().ok()
+    };
+    if trimmed.is_empty() || value.is_some() {
+        persisted_store::update_settings_blob(|settings| {
+            match key {
+                WS_DELAY_IN_KEY => settings.ws_delay.inbound_ms = value,
+                WS_DELAY_OUT_KEY => settings.ws_delay.outbound_ms = value,
+                WS_DELAY_JITTER_KEY => settings.ws_delay.jitter_ms = value,
+                _ => {}
+            }
+        });
     }
 }
 
 fn load_dev_panel_group_open(key: &str, default_value: bool) -> bool {
-    let Some(window) = web_sys::window() else {
-        return default_value;
-    };
-    let Ok(Some(storage)) = window.local_storage() else {
-        return default_value;
-    };
-    match storage.get_item(key).ok().flatten().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
+    let dev_panel = persisted_store::settings_blob().dev_panel;
+    match key {
+        DEV_PANEL_GROUP_PUZZLE_KEY => dev_panel.puzzle_open,
+        DEV_PANEL_GROUP_MULTIPLAYER_KEY => dev_panel.multiplayer_open,
+        DEV_PANEL_GROUP_GRAPHICS_KEY => dev_panel.graphics_open,
+        DEV_PANEL_GROUP_RULES_KEY => dev_panel.rules_open,
+        DEV_PANEL_GROUP_SHAPING_KEY => dev_panel.shaping_open,
         _ => default_value,
     }
 }
 
 fn save_dev_panel_group_open(key: &str, value: bool) {
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let stored = if value { "1" } else { "0" };
-    let _ = storage.set_item(key, stored);
+    persisted_store::update_settings_blob(|settings| {
+        match key {
+            DEV_PANEL_GROUP_PUZZLE_KEY => settings.dev_panel.puzzle_open = value,
+            DEV_PANEL_GROUP_MULTIPLAYER_KEY => settings.dev_panel.multiplayer_open = value,
+            DEV_PANEL_GROUP_GRAPHICS_KEY => settings.dev_panel.graphics_open = value,
+            DEV_PANEL_GROUP_RULES_KEY => settings.dev_panel.rules_open = value,
+            DEV_PANEL_GROUP_SHAPING_KEY => settings.dev_panel.shaping_open = value,
+            _ => {}
+        }
+    });
 }
 
 fn details_toggle(handle: UseStateHandle<bool>, key: &'static str) -> Callback<Event> {
@@ -1741,13 +1731,28 @@ fn app(props: &AppProps) -> Html {
     let rules_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_RULES_KEY, false));
     let shaping_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_SHAPING_KEY, false));
     let sync_revision = use_state(|| 0u32);
+    let boot_ready = use_state(|| matches!(boot_runtime::boot_state(), BootState::Ready));
+    {
+        let boot_ready = boot_ready.clone();
+        use_effect(move || {
+            let hook = Rc::new(move || {
+                boot_ready.set(matches!(boot_runtime::boot_state(), BootState::Ready));
+            });
+            let id = boot_runtime::add_boot_state_hook(hook);
+            move || {
+                boot_runtime::remove_boot_state_hook(id);
+            }
+        });
+    }
+    let boot_ready_value = *boot_ready;
     let sync_view = sync_runtime::sync_view();
     let multiplayer_active = matches!(sync_view.mode(), InitMode::Online);
     let multiplayer_connected = sync_view.connected();
     let multiplayer_disconnected = multiplayer_active && !multiplayer_connected;
-    let allow_drag = !multiplayer_active || multiplayer_connected;
+    let allow_drag = boot_ready_value && (!multiplayer_active || multiplayer_connected);
     let mp_init_required_value = sync_view.init_required();
-    let lock_puzzle_controls = multiplayer_active && !mp_init_required_value;
+    let lock_puzzle_controls =
+        !boot_ready_value || (multiplayer_active && !mp_init_required_value);
     let _ = *sync_revision;
     let dispatch_view_action: Rc<dyn Fn(CoreAction)> = {
         let multiplayer_active = multiplayer_active;
@@ -2177,9 +2182,9 @@ fn app(props: &AppProps) -> Html {
     let solved = use_state(|| false);
     let solved_value = *solved;
     let show_controls = use_state(|| false);
-    let show_controls_value = *show_controls;
+    let show_controls_value = *show_controls && boot_ready_value;
     let menu_visible = use_state(|| false);
-    let menu_visible_value = *menu_visible;
+    let menu_visible_value = *menu_visible && boot_ready_value;
     let ui_credit_hovered = use_state(|| false);
     let ui_credit_hovered_value = *ui_credit_hovered;
     let show_debug = use_state(|| false);

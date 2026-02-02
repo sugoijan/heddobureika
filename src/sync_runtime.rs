@@ -2,9 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gloo::timers::callback::Timeout;
+use gloo::timers::future::TimeoutFuture;
 
 use crate::app_core::{AppCore, AppSnapshot, AppSubscription};
 use crate::app_router::{self, MultiplayerConfig};
+use crate::boot_runtime::{self, BootState};
 use crate::core::{collect_group, InitMode};
 use crate::local_snapshot::{apply_game_snapshot_to_core, ApplySnapshotResult};
 use crate::multiplayer_game_sync::MultiplayerGameSync;
@@ -146,6 +148,8 @@ impl SyncRuntimeState {
 }
 
 const RETRY_DELAYS_MS: &[u32] = &[200, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+const BOOT_WAIT_POLL_MS: u32 = 25;
+const BOOT_WAIT_TIMEOUT_MS: u32 = 10_000;
 
 fn schedule_multiplayer_retry() {
     let mut should_notify = false;
@@ -299,6 +303,28 @@ pub(crate) fn init_from_config(config: Option<MultiplayerConfig>) {
     notify_sync_view_changed();
 }
 
+pub(crate) async fn wait_for_ready() {
+    let mut waited_ms = 0u32;
+    loop {
+        let view = sync_view();
+        match view.mode() {
+            InitMode::Local => return,
+            InitMode::Online => {
+                if view.connected() {
+                    return;
+                }
+            }
+        }
+        if waited_ms >= BOOT_WAIT_TIMEOUT_MS {
+            let on_fail = STATE.with(|slot| slot.borrow().on_fail.clone());
+            on_fail();
+            return;
+        }
+        TimeoutFuture::new(BOOT_WAIT_POLL_MS).await;
+        waited_ms = waited_ms.saturating_add(BOOT_WAIT_POLL_MS);
+    }
+}
+
 pub(crate) fn attach_core(core: Rc<AppCore>) {
     let already_installed = STATE.with(|slot| slot.borrow().core_subscription.is_some());
     if already_installed {
@@ -447,6 +473,9 @@ pub(crate) fn handle_local_action(action: &CoreAction) {
 }
 
 fn should_block_actions() -> bool {
+    if !matches!(boot_runtime::boot_state(), BootState::Ready) {
+        return true;
+    }
     STATE.with(|slot| {
         let state = slot.borrow();
         if state.active != ActiveSync::Multiplayer {

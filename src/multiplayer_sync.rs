@@ -10,6 +10,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
 use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
+use crate::persisted_store;
 
 pub(crate) struct WsHandlers {
     onopen: Closure<dyn FnMut(Event)>,
@@ -36,10 +37,6 @@ pub(crate) struct MultiplayerSyncAdapter {
     closing: Rc<Cell<bool>>,
 }
 
-const WS_DELAY_IN_KEY: &str = "heddobureika.debug.ws_in_ms";
-const WS_DELAY_OUT_KEY: &str = "heddobureika.debug.ws_out_ms";
-const WS_DELAY_JITTER_KEY: &str = "heddobureika.debug.ws_jitter_ms";
-
 #[derive(Clone, Copy)]
 struct WsDelayConfig {
     inbound_ms: u32,
@@ -47,22 +44,12 @@ struct WsDelayConfig {
     jitter_ms: u32,
 }
 
-fn read_storage_u32(key: &str) -> Option<u32> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let raw = storage.get_item(key).ok()??;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<u32>().ok()
-}
-
 fn load_ws_delay_config() -> WsDelayConfig {
+    let ws_delay = persisted_store::settings_blob().ws_delay;
     WsDelayConfig {
-        inbound_ms: read_storage_u32(WS_DELAY_IN_KEY).unwrap_or(0),
-        outbound_ms: read_storage_u32(WS_DELAY_OUT_KEY).unwrap_or(0),
-        jitter_ms: read_storage_u32(WS_DELAY_JITTER_KEY).unwrap_or(0),
+        inbound_ms: ws_delay.inbound_ms.unwrap_or(0),
+        outbound_ms: ws_delay.outbound_ms.unwrap_or(0),
+        jitter_ms: ws_delay.jitter_ms.unwrap_or(0),
     }
 }
 

@@ -2,10 +2,14 @@ mod app_builder;
 mod app_core;
 mod app_router;
 mod app_runtime;
+mod boot_runtime;
 mod view_runtime;
 mod core;
+mod idb;
 mod local_snapshot;
 mod model;
+mod persisted;
+mod persisted_store;
 #[cfg(target_arch = "wasm32")]
 mod multiplayer_bridge;
 mod multiplayer_game_sync;

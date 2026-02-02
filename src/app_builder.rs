@@ -1,13 +1,12 @@
 use crate::app_core::AppCore;
 use crate::app_router;
 use crate::app_runtime;
+use crate::boot_runtime::{self, BootState};
 use crate::sync_runtime;
-use crate::core::{
-    RendererKind, RenderSettings, GridChoice, InitMode, PUZZLE_SELECTION_KEY,
-    PUZZLE_SELECTION_VERSION,
-};
+use crate::core::{RendererKind, RenderSettings, GridChoice, InitMode};
 use crate::local_snapshot::load_local_snapshot;
-use serde::{Deserialize, Serialize};
+use crate::persisted::BootPuzzleSelection;
+use crate::persisted_store;
 use web_sys::window;
 use js_sys::decode_uri_component;
 use heddobureika_core::catalog::{
@@ -20,6 +19,7 @@ use crate::core::{
     scramble_nonce_from_seed,
 };
 use std::rc::Rc;
+use wasm_bindgen_futures::spawn_local;
 
 #[cfg(target_arch = "wasm32")]
 use crate::multiplayer_bridge;
@@ -32,14 +32,6 @@ use crate::svg_app;
 
 #[cfg(feature = "dev-panel-yew")]
 use crate::yew_app;
-
-#[derive(Serialize, Deserialize)]
-struct SavedPuzzleSelection {
-    version: u32,
-    puzzle_src: String,
-    cols: u32,
-    rows: u32,
-}
 
 #[derive(Clone, Copy)]
 enum HashRouteMode {
@@ -155,43 +147,32 @@ fn parse_hash_route() -> Option<HashRoute> {
     None
 }
 
-fn load_saved_puzzle_selection() -> Option<SavedPuzzleSelection> {
-    let storage = window()?.local_storage().ok()??;
-    let raw = storage.get_item(PUZZLE_SELECTION_KEY).ok()??;
-    let selection: SavedPuzzleSelection = serde_json::from_str(&raw).ok()?;
-    if selection.version != PUZZLE_SELECTION_VERSION {
-        return None;
-    }
-    if selection.puzzle_src.is_empty() || selection.cols == 0 || selection.rows == 0 {
+fn load_saved_puzzle_selection() -> Option<BootPuzzleSelection> {
+    let selection = persisted_store::boot_record().last_puzzle?;
+    if selection.puzzle_src.trim().is_empty() || selection.cols == 0 || selection.rows == 0 {
         return None;
     }
     Some(selection)
 }
 
 fn clear_saved_puzzle_selection() {
-    let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten()) else {
-        return;
-    };
-    let _ = storage.remove_item(PUZZLE_SELECTION_KEY);
+    persisted_store::update_boot_record(|record| {
+        record.last_puzzle = None;
+    });
 }
 
 fn save_puzzle_selection(entry: PuzzleCatalogEntry, grid: GridChoice) {
     if entry.src.trim().is_empty() || grid.cols == 0 || grid.rows == 0 {
         return;
     }
-    let selection = SavedPuzzleSelection {
-        version: PUZZLE_SELECTION_VERSION,
+    let selection = BootPuzzleSelection {
         puzzle_src: entry.src.to_string(),
         cols: grid.cols,
         rows: grid.rows,
     };
-    let Ok(raw) = serde_json::to_string(&selection) else {
-        return;
-    };
-    let Some(storage) = window().and_then(|window| window.local_storage().ok().flatten()) else {
-        return;
-    };
-    let _ = storage.set_item(PUZZLE_SELECTION_KEY, &raw);
+    persisted_store::update_boot_record(|record| {
+        record.last_puzzle = Some(selection.clone());
+    });
 }
 
 fn default_grid_choice(width: u32, height: u32) -> GridChoice {
@@ -338,51 +319,71 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
     apply_selection(core, settings.image_max_dim, selection);
 }
 
+struct BootCoordinator {
+    core: Rc<AppCore>,
+}
+
+impl BootCoordinator {
+    async fn run(self) {
+        boot_runtime::set_boot_state(BootState::LoadingRoute);
+        boot_runtime::set_boot_state(BootState::LoadingStorage);
+        let _ = persisted_store::bootstrap().await;
+        let init = app_router::load_init_config();
+        let _ = init.mode_preference;
+        app_runtime::set_init_config(init.clone());
+        let render_settings = app_router::load_render_settings_with_init();
+        let renderer = init.renderer;
+
+        self.core.set_renderer_kind(renderer);
+        let render_settings_for_fallback = render_settings.clone();
+        let core_for_fallback = self.core.clone();
+        sync_runtime::set_on_fail(Rc::new(move || {
+            app_router::clear_room_session();
+            app_router::save_mode_preference(InitMode::Local);
+            app_router::clear_location_hash();
+            sync_runtime::init_from_config(None);
+            boot_local_game(core_for_fallback.clone(), &render_settings_for_fallback);
+        }));
+        sync_runtime::init_from_config(init.multiplayer.clone());
+
+        boot_runtime::set_boot_state(BootState::InitSync);
+        if init.mode == InitMode::Local {
+            boot_local_game(self.core.clone(), &render_settings);
+        }
+
+        match renderer {
+            RendererKind::Wgpu => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    wgpu_app::run(self.core.clone());
+                }
+            }
+            RendererKind::Svg => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    svg_app::run(self.core.clone());
+                }
+            }
+        }
+
+        #[cfg(feature = "dev-panel-yew")]
+        {
+            yew_app::run_dev_panel(self.core.clone());
+        }
+
+        sync_runtime::wait_for_ready().await;
+        boot_runtime::set_boot_state(BootState::Ready);
+    }
+}
+
 pub(crate) fn run() {
-    let init = app_router::load_init_config();
-    let _ = init.mode_preference;
-    app_runtime::set_init_config(init.clone());
     let core = AppCore::new();
     sync_runtime::attach_core(core.clone());
     #[cfg(target_arch = "wasm32")]
     {
         multiplayer_bridge::install(core.clone());
     }
-    let render_settings = app_router::load_render_settings_with_init();
-    let renderer = init.renderer;
-
-    core.set_renderer_kind(renderer);
-    let render_settings_for_fallback = render_settings.clone();
-    let core_for_fallback = core.clone();
-    sync_runtime::set_on_fail(Rc::new(move || {
-        app_router::clear_room_session();
-        app_router::save_mode_preference(InitMode::Local);
-        app_router::clear_location_hash();
-        sync_runtime::init_from_config(None);
-        boot_local_game(core_for_fallback.clone(), &render_settings_for_fallback);
-    }));
-    sync_runtime::init_from_config(init.multiplayer.clone());
-    if init.mode == InitMode::Local {
-        boot_local_game(core.clone(), &render_settings);
-    }
-
-    match renderer {
-        RendererKind::Wgpu => {
-            #[cfg(target_arch = "wasm32")]
-            {
-                wgpu_app::run(core.clone());
-            }
-        }
-        RendererKind::Svg => {
-            #[cfg(target_arch = "wasm32")]
-            {
-                svg_app::run(core.clone());
-            }
-        }
-    }
-
-    #[cfg(feature = "dev-panel-yew")]
-    {
-        yew_app::run_dev_panel(core.clone());
-    }
+    spawn_local(async move {
+        BootCoordinator { core }.run().await;
+    });
 }

@@ -1027,6 +1027,7 @@ dependencies = [
  "naga",
  "p256",
  "rand_core 0.6.4",
+ "rkyv",
  "serde",
  "serde_json",
  "sha2",

@@ -1,43 +1,15 @@
-use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use web_sys::UrlSearchParams;
 
-use crate::core::{InitMode, RenderSettings, RendererKind, INIT_SETTINGS_KEY, RENDER_SETTINGS_KEY};
+use crate::core::{InitMode, RenderSettings, RendererKind};
+use crate::persisted::BootRoomSession;
+use crate::persisted_store;
 use heddobureika_core::is_valid_room_id;
-
-const INIT_SETTINGS_VERSION: u32 = 1;
-const ROOM_SESSION_KEY: &str = "heddobureika.room.v1";
-const ROOM_SESSION_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MultiplayerConfig {
     pub(crate) room_id: String,
     pub(crate) clear_hash: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct InitSettings {
-    version: u32,
-    #[serde(default)]
-    renderer: RendererKind,
-    #[serde(default)]
-    mode: InitMode,
-}
-
-impl Default for InitSettings {
-    fn default() -> Self {
-        Self {
-            version: INIT_SETTINGS_VERSION,
-            renderer: RendererKind::default(),
-            mode: InitMode::default(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct SavedRoomSession {
-    version: u32,
-    room_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -49,17 +21,9 @@ pub(crate) struct InitConfig {
 }
 
 pub(crate) fn load_init_config() -> InitConfig {
-    let init_settings = load_init_settings();
-    let render_settings = load_render_settings();
-    let renderer = init_settings
-        .as_ref()
-        .map(|settings| settings.renderer)
-        .or_else(|| render_settings.as_ref().map(|settings| settings.renderer))
-        .unwrap_or_default();
-    let mode_preference = init_settings
-        .as_ref()
-        .map(|settings| settings.mode)
-        .unwrap_or_default();
+    let boot = persisted_store::boot_record();
+    let renderer = boot.renderer_preference;
+    let mode_preference = boot.mode_preference;
     let multiplayer = load_multiplayer_config();
     let mode = if multiplayer.is_some() {
         InitMode::Online
@@ -75,33 +39,29 @@ pub(crate) fn load_init_config() -> InitConfig {
 }
 
 pub(crate) fn load_renderer_preference() -> RendererKind {
-    load_init_settings()
-        .map(|settings| settings.renderer)
-        .or_else(|| load_render_settings().map(|settings| settings.renderer))
-        .unwrap_or_default()
+    persisted_store::boot_record().renderer_preference
 }
 
 pub(crate) fn load_render_settings_with_init() -> RenderSettings {
-    let mut settings = load_render_settings().unwrap_or_default();
-    if let Some(init) = load_init_settings() {
-        settings.renderer = init.renderer;
-    }
+    let mut settings = persisted_store::settings_blob().render_settings;
+    settings.renderer = persisted_store::boot_record().renderer_preference;
     settings
 }
 
 pub(crate) fn save_renderer_preference(renderer: RendererKind, render_settings: &RenderSettings) {
-    let mut settings = render_settings.clone();
-    settings.renderer = renderer;
-    save_render_settings(&settings);
-    let mut init_settings = load_init_settings().unwrap_or_default();
-    init_settings.renderer = renderer;
-    save_init_settings(&init_settings);
+    persisted_store::update_settings_blob(|settings| {
+        settings.render_settings = render_settings.clone();
+        settings.render_settings.renderer = renderer;
+    });
+    persisted_store::update_boot_record(|record| {
+        record.renderer_preference = renderer;
+    });
 }
 
 pub(crate) fn save_mode_preference(mode: InitMode) {
-    let mut settings = load_init_settings().unwrap_or_default();
-    settings.mode = mode;
-    save_init_settings(&settings);
+    persisted_store::update_boot_record(|record| {
+        record.mode_preference = mode;
+    });
 }
 
 pub(crate) fn clear_location_hash() {
@@ -120,22 +80,21 @@ pub(crate) fn clear_location_hash() {
 }
 
 pub(crate) fn save_room_session(room_id: &str) {
-    let session = SavedRoomSession {
-        version: ROOM_SESSION_VERSION,
-        room_id: room_id.to_string(),
-    };
-    let Ok(raw) = serde_json::to_string(&session) else {
+    let room_id = room_id.trim();
+    if room_id.is_empty() {
         return;
-    };
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let _ = storage.set_item(ROOM_SESSION_KEY, &raw);
+    }
+    persisted_store::update_boot_record(|record| {
+        record.room_session = Some(BootRoomSession {
+            room_id: room_id.to_string(),
+        });
+    });
 }
 
 pub(crate) fn clear_room_session() {
-    clear_room_session_inner();
+    persisted_store::update_boot_record(|record| {
+        record.room_session = None;
+    });
 }
 
 pub(crate) fn default_ws_base() -> Option<String> {
@@ -165,65 +124,14 @@ pub(crate) fn build_room_ws_url(ws_base: &str, room_id: &str) -> String {
 }
 
 pub(crate) fn save_render_settings(settings: &RenderSettings) {
-    let Ok(raw) = serde_json::to_string(settings) else {
-        return;
-    };
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let _ = storage.set_item(RENDER_SETTINGS_KEY, &raw);
+    let settings = settings.clone();
+    persisted_store::update_settings_blob(|blob| {
+        blob.render_settings = settings;
+    });
 }
 
-fn load_render_settings() -> Option<RenderSettings> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let raw = storage.get_item(RENDER_SETTINGS_KEY).ok()??;
-    serde_json::from_str(&raw).ok()
-}
-
-fn load_init_settings() -> Option<InitSettings> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let raw = storage.get_item(INIT_SETTINGS_KEY).ok()??;
-    let settings: InitSettings = serde_json::from_str(&raw).ok()?;
-    if settings.version != INIT_SETTINGS_VERSION {
-        return None;
-    }
-    Some(settings)
-}
-
-fn save_init_settings(settings: &InitSettings) {
-    let Ok(raw) = serde_json::to_string(settings) else {
-        return;
-    };
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let _ = storage.set_item(INIT_SETTINGS_KEY, &raw);
-}
-
-fn load_room_session() -> Option<SavedRoomSession> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let raw = storage.get_item(ROOM_SESSION_KEY).ok()??;
-    let session: SavedRoomSession = serde_json::from_str(&raw).ok()?;
-    if session.version != ROOM_SESSION_VERSION {
-        return None;
-    }
-    if session.room_id.trim().is_empty() {
-        return None;
-    }
-    Some(session)
-}
-
-fn clear_room_session_inner() {
-    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-    else {
-        return;
-    };
-    let _ = storage.remove_item(ROOM_SESSION_KEY);
+fn load_room_session() -> Option<BootRoomSession> {
+    persisted_store::boot_record().room_session
 }
 
 fn normalize_ws_base(raw: &str) -> String {
@@ -261,7 +169,7 @@ fn load_multiplayer_config() -> Option<MultiplayerConfig> {
     load_room_session().and_then(|session| {
         let room_id = session.room_id.trim().to_string();
         if room_id.is_empty() || !is_valid_room_id(&room_id) {
-            clear_room_session_inner();
+            clear_room_session();
             return None;
         }
         Some(MultiplayerConfig {

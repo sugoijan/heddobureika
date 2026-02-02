@@ -1,12 +1,8 @@
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-
 use crate::app_core::{AppCore, AppSnapshot};
 use crate::core::{
     build_group_order_from_piece_order, build_piece_order_from_groups, groups_from_connections,
-    LOCAL_GAME_KEY,
 };
-use heddobureika_core::{decode, encode, GameSnapshot, PuzzleStateSnapshot, GAME_SNAPSHOT_VERSION};
+use heddobureika_core::{GameSnapshot, PuzzleStateSnapshot, GAME_SNAPSHOT_VERSION};
 
 pub(crate) fn build_game_snapshot_from_app(snapshot: &AppSnapshot) -> Option<GameSnapshot> {
     let info = snapshot.puzzle_info.as_ref()?.clone();
@@ -141,26 +137,7 @@ pub(crate) fn apply_game_snapshot_to_core(
 pub(crate) fn load_local_snapshot() -> Option<GameSnapshot> {
     #[cfg(target_arch = "wasm32")]
     {
-        gloo::console::log!("local snapshot: load");
-        let window = web_sys::window()?;
-        let storage = window.local_storage().ok()??;
-        let raw = storage.get_item(LOCAL_GAME_KEY).ok()??;
-        if raw.is_empty() {
-            gloo::console::log!("local snapshot: empty value");
-            return None;
-        }
-        let bytes = STANDARD.decode(raw.as_bytes()).ok()?;
-        let snapshot = decode::<GameSnapshot>(&bytes)?;
-        if snapshot.version != GAME_SNAPSHOT_VERSION {
-            gloo::console::log!(
-                "local snapshot: version mismatch",
-                snapshot.version,
-                GAME_SNAPSHOT_VERSION
-            );
-            return None;
-        }
-        gloo::console::log!("local snapshot: loaded");
-        Some(snapshot)
+        crate::persisted_store::snapshot()
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -171,33 +148,14 @@ pub(crate) fn load_local_snapshot() -> Option<GameSnapshot> {
 pub(crate) fn save_local_snapshot(snapshot: &GameSnapshot) {
     #[cfg(target_arch = "wasm32")]
     {
-        gloo::console::log!("local snapshot: save");
-        let Some(bytes) = encode(snapshot) else {
-            gloo::console::log!("local snapshot: encode failed");
-            return;
-        };
-        let raw = STANDARD.encode(bytes);
-        let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-        else {
-            gloo::console::log!("local snapshot: storage unavailable");
-            return;
-        };
-        if storage.set_item(LOCAL_GAME_KEY, &raw).is_err() {
-            gloo::console::log!("local snapshot: storage set failed");
-        } else {
-            gloo::console::log!("local snapshot: saved");
-        }
+        crate::persisted_store::set_snapshot(Some(snapshot.clone()));
     }
 }
 
 pub(crate) fn clear_local_snapshot() {
     #[cfg(target_arch = "wasm32")]
     {
-        let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
-        else {
-            return;
-        };
-        let _ = storage.remove_item(LOCAL_GAME_KEY);
+        crate::persisted_store::set_snapshot(None);
     }
 }
 

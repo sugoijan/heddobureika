@@ -60,13 +60,6 @@ pub(crate) const LINE_BEND_MIN: f32 = 0.0;
 pub(crate) const EDGE_STEP_DIV: f32 = 6.0;
 pub(crate) const EDGE_STEP_MIN: f32 = 6.0;
 pub(crate) const CORNER_RADIUS_RATIO: f32 = 0.05;
-pub(crate) const LOCAL_GAME_KEY: &str = "heddobureika.game.v1";
-pub(crate) const PUZZLE_SELECTION_KEY: &str = "heddobureika.puzzle.v1";
-pub(crate) const RENDER_SETTINGS_KEY: &str = "heddobureika.render.v1";
-pub(crate) const THEME_MODE_KEY: &str = "heddobureika.theme.v1";
-pub(crate) const INIT_SETTINGS_KEY: &str = "heddobureika.init.v1";
-pub(crate) const ADMIN_TOKEN_KEY: &str = "heddobureika.admin.v1";
-pub(crate) const PUZZLE_SELECTION_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Piece {
@@ -197,7 +190,16 @@ pub(crate) enum PreviewCorner {
     TopRight,
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ThemeMode {
     System,
@@ -205,7 +207,17 @@ pub(crate) enum ThemeMode {
     Dark,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InitMode {
     Local,
@@ -218,7 +230,17 @@ impl Default for InitMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RendererKind {
     Svg,
@@ -231,7 +253,15 @@ impl Default for RendererKind {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SvgRenderSettings {
     pub(crate) animations: bool,
     pub(crate) emboss: bool,
@@ -250,7 +280,15 @@ impl Default for SvgRenderSettings {
     }
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct WgpuRenderSettings {
     #[serde(default)]
     pub(crate) show_fps: bool,
@@ -278,7 +316,15 @@ fn default_wgpu_render_scale() -> f32 {
     WGPU_RENDER_SCALE_DEFAULT
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct RenderSettings {
     #[serde(default = "default_image_max_dim")]
     pub(crate) image_max_dim: u32,
