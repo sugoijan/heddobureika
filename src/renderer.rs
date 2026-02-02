@@ -104,41 +104,13 @@ pub(crate) struct UiTextSpec {
     pub(crate) color: [u8; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum UiIconId {
-    EyeOpen,
-    EyeOff,
-    Chevron,
-}
-
 pub(crate) const UI_ICON_ATLAS_CELL_PX: u32 = 64;
 pub(crate) const UI_ICON_ATLAS_COLS: u32 = 2;
 pub(crate) const UI_ICON_ATLAS_ROWS: u32 = 2;
 pub(crate) const UI_ICON_ATLAS_WIDTH: u32 = UI_ICON_ATLAS_CELL_PX * UI_ICON_ATLAS_COLS;
 pub(crate) const UI_ICON_ATLAS_HEIGHT: u32 = UI_ICON_ATLAS_CELL_PX * UI_ICON_ATLAS_ROWS;
-const UI_ICON_ATLAS_INSET_PX: f32 = 0.5;
 const UI_PREVIEW_BLUR_MAX_DIM: u32 = 192;
 const UI_PREVIEW_BLUR_FILTER_PX: f64 = 6.0;
-
-pub(crate) fn ui_icon_uv(id: UiIconId) -> ([f32; 2], [f32; 2]) {
-    let (col, row) = match id {
-        UiIconId::EyeOpen => (0, 0),
-        UiIconId::EyeOff => (1, 0),
-        UiIconId::Chevron => (0, 1),
-    };
-    let x = col as f32 * UI_ICON_ATLAS_CELL_PX as f32;
-    let y = row as f32 * UI_ICON_ATLAS_CELL_PX as f32;
-    let w = UI_ICON_ATLAS_WIDTH as f32;
-    let h = UI_ICON_ATLAS_HEIGHT as f32;
-    let inset = UI_ICON_ATLAS_INSET_PX;
-    (
-        [(x + inset) / w, (y + inset) / h],
-        [
-            (x + UI_ICON_ATLAS_CELL_PX as f32 - inset) / w,
-            (y + UI_ICON_ATLAS_CELL_PX as f32 - inset) / h,
-        ],
-    )
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiSpriteTexture {
@@ -626,7 +598,7 @@ struct UiOverlaySprite {
 
 struct IconAtlas {
     _texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    _view: wgpu::TextureView,
     bind_group: Rc<wgpu::BindGroup>,
 }
 
@@ -2685,9 +2657,10 @@ fn build_icon_atlas(
             },
         ],
     }));
+    let _ = UiSpriteTexture::IconAtlas;
     Ok(IconAtlas {
         _texture: texture,
-        view,
+        _view: view,
         bind_group,
     })
 }

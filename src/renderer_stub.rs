@@ -14,6 +14,7 @@ pub(crate) enum UiTextId {
     MenuSubtitle,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UiRotationOrigin {
     Center,
@@ -84,11 +85,6 @@ pub(crate) fn build_mask_atlas(
 }
 
 pub(crate) struct WgpuRenderer;
-
-fn touch_rotation_origin_variants() {
-    let _ = UiRotationOrigin::BottomRight;
-    let _ = UiRotationOrigin::TopRight;
-}
 
 impl WgpuRenderer {
     pub(crate) async fn new(

@@ -11,12 +11,22 @@ use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket
 
 use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
 
-#[allow(dead_code)]
 pub(crate) struct WsHandlers {
     onopen: Closure<dyn FnMut(Event)>,
     onmessage: Closure<dyn FnMut(MessageEvent)>,
     onerror: Closure<dyn FnMut(ErrorEvent)>,
     onclose: Closure<dyn FnMut(Event)>,
+}
+
+impl WsHandlers {
+    fn keep_alive(&self) {
+        let _ = (
+            &self.onopen,
+            &self.onmessage,
+            &self.onerror,
+            &self.onclose,
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -100,15 +110,6 @@ impl MultiplayerSyncAdapter {
             handlers: Rc::new(RefCell::new(None)),
             closing: Rc::new(Cell::new(false)),
         }
-    }
-
-    pub(crate) fn connect(
-        &mut self,
-        url: &str,
-        on_server_msg: Rc<dyn Fn(ServerMsg)>,
-        on_fail: Rc<dyn Fn()>,
-    ) {
-        self.connect_with_open(url, on_server_msg, on_fail, None, None);
     }
 
     pub(crate) fn connect_with_open(
@@ -237,12 +238,14 @@ impl MultiplayerSyncAdapter {
         ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
-        *self.handlers.borrow_mut() = Some(WsHandlers {
+        let handlers = WsHandlers {
             onopen,
             onmessage,
             onerror,
             onclose,
-        });
+        };
+        handlers.keep_alive();
+        *self.handlers.borrow_mut() = Some(handlers);
     }
 
     pub(crate) fn send(&self, msg: ClientMsg) {

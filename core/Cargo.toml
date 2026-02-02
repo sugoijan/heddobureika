@@ -11,4 +11,4 @@ rkyv = "0.8.14"
 [build-dependencies]
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
-toml = "0.9.11+spec-1.1.0"
+toml = "0.9.11"

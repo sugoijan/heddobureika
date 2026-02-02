@@ -145,13 +145,6 @@ impl MultiplayerGameSync {
         handler
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn inject_server_msg(&self, msg: ServerMsg) {
-        if let Some(handler) = self.handler.borrow().as_ref() {
-            handler(msg);
-        }
-    }
-
     fn reset_state(&self) {
         self.last_seq.set(0);
         self.next_client_seq.set(0);

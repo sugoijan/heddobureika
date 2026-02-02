@@ -4,12 +4,9 @@ use std::rc::Rc;
 
 use std::collections::hash_map::DefaultHasher;
 
-use crate::app_core::{AppCore, AppSnapshot};
+use crate::app_core::AppSnapshot;
 use crate::core::InitMode;
-use crate::local_snapshot::{
-    apply_game_snapshot_to_core, build_game_snapshot_from_app, clear_local_snapshot,
-    load_local_snapshot, save_local_snapshot, ApplySnapshotResult,
-};
+use crate::local_snapshot::{build_game_snapshot_from_app, clear_local_snapshot, load_local_snapshot, save_local_snapshot};
 pub use heddobureika_core::{CoreAction, SyncAction};
 use heddobureika_core::{ClientId, GameSnapshot, RoomPersistence, RoomUpdate};
 
@@ -20,7 +17,6 @@ pub struct ViewHooks {
 
 #[derive(Clone)]
 pub struct SyncHooks {
-    #[allow(dead_code)]
     pub on_remote_action: Rc<dyn Fn(CoreAction)>,
     pub on_snapshot: Rc<dyn Fn(AppSnapshot)>,
     pub on_remote_snapshot: Rc<dyn Fn(GameSnapshot, u64)>,
@@ -48,7 +44,6 @@ pub enum SyncEvent {
         initialized: bool,
         client_id: Option<ClientId>,
     },
-    Disconnected,
     NeedInit,
     Warning { minutes_idle: u32 },
     Ownership { anchor_id: u32, owner: Option<ClientId> },
@@ -56,7 +51,6 @@ pub enum SyncEvent {
     Error { code: String, message: String },
 }
 
-#[allow(dead_code)]
 pub trait GameSyncView {
     fn mode(&self) -> InitMode;
     fn connected(&self) -> bool;
@@ -67,7 +61,6 @@ pub trait GameSyncView {
     fn ownership_by_anchor(&self) -> Rc<HashMap<u32, ClientId>>;
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SyncView {
     mode: InitMode,
@@ -93,7 +86,6 @@ impl Default for SyncView {
     }
 }
 
-#[allow(dead_code)]
 impl SyncView {
     pub(crate) fn new(
         mode: InitMode,
@@ -174,14 +166,11 @@ impl GameSyncView for SyncView {
     }
 }
 
-#[allow(dead_code)]
 pub trait GameView {
     fn init(&mut self, hooks: ViewHooks);
     fn render(&mut self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView);
-    fn shutdown(&mut self);
 }
 
-#[allow(dead_code)]
 pub trait GameSync {
     fn init(&mut self, hooks: SyncHooks);
     fn handle_local_action(&mut self, action: &CoreAction);
@@ -234,50 +223,6 @@ impl LocalSyncAdapter {
 
     pub fn clear_storage() {
         clear_local_snapshot();
-    }
-
-    #[allow(dead_code)]
-    pub fn with_observer(observer: Rc<dyn Fn(&CoreAction)>) -> Self {
-        Self {
-            hooks: None,
-            observer: Some(observer),
-            pending_snapshot: None,
-            pending_loaded: false,
-            last_saved_fingerprint: None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn handle_snapshot(
-        &mut self,
-        snapshot: AppSnapshot,
-        core: &AppCore,
-        allow_persist: bool,
-    ) {
-        if allow_persist {
-            if self.try_restore(&snapshot, core) {
-                return;
-            }
-            self.maybe_save(&snapshot);
-        }
-        if let Some(hooks) = &self.hooks {
-            (hooks.on_snapshot)(snapshot);
-        }
-    }
-
-    fn try_restore(&mut self, snapshot: &AppSnapshot, core: &AppCore) -> bool {
-        self.ensure_pending_loaded();
-        let Some(pending) = self.pending_snapshot.take() else {
-            return false;
-        };
-        match apply_game_snapshot_to_core(&pending, core, snapshot) {
-            ApplySnapshotResult::Applied => true,
-            ApplySnapshotResult::NotReady => {
-                self.pending_snapshot = Some(pending);
-                false
-            }
-            ApplySnapshotResult::Mismatch => false,
-        }
     }
 
     fn ensure_pending_loaded(&mut self) {

@@ -3190,10 +3190,6 @@ impl GameView for WgpuViewAdapter {
         let _ = sync_view;
         self.view.queue_render_snapshot(snapshot.clone());
     }
-
-    fn shutdown(&mut self) {
-        view_runtime::set_wgpu_settings_hook(None);
-    }
 }
 
 fn now_ms() -> f32 {

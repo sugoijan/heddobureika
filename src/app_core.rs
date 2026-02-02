@@ -240,11 +240,6 @@ impl AppCore {
         self.state.borrow().assets.clone()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_puzzle(&self, label: String, src: String, dims: (u32, u32)) {
-        self.set_puzzle_with_grid(label, src, dims, None);
-    }
-
     pub(crate) fn set_puzzle_with_grid(
         &self,
         label: String,
@@ -980,11 +975,6 @@ impl AppCore {
         state.hovered_id = hovered;
         drop(state);
         self.notify();
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn clear_hovered(&self) {
-        self.set_hovered(None);
     }
 
     pub(crate) fn set_workspace_padding_ratio(&self, value: f32) {

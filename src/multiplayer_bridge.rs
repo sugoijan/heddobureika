@@ -128,7 +128,6 @@ impl MultiplayerBridgeState {
             SyncEvent::Ownership { anchor_id, owner } => state.handle_ownership(anchor_id, owner),
             SyncEvent::DropNotReady => state.handle_drop_not_ready(),
             SyncEvent::Error { code, message } => state.handle_error(code, message),
-            SyncEvent::Disconnected => {}
         });
         let state = Rc::clone(self);
         let on_remote_snapshot = Rc::new(move |snapshot, seq| {

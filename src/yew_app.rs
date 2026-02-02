@@ -121,10 +121,6 @@ impl PuzzleInfoStore {
         self.state.set(info);
     }
 
-    #[allow(dead_code)]
-    fn view(&self) -> Option<PuzzleInfo> {
-        (*self.state).clone()
-    }
 }
 
 struct AdminSocket {

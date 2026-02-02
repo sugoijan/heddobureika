@@ -42,11 +42,8 @@ struct SavedRoomSession {
 
 #[derive(Clone, Debug)]
 pub(crate) struct InitConfig {
-    #[allow(dead_code)]
     pub(crate) renderer: RendererKind,
-    #[allow(dead_code)]
     pub(crate) mode: InitMode,
-    #[allow(dead_code)]
     pub(crate) mode_preference: InitMode,
     pub(crate) multiplayer: Option<MultiplayerConfig>,
 }

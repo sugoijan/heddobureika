@@ -340,6 +340,7 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
 
 pub(crate) fn run() {
     let init = app_router::load_init_config();
+    let _ = init.mode_preference;
     app_runtime::set_init_config(init.clone());
     let core = AppCore::new();
     sync_runtime::attach_core(core.clone());

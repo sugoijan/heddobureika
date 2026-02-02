@@ -186,43 +186,6 @@ fn schedule_multiplayer_retry() {
     }
 }
 
-fn reset_multiplayer_retry() {
-    let mut should_notify = false;
-    STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.retry_attempts = 0;
-        state.retry_timer.take();
-        should_notify = true;
-    });
-    if should_notify {
-        notify_sync_view_changed();
-    }
-}
-
-fn fail_multiplayer_now() {
-    let mut should_notify = false;
-    let on_fail = STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        if state.active != ActiveSync::Multiplayer {
-            return None;
-        }
-        if let Some(sync) = state.multiplayer.as_ref() {
-            sync.borrow_mut().disconnect();
-        }
-        state.active_room = None;
-        state.retry_attempts = 0;
-        state.retry_timer.take();
-        should_notify = true;
-        Some(state.on_fail.clone())
-    });
-    if should_notify {
-        notify_sync_view_changed();
-    }
-    if let Some(on_fail) = on_fail {
-        on_fail();
-    }
-}
-
 fn notify_sync_view_changed() {
     let hooks = STATE.with(|slot| {
         let state = slot.borrow();

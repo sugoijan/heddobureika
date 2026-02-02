@@ -217,18 +217,6 @@ impl Rect {
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
     }
 
-    fn inset(&self, inset: f32) -> Self {
-        let inset = inset.max(0.0);
-        let w = (self.w - inset * 2.0).max(0.0);
-        let h = (self.h - inset * 2.0).max(0.0);
-        Self {
-            x: self.x + inset,
-            y: self.y + inset,
-            w,
-            h,
-        }
-    }
-
     fn center(&self) -> [f32; 2] {
         [self.x + self.w * 0.5, self.y + self.h * 0.5]
     }
@@ -236,7 +224,6 @@ impl Rect {
 
 struct PreviewLayout {
     box_rect: Rect,
-    image_rect: Rect,
 }
 
 struct DebugOverlay {
@@ -307,15 +294,11 @@ struct SvgPieceNodes {
     outline_group: Element,
     surface_group: Element,
     internal_group: Element,
-    hitbox: Element,
     outline_external: Element,
     outline_internal: Element,
     outline_simple: Element,
-    back_rect: Element,
-    image: Element,
     debug_group: Element,
     debug_label: Element,
-    debug_center: Element,
 }
 
 struct SvgView {
@@ -2455,16 +2438,8 @@ impl SvgView {
             w: box_w,
             h: box_h,
         };
-        let image_rect = Rect {
-            x: pos[0] + PREVIEW_BOX_PADDING,
-            y: pos[1] + PREVIEW_BOX_PADDING,
-            w: image_w,
-            h: image_h,
-        };
-        Some(PreviewLayout {
-            box_rect,
-            image_rect,
-        })
+        let _ = (image_w, image_h);
+        Some(PreviewLayout { box_rect })
     }
 
     fn preview_unrotate_point(&self, center: [f32; 2], x: f32, y: f32) -> [f32; 2] {
@@ -2789,15 +2764,11 @@ impl SvgView {
             outline_group,
             surface_group,
             internal_group,
-            hitbox,
             outline_external,
             outline_internal,
             outline_simple,
-            back_rect,
-            image,
             debug_group,
             debug_label,
-            debug_center,
         }
     }
 
@@ -3234,10 +3205,6 @@ impl GameView for SvgViewAdapter {
         let sync_view = snapshot_sync_view(sync_view);
         self.view
             .queue_render_snapshot(snapshot.clone(), sync_view);
-    }
-
-    fn shutdown(&mut self) {
-        view_runtime::set_svg_settings_hook(None);
     }
 }
 
