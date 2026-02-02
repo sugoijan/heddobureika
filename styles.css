@@ -262,6 +262,7 @@ body {
   stroke: var(--workspace-stroke);
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
+  pointer-events: all;
 }
 
 .puzzle-bounds {

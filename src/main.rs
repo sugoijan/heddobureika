@@ -5,6 +5,7 @@ mod app_runtime;
 mod boot_runtime;
 mod view_runtime;
 mod core;
+mod input;
 mod idb;
 mod local_snapshot;
 mod model;

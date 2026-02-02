@@ -24,14 +24,14 @@ pub enum CoreAction {
         shift_key: bool,
         rotate_mode: bool,
         right_click: bool,
-        touch_id: Option<i32>,
+        pointer_id: Option<i32>,
     },
     DragMove {
         x: f32,
         y: f32,
     },
     DragEnd {
-        touch_id: Option<i32>,
+        pointer_id: Option<i32>,
     },
     SetHovered {
         hovered: Option<usize>,

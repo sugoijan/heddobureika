@@ -527,7 +527,7 @@ impl MultiplayerBridgeState {
                 snapshot.dragging_members.clear();
                 snapshot.active_id = None;
                 snapshot.drag_cursor = None;
-                snapshot.drag_touch_id = None;
+                snapshot.drag_pointer_id = None;
                 snapshot.drag_rotate_mode = false;
                 snapshot.drag_right_click = false;
                 snapshot.drag_primary_id = None;

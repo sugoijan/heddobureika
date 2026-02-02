@@ -12,11 +12,16 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, Document, Element, Event, HtmlCanvasElement, HtmlImageElement,
-    MouseEvent, Touch, TouchEvent, WheelEvent,
+    PointerEvent, WheelEvent,
 };
 
 use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
+use crate::input::{
+    screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
+    workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
+    WheelIntentTracker,
+};
 use crate::sync_runtime;
 use crate::core::*;
 use crate::renderer::{
@@ -73,12 +78,10 @@ const PREVIEW_MIN_VISIBLE_FRAC: f32 = 0.35;
 const PREVIEW_MOMENTUM_DECAY: f32 = 8.0;
 const PREVIEW_VELOCITY_EPS: f32 = 10.0;
 const PREVIEW_VELOCITY_SMOOTH: f32 = 0.25;
-const PREVIEW_CLICK_SLOP: f32 = 4.0;
 const PREVIEW_TILT_DEG: f32 = 1.1;
 // Keep in sync with ViewState::fit_zoom_for_size in src/app_core.rs.
 const PREVIEW_FIT_PADDING_RATIO: f32 = 0.02;
 const PREVIEW_MAX_FIT_SCALE: f32 = 0.97;
-
 #[derive(Clone, Copy)]
 struct UiHitbox {
     center: [f32; 2],
@@ -89,7 +92,7 @@ struct UiHitbox {
 struct PanState {
     last_x: f32,
     last_y: f32,
-    touch_id: Option<i32>,
+    pointer_id: Option<i32>,
 }
 
 struct PinchState {
@@ -99,7 +102,7 @@ struct PinchState {
 }
 
 struct TouchDragGate {
-    touch_id: i32,
+    pointer_id: i32,
     start_x: f32,
     start_y: f32,
     moved: bool,
@@ -255,8 +258,7 @@ enum PreviewDragState {
 #[derive(Clone, Copy, Debug)]
 struct PreviewClickState {
     pointer_id: Option<i32>,
-    start: [f32; 2],
-    moved: bool,
+    gesture: ClickGesture,
 }
 
 impl PreviewDragState {
@@ -455,6 +457,7 @@ struct WgpuView {
     pan_state: RefCell<Option<PanState>>,
     pinch_state: RefCell<Option<PinchState>>,
     touch_drag_gate: RefCell<Option<TouchDragGate>>,
+    pointer_policy: RefCell<PointerPolicy>,
     auto_pan: RefCell<AutoPanState>,
     pending_snapshot: RefCell<Option<AppSnapshot>>,
     render_timer: RefCell<Option<Timeout>>,
@@ -485,6 +488,7 @@ struct WgpuView {
     pending_ui_overlay: RefCell<Option<Vec<UiSpriteSpec>>>,
     debug_overlay: RefCell<Option<DebugOverlay>>,
     wgpu_settings: RefCell<WgpuRenderSettings>,
+    wheel_intent: RefCell<WheelIntentTracker>,
 }
 
 impl WgpuView {
@@ -510,6 +514,7 @@ impl WgpuView {
             pan_state: RefCell::new(None),
             pinch_state: RefCell::new(None),
             touch_drag_gate: RefCell::new(None),
+            pointer_policy: RefCell::new(PointerPolicy::new()),
             auto_pan: RefCell::new(AutoPanState::new()),
             pending_snapshot: RefCell::new(None),
             render_timer: RefCell::new(None),
@@ -540,6 +545,7 @@ impl WgpuView {
             pending_ui_overlay: RefCell::new(None),
             debug_overlay: RefCell::new(None),
             wgpu_settings: RefCell::new(wgpu_settings),
+            wheel_intent: RefCell::new(WheelIntentTracker::new()),
         }
     }
 
@@ -592,6 +598,551 @@ impl WgpuView {
         let width = rect.width() as f32;
         let height = rect.height() as f32;
         self.core.set_viewport_size(width, height);
+    }
+
+    fn pointer_kind(event: &PointerEvent) -> PointerKind {
+        PointerKind::from_pointer_type(&event.pointer_type())
+    }
+
+    fn clear_hover_state(self: &Rc<Self>, snapshot: &AppSnapshot) {
+        let mut changed = snapshot.hovered_id.is_some();
+        if self.ui_credit_hovered.get() {
+            self.ui_credit_hovered.set(false);
+            changed = true;
+        }
+        if self.set_preview_hover(PreviewHoverTarget::None) {
+            changed = true;
+        }
+        self.dispatch_action(CoreAction::SetHovered { hovered: None });
+        if changed {
+            self.update_canvas_class(snapshot);
+            self.request_render();
+        }
+    }
+
+    fn handle_pointer_down(self: &Rc<Self>, event: &PointerEvent) {
+        let kind = Self::pointer_kind(event);
+        let button = event.button();
+        if matches!(kind, PointerKind::Mouse | PointerKind::Pen) && button != 0 && button != 2 {
+            return;
+        }
+        let now_ms = now_ms();
+        let pointer_id = event.pointer_id();
+        let screen_x = event.client_x() as f32;
+        let screen_y = event.client_y() as f32;
+        let kind_changed = { self.pointer_policy.borrow().kind_changed(kind) };
+        {
+            let mut policy = self.pointer_policy.borrow_mut();
+            if !policy.accept_kind(kind, now_ms) {
+                return;
+            }
+            policy.insert_pointer(pointer_id, kind, screen_x, screen_y, event.buttons());
+        }
+        let snapshot = self.core.snapshot();
+        if kind_changed {
+            self.clear_hover_state(&snapshot);
+        }
+        let _ = self.canvas.set_pointer_capture(pointer_id);
+        let rect = self.canvas.get_bounding_client_rect();
+        let local_x = screen_x - rect.left() as f32;
+        let local_y = screen_y - rect.top() as f32;
+        if kind == PointerKind::Touch {
+            let touch_points = { self.pointer_policy.borrow().active_touch_points() };
+            if touch_points.len() >= 2 {
+                self.touch_drag_gate.borrow_mut().take();
+                event.prevent_default();
+                if !snapshot.dragging_members.is_empty() {
+                    self.dispatch_action(CoreAction::DragEnd {
+                        pointer_id: snapshot.drag_pointer_id,
+                    });
+                }
+                let (id_a, a) = touch_points[0];
+                let (id_b, b) = touch_points[1];
+                let local_ax = a.screen_x - rect.left() as f32;
+                let local_ay = a.screen_y - rect.top() as f32;
+                let local_bx = b.screen_x - rect.left() as f32;
+                let local_by = b.screen_y - rect.top() as f32;
+                if let Some(layout) = self.preview_layout(&snapshot, &rect) {
+                    if self.preview_point_inside(&layout, local_ax, local_ay)
+                        && self.preview_point_inside(&layout, local_bx, local_by)
+                    {
+                        self.clear_preview_click();
+                        if self.begin_preview_pinch(
+                            id_a,
+                            id_b,
+                            [a.screen_x, a.screen_y],
+                            [b.screen_x, b.screen_y],
+                            &snapshot,
+                            &rect,
+                        ) {
+                            self.update_canvas_class(&snapshot);
+                            self.request_render();
+                            event.prevent_default();
+                            return;
+                        }
+                    }
+                }
+                let dx = b.screen_x - a.screen_x;
+                let dy = b.screen_y - a.screen_y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance > 0.0 {
+                    *self.pinch_state.borrow_mut() = Some(PinchState {
+                        touch_a: id_a,
+                        touch_b: id_b,
+                        last_distance: distance,
+                    });
+                    if self.pan_state.borrow_mut().take().is_some() {
+                        self.core.settle_view();
+                    }
+                    self.update_canvas_class(&snapshot);
+                    event.prevent_default();
+                }
+                return;
+            }
+        }
+        if let Some(layout) = self.preview_layout(&snapshot, &rect) {
+            let target = self.preview_hit_test(&layout, local_x, local_y);
+            if target != PreviewHoverTarget::None {
+                if button == 0 {
+                    let [drag_x, drag_y] = self.preview_local_point(&layout, local_x, local_y);
+                    self.begin_preview_drag(target, drag_x, drag_y, Some(pointer_id));
+                    if matches!(target, PreviewHoverTarget::Body) {
+                        self.arm_preview_click(Some(pointer_id), local_x, local_y);
+                    } else {
+                        self.clear_preview_click();
+                    }
+                    self.request_render();
+                }
+                if self.set_preview_hover(target) {
+                    self.request_render();
+                }
+                self.update_canvas_class(&snapshot);
+                event.prevent_default();
+                return;
+            }
+        }
+        self.clear_preview_click();
+        let Some((view_x, view_y)) =
+            screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+        else {
+            return;
+        };
+        let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+        if let Some(piece_id) = self.pick_piece(px, py, &snapshot) {
+            self.touch_drag_gate.borrow_mut().take();
+            let right_click = button == 2;
+            if kind == PointerKind::Touch {
+                *self.touch_drag_gate.borrow_mut() = Some(TouchDragGate {
+                    pointer_id,
+                    start_x: px,
+                    start_y: py,
+                    moved: false,
+                });
+            }
+            self.dispatch_action(CoreAction::BeginDrag {
+                piece_id,
+                x: px,
+                y: py,
+                shift_key: event.shift_key(),
+                rotate_mode: event.ctrl_key(),
+                right_click,
+                pointer_id: Some(pointer_id),
+            });
+            let drag_snapshot = self.core.snapshot();
+            self.update_auto_pan(screen_x, screen_y, &drag_snapshot);
+            event.prevent_default();
+            return;
+        }
+        if self.hit_credit(view_x, view_y) {
+            open_credit_url();
+            event.prevent_default();
+            return;
+        }
+        if button == 0 {
+            self.ui_credit_hovered.set(false);
+            *self.pan_state.borrow_mut() = Some(PanState {
+                last_x: screen_x,
+                last_y: screen_y,
+                pointer_id: Some(pointer_id),
+            });
+            self.update_canvas_class(&snapshot);
+            event.prevent_default();
+        }
+    }
+
+    fn handle_pointer_move(self: &Rc<Self>, event: &PointerEvent) {
+        let kind = Self::pointer_kind(event);
+        let pointer_id = event.pointer_id();
+        let now_ms = now_ms();
+        let screen_x = event.client_x() as f32;
+        let screen_y = event.client_y() as f32;
+        let buttons = event.buttons();
+        let kind_changed = { self.pointer_policy.borrow().kind_changed(kind) };
+        {
+            let mut policy = self.pointer_policy.borrow_mut();
+            if !policy.accept_kind(kind, now_ms) {
+                return;
+            }
+            policy.update_pointer(pointer_id, kind, screen_x, screen_y, buttons);
+        }
+        let snapshot = self.core.snapshot();
+        if kind_changed {
+            self.clear_hover_state(&snapshot);
+        }
+        let rect = self.canvas.get_bounding_client_rect();
+        let local_x = screen_x - rect.left() as f32;
+        let local_y = screen_y - rect.top() as f32;
+        self.update_preview_click_movement(Some(pointer_id), local_x, local_y);
+        if let Some(PreviewDragState::Pinch {
+            touch_a,
+            touch_b,
+            start_distance,
+            start_width,
+            anchor_rel,
+        }) = *self.preview_drag.borrow()
+        {
+            let (point_a, point_b) = {
+                let policy = self.pointer_policy.borrow();
+                (policy.pointer_sample(touch_a), policy.pointer_sample(touch_b))
+            };
+            if let (Some(a), Some(b)) = (point_a, point_b) {
+                if self.update_preview_pinch(
+                    [a.screen_x, a.screen_y],
+                    [b.screen_x, b.screen_y],
+                    &snapshot,
+                    &rect,
+                    now_ms,
+                    start_distance,
+                    start_width,
+                    anchor_rel,
+                ) {
+                    self.request_render();
+                    event.prevent_default();
+                    return;
+                }
+            }
+        }
+        if self.update_preview_drag(Some(pointer_id), local_x, local_y, now_ms, &snapshot, &rect) {
+            self.request_render();
+            event.prevent_default();
+            return;
+        }
+        if kind == PointerKind::Touch {
+            let touch_points = { self.pointer_policy.borrow().active_touch_points() };
+            let pinch_opt = { self.pinch_state.borrow_mut().take() };
+            if let Some(mut pinch) = pinch_opt {
+                let (point_a, point_b) = {
+                    let policy = self.pointer_policy.borrow();
+                    (
+                        policy.pointer_sample(pinch.touch_a),
+                        policy.pointer_sample(pinch.touch_b),
+                    )
+                };
+                if let (Some(a), Some(b)) = (point_a, point_b) {
+                    let center_x = (a.screen_x + b.screen_x) * 0.5;
+                    let center_y = (a.screen_y + b.screen_y) * 0.5;
+                    let dx = b.screen_x - a.screen_x;
+                    let dy = b.screen_y - a.screen_y;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.0 {
+                        let factor = distance / pinch.last_distance;
+                        if factor.is_finite() && factor > 0.0 {
+                            if let Some((view_x, view_y)) = screen_to_view_coords(
+                                center_x,
+                                center_y,
+                                &self.canvas,
+                                snapshot.view,
+                            ) {
+                                self.core.zoom_view_at(factor, view_x, view_y);
+                            }
+                            pinch.last_distance = distance;
+                        }
+                    }
+                    if let Ok(mut slot) = self.pinch_state.try_borrow_mut() {
+                        *slot = Some(pinch);
+                    }
+                    event.prevent_default();
+                    return;
+                }
+            }
+            if touch_points.len() >= 2 {
+                let (id_a, a) = touch_points[0];
+                let (id_b, b) = touch_points[1];
+                let dx = b.screen_x - a.screen_x;
+                let dy = b.screen_y - a.screen_y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance > 0.0 {
+                    *self.pinch_state.borrow_mut() = Some(PinchState {
+                        touch_a: id_a,
+                        touch_b: id_b,
+                        last_distance: distance,
+                    });
+                }
+                event.prevent_default();
+                return;
+            }
+        }
+        let delta = {
+            let mut pan_state = self.pan_state.borrow_mut();
+            if let Some(pan) = pan_state.as_mut() {
+                if pan.pointer_id != Some(pointer_id) {
+                    None
+                } else {
+                    let dx = screen_x - pan.last_x;
+                    let dy = screen_y - pan.last_y;
+                    pan.last_x = screen_x;
+                    pan.last_y = screen_y;
+                    screen_delta_to_world(dx, dy, &self.canvas, snapshot.view)
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((dx_world, dy_world)) = delta {
+            self.core.pan_view(dx_world, dy_world);
+            event.prevent_default();
+            return;
+        }
+        if !snapshot.dragging_members.is_empty() {
+            if snapshot.drag_pointer_id != Some(pointer_id) {
+                return;
+            }
+            let Some((view_x, view_y)) =
+                screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+            else {
+                return;
+            };
+            let (px, py) =
+                workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+            if let Some(gate) = self.touch_drag_gate.borrow_mut().as_mut() {
+                if let Some(drag_id) = snapshot.drag_pointer_id {
+                    if gate.pointer_id != drag_id {
+                        gate.moved = true;
+                    } else if !gate.moved {
+                        let click_tolerance =
+                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        let slop = screen_slop_to_puzzle(
+                            TOUCH_DRAG_SLOP_PX,
+                            &self.canvas,
+                            snapshot.view,
+                            snapshot.layout.puzzle_scale,
+                        );
+                        let drag_tolerance = click_tolerance.max(slop);
+                        let dx = px - gate.start_x;
+                        let dy = py - gate.start_y;
+                        if dx * dx + dy * dy < drag_tolerance * drag_tolerance {
+                            event.prevent_default();
+                            return;
+                        }
+                        gate.moved = true;
+                    }
+                }
+            }
+            self.update_auto_pan(screen_x, screen_y, &snapshot);
+            self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+            event.prevent_default();
+            return;
+        }
+        if !matches!(kind, PointerKind::Mouse | PointerKind::Pen) || buttons != 0 {
+            return;
+        }
+        if self.preview_drag.borrow().is_some() {
+            return;
+        }
+        if self.pan_state.borrow().is_some() {
+            return;
+        }
+        let mut preview_target = PreviewHoverTarget::None;
+        if let Some(layout) = self.preview_layout(&snapshot, &rect) {
+            preview_target = self.preview_hit_test(&layout, local_x, local_y);
+        }
+        if self.set_preview_hover(preview_target) {
+            self.update_canvas_class(&snapshot);
+            self.request_render();
+        }
+        if preview_target != PreviewHoverTarget::None {
+            if self.ui_credit_hovered.get() {
+                self.ui_credit_hovered.set(false);
+                self.update_canvas_class(&snapshot);
+            }
+            self.dispatch_action(CoreAction::SetHovered { hovered: None });
+            return;
+        }
+        let Some((view_x, view_y)) =
+            screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+        else {
+            self.dispatch_action(CoreAction::SetHovered { hovered: None });
+            return;
+        };
+        let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+        let hovered = self.pick_piece(px, py, &snapshot);
+        if hovered.is_some() {
+            if self.ui_credit_hovered.get() {
+                self.ui_credit_hovered.set(false);
+                self.update_canvas_class(&snapshot);
+            }
+            self.dispatch_action(CoreAction::SetHovered { hovered });
+            return;
+        }
+        let credit_hovered = self.hit_credit(view_x, view_y);
+        if self.ui_credit_hovered.get() != credit_hovered {
+            self.ui_credit_hovered.set(credit_hovered);
+            self.update_canvas_class(&snapshot);
+        }
+        if credit_hovered {
+            self.dispatch_action(CoreAction::SetHovered { hovered: None });
+            return;
+        }
+        self.dispatch_action(CoreAction::SetHovered { hovered });
+    }
+
+    fn handle_pointer_up(self: &Rc<Self>, event: &PointerEvent) {
+        let kind = Self::pointer_kind(event);
+        let pointer_id = event.pointer_id();
+        let now_ms = now_ms();
+        let screen_x = event.client_x() as f32;
+        let screen_y = event.client_y() as f32;
+        let kind_changed = { self.pointer_policy.borrow().kind_changed(kind) };
+        {
+            let mut policy = self.pointer_policy.borrow_mut();
+            if !policy.accept_kind(kind, now_ms) {
+                return;
+            }
+            policy.remove_pointer(pointer_id);
+            policy.clear_active();
+        }
+        let _ = self.canvas.release_pointer_capture(pointer_id);
+        let snapshot = self.core.snapshot();
+        if kind_changed {
+            self.clear_hover_state(&snapshot);
+        }
+        let rect = self.canvas.get_bounding_client_rect();
+        let local_x = screen_x - rect.left() as f32;
+        let local_y = screen_y - rect.top() as f32;
+        self.update_preview_click_movement(Some(pointer_id), local_x, local_y);
+        let preview_clicked = self.consume_preview_click(Some(pointer_id));
+        let mut preview_dragged = false;
+        if let Some(PreviewDragState::Pinch { touch_a, touch_b, .. }) =
+            *self.preview_drag.borrow()
+        {
+            if pointer_id == touch_a || pointer_id == touch_b {
+                preview_dragged = self.end_preview_drag(None);
+            }
+        }
+        if !preview_dragged {
+            preview_dragged = self.end_preview_drag(Some(pointer_id));
+        }
+        if preview_clicked {
+            self.toggle_preview_revealed();
+        }
+        if preview_dragged || preview_clicked {
+            self.request_render();
+            event.prevent_default();
+            return;
+        }
+        self.touch_drag_gate.borrow_mut().take();
+        self.stop_auto_pan();
+        let mut cleared = false;
+        let clear_pinch = {
+            let pinch_state = self.pinch_state.borrow();
+            pinch_state
+                .as_ref()
+                .map(|pinch| pinch.touch_a == pointer_id || pinch.touch_b == pointer_id)
+                .unwrap_or(false)
+        };
+        if clear_pinch {
+            self.pinch_state.borrow_mut().take();
+            cleared = true;
+        }
+        let clear_pan = {
+            let pan_state = self.pan_state.borrow();
+            pan_state
+                .as_ref()
+                .map(|pan| pan.pointer_id == Some(pointer_id))
+                .unwrap_or(false)
+        };
+        if clear_pan {
+            self.pan_state.borrow_mut().take();
+            cleared = true;
+        }
+        if cleared {
+            self.update_canvas_class(&snapshot);
+            self.core.settle_view();
+        }
+        if !snapshot.dragging_members.is_empty() {
+            if let Some((view_x, view_y)) =
+                screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+            {
+                let (px, py) =
+                    workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+            }
+            self.dispatch_action(CoreAction::DragEnd {
+                pointer_id: Some(pointer_id),
+            });
+        }
+        let snapshot = self.core.snapshot();
+        if !snapshot.dragging_members.is_empty() {
+            return;
+        }
+        if !matches!(kind, PointerKind::Mouse | PointerKind::Pen) {
+            return;
+        }
+        let hovered = screen_to_view_coords(screen_x, screen_y, &self.canvas, snapshot.view)
+            .and_then(|(view_x, view_y)| {
+                let (px, py) =
+                    workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+                self.pick_piece(px, py, &snapshot)
+            });
+        self.dispatch_action(CoreAction::SetHovered { hovered });
+    }
+
+    fn handle_pointer_cancel(self: &Rc<Self>, event: &PointerEvent) {
+        let kind = Self::pointer_kind(event);
+        let pointer_id = event.pointer_id();
+        let now_ms = now_ms();
+        {
+            let mut policy = self.pointer_policy.borrow_mut();
+            if !policy.accept_kind(kind, now_ms) {
+                return;
+            }
+            policy.remove_pointer(pointer_id);
+        }
+        let _ = self.canvas.release_pointer_capture(pointer_id);
+        self.pan_state.borrow_mut().take();
+        self.pinch_state.borrow_mut().take();
+        self.touch_drag_gate.borrow_mut().take();
+        self.preview_drag.borrow_mut().take();
+        self.preview_click.borrow_mut().take();
+        self.preview_velocity.set([0.0, 0.0]);
+        self.stop_auto_pan();
+        let snapshot = self.core.snapshot();
+        self.update_canvas_class(&snapshot);
+        self.core.settle_view();
+        self.dispatch_action(CoreAction::DragEnd {
+            pointer_id: snapshot.drag_pointer_id,
+        });
+    }
+
+    fn handle_pointer_leave(self: &Rc<Self>, event: &PointerEvent) {
+        let kind = Self::pointer_kind(event);
+        if !matches!(kind, PointerKind::Mouse | PointerKind::Pen) {
+            return;
+        }
+        let now_ms = now_ms();
+        {
+            let mut policy = self.pointer_policy.borrow_mut();
+            if !policy.accept_kind(kind, now_ms) {
+                return;
+            }
+        }
+        self.ui_credit_hovered.set(false);
+        if self.set_preview_hover(PreviewHoverTarget::None) {
+            self.request_render();
+        }
+        let snapshot = self.core.snapshot();
+        self.update_canvas_class(&snapshot);
+        self.dispatch_action(CoreAction::SetHovered { hovered: None });
     }
 
     fn load_image_for_puzzle(
@@ -744,88 +1295,89 @@ impl WgpuView {
     fn install_listeners(self: &Rc<Self>) {
         let mut listeners = Vec::new();
         let canvas = self.canvas.clone();
-        let canvas_for_down = canvas.clone();
-        let core = self.core.clone();
+
         let view = Rc::clone(self);
         let listener = EventListener::new_with_options(
             &canvas,
-            "mousedown",
+            "pointerdown",
             EventListenerOptions {
                 phase: EventListenerPhase::Bubble,
                 passive: false,
             },
             move |event: &Event| {
-            let Some(event) = event.dyn_ref::<MouseEvent>() else {
-                return;
-            };
-            if event.button() != 0 && event.button() != 2 {
-                return;
-            }
-            let snapshot = core.snapshot();
-            let rect = canvas_for_down.get_bounding_client_rect();
-            let local_x = event.client_x() as f32 - rect.left() as f32;
-            let local_y = event.client_y() as f32 - rect.top() as f32;
-            if let Some(layout) = view.preview_layout(&snapshot, &rect) {
-                let target = view.preview_hit_test(&layout, local_x, local_y);
-                if target != PreviewHoverTarget::None {
-                    if event.button() == 0 {
-                        let [drag_x, drag_y] = view.preview_local_point(&layout, local_x, local_y);
-                        view.begin_preview_drag(target, drag_x, drag_y, None);
-                        if matches!(target, PreviewHoverTarget::Body) {
-                            view.arm_preview_click(None, local_x, local_y);
-                        } else {
-                            view.clear_preview_click();
-                        }
-                        view.request_render();
-                    }
-                    if view.set_preview_hover(target) {
-                        view.request_render();
-                    }
-                    view.update_canvas_class(&snapshot);
-                    event.prevent_default();
+                let Some(event) = event.dyn_ref::<PointerEvent>() else {
                     return;
-                }
-            }
-            let Some((view_x, view_y)) =
-                event_to_canvas_coords(event, &canvas_for_down, snapshot.view)
-            else {
-                return;
-            };
-            view.clear_preview_click();
-            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-            if let Some(piece_id) = view.pick_piece(px, py, &snapshot) {
-                view.touch_drag_gate.borrow_mut().take();
-                let right_click = event.button() == 2;
-                view.dispatch_action(CoreAction::BeginDrag {
-                    piece_id,
-                    x: px,
-                    y: py,
-                    shift_key: event.shift_key(),
-                    rotate_mode: event.ctrl_key(),
-                    right_click,
-                    touch_id: None,
-                });
-                let drag_snapshot = view.core.snapshot();
-                view.update_auto_pan(event.client_x() as f32, event.client_y() as f32, &drag_snapshot);
-                event.prevent_default();
-                return;
-            }
-            if view.hit_credit(view_x, view_y) {
-                open_credit_url();
-                event.prevent_default();
-                return;
-            }
-            if event.button() == 0 {
-                view.ui_credit_hovered.set(false);
-                *view.pan_state.borrow_mut() = Some(PanState {
-                    last_x: event.client_x() as f32,
-                    last_y: event.client_y() as f32,
-                    touch_id: None,
-                });
-                view.update_canvas_class(&snapshot);
-                event.prevent_default();
-            }
-        },
+                };
+                view.handle_pointer_down(event);
+            },
+        );
+        listeners.push(listener);
+
+        let view = Rc::clone(self);
+        let listener = EventListener::new_with_options(
+            &canvas,
+            "pointermove",
+            EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: false,
+            },
+            move |event: &Event| {
+                let Some(event) = event.dyn_ref::<PointerEvent>() else {
+                    return;
+                };
+                view.handle_pointer_move(event);
+            },
+        );
+        listeners.push(listener);
+
+        let view = Rc::clone(self);
+        let listener = EventListener::new_with_options(
+            &canvas,
+            "pointerup",
+            EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: false,
+            },
+            move |event: &Event| {
+                let Some(event) = event.dyn_ref::<PointerEvent>() else {
+                    return;
+                };
+                view.handle_pointer_up(event);
+            },
+        );
+        listeners.push(listener);
+
+        let view = Rc::clone(self);
+        let listener = EventListener::new_with_options(
+            &canvas,
+            "pointercancel",
+            EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: false,
+            },
+            move |event: &Event| {
+                let Some(event) = event.dyn_ref::<PointerEvent>() else {
+                    return;
+                };
+                view.handle_pointer_cancel(event);
+            },
+        );
+        listeners.push(listener);
+
+        let view = Rc::clone(self);
+        let listener = EventListener::new_with_options(
+            &canvas,
+            "pointerleave",
+            EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: true,
+            },
+            move |event: &Event| {
+                let Some(event) = event.dyn_ref::<PointerEvent>() else {
+                    return;
+                };
+                view.handle_pointer_leave(event);
+            },
         );
         listeners.push(listener);
 
@@ -876,9 +1428,12 @@ impl WgpuView {
                     }
                     _ => {}
                 }
-                if event.ctrl_key() || event.meta_key() {
+                let intent = view.wheel_intent.borrow_mut().decide(event, now_ms());
+                let wants_pan =
+                    (event.ctrl_key() || event.meta_key()) && matches!(intent, WheelIntent::Pan);
+                if wants_pan {
                     if let Some((dx_world, dy_world)) =
-                        screen_delta_to_world(delta_x, delta_y, &canvas_for_wheel, snapshot.view)
+                        screen_scroll_to_world(delta_x, delta_y, &canvas_for_wheel, snapshot.view)
                     {
                         core.pan_view(dx_world, dy_world);
                     }
@@ -902,695 +1457,7 @@ impl WgpuView {
         );
         listeners.push(listener);
 
-        let core = self.core.clone();
-        let canvas_for_move = canvas.clone();
-        let view = Rc::clone(self);
-        let listener = EventListener::new(&canvas, "mousemove", move |event: &Event| {
-            let Some(event) = event.dyn_ref::<MouseEvent>() else {
-                return;
-            };
-            let snapshot = core.snapshot();
-            if view.preview_drag.borrow().is_some() {
-                return;
-            }
-            if !snapshot.dragging_members.is_empty() || view.pan_state.borrow().is_some() {
-                if view.set_preview_hover(PreviewHoverTarget::None) {
-                view.update_canvas_class(&snapshot);
-                    view.request_render();
-                }
-                return;
-            }
-            let rect = canvas_for_move.get_bounding_client_rect();
-            let local_x = event.client_x() as f32 - rect.left() as f32;
-            let local_y = event.client_y() as f32 - rect.top() as f32;
-            let mut preview_target = PreviewHoverTarget::None;
-            if let Some(layout) = view.preview_layout(&snapshot, &rect) {
-                preview_target = view.preview_hit_test(&layout, local_x, local_y);
-            }
-            if view.set_preview_hover(preview_target) {
-                view.update_canvas_class(&snapshot);
-                view.request_render();
-            }
-            if preview_target != PreviewHoverTarget::None {
-                if view.ui_credit_hovered.get() {
-                    view.ui_credit_hovered.set(false);
-                view.update_canvas_class(&snapshot);
-                }
-                view.dispatch_action(CoreAction::SetHovered { hovered: None });
-                return;
-            }
-            let Some((view_x, view_y)) =
-                event_to_canvas_coords(event, &canvas_for_move, snapshot.view)
-            else {
-                view.dispatch_action(CoreAction::SetHovered { hovered: None });
-                return;
-            };
-            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-            let hovered = view.pick_piece(px, py, &snapshot);
-            if hovered.is_some() {
-                if view.ui_credit_hovered.get() {
-                    view.ui_credit_hovered.set(false);
-                view.update_canvas_class(&snapshot);
-                }
-                view.dispatch_action(CoreAction::SetHovered { hovered });
-                return;
-            }
-            let credit_hovered = view.hit_credit(view_x, view_y);
-            if view.ui_credit_hovered.get() != credit_hovered {
-                view.ui_credit_hovered.set(credit_hovered);
-                view.update_canvas_class(&snapshot);
-            }
-            if credit_hovered {
-                view.dispatch_action(CoreAction::SetHovered { hovered: None });
-                return;
-            }
-            view.dispatch_action(CoreAction::SetHovered { hovered });
-        });
-        listeners.push(listener);
-
-        let view = Rc::clone(self);
-        let core_for_leave = self.core.clone();
-        let listener = EventListener::new(&canvas, "mouseleave", move |_event: &Event| {
-            view.ui_credit_hovered.set(false);
-            if view.set_preview_hover(PreviewHoverTarget::None) {
-                view.request_render();
-            }
-            let snapshot = core_for_leave.snapshot();
-                view.update_canvas_class(&snapshot);
-            view.dispatch_action(CoreAction::SetHovered { hovered: None });
-        });
-        listeners.push(listener);
-
-        let core = self.core.clone();
-        let canvas_for_touch = canvas.clone();
-        let view = Rc::clone(self);
-        let listener = EventListener::new_with_options(
-            &canvas,
-            "touchstart",
-            EventListenerOptions {
-                phase: EventListenerPhase::Bubble,
-                passive: false,
-            },
-            move |event: &Event| {
-            let Some(event) = event.dyn_ref::<TouchEvent>() else {
-                return;
-            };
-            let touch_count = event.touches().length();
-            let snapshot = core.snapshot();
-            if touch_count >= 2 {
-                view.touch_drag_gate.borrow_mut().take();
-                event.prevent_default();
-                if !snapshot.dragging_members.is_empty() {
-                    view.dispatch_action(CoreAction::DragEnd {
-                        touch_id: snapshot.drag_touch_id,
-                    });
-                }
-                if let (Some(touch_a), Some(touch_b)) =
-                    (event.touches().item(0), event.touches().item(1))
-                {
-                    let rect = canvas_for_touch.get_bounding_client_rect();
-                    let local_ax = touch_a.client_x() as f32 - rect.left() as f32;
-                    let local_ay = touch_a.client_y() as f32 - rect.top() as f32;
-                    let local_bx = touch_b.client_x() as f32 - rect.left() as f32;
-                    let local_by = touch_b.client_y() as f32 - rect.top() as f32;
-                    if let Some(layout) = view.preview_layout(&snapshot, &rect) {
-                        if view.preview_point_inside(&layout, local_ax, local_ay)
-                            && view.preview_point_inside(&layout, local_bx, local_by)
-                        {
-                            view.clear_preview_click();
-                            if view.begin_preview_pinch(&touch_a, &touch_b, &snapshot, &rect) {
-                                view.update_canvas_class(&snapshot);
-                                view.request_render();
-                                event.prevent_default();
-                                return;
-                            }
-                        }
-                    }
-                    let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
-                    let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
-                    let distance = (dx * dx + dy * dy).sqrt();
-                    if distance > 0.0 {
-                        *view.pinch_state.borrow_mut() = Some(PinchState {
-                            touch_a: touch_a.identifier(),
-                            touch_b: touch_b.identifier(),
-                            last_distance: distance,
-                        });
-                        if view.pan_state.borrow_mut().take().is_some() {
-                            core.settle_view();
-                        }
-                        view.update_canvas_class(&snapshot);
-                        event.prevent_default();
-                    }
-                }
-                return;
-            }
-            let touch = touch_from_event(event, None, true);
-            let Some(touch) = touch else {
-                return;
-            };
-            let screen_x = touch.client_x() as f32;
-            let screen_y = touch.client_y() as f32;
-            let rect = canvas_for_touch.get_bounding_client_rect();
-            let local_x = screen_x - rect.left() as f32;
-            let local_y = screen_y - rect.top() as f32;
-                if let Some(layout) = view.preview_layout(&snapshot, &rect) {
-                    let target = view.preview_hit_test(&layout, local_x, local_y);
-                    if target != PreviewHoverTarget::None {
-                        let [drag_x, drag_y] =
-                            view.preview_local_point(&layout, local_x, local_y);
-                        view.begin_preview_drag(
-                            target,
-                            drag_x,
-                            drag_y,
-                            Some(touch.identifier()),
-                        );
-                        if matches!(target, PreviewHoverTarget::Body) {
-                            view.arm_preview_click(Some(touch.identifier()), local_x, local_y);
-                        } else {
-                            view.clear_preview_click();
-                        }
-                        view.update_canvas_class(&snapshot);
-                        view.request_render();
-                        event.prevent_default();
-                        return;
-                    }
-                }
-                view.clear_preview_click();
-            let Some((view_x, view_y)) =
-                screen_to_view_coords(screen_x, screen_y, &canvas_for_touch, snapshot.view)
-            else {
-                return;
-            };
-            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-            if let Some(piece_id) = view.pick_piece(px, py, &snapshot) {
-                *view.touch_drag_gate.borrow_mut() = Some(TouchDragGate {
-                    touch_id: touch.identifier(),
-                    start_x: px,
-                    start_y: py,
-                    moved: false,
-                });
-                view.dispatch_action(CoreAction::BeginDrag {
-                    piece_id,
-                    x: px,
-                    y: py,
-                    shift_key: false,
-                    rotate_mode: false,
-                    right_click: false,
-                    touch_id: Some(touch.identifier()),
-                });
-                let drag_snapshot = view.core.snapshot();
-                view.update_auto_pan(
-                    touch.client_x() as f32,
-                    touch.client_y() as f32,
-                    &drag_snapshot,
-                );
-                event.prevent_default();
-                return;
-            }
-            if view.hit_credit(view_x, view_y) {
-                open_credit_url();
-                event.prevent_default();
-                return;
-            }
-            *view.pan_state.borrow_mut() = Some(PanState {
-                last_x: screen_x,
-                last_y: screen_y,
-                touch_id: Some(touch.identifier()),
-            });
-            view.pinch_state.borrow_mut().take();
-            view.ui_credit_hovered.set(false);
-            view.update_canvas_class(&snapshot);
-            event.prevent_default();
-        },
-        );
-        listeners.push(listener);
-
         let window = web_sys::window().expect("window available");
-        let core = self.core.clone();
-        let canvas_for_drag = canvas.clone();
-        let view = Rc::clone(self);
-        let listener = EventListener::new_with_options(
-            &window,
-            "mousemove",
-            EventListenerOptions {
-                phase: EventListenerPhase::Capture,
-                passive: false,
-            },
-            move |event: &Event| {
-                let Some(event) = event.dyn_ref::<MouseEvent>() else {
-                    return;
-                };
-                let snapshot = core.snapshot();
-                let rect = canvas_for_drag.get_bounding_client_rect();
-                let local_x = event.client_x() as f32 - rect.left() as f32;
-                let local_y = event.client_y() as f32 - rect.top() as f32;
-                view.update_preview_click_movement(None, local_x, local_y);
-                if view.update_preview_drag(None, local_x, local_y, now_ms(), &snapshot, &rect) {
-                    view.request_render();
-                    event.prevent_default();
-                    return;
-                }
-                if !snapshot.dragging_members.is_empty() {
-                    view.update_auto_pan(event.client_x() as f32, event.client_y() as f32, &snapshot);
-                    let Some((view_x, view_y)) =
-                        event_to_canvas_coords(event, &canvas_for_drag, snapshot.view)
-                    else {
-                        return;
-                    };
-                    let (px, py) =
-                        workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-                    view.dispatch_action(CoreAction::DragMove { x: px, y: py });
-                    event.prevent_default();
-                    return;
-                }
-                let delta = {
-                    let mut pan_state = view.pan_state.borrow_mut();
-                    let Some(pan) = pan_state.as_mut() else {
-                        return;
-                    };
-                    let dx = event.client_x() as f32 - pan.last_x;
-                    let dy = event.client_y() as f32 - pan.last_y;
-                    pan.last_x = event.client_x() as f32;
-                    pan.last_y = event.client_y() as f32;
-                    screen_delta_to_world(dx, dy, &canvas_for_drag, snapshot.view)
-                };
-                if let Some((dx_world, dy_world)) = delta {
-                    core.pan_view(dx_world, dy_world);
-                }
-                event.prevent_default();
-            },
-        );
-        listeners.push(listener);
-
-        let view = Rc::clone(self);
-        let core = self.core.clone();
-        let canvas_for_up = canvas.clone();
-        let listener = EventListener::new_with_options(
-            &window,
-            "mouseup",
-            EventListenerOptions {
-                phase: EventListenerPhase::Capture,
-                passive: false,
-            },
-            move |event: &Event| {
-                let Some(event) = event.dyn_ref::<MouseEvent>() else {
-                    return;
-                };
-                let rect = canvas_for_up.get_bounding_client_rect();
-                let local_x = event.client_x() as f32 - rect.left() as f32;
-                let local_y = event.client_y() as f32 - rect.top() as f32;
-                view.update_preview_click_movement(None, local_x, local_y);
-                let preview_clicked = view.consume_preview_click(None);
-                let preview_dragged = view.end_preview_drag(None);
-                if preview_clicked {
-                    view.toggle_preview_revealed();
-                }
-                if preview_dragged || preview_clicked {
-                    view.request_render();
-                    event.prevent_default();
-                    return;
-                }
-                let snapshot = core.snapshot();
-                view.touch_drag_gate.borrow_mut().take();
-                view.stop_auto_pan();
-                let mut pan_cleared = false;
-                if view.pan_state.borrow().is_some() {
-                    view.pan_state.borrow_mut().take();
-                    pan_cleared = true;
-                    view.update_canvas_class(&snapshot);
-                }
-                if pan_cleared {
-                    core.settle_view();
-                }
-                if !snapshot.dragging_members.is_empty() {
-                    if let Some((view_x, view_y)) =
-                        event_to_canvas_coords(event, &canvas_for_up, snapshot.view)
-                    {
-                        let (px, py) = workspace_to_puzzle_coords(
-                            snapshot.layout.puzzle_scale,
-                            view_x,
-                            view_y,
-                        );
-                        view.dispatch_action(CoreAction::DragMove { x: px, y: py });
-                    }
-                }
-                view.dispatch_action(CoreAction::DragEnd { touch_id: None });
-                let snapshot = core.snapshot();
-                if !snapshot.dragging_members.is_empty() {
-                    return;
-                }
-                let hovered = event_to_canvas_coords(event, &canvas_for_up, snapshot.view)
-                    .and_then(|(view_x, view_y)| {
-                        let (px, py) = workspace_to_puzzle_coords(
-                            snapshot.layout.puzzle_scale,
-                            view_x,
-                            view_y,
-                        );
-                        view.pick_piece(px, py, &snapshot)
-                    });
-                view.dispatch_action(CoreAction::SetHovered { hovered });
-            },
-        );
-        listeners.push(listener);
-
-        let core = self.core.clone();
-        let canvas_for_touch_move = canvas.clone();
-        let view = Rc::clone(self);
-        let listener = EventListener::new_with_options(
-            &window,
-            "touchmove",
-            EventListenerOptions {
-                phase: EventListenerPhase::Capture,
-                passive: false,
-            },
-            move |event: &Event| {
-                let Some(event) = event.dyn_ref::<TouchEvent>() else {
-                    return;
-                };
-                let touch_count = event.touches().length();
-            if touch_count >= 2 {
-                event.prevent_default();
-            }
-            let snapshot = core.snapshot();
-            let pinch_state = *view.preview_drag.borrow();
-            if let Some(PreviewDragState::Pinch {
-                touch_a,
-                touch_b,
-                start_distance,
-                start_width,
-                anchor_rel,
-            }) = pinch_state
-            {
-                let touch_a = touch_from_event(event, Some(touch_a), false);
-                let touch_b = touch_from_event(event, Some(touch_b), false);
-                if let (Some(touch_a), Some(touch_b)) = (touch_a, touch_b) {
-                    let rect = canvas_for_touch_move.get_bounding_client_rect();
-                    if view.update_preview_pinch(
-                        &touch_a,
-                        &touch_b,
-                        &snapshot,
-                        &rect,
-                        now_ms(),
-                        start_distance,
-                        start_width,
-                        anchor_rel,
-                    ) {
-                        view.request_render();
-                        event.prevent_default();
-                        return;
-                    }
-                }
-            }
-            if let Some(pointer_id) = view.preview_drag_pointer_id() {
-                if let Some(touch) = touch_from_event(event, Some(pointer_id), false) {
-                    let rect = canvas_for_touch_move.get_bounding_client_rect();
-                    let local_x = touch.client_x() as f32 - rect.left() as f32;
-                    let local_y = touch.client_y() as f32 - rect.top() as f32;
-                    view.update_preview_click_movement(Some(pointer_id), local_x, local_y);
-                    if view.update_preview_drag(
-                        Some(pointer_id),
-                        local_x,
-                        local_y,
-                        now_ms(),
-                        &snapshot,
-                        &rect,
-                    ) {
-                        view.request_render();
-                        event.prevent_default();
-                        return;
-                    }
-                }
-            }
-            let pinch_opt = { view.pinch_state.borrow_mut().take() };
-                if let Some(mut pinch) = pinch_opt {
-                    let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
-                    let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
-                    if let (Some(touch_a), Some(touch_b)) = (touch_a, touch_b) {
-                        let center_x =
-                            (touch_a.client_x() as f32 + touch_b.client_x() as f32) * 0.5;
-                        let center_y =
-                            (touch_a.client_y() as f32 + touch_b.client_y() as f32) * 0.5;
-                        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
-                        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
-                        let distance = (dx * dx + dy * dy).sqrt();
-                        if distance > 0.0 {
-                            let factor = distance / pinch.last_distance;
-                            if factor.is_finite() && factor > 0.0 {
-                                if let Some((view_x, view_y)) = screen_to_view_coords(
-                                    center_x,
-                                    center_y,
-                                    &canvas_for_touch_move,
-                                    snapshot.view,
-                                ) {
-                                    core.zoom_view_at(factor, view_x, view_y);
-                                }
-                                pinch.last_distance = distance;
-                            }
-                        }
-                        if let Ok(mut slot) = view.pinch_state.try_borrow_mut() {
-                            *slot = Some(pinch);
-                        }
-                        event.prevent_default();
-                        return;
-                    }
-                }
-                if touch_count >= 2 {
-                    if let (Some(touch_a), Some(touch_b)) =
-                        (event.touches().item(0), event.touches().item(1))
-                    {
-                        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
-                        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
-                        let distance = (dx * dx + dy * dy).sqrt();
-                        if distance > 0.0 {
-                            *view.pinch_state.borrow_mut() = Some(PinchState {
-                                touch_a: touch_a.identifier(),
-                                touch_b: touch_b.identifier(),
-                                last_distance: distance,
-                            });
-                        }
-                    }
-                    return;
-                }
-                let delta = {
-                    let mut pan_state = view.pan_state.borrow_mut();
-                    if let Some(pan) = pan_state.as_mut() {
-                        if let Some(touch) = touch_from_event(event, pan.touch_id, false) {
-                            let dx = touch.client_x() as f32 - pan.last_x;
-                            let dy = touch.client_y() as f32 - pan.last_y;
-                            pan.last_x = touch.client_x() as f32;
-                            pan.last_y = touch.client_y() as f32;
-                            screen_delta_to_world(dx, dy, &canvas_for_touch_move, snapshot.view)
-                        } else {
-                            pan_state.take();
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                if let Some((dx_world, dy_world)) = delta {
-                    core.pan_view(dx_world, dy_world);
-                    event.prevent_default();
-                    return;
-                }
-                if snapshot.dragging_members.is_empty() {
-                    return;
-                }
-                if snapshot.drag_touch_id.is_none() {
-                    return;
-                }
-                let Some((view_x, view_y, _touch_id)) = touch_event_to_canvas_coords(
-                    event,
-                    &canvas_for_touch_move,
-                    snapshot.view,
-                    snapshot.drag_touch_id,
-                    false,
-                ) else {
-                    return;
-                };
-                let (px, py) =
-                    workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-                if let Some(gate) = view.touch_drag_gate.borrow_mut().as_mut() {
-                    if let Some(drag_id) = snapshot.drag_touch_id {
-                        if gate.touch_id != drag_id {
-                            gate.moved = true;
-                        } else if !gate.moved {
-                            let click_tolerance =
-                                snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
-                            let slop = screen_slop_to_puzzle(
-                                TOUCH_DRAG_SLOP_PX,
-                                &canvas_for_touch_move,
-                                snapshot.view,
-                                snapshot.layout.puzzle_scale,
-                            );
-                            let drag_tolerance = click_tolerance.max(slop);
-                            let dx = px - gate.start_x;
-                            let dy = py - gate.start_y;
-                            if dx * dx + dy * dy < drag_tolerance * drag_tolerance {
-                                event.prevent_default();
-                                return;
-                            }
-                            gate.moved = true;
-                        }
-                    }
-                }
-                if let Some(touch) = touch_from_event(event, snapshot.drag_touch_id, false) {
-                    view.update_auto_pan(
-                        touch.client_x() as f32,
-                        touch.client_y() as f32,
-                        &snapshot,
-                    );
-                }
-                view.dispatch_action(CoreAction::DragMove { x: px, y: py });
-                event.prevent_default();
-            },
-        );
-        listeners.push(listener);
-
-        let core = self.core.clone();
-        let view = Rc::clone(self);
-        let listener = EventListener::new_with_options(
-            &window,
-            "touchend",
-            EventListenerOptions {
-                phase: EventListenerPhase::Capture,
-                passive: false,
-            },
-            move |event: &Event| {
-                let Some(event) = event.dyn_ref::<TouchEvent>() else {
-                    return;
-                };
-                let changed = event.changed_touches();
-                let click_state = *view.preview_click.borrow();
-                if let Some(click) = click_state {
-                    if let Some(id) = click.pointer_id {
-                        let mut ended = false;
-                        let mut touch_opt = None;
-                        for idx in 0..changed.length() {
-                            if let Some(touch) = changed.item(idx) {
-                                if touch.identifier() == id {
-                                    ended = true;
-                                    touch_opt = Some(touch);
-                                    break;
-                                }
-                            }
-                        }
-                        if ended {
-                            if let Some(touch) = touch_opt {
-                                let rect = view.canvas.get_bounding_client_rect();
-                                let local_x = touch.client_x() as f32 - rect.left() as f32;
-                                let local_y = touch.client_y() as f32 - rect.top() as f32;
-                                view.update_preview_click_movement(Some(id), local_x, local_y);
-                            }
-                            let preview_clicked = view.consume_preview_click(Some(id));
-                            if preview_clicked {
-                                view.toggle_preview_revealed();
-                                view.request_render();
-                                event.prevent_default();
-                                return;
-                            }
-                        }
-                    }
-                }
-                let pinch_state = *view.preview_drag.borrow();
-                if let Some(PreviewDragState::Pinch { touch_a, touch_b, .. }) = pinch_state {
-                    let changed = event.changed_touches();
-                    let mut ended = false;
-                    for idx in 0..changed.length() {
-                        if let Some(touch) = changed.item(idx) {
-                            let id = touch.identifier();
-                            if id == touch_a || id == touch_b {
-                                ended = true;
-                                break;
-                            }
-                        }
-                    }
-                    if ended && view.end_preview_drag(None) {
-                        view.request_render();
-                        event.prevent_default();
-                        return;
-                    }
-                }
-                if let Some(pointer_id) = view.preview_drag_pointer_id() {
-                    let mut ended = false;
-                    for idx in 0..changed.length() {
-                        if let Some(touch) = changed.item(idx) {
-                            if touch.identifier() == pointer_id {
-                                ended = true;
-                                break;
-                            }
-                        }
-                    }
-                    if ended && view.end_preview_drag(Some(pointer_id)) {
-                        view.request_render();
-                        event.prevent_default();
-                        return;
-                    }
-                }
-                let snapshot = core.snapshot();
-                view.touch_drag_gate.borrow_mut().take();
-                view.stop_auto_pan();
-                let mut cleared = false;
-                if let Some(pinch) = view.pinch_state.borrow_mut().take() {
-                    let touch_a = touch_from_event(event, Some(pinch.touch_a), false);
-                    let touch_b = touch_from_event(event, Some(pinch.touch_b), false);
-                    if touch_a.is_some() && touch_b.is_some() {
-                        *view.pinch_state.borrow_mut() = Some(pinch);
-                    } else {
-                        cleared = true;
-                    }
-                }
-                {
-                    let mut pan_state = view.pan_state.borrow_mut();
-                    if let Some(pan) = pan_state.as_ref() {
-                        if touch_from_event(event, pan.touch_id, true).is_some() {
-                            pan_state.take();
-                            cleared = true;
-                        }
-                    }
-                }
-                if cleared {
-                view.update_canvas_class(&snapshot);
-                    core.settle_view();
-                }
-                if snapshot.drag_touch_id.is_some() {
-                    if let Some(touch) = touch_from_event(event, None, true) {
-                        view.dispatch_action(CoreAction::DragEnd {
-                            touch_id: Some(touch.identifier()),
-                        });
-                    } else {
-                        view.dispatch_action(CoreAction::DragEnd { touch_id: None });
-                    }
-                }
-            },
-        );
-        listeners.push(listener);
-
-        let view = Rc::clone(self);
-        let core = self.core.clone();
-        let listener = EventListener::new_with_options(
-            &window,
-            "touchcancel",
-            EventListenerOptions {
-                phase: EventListenerPhase::Capture,
-                passive: false,
-            },
-            move |_event: &Event| {
-                view.pan_state.borrow_mut().take();
-                view.pinch_state.borrow_mut().take();
-                view.touch_drag_gate.borrow_mut().take();
-                view.preview_drag.borrow_mut().take();
-                view.preview_click.borrow_mut().take();
-                view.preview_velocity.set([0.0, 0.0]);
-                view.stop_auto_pan();
-                let snapshot = core.snapshot();
-                view.update_canvas_class(&snapshot);
-                core.settle_view();
-                view.dispatch_action(CoreAction::DragEnd { touch_id: None });
-            },
-        );
-        listeners.push(listener);
-
         let view = Rc::clone(self);
         let listener = EventListener::new(&window, "resize", move |_event: &Event| {
             view.update_viewport_size();
@@ -1744,11 +1611,9 @@ impl WgpuView {
     }
 
     fn arm_preview_click(&self, pointer_id: Option<i32>, local_x: f32, local_y: f32) {
-        *self.preview_click.borrow_mut() = Some(PreviewClickState {
-            pointer_id,
-            start: [local_x, local_y],
-            moved: false,
-        });
+        let mut gesture = ClickGesture::new_default();
+        gesture.arm(local_x, local_y, now_ms());
+        *self.preview_click.borrow_mut() = Some(PreviewClickState { pointer_id, gesture });
     }
 
     fn clear_preview_click(&self) {
@@ -1763,11 +1628,7 @@ impl WgpuView {
         if click.pointer_id != pointer_id {
             return;
         }
-        let dx = local_x - click.start[0];
-        let dy = local_y - click.start[1];
-        if dx * dx + dy * dy > PREVIEW_CLICK_SLOP * PREVIEW_CLICK_SLOP {
-            click.moved = true;
-        }
+        click.gesture.update(local_x, local_y);
     }
 
     fn consume_preview_click(&self, pointer_id: Option<i32>) -> bool {
@@ -1779,7 +1640,7 @@ impl WgpuView {
             *click_ref = Some(click);
             return false;
         }
-        !click.moved
+        click.gesture.is_click(now_ms())
     }
 
     fn preview_aspect(info: &PuzzleInfo) -> f32 {
@@ -1988,8 +1849,10 @@ impl WgpuView {
 
     fn begin_preview_pinch(
         &self,
-        touch_a: &Touch,
-        touch_b: &Touch,
+        pointer_a: i32,
+        pointer_b: i32,
+        screen_a: [f32; 2],
+        screen_b: [f32; 2],
         snapshot: &AppSnapshot,
         canvas_rect: &web_sys::DomRect,
     ) -> bool {
@@ -2011,10 +1874,8 @@ impl WgpuView {
         if box_w <= 0.0 || box_h <= 0.0 {
             return false;
         }
-        let mid_x = (touch_a.client_x() as f32 + touch_b.client_x() as f32) * 0.5
-            - canvas_rect.left() as f32;
-        let mid_y = (touch_a.client_y() as f32 + touch_b.client_y() as f32) * 0.5
-            - canvas_rect.top() as f32;
+        let mid_x = (screen_a[0] + screen_b[0]) * 0.5 - canvas_rect.left() as f32;
+        let mid_y = (screen_a[1] + screen_b[1]) * 0.5 - canvas_rect.top() as f32;
         let center = [pos[0] + box_w * 0.5, pos[1] + box_h * 0.5];
         let dx = mid_x - center[0];
         let dy = mid_y - center[1];
@@ -2022,15 +1883,15 @@ impl WgpuView {
         let mut anchor_rel = [0.5 + ux / box_w, 0.5 + uy / box_h];
         anchor_rel[0] = anchor_rel[0].clamp(0.0, 1.0);
         anchor_rel[1] = anchor_rel[1].clamp(0.0, 1.0);
-        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
-        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+        let dx = screen_b[0] - screen_a[0];
+        let dy = screen_b[1] - screen_a[1];
         let distance = (dx * dx + dy * dy).sqrt();
         if distance <= 0.0 || !distance.is_finite() {
             return false;
         }
         *self.preview_drag.borrow_mut() = Some(PreviewDragState::Pinch {
-            touch_a: touch_a.identifier(),
-            touch_b: touch_b.identifier(),
+            touch_a: pointer_a,
+            touch_b: pointer_b,
             start_distance: distance,
             start_width: width,
             anchor_rel,
@@ -2042,8 +1903,8 @@ impl WgpuView {
 
     fn update_preview_pinch(
         &self,
-        touch_a: &Touch,
-        touch_b: &Touch,
+        screen_a: [f32; 2],
+        screen_b: [f32; 2],
         snapshot: &AppSnapshot,
         canvas_rect: &web_sys::DomRect,
         now_ms: f32,
@@ -2064,8 +1925,8 @@ impl WgpuView {
             Self::preview_frame_max_width(info, snapshot.layout, viewport_w, viewport_h);
         let (min_w, max_w) =
             self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
-        let dx = touch_b.client_x() as f32 - touch_a.client_x() as f32;
-        let dy = touch_b.client_y() as f32 - touch_a.client_y() as f32;
+        let dx = screen_b[0] - screen_a[0];
+        let dy = screen_b[1] - screen_a[1];
         let distance = (dx * dx + dy * dy).sqrt();
         if start_distance <= 0.0 || !distance.is_finite() {
             return false;
@@ -2077,10 +1938,8 @@ impl WgpuView {
         }
         width = width.clamp(min_w, max_w);
         let (box_w, box_h, _, _) = Self::preview_box_metrics(width, aspect);
-        let mid_x = (touch_a.client_x() as f32 + touch_b.client_x() as f32) * 0.5
-            - canvas_rect.left() as f32;
-        let mid_y = (touch_a.client_y() as f32 + touch_b.client_y() as f32) * 0.5
-            - canvas_rect.top() as f32;
+        let mid_x = (screen_a[0] + screen_b[0]) * 0.5 - canvas_rect.left() as f32;
+        let mid_y = (screen_a[1] + screen_b[1]) * 0.5 - canvas_rect.top() as f32;
         let half_w = box_w * 0.5;
         let half_h = box_h * 0.5;
         let vx = (anchor_rel[0] - 0.5) * box_w;
@@ -2274,13 +2133,6 @@ impl WgpuView {
         self.preview_velocity.set(velocity);
         self.preview_motion_last_ms.set(now_ms);
         true
-    }
-
-    fn preview_drag_pointer_id(&self) -> Option<i32> {
-        self.preview_drag
-            .borrow()
-            .as_ref()
-            .and_then(|drag| drag.pointer_id())
     }
 
     fn end_preview_drag(&self, pointer_id: Option<i32>) -> bool {
@@ -3245,112 +3097,6 @@ fn workspace_fade_scale(x: f32, y: f32, layout: WorkspaceLayout, view: ViewRect)
     }
     let t = (dist / falloff).clamp(0.0, 1.0);
     1.0 - smoothstep(t)
-}
-
-fn screen_to_view_coords(
-    screen_x: f32,
-    screen_y: f32,
-    canvas: &HtmlCanvasElement,
-    view: ViewRect,
-) -> Option<(f32, f32)> {
-    let rect = canvas.get_bounding_client_rect();
-    let rect_width = rect.width() as f32;
-    let rect_height = rect.height() as f32;
-    if rect_width <= 0.0 || rect_height <= 0.0 {
-        return None;
-    }
-    let rect_left = rect.left() as f32;
-    let rect_top = rect.top() as f32;
-    let x = view.min_x + (screen_x - rect_left) * view.width / rect_width;
-    let y = view.min_y + (screen_y - rect_top) * view.height / rect_height;
-    Some((x, y))
-}
-
-fn screen_delta_to_world(
-    dx_screen: f32,
-    dy_screen: f32,
-    canvas: &HtmlCanvasElement,
-    view: ViewRect,
-) -> Option<(f32, f32)> {
-    let rect = canvas.get_bounding_client_rect();
-    let rect_width = rect.width() as f32;
-    let rect_height = rect.height() as f32;
-    if rect_width <= 0.0 || rect_height <= 0.0 {
-        return None;
-    }
-    let scale_x = view.width / rect_width;
-    let scale_y = view.height / rect_height;
-    Some((-dx_screen * scale_x, -dy_screen * scale_y))
-}
-
-fn screen_slop_to_puzzle(
-    slop_px: f32,
-    canvas: &HtmlCanvasElement,
-    view: ViewRect,
-    puzzle_scale: f32,
-) -> f32 {
-    let rect = canvas.get_bounding_client_rect();
-    let rect_width = rect.width() as f32;
-    let rect_height = rect.height() as f32;
-    if rect_width <= 0.0 || rect_height <= 0.0 {
-        return 0.0;
-    }
-    let scale_x = view.width / rect_width;
-    let scale_y = view.height / rect_height;
-    let slop_view = slop_px * scale_x.max(scale_y);
-    let puzzle_scale = puzzle_scale.max(1.0e-4);
-    slop_view / puzzle_scale
-}
-
-fn event_to_canvas_coords(
-    event: &MouseEvent,
-    canvas: &HtmlCanvasElement,
-    view: ViewRect,
-) -> Option<(f32, f32)> {
-    screen_to_view_coords(
-        event.client_x() as f32,
-        event.client_y() as f32,
-        canvas,
-        view,
-    )
-}
-
-fn touch_from_event(event: &TouchEvent, touch_id: Option<i32>, use_changed: bool) -> Option<Touch> {
-    let list = if use_changed { event.changed_touches() } else { event.touches() };
-    if let Some(id) = touch_id {
-        for idx in 0..list.length() {
-            if let Some(touch) = list.item(idx) {
-                if touch.identifier() == id {
-                    return Some(touch);
-                }
-            }
-        }
-        None
-    } else {
-        list.item(0)
-    }
-}
-
-fn touch_event_to_canvas_coords(
-    event: &TouchEvent,
-    canvas: &HtmlCanvasElement,
-    view: ViewRect,
-    touch_id: Option<i32>,
-    use_changed: bool,
-) -> Option<(f32, f32, i32)> {
-    let touch = touch_from_event(event, touch_id, use_changed)?;
-    let (x, y) = screen_to_view_coords(
-        touch.client_x() as f32,
-        touch.client_y() as f32,
-        canvas,
-        view,
-    )?;
-    Some((x, y, touch.identifier()))
-}
-
-fn workspace_to_puzzle_coords(scale: f32, x: f32, y: f32) -> (f32, f32) {
-    let scale = scale.max(1.0e-4);
-    (x / scale, y / scale)
 }
 
 fn drag_angle_for_group(count: usize) -> f32 {

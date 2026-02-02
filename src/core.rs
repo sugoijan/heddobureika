@@ -30,10 +30,7 @@ pub(crate) const AUTO_PAN_SPEED_RATIO_MIN: f32 = 0.1;
 pub(crate) const AUTO_PAN_SPEED_RATIO_MAX: f32 = 2.0;
 pub(crate) const AUTO_PAN_SPEED_RATIO_DEFAULT: f32 = 1.0;
 pub(crate) const CLICK_MOVE_RATIO: f32 = 0.01;
-pub(crate) const CLICK_MAX_DURATION_MS: f32 = 240.0;
-pub(crate) const CLICK_QUICK_TAP_MS: f32 = 120.0;
 pub(crate) const TOUCH_DRAG_SLOP_PX: f32 = 4.0;
-pub(crate) const SNAP_ANIMATION_MS: f32 = 160.0;
 pub(crate) const RUBBER_BAND_RATIO: f32 = 0.35;
 pub(crate) const TAB_WIDTH_MIN: f32 = 0.2;
 pub(crate) const TAB_WIDTH_MAX: f32 = 0.72;
@@ -124,70 +121,6 @@ pub(crate) struct WarpField<'a> {
     pub(crate) height: f32,
     pub(crate) horizontal: &'a [LineWave],
     pub(crate) vertical: &'a [LineWave],
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DragState {
-    pub(crate) start_x: f32,
-    pub(crate) start_y: f32,
-    pub(crate) start_time: f32,
-    pub(crate) primary_id: usize,
-    pub(crate) anchor_id: usize,
-    pub(crate) anchor_pos: (f32, f32),
-    pub(crate) anchor_rot: f32,
-    pub(crate) touch_id: Option<i32>,
-    pub(crate) rotate_mode: bool,
-    pub(crate) right_click: bool,
-    pub(crate) cursor_x: f32,
-    pub(crate) cursor_y: f32,
-    pub(crate) pivot_x: f32,
-    pub(crate) pivot_y: f32,
-    pub(crate) start_angle: f32,
-    pub(crate) members: Vec<usize>,
-    pub(crate) start_positions: Vec<(f32, f32)>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum AnimationKind {
-    Pivot {
-        pivot_x: f32,
-        pivot_y: f32,
-        delta: f32,
-    },
-    Anchor {
-        anchor_id: usize,
-        start_center: (f32, f32),
-        target_center: (f32, f32),
-        start_rot: f32,
-        target_rot: f32,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RotationAnimation {
-    pub(crate) start_time: f32,
-    pub(crate) duration: f32,
-    pub(crate) members: Vec<usize>,
-    pub(crate) start_positions: Vec<(f32, f32)>,
-    pub(crate) start_rotations: Vec<f32>,
-    pub(crate) kind: AnimationKind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct QueuedRotation {
-    pub(crate) members: Vec<usize>,
-    pub(crate) pivot_x: f32,
-    pub(crate) pivot_y: f32,
-    pub(crate) noise: f32,
-    pub(crate) reverse: bool,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum PreviewCorner {
-    BottomLeft,
-    BottomRight,
-    TopLeft,
-    TopRight,
 }
 
 #[derive(

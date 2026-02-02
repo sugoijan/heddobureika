@@ -191,7 +191,5 @@ impl WgpuRenderer {
         }
     }
 
-    pub(crate) fn set_show_frame(&mut self, _value: bool) {}
-
     pub(crate) fn render(&mut self) {}
 }

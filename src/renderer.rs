@@ -2358,10 +2358,6 @@ impl WgpuRenderer {
         self.frame_stroke_instance_count = frame_stroke_instances.len() as u32;
     }
 
-    pub(crate) fn set_show_frame(&mut self, enabled: bool) {
-        self.show_frame = enabled;
-    }
-
     pub(crate) fn set_edge_aa(&mut self, edge_aa: f32) {
         self.globals.edge_aa = edge_aa.max(0.0);
     }

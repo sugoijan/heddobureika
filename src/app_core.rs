@@ -7,6 +7,7 @@ use js_sys::{Date, Function, Reflect};
 use wasm_bindgen::JsCast;
 
 use crate::core::*;
+use crate::input::ClickGesture;
 use crate::runtime::CoreAction;
 use heddobureika_core::{CoreSnapshot, CoreState, GameRules, PuzzleInfo};
 
@@ -61,7 +62,7 @@ pub(crate) struct AppSnapshot {
     pub(crate) active_id: Option<usize>,
     pub(crate) dragging_members: Vec<usize>,
     pub(crate) drag_cursor: Option<(f32, f32)>,
-    pub(crate) drag_touch_id: Option<i32>,
+    pub(crate) drag_pointer_id: Option<i32>,
     pub(crate) drag_rotate_mode: bool,
     pub(crate) drag_right_click: bool,
     pub(crate) drag_primary_id: Option<usize>,
@@ -153,7 +154,7 @@ struct DragState {
     start_y: f32,
     cursor_x: f32,
     cursor_y: f32,
-    start_time: f32,
+    click_gesture: ClickGesture,
     primary_id: usize,
     members: Vec<usize>,
     start_positions: Vec<(f32, f32)>,
@@ -163,7 +164,7 @@ struct DragState {
     pivot_x: f32,
     pivot_y: f32,
     start_angle: f32,
-    touch_id: Option<i32>,
+    pointer_id: Option<i32>,
 }
 
 struct AppState {
@@ -410,7 +411,7 @@ impl AppCore {
         shift_key: bool,
         rotate_mode: bool,
         right_click: bool,
-        touch_id: Option<i32>,
+        pointer_id: Option<i32>,
     ) {
         let mut state = self.state.borrow_mut();
         let total = (state.core.grid.cols as usize) * (state.core.grid.rows as usize);
@@ -445,6 +446,10 @@ impl AppCore {
         }
         let piece_width = state.core.piece_width;
         let piece_height = state.core.piece_height;
+        let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+        let now_ms = now_ms_f32();
+        let mut click_gesture = ClickGesture::new_with_slop(click_tolerance);
+        click_gesture.arm(x, y, now_ms);
         let base_pos = state
             .core
             .positions
@@ -462,7 +467,7 @@ impl AppCore {
             start_y: y,
             cursor_x: x,
             cursor_y: y,
-            start_time: now_ms_f32(),
+            click_gesture,
             primary_id: piece_id,
             members: members.clone(),
             start_positions,
@@ -472,7 +477,7 @@ impl AppCore {
             pivot_x,
             pivot_y,
             start_angle,
-            touch_id,
+            pointer_id,
         });
         state.dragging_members = members.clone();
         state.active_id = Some(piece_id);
@@ -489,6 +494,7 @@ impl AppCore {
         };
         drag.cursor_x = x;
         drag.cursor_y = y;
+        drag.click_gesture.update(x, y);
         if drag.rotate_mode {
             let piece_width = state.core.piece_width;
             let piece_height = state.core.piece_height;
@@ -605,16 +611,16 @@ impl AppCore {
         self.notify();
     }
 
-    pub(crate) fn drag_end(&self, touch_id: Option<i32>) {
+    pub(crate) fn drag_end(&self, pointer_id: Option<i32>) {
         let mut state = self.state.borrow_mut();
         let Some(drag) = state.drag_state.take() else {
             return;
         };
-        if drag.touch_id.is_some() && touch_id.is_none() {
+        if drag.pointer_id.is_some() && pointer_id.is_none() {
             state.drag_state = Some(drag);
             return;
         }
-        if touch_id.is_some() && drag.touch_id != touch_id {
+        if pointer_id.is_some() && drag.pointer_id != pointer_id {
             state.drag_state = Some(drag);
             return;
         }
@@ -655,11 +661,6 @@ impl AppCore {
         let rotation_enabled = state.core.rules.rotation_enabled;
         let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
         let click_tolerance_sq = click_tolerance * click_tolerance;
-        let dx = drag.cursor_x - drag.start_x;
-        let dy = drag.cursor_y - drag.start_y;
-        let dist = (dx * dx + dy * dy).sqrt();
-        let elapsed = now_ms_f32() - drag.start_time;
-        let quick_click = elapsed <= CLICK_QUICK_TAP_MS;
         let moved = drag
             .members
             .iter()
@@ -671,8 +672,9 @@ impl AppCore {
                 let dy = current.1 - start.1;
                 dx * dx + dy * dy > click_tolerance_sq
             });
-        let is_click =
-            !moved && ((dist <= click_tolerance && elapsed <= CLICK_MAX_DURATION_MS) || quick_click);
+        let is_click = drag
+            .click_gesture
+            .is_click_with_external_moved(now_ms_f32(), moved);
         let click_id = drag.primary_id;
         let was_flipped = state.core.flips.get(click_id).copied().unwrap_or(false);
         if is_click && drag.rotate_mode {
@@ -1373,7 +1375,7 @@ impl AppCore {
                 shift_key,
                 rotate_mode,
                 right_click,
-                touch_id,
+                pointer_id,
             } => self.begin_drag(
                 piece_id,
                 x,
@@ -1381,10 +1383,10 @@ impl AppCore {
                 shift_key,
                 rotate_mode,
                 right_click,
-                touch_id,
+                pointer_id,
             ),
             CoreAction::DragMove { x, y } => self.drag_move(x, y),
-            CoreAction::DragEnd { touch_id } => self.drag_end(touch_id),
+            CoreAction::DragEnd { pointer_id } => self.drag_end(pointer_id),
             CoreAction::SetHovered { hovered } => self.set_hovered(hovered),
             CoreAction::Sync(_) => {}
         }
@@ -1412,7 +1414,7 @@ fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
         active_id: None,
         dragging_members: Vec::new(),
         drag_cursor: None,
-        drag_touch_id: None,
+        drag_pointer_id: None,
         drag_rotate_mode: false,
         drag_right_click: false,
         drag_primary_id: None,
@@ -1443,7 +1445,7 @@ fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
         .drag_state
         .as_ref()
         .map(|drag| (drag.cursor_x, drag.cursor_y));
-    snapshot.drag_touch_id = state.drag_state.as_ref().and_then(|drag| drag.touch_id);
+    snapshot.drag_pointer_id = state.drag_state.as_ref().and_then(|drag| drag.pointer_id);
     snapshot.drag_rotate_mode = state
         .drag_state
         .as_ref()
