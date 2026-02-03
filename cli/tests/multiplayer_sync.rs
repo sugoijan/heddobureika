@@ -2,7 +2,8 @@ use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::catalog::DEFAULT_PUZZLE_SLUG;
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::{
-    AdminMsg, ClientMsg, PuzzleInfo, PuzzleStateSnapshot, RoomPersistence, ServerMsg,
+    AdminMsg, ClientMsg, PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleStateSnapshot,
+    RoomPersistence, ServerMsg,
 };
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use rand::Rng;
@@ -107,7 +108,9 @@ fn build_init_payload() -> (PuzzleInfo, PuzzleStateSnapshot) {
     let group_order = (0..(cols * rows)).map(|id| id as u32).collect();
     let puzzle = PuzzleInfo {
         label: "Test".to_string(),
-        image_src: "test://image".to_string(),
+        image_ref: PuzzleImageRef::BuiltIn {
+            slug: DEFAULT_PUZZLE_SLUG.to_string(),
+        },
         rows,
         cols,
         shape_seed: 0,
@@ -139,9 +142,13 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
     let (mut admin_write, mut admin_read) = admin_ws.split();
     let admin_msg = AdminMsg::Create {
         persistence: RoomPersistence::Durable,
-        puzzle: DEFAULT_PUZZLE_SLUG.to_string(),
-        pieces: None,
-        seed: None,
+        puzzle: PuzzleSpec {
+            image_ref: PuzzleImageRef::BuiltIn {
+                slug: DEFAULT_PUZZLE_SLUG.to_string(),
+            },
+            pieces: None,
+            seed: None,
+        },
     };
     if let Some(bytes) = encode(&admin_msg) {
         admin_write.send(Message::Binary(bytes.into())).await?;

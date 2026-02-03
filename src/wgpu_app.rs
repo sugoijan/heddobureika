@@ -31,7 +31,9 @@ use crate::renderer::{
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
 use crate::view_runtime;
-use heddobureika_core::PuzzleInfo;
+use heddobureika_core::{PuzzleImageRef, PuzzleInfo};
+use crate::persisted_store;
+use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
@@ -335,7 +337,7 @@ pub(crate) fn request_render() {
 
 #[derive(Clone, PartialEq)]
 struct PuzzleKey {
-    src: String,
+    image_ref: PuzzleImageRef,
     cols: u32,
     rows: u32,
     width: u32,
@@ -345,7 +347,7 @@ struct PuzzleKey {
 impl PuzzleKey {
     fn from_info(info: &PuzzleInfo) -> Self {
         Self {
-            src: info.image_src.clone(),
+            image_ref: info.image_ref.clone(),
             cols: info.cols,
             rows: info.rows,
             width: info.image_width,
@@ -473,6 +475,11 @@ struct WgpuView {
     last_view_size: Cell<(u32, u32)>,
     puzzle_epoch: Cell<u64>,
     last_puzzle: RefCell<Option<PuzzleKey>>,
+    private_image_url: RefCell<Option<String>>,
+    private_image_hash: RefCell<Option<String>>,
+    private_image_loading: Cell<bool>,
+    private_image_error: RefCell<Option<String>>,
+    multiplayer_active: Cell<bool>,
     hooks: RefCell<Option<ViewHooks>>,
     sync_hook: RefCell<Option<sync_runtime::SyncViewHookHandle>>,
     preview_revealed: Cell<bool>,
@@ -530,6 +537,11 @@ impl WgpuView {
             last_view_size: Cell::new((0, 0)),
             puzzle_epoch: Cell::new(0),
             last_puzzle: RefCell::new(None),
+            private_image_url: RefCell::new(None),
+            private_image_hash: RefCell::new(None),
+            private_image_loading: Cell::new(false),
+            private_image_error: RefCell::new(None),
+            multiplayer_active: Cell::new(false),
             hooks: RefCell::new(None),
             sync_hook: RefCell::new(None),
             preview_revealed: Cell::new(false),
@@ -581,6 +593,7 @@ impl WgpuView {
     fn reset_puzzle_cache(&self) {
         self.puzzle_epoch
             .set(self.puzzle_epoch.get().wrapping_add(1));
+        self.clear_private_image_cache();
         self.creating.set(false);
         self.renderer.borrow_mut().take();
         self.mask_atlas.borrow_mut().take();
@@ -593,6 +606,76 @@ impl WgpuView {
         self.preview_velocity.set([0.0, 0.0]);
         self.preview_motion_last_ms.set(0.0);
         *self.image.borrow_mut() = None;
+    }
+
+    fn clear_private_image_cache(&self) {
+        if let Some(url) = self.private_image_url.borrow_mut().take() {
+            revoke_object_url(&url);
+        }
+        self.private_image_hash.borrow_mut().take();
+        self.private_image_error.borrow_mut().take();
+        self.private_image_loading.set(false);
+    }
+
+    fn note_private_image_error(&self, hash: &str, message: &str) {
+        let mut last = self.private_image_error.borrow_mut();
+        if last.as_deref() == Some(hash) {
+            return;
+        }
+        *last = Some(hash.to_string());
+        if !self.multiplayer_active.get() {
+            boot::fail("image-missing", message, "Re-upload the image to this browser.");
+        }
+        self.private_image_loading.set(false);
+    }
+
+    fn ensure_private_image_src(self: &Rc<Self>, hash: &str, key: PuzzleKey) -> Option<String> {
+        if self.private_image_hash.borrow().as_deref() == Some(hash) {
+            if let Some(url) = self.private_image_url.borrow().as_ref() {
+                return Some(url.clone());
+            }
+        }
+        if self.private_image_loading.get() {
+            return None;
+        }
+        self.private_image_loading.set(true);
+        let hash_value = hash.to_string();
+        let view = Rc::clone(self);
+        spawn_local(async move {
+            let entry = match persisted_store::load_private_image(&hash_value).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    view.note_private_image_error(&hash_value, "Private image is missing.");
+                    return;
+                }
+                Err(message) => {
+                    view.note_private_image_error(&hash_value, &message);
+                    return;
+                }
+            };
+            let url = match create_object_url(&entry.bytes, &entry.mime) {
+                Ok(url) => url,
+                Err(_) => {
+                    view.note_private_image_error(&hash_value, "Failed to prepare private image.");
+                    return;
+                }
+            };
+            if !view.is_current_puzzle(&key) {
+                revoke_object_url(&url);
+                view.private_image_loading.set(false);
+                return;
+            }
+            *view.private_image_url.borrow_mut() = Some(url.clone());
+            *view.private_image_hash.borrow_mut() = Some(hash_value.clone());
+            view.private_image_loading.set(false);
+            let mut updated = entry;
+            updated.last_used_at = js_sys::Date::now().max(0.0) as u64;
+            let _ = persisted_store::save_private_image(&hash_value, updated).await;
+            let image_max_dim = view.core.image_max_dim();
+            let render_scale = view.wgpu_settings.borrow().render_scale;
+            view.load_image_for_puzzle(key, url, image_max_dim, render_scale);
+        });
+        None
     }
 
     fn update_viewport_size(&self) {
@@ -733,7 +816,7 @@ impl WgpuView {
         if let Some(piece_id) = self.pick_piece(px, py, &snapshot) {
             self.touch_drag_gate.borrow_mut().take();
             let right_click = button == 2;
-            if kind == PointerKind::Touch {
+            if matches!(kind, PointerKind::Touch | PointerKind::Pen) {
                 *self.touch_drag_gate.borrow_mut() = Some(TouchDragGate {
                     pointer_id,
                     start_x: px,
@@ -741,6 +824,12 @@ impl WgpuView {
                     moved: false,
                 });
             }
+            let click_slop = screen_slop_to_puzzle(
+                TOUCH_DRAG_SLOP_PX,
+                &self.canvas,
+                snapshot.view,
+                snapshot.layout.puzzle_scale,
+            );
             self.dispatch_action(CoreAction::BeginDrag {
                 piece_id,
                 x: px,
@@ -748,6 +837,7 @@ impl WgpuView {
                 shift_key: event.shift_key(),
                 rotate_mode: event.ctrl_key(),
                 right_click,
+                click_slop,
                 pointer_id: Some(pointer_id),
             });
             let drag_snapshot = self.core.snapshot();
@@ -1024,9 +1114,16 @@ impl WgpuView {
         self.update_preview_click_movement(Some(pointer_id), local_x, local_y);
         let preview_clicked = self.consume_preview_click(Some(pointer_id));
         let mut preview_dragged = false;
-        if let Some(PreviewDragState::Pinch { touch_a, touch_b, .. }) =
-            *self.preview_drag.borrow()
-        {
+        let pinch_ids = {
+            let drag_ref = self.preview_drag.borrow();
+            match drag_ref.as_ref() {
+                Some(PreviewDragState::Pinch { touch_a, touch_b, .. }) => {
+                    Some((*touch_a, *touch_b))
+                }
+                _ => None,
+            }
+        };
+        if let Some((touch_a, touch_b)) = pinch_ids {
             if pointer_id == touch_a || pointer_id == touch_b {
                 preview_dragged = self.end_preview_drag(None);
             }
@@ -1150,6 +1247,7 @@ impl WgpuView {
     fn load_image_for_puzzle(
         self: &Rc<Self>,
         key: PuzzleKey,
+        src: String,
         image_max_dim: u32,
         render_scale: f32,
     ) {
@@ -1158,7 +1256,8 @@ impl WgpuView {
         let img_clone = img.clone();
         let view = Rc::clone(self);
         let key_for_onload = key.clone();
-        let src = key.src.clone();
+        let key_for_error = key.clone();
+        let src = src;
         let render_scale = render_scale.clamp(WGPU_RENDER_SCALE_MIN, WGPU_RENDER_SCALE_MAX);
         let source_cap = (IMAGE_MAX_DIMENSION_MAX as f32 * WGPU_RENDER_SCALE_MAX)
             .round()
@@ -1217,8 +1316,11 @@ impl WgpuView {
             {
                 Some(ctx) => ctx,
                 None => {
-                    view.set_image(img_clone.clone());
-                    view.request_render();
+                    boot::fail(
+                        "image-read",
+                        "Failed to prepare the puzzle image.",
+                        "Check the URL or CORS headers.",
+                    );
                     return;
                 }
             };
@@ -1233,15 +1335,21 @@ impl WgpuView {
                 )
                 .is_err()
             {
-                view.set_image(img_clone.clone());
-                view.request_render();
+                boot::fail(
+                    "image-read",
+                    "Failed to read the puzzle image.",
+                    "Check the URL or CORS headers.",
+                );
                 return;
             }
             let data_url = match canvas.to_data_url() {
                 Ok(data_url) => data_url,
                 Err(_) => {
-                    view.set_image(img_clone.clone());
-                    view.request_render();
+                    boot::fail(
+                        "image-read",
+                        "Failed to read the puzzle image.",
+                        "Check the URL or CORS headers.",
+                    );
                     return;
                 }
             };
@@ -1268,6 +1376,19 @@ impl WgpuView {
             onload_scaled.forget();
         }));
         img.set_onload(Some(onload.as_ref().unchecked_ref()));
+        let view_error = Rc::clone(self);
+        let onerror = Closure::<dyn FnMut()>::wrap(Box::new(move || {
+            if !view_error.is_current_puzzle(&key_for_error) {
+                return;
+            }
+            boot::fail(
+                "image-load",
+                "Failed to load the puzzle image.",
+                "Check the URL or CORS headers.",
+            );
+        }));
+        img.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        onerror.forget();
         img.set_src(&src);
         onload.forget();
     }
@@ -1275,6 +1396,7 @@ impl WgpuView {
     fn ensure_puzzle_image(self: &Rc<Self>, snapshot: &AppSnapshot) {
         let Some(info) = snapshot.puzzle_info.as_ref() else {
             self.last_puzzle.replace(None);
+            self.clear_private_image_cache();
             return;
         };
         let key = PuzzleKey::from_info(info);
@@ -1290,9 +1412,16 @@ impl WgpuView {
             *last = Some(key.clone());
         }
         self.reset_puzzle_cache();
+        let src = match &info.image_ref {
+            PuzzleImageRef::Private { hash } => self.ensure_private_image_src(hash, key.clone()),
+            _ => resolve_puzzle_image_src(&info.image_ref),
+        };
+        let Some(src) = src else {
+            return;
+        };
         let image_max_dim = self.core.image_max_dim();
         let render_scale = self.wgpu_settings.borrow().render_scale;
-        self.load_image_for_puzzle(key, image_max_dim, render_scale);
+        self.load_image_for_puzzle(key, src, image_max_dim, render_scale);
     }
 
     fn install_listeners(self: &Rc<Self>) {
@@ -2716,6 +2845,8 @@ impl WgpuView {
         if force_fps_fallback {
             self.force_fps_fallback.set(false);
         }
+        self.multiplayer_active
+            .set(matches!(sync_view.mode(), InitMode::Online));
         self.ensure_puzzle_image(snapshot);
         let disconnected =
             matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
@@ -3019,11 +3150,17 @@ impl WgpuView {
                     *view.renderer.borrow_mut() = Some(renderer);
                 }
                 Err(err) => {
-                    boot::fail(
-                        "renderer-init",
-                        "Failed to initialize the renderer.",
-                        "Check browser support or try a different browser.",
-                    );
+                    let (message, hint) = match err.as_string().as_deref() {
+                        Some("image_read_failed") | Some("image_draw_failed") => (
+                            "Failed to read the puzzle image.",
+                            "Check the URL or CORS headers.",
+                        ),
+                        _ => (
+                            "Failed to initialize the renderer.",
+                            "Check browser support or try a different browser.",
+                        ),
+                    };
+                    boot::fail("renderer-init", message, hint);
                     web_sys::console::error_1(&err);
                 }
             }

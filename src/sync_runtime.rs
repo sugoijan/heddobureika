@@ -117,6 +117,8 @@ fn merge_hooks(primary: &SyncHooks, secondary: &SyncHooks) -> SyncHooks {
     let on_remote_update_b = secondary.on_remote_update.clone();
     let on_event_a = primary.on_event.clone();
     let on_event_b = secondary.on_event.clone();
+    let on_asset_a = primary.on_asset.clone();
+    let on_asset_b = secondary.on_asset.clone();
     SyncHooks {
         on_remote_action: Rc::new(move |action| {
             on_remote_action_a(action.clone());
@@ -137,6 +139,10 @@ fn merge_hooks(primary: &SyncHooks, secondary: &SyncHooks) -> SyncHooks {
         on_event: Rc::new(move |event| {
             on_event_a(event.clone());
             on_event_b(event);
+        }),
+        on_asset: Rc::new(move |event| {
+            on_asset_a(event.clone());
+            on_asset_b(event);
         }),
     }
 }

@@ -12,6 +12,7 @@ mod local_snapshot;
 mod model;
 mod persisted;
 mod persisted_store;
+mod puzzle_image;
 #[cfg(target_arch = "wasm32")]
 mod multiplayer_bridge;
 mod multiplayer_game_sync;

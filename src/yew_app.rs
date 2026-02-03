@@ -5,7 +5,8 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Element, Event, HtmlInputElement, HtmlSelectElement, InputEvent, KeyboardEvent, MouseEvent,
+    Element, Event, File, HtmlImageElement, HtmlInputElement, HtmlSelectElement, InputEvent,
+    KeyboardEvent, MouseEvent,
 };
 use yew::prelude::*;
 
@@ -23,16 +24,29 @@ use crate::multiplayer_bridge;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
 use crate::persisted_store;
+use crate::persisted::{PrivateImageEntry, PrivateImageRefs, LOCAL_PRIVATE_SCOPE};
 use crate::runtime::{SyncEvent, SyncHooks};
 use heddobureika_core::{
-    logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleInfo, RoomUpdate, ServerMsg,
+    logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleImageRef,
+    PuzzleInfo, PuzzleSpec, RoomUpdate, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
 };
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
+use sha2::{Digest, Sha256};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdminStatus {
     Idle,
     Connecting,
     Accepted,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdminUploadStatus {
+    Idle,
+    Reading,
+    Sending,
+    AwaitingAck,
+    Done,
     Failed,
 }
 
@@ -89,6 +103,8 @@ struct AdminSocket {
     status: Rc<Cell<AdminStatus>>,
     status_hook: Option<Rc<dyn Fn(AdminStatus)>>,
     connect_seq: Rc<Cell<u64>>,
+    upload_pending: Rc<Cell<bool>>,
+    upload_status_hook: Option<Rc<dyn Fn(AdminUploadStatus, Option<String>)>>,
 }
 
 impl AdminSocket {
@@ -101,11 +117,17 @@ impl AdminSocket {
             status: Rc::new(Cell::new(AdminStatus::Idle)),
             status_hook: None,
             connect_seq: Rc::new(Cell::new(0)),
+            upload_pending: Rc::new(Cell::new(false)),
+            upload_status_hook: None,
         }
     }
 
     fn set_status_hook(&mut self, hook: Rc<dyn Fn(AdminStatus)>) {
         self.status_hook = Some(hook);
+    }
+
+    fn set_upload_status_hook(&mut self, hook: Rc<dyn Fn(AdminUploadStatus, Option<String>)>) {
+        self.upload_status_hook = Some(hook);
     }
 
     fn reset(&mut self) {
@@ -114,12 +136,44 @@ impl AdminSocket {
         self.connected.set(false);
         self.pending.borrow_mut().clear();
         self.update_status(AdminStatus::Idle);
+        self.upload_pending.set(false);
+        self.notify_upload_status(AdminUploadStatus::Idle, None);
         let next = self.connect_seq.get().wrapping_add(1);
         self.connect_seq.set(next);
     }
 
     fn send(&mut self, ws_base: String, room_id: String, admin_token: String, msg: AdminMsg) {
         self.pending.borrow_mut().push(msg);
+        let url = app_router::build_room_ws_url(&ws_base, &room_id);
+        let connect_key = format!("{url}|{admin_token}");
+        let url_changed = self.connect_key.as_deref() != Some(connect_key.as_str());
+        if url_changed {
+            self.connect_key = Some(connect_key);
+            self.connected.set(false);
+            self.update_status(AdminStatus::Connecting);
+            self.connect(url, room_id, admin_token);
+            return;
+        }
+        if self.connected.get() {
+            self.flush();
+        } else {
+            self.update_status(AdminStatus::Connecting);
+            self.connect(url, room_id, admin_token);
+        }
+    }
+
+    fn send_upload(
+        &mut self,
+        ws_base: String,
+        room_id: String,
+        admin_token: String,
+        msgs: Vec<AdminMsg>,
+    ) {
+        if msgs.is_empty() {
+            return;
+        }
+        self.upload_pending.set(true);
+        self.pending.borrow_mut().extend(msgs);
         let url = app_router::build_room_ws_url(&ws_base, &room_id);
         let connect_key = format!("{url}|{admin_token}");
         let url_changed = self.connect_key.as_deref() != Some(connect_key.as_str());
@@ -167,14 +221,27 @@ impl AdminSocket {
             }
         });
         let connected_on_fail = self.connected.clone();
+        let upload_pending_on_fail = self.upload_pending.clone();
+        let upload_status_hook_on_fail = self.upload_status_hook.clone();
         let on_fail = Rc::new(move || {
             connected_on_fail.set(false);
             status_on_fail.set(AdminStatus::Failed);
             if let Some(hook) = status_hook.as_ref() {
                 hook(AdminStatus::Failed);
             }
+            if upload_pending_on_fail.get() {
+                upload_pending_on_fail.set(false);
+                if let Some(hook) = upload_status_hook_on_fail.as_ref() {
+                    hook(
+                        AdminUploadStatus::Failed,
+                        Some("admin connection failed".to_string()),
+                    );
+                }
+            }
         });
         let status_hook = self.status_hook.clone();
+        let upload_pending_on_msg = self.upload_pending.clone();
+        let upload_status_hook_on_msg = self.upload_status_hook.clone();
         let on_server_msg = Rc::new(move |msg: ServerMsg| match msg {
             ServerMsg::AdminAck { room_id, persistence } => {
                 status_on_msg.set(AdminStatus::Accepted);
@@ -198,7 +265,22 @@ impl AdminSocket {
                 if let Some(hook) = status_hook.as_ref() {
                     hook(AdminStatus::Failed);
                 }
-                gloo::console::warn!("admin error", code, message);
+                let error_message = format!("{code}: {message}");
+                gloo::console::warn!("admin error", code.clone(), message.clone());
+                if upload_pending_on_msg.get() {
+                    upload_pending_on_msg.set(false);
+                    if let Some(hook) = upload_status_hook_on_msg.as_ref() {
+                        hook(AdminUploadStatus::Failed, Some(error_message));
+                    }
+                }
+            }
+            ServerMsg::UploadAck { hash } => {
+                if upload_pending_on_msg.get() {
+                    upload_pending_on_msg.set(false);
+                    if let Some(hook) = upload_status_hook_on_msg.as_ref() {
+                        hook(AdminUploadStatus::Done, Some(format!("upload ok: {hash}")));
+                    }
+                }
             }
             _ => {}
         });
@@ -247,17 +329,19 @@ impl AdminSocket {
             hook(status);
         }
     }
+
+    fn notify_upload_status(&self, status: AdminUploadStatus, message: Option<String>) {
+        if let Some(hook) = self.upload_status_hook.as_ref() {
+            hook(status, message);
+        }
+    }
 }
 
-fn puzzle_art_index_by_src(src: &str) -> Option<usize> {
-    PUZZLE_ARTS.iter().position(|art| art.src == src)
-}
-
-fn puzzle_art_index_by_label(label: &str) -> Option<usize> {
-    let trimmed = label.trim();
+fn puzzle_art_index_by_slug(slug: &str) -> Option<usize> {
+    let trimmed = slug.trim();
     PUZZLE_ARTS
         .iter()
-        .position(|art| art.label.eq_ignore_ascii_case(trimmed))
+        .position(|art| art.slug.eq_ignore_ascii_case(trimmed))
 }
 
 fn encode_hash_value(value: &str) -> String {
@@ -363,6 +447,70 @@ fn persist_theme_mode(_mode: ThemeMode) {}
 
 fn clear_saved_game() {
     crate::sync_runtime::clear_local_snapshot();
+}
+
+fn now_ms_u64() -> u64 {
+    Date::now().max(0.0) as u64
+}
+
+async fn read_file_bytes(file: File) -> Result<Vec<u8>, String> {
+    let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+        .await
+        .map_err(|_| "failed to read file".to_string())?;
+    let array = js_sys::Uint8Array::new(&buffer);
+    Ok(array.to_vec())
+}
+
+async fn load_image_dimensions(file: File) -> Result<(u32, u32), String> {
+    let url = web_sys::Url::create_object_url_with_blob(&file)
+        .map_err(|_| "failed to read image".to_string())?;
+    let img = HtmlImageElement::new().map_err(|_| "failed to read image".to_string())?;
+    let img = std::rc::Rc::new(img);
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let img_onload = img.clone();
+        let url_for_onload = url.clone();
+        let onload = wasm_bindgen::closure::Closure::once(move || {
+            let width = img_onload.natural_width();
+            let height = img_onload.natural_height();
+            let _ = web_sys::Url::revoke_object_url(&url_for_onload);
+            let result = js_sys::Array::new();
+            result.push(&wasm_bindgen::JsValue::from_f64(width as f64));
+            result.push(&wasm_bindgen::JsValue::from_f64(height as f64));
+            let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &result);
+        });
+        let url_for_onerror = url.clone();
+        let onerror = wasm_bindgen::closure::Closure::once(move || {
+            let _ = web_sys::Url::revoke_object_url(&url_for_onerror);
+            let _ = reject.call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str("image_load_failed"),
+            );
+        });
+        img.set_onload(Some(onload.as_ref().unchecked_ref()));
+        img.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        img.set_src(&url);
+        onload.forget();
+        onerror.forget();
+    });
+    let value = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|_| "failed to read image".to_string())?;
+    let array = js_sys::Array::from(&value);
+    let width = array.get(0).as_f64().unwrap_or(0.0) as u32;
+    let height = array.get(1).as_f64().unwrap_or(0.0) as u32;
+    if width == 0 || height == 0 {
+        return Err("invalid image dimensions".to_string());
+    }
+    Ok((width, height))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{:02x}", byte));
+    }
+    hex
 }
 
 fn save_theme_mode(mode: ThemeMode) {
@@ -621,9 +769,9 @@ fn app(props: &AppProps) -> Html {
         .snapshot()
         .puzzle_info
         .as_ref()
-        .and_then(|info| {
-            puzzle_art_index_by_src(&info.image_src)
-                .or_else(|| puzzle_art_index_by_label(&info.label))
+        .and_then(|info| match &info.image_ref {
+            PuzzleImageRef::BuiltIn { slug } => puzzle_art_index_by_slug(slug),
+            _ => None,
         })
         .unwrap_or(0);
     let puzzle_art_index = use_state(|| initial_puzzle_art_index);
@@ -656,6 +804,16 @@ fn app(props: &AppProps) -> Html {
             }
         })
         .collect();
+    let private_label = use_state(|| String::new());
+    let private_label_value = (*private_label).clone();
+    let private_error = use_state(|| None::<String>);
+    let private_error_value = (*private_error).clone();
+    let admin_private_error = use_state(|| None::<String>);
+    let admin_private_error_value = (*admin_private_error).clone();
+    let admin_private_status = use_state(|| AdminUploadStatus::Idle);
+    let admin_private_status_value = *admin_private_status;
+    let admin_private_status_note = use_state(|| None::<String>);
+    let admin_private_status_note_value = (*admin_private_status_note).clone();
     let init_config = app_runtime::init_config();
     let multiplayer_config = use_state(|| init_config.multiplayer.clone());
     let multiplayer_config_value = (*multiplayer_config).clone();
@@ -865,37 +1023,50 @@ fn app(props: &AppProps) -> Html {
             include_share_seed.set(input.checked());
         })
     };
-    let share_seed_value = if !multiplayer_active && include_share_seed_value {
-        if puzzle_info_value.is_some() {
-            Some(scramble_seed(
-                PUZZLE_SEED,
-                scramble_nonce_value,
-                grid.cols as usize,
-                grid.rows as usize,
-            ))
-        } else {
-            None
-        }
+    let shareable_slug = if multiplayer_active {
+        None
+    } else {
+        puzzle_info_value.as_ref().and_then(|info| match &info.image_ref {
+            PuzzleImageRef::BuiltIn { slug } => Some(slug.clone()),
+            _ => None,
+        })
+    };
+    let shareable_local = shareable_slug.is_some();
+    let share_seed_value = if shareable_slug.is_some() && include_share_seed_value {
+        Some(scramble_seed(
+            PUZZLE_SEED,
+            scramble_nonce_value,
+            grid.cols as usize,
+            grid.rows as usize,
+        ))
     } else {
         None
     };
     let share_link_label = if multiplayer_active { "Room link" } else { "Share link" };
-    let share_link = base_url_without_hash()
-        .map(|base| {
-            if let Some(config) = multiplayer_config_value.as_ref() {
+    let share_link = if let Some(config) = multiplayer_config_value.as_ref() {
+        base_url_without_hash()
+            .map(|base| {
                 let room_id = encode_hash_value(&config.room_id);
                 let fragment = format!("room={room_id}");
                 format!("{base}#{fragment}")
-            } else {
-                let slug = encode_hash_value(puzzle_art.slug);
+            })
+            .unwrap_or_default()
+    } else if let Some(slug) = shareable_slug {
+        base_url_without_hash()
+            .map(|base| {
+                let slug = encode_hash_value(&slug);
                 let mut fragment = format!("puzzle={slug};pieces={}", grid.actual_count);
                 if let Some(seed) = share_seed_value {
                     fragment.push_str(&format!(";seed={:#x}", seed));
                 }
                 format!("{base}#{fragment}")
-            }
-        })
-        .unwrap_or_default();
+            })
+            .unwrap_or_default()
+    } else if puzzle_info_value.is_none() {
+        "--".to_string()
+    } else {
+        "Not shareable for private images".to_string()
+    };
     let mp_room_label = sync_view
         .room_id()
         .map(|room_id| room_id.to_string())
@@ -918,6 +1089,28 @@ fn app(props: &AppProps) -> Html {
                 .borrow_mut()
                 .set_status_hook(Rc::new(move |status| {
                     admin_status.set(status);
+                }));
+            || ()
+        });
+    }
+    {
+        let admin_socket = admin_socket.clone();
+        let admin_private_status = admin_private_status.clone();
+        let admin_private_status_note = admin_private_status_note.clone();
+        let admin_private_error = admin_private_error.clone();
+        use_effect_with((), move |_| {
+            admin_socket
+                .borrow_mut()
+                .set_upload_status_hook(Rc::new(move |status, message| {
+                    admin_private_status.set(status);
+                    admin_private_status_note.set(message.clone());
+                    if status == AdminUploadStatus::Failed {
+                        if let Some(message) = message {
+                            admin_private_error.set(Some(message));
+                        }
+                    } else if status == AdminUploadStatus::Done || status == AdminUploadStatus::Idle {
+                        admin_private_error.set(None);
+                    }
                 }));
             || ()
         });
@@ -969,6 +1162,23 @@ fn app(props: &AppProps) -> Html {
         AdminStatus::Accepted => "Admin token accepted",
         AdminStatus::Failed => "Admin token rejected",
     };
+    let admin_private_status_label = match admin_private_status_value {
+        AdminUploadStatus::Idle => "Idle",
+        AdminUploadStatus::Reading => "Reading file...",
+        AdminUploadStatus::Sending => "Sending upload...",
+        AdminUploadStatus::AwaitingAck => "Waiting for server...",
+        AdminUploadStatus::Done => "Upload complete",
+        AdminUploadStatus::Failed => "Upload failed",
+    };
+    let admin_private_status_display = if let Some(note) = admin_private_status_note_value.clone() {
+        format!("{admin_private_status_label} ({note})")
+    } else {
+        admin_private_status_label.to_string()
+    };
+    let admin_private_upload_busy = matches!(
+        admin_private_status_value,
+        AdminUploadStatus::Reading | AdminUploadStatus::Sending | AdminUploadStatus::AwaitingAck
+    );
     let on_admin_change_puzzle = {
         let admin_socket = admin_socket.clone();
         let admin_room_id = admin_room_id.clone();
@@ -1005,11 +1215,124 @@ fn app(props: &AppProps) -> Html {
                 room_id.clone(),
                 token.to_string(),
                 AdminMsg::ChangePuzzle {
-                    puzzle: entry.slug.to_string(),
-                    pieces,
-                    seed,
+                    puzzle: PuzzleSpec {
+                        image_ref: PuzzleImageRef::BuiltIn {
+                            slug: entry.slug.to_string(),
+                        },
+                        pieces,
+                        seed,
+                    },
                 },
             );
+        })
+    };
+    let on_admin_private_file_input = {
+        let admin_socket = admin_socket.clone();
+        let admin_room_id = admin_room_id.clone();
+        let admin_token_value = admin_token_active_value.clone();
+        let admin_seed_value = admin_seed_value.clone();
+        let admin_grid_choices = admin_grid_choices.clone();
+        let admin_pieces_index_value = admin_pieces_index_value;
+        let admin_private_error = admin_private_error.clone();
+        let admin_private_status = admin_private_status.clone();
+        let admin_private_status_note = admin_private_status_note.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let Some(files) = input.files() else {
+                return;
+            };
+            let Some(file) = files.get(0) else {
+                return;
+            };
+            input.set_value("");
+            admin_private_error.set(None);
+            admin_private_status.set(AdminUploadStatus::Reading);
+            admin_private_status_note.set(None);
+            let Some(room_id) = admin_room_id.as_ref() else {
+                admin_private_error.set(Some("Missing room id".to_string()));
+                admin_private_status.set(AdminUploadStatus::Failed);
+                return;
+            };
+            let token = admin_token_value.trim();
+            if token.is_empty() {
+                admin_private_error.set(Some("Admin token required".to_string()));
+                admin_private_status.set(AdminUploadStatus::Failed);
+                return;
+            }
+            let Some(ws_base) = app_router::default_ws_base() else {
+                admin_private_error.set(Some("Missing websocket base".to_string()));
+                admin_private_status.set(AdminUploadStatus::Failed);
+                return;
+            };
+            let mime = file.type_();
+            if !mime.starts_with("image/") {
+                admin_private_error.set(Some("Unsupported file type".to_string()));
+                admin_private_status.set(AdminUploadStatus::Failed);
+                return;
+            }
+            let size = file.size() as u64;
+            if size == 0 || size > PRIVATE_UPLOAD_MAX_BYTES as u64 {
+                admin_private_error.set(Some(format!(
+                    "upload exceeds limit (max {} bytes)",
+                    PRIVATE_UPLOAD_MAX_BYTES
+                )));
+                admin_private_status.set(AdminUploadStatus::Failed);
+                return;
+            }
+            let pieces = if admin_pieces_index_value == 0 {
+                None
+            } else {
+                admin_grid_choices
+                    .get(admin_pieces_index_value.saturating_sub(1))
+                    .map(|choice| choice.target_count)
+            };
+            let seed = parse_optional_seed(&admin_seed_value);
+            let admin_socket = admin_socket.clone();
+            let admin_private_error = admin_private_error.clone();
+            let admin_private_status = admin_private_status.clone();
+            let admin_private_status_note = admin_private_status_note.clone();
+            let room_id = room_id.clone();
+            let token = token.to_string();
+            spawn_local(async move {
+                let bytes = match read_file_bytes(file.clone()).await {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        admin_private_error.set(Some(message));
+                        admin_private_status.set(AdminUploadStatus::Failed);
+                        return;
+                    }
+                };
+                if bytes.is_empty() {
+                    admin_private_error.set(Some("puzzle file is empty".to_string()));
+                    admin_private_status.set(AdminUploadStatus::Failed);
+                    return;
+                }
+                if bytes.len() > PRIVATE_UPLOAD_MAX_BYTES as usize {
+                    admin_private_error.set(Some(format!(
+                        "upload exceeds limit (max {} bytes)",
+                        PRIVATE_UPLOAD_MAX_BYTES
+                    )));
+                    admin_private_status.set(AdminUploadStatus::Failed);
+                    return;
+                }
+                admin_private_status.set(AdminUploadStatus::Sending);
+                let mut messages = Vec::new();
+                messages.push(AdminMsg::UploadPrivateBegin {
+                    mime,
+                    size: bytes.len() as u32,
+                });
+                for chunk in bytes.chunks(ASSET_CHUNK_BYTES) {
+                    messages.push(AdminMsg::UploadPrivateChunk {
+                        bytes: chunk.to_vec(),
+                    });
+                }
+                messages.push(AdminMsg::UploadPrivateEnd { pieces, seed });
+                admin_socket
+                    .borrow_mut()
+                    .send_upload(ws_base, room_id, token, messages);
+                admin_private_status.set(AdminUploadStatus::AwaitingAck);
+                admin_private_status_note.set(Some("waiting for server".to_string()));
+            });
         })
     };
     let on_admin_scramble = {
@@ -1156,8 +1479,10 @@ fn app(props: &AppProps) -> Html {
                 app_snapshot.set(snapshot.clone());
                 puzzle_info.set(snapshot.puzzle_info.clone());
                 if let Some(info) = snapshot.puzzle_info.as_ref() {
-                    let desired_index = puzzle_art_index_by_src(&info.image_src)
-                        .or_else(|| puzzle_art_index_by_label(&info.label));
+                    let desired_index = match &info.image_ref {
+                        PuzzleImageRef::BuiltIn { slug } => puzzle_art_index_by_slug(slug),
+                        _ => None,
+                    };
                     if let Some(index) = desired_index {
                         if *puzzle_art_index != index {
                             puzzle_art_index.set(index);
@@ -1236,6 +1561,7 @@ fn app(props: &AppProps) -> Html {
                 on_remote_snapshot: on_remote_snapshot.clone(),
                 on_remote_update: on_remote_update.clone(),
                 on_event: on_event.clone(),
+                on_asset: Rc::new(|_| {}),
             });
             move || {
                 sync_runtime::clear_sync_hooks();
@@ -1398,6 +1724,96 @@ fn app(props: &AppProps) -> Html {
                     );
                 }
             }
+        })
+    };
+    let on_private_label_input = {
+        let private_label = private_label.clone();
+        let private_error = private_error.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            private_label.set(input.value());
+            private_error.set(None);
+        })
+    };
+    let on_private_file_input = {
+        let private_label = private_label.clone();
+        let private_error = private_error.clone();
+        let app_core = app_core.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let Some(files) = input.files() else {
+                return;
+            };
+            let Some(file) = files.get(0) else {
+                return;
+            };
+            private_error.set(None);
+            let mime = file.type_();
+            if !mime.starts_with("image/") {
+                private_error.set(Some("Unsupported file type".to_string()));
+                return;
+            }
+            let label = (*private_label).trim().to_string();
+            let app_core = app_core.clone();
+            let private_error = private_error.clone();
+            spawn_local(async move {
+                let bytes = match read_file_bytes(file.clone()).await {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        private_error.set(Some(message));
+                        return;
+                    }
+                };
+                let (width, height) = match load_image_dimensions(file).await {
+                    Ok(value) => value,
+                    Err(message) => {
+                        private_error.set(Some(message));
+                        return;
+                    }
+                };
+                let hash = sha256_hex(&bytes);
+                let now = now_ms_u64();
+                let size = (bytes.len() as u64).min(u32::MAX as u64) as u32;
+                let entry = PrivateImageEntry {
+                    bytes,
+                    mime: mime.clone(),
+                    width,
+                    height,
+                    size,
+                    created_at: now,
+                    last_used_at: now,
+                };
+                if let Err(message) = persisted_store::save_private_image(&hash, entry).await {
+                    private_error.set(Some(message));
+                    return;
+                }
+                let refs = match persisted_store::load_private_image_refs(LOCAL_PRIVATE_SCOPE).await {
+                    Ok(Some(mut refs)) => {
+                        if !refs.hashes.iter().any(|value| value == &hash) {
+                            refs.hashes.push(hash.clone());
+                        }
+                        refs.updated_at = now;
+                        refs
+                    }
+                    Ok(None) => PrivateImageRefs {
+                        hashes: vec![hash.clone()],
+                        updated_at: now,
+                    },
+                    Err(message) => {
+                        private_error.set(Some(message));
+                        return;
+                    }
+                };
+                if let Err(message) =
+                    persisted_store::save_private_image_refs(LOCAL_PRIVATE_SCOPE, refs).await
+                {
+                    private_error.set(Some(message));
+                    return;
+                }
+                clear_saved_game();
+                let image_ref = PuzzleImageRef::Private { hash };
+                app_core.set_puzzle_with_grid(label, image_ref, (width, height), None);
+            });
         })
     };
     let on_admin_token_input = {
@@ -2291,6 +2707,7 @@ fn app(props: &AppProps) -> Html {
                                 id="share-seed"
                                 type="checkbox"
                                 checked={include_share_seed_value}
+                                disabled={!shareable_local}
                                 onchange={on_share_seed_toggle}
                             />
                         </label>
@@ -2353,6 +2770,52 @@ fn app(props: &AppProps) -> Html {
                     html! {}
                 }}
             </div>
+            { if !multiplayer_active {
+                html! {
+                    <>
+                        <hr class="control-separator" />
+                        <div class="control">
+                            <label for="private-file">
+                                { "Private image file" }
+                            </label>
+                            <input
+                                id="private-file"
+                                type="file"
+                                accept="image/*"
+                                onchange={on_private_file_input}
+                                disabled={lock_puzzle_controls}
+                            />
+                        </div>
+                        <div class="control">
+                            <label for="private-label">
+                                { "Private label" }
+                                <span class="control-value">{ "optional" }</span>
+                            </label>
+                            <input
+                                id="private-label"
+                                type="text"
+                                value={private_label_value.clone()}
+                                oninput={on_private_label_input}
+                                disabled={lock_puzzle_controls}
+                            />
+                        </div>
+                        { if let Some(message) = private_error_value.clone() {
+                            html! {
+                                <div class="control">
+                                    <label>
+                                        { "Private image error" }
+                                        <span class="control-value">{ message }</span>
+                                    </label>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }}
+                    </>
+                }
+            } else {
+                html! {}
+            }}
             { if !multiplayer_active {
                 html! {
                     <>
@@ -2515,6 +2978,36 @@ fn app(props: &AppProps) -> Html {
                                             { "Admin: Change puzzle" }
                                         </button>
                                     </div>
+                                    <div class="control">
+                                        <label for="admin-private-file">
+                                            { "Admin private image file" }
+                                        </label>
+                                        <input
+                                            id="admin-private-file"
+                                            type="file"
+                                            accept="image/*"
+                                            onchange={on_admin_private_file_input}
+                                            disabled={admin_private_upload_busy}
+                                        />
+                                    </div>
+                                    <div class="control">
+                                        <label>
+                                            { "Admin upload status" }
+                                            <span class="control-value">{ admin_private_status_display.clone() }</span>
+                                        </label>
+                                    </div>
+                                    { if let Some(message) = admin_private_error_value.clone() {
+                                        html! {
+                                            <div class="control">
+                                                <label>
+                                                    { "Admin private image error" }
+                                                    <span class="control-value">{ message }</span>
+                                                </label>
+                                            </div>
+                                        }
+                                    } else {
+                                        html! {}
+                                    }}
                                     <div class="control">
                                         <button
                                             class="control-button"

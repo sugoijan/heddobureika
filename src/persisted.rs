@@ -1,15 +1,17 @@
 use crate::core::{InitMode, RenderSettings, RendererKind, ThemeMode};
 
-pub(crate) const BOOT_RECORD_VERSION: u32 = 1;
+pub(crate) const BOOT_RECORD_VERSION: u32 = 2;
 pub(crate) const SETTINGS_VERSION: u32 = 1;
 
-pub(crate) const BOOT_RECORD_KEY: &str = "boot.v1";
+pub(crate) const BOOT_RECORD_KEY: &str = "boot.v2";
 pub(crate) const SETTINGS_KEY: &str = "settings.v1";
 pub(crate) const SNAPSHOT_KEY: &str = "snapshot.v1";
 
+pub(crate) const LOCAL_PRIVATE_SCOPE: &str = "local";
+
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct BootPuzzleSelection {
-    pub(crate) puzzle_src: String,
+    pub(crate) puzzle_slug: String,
     pub(crate) cols: u32,
     pub(crate) rows: u32,
 }
@@ -45,6 +47,23 @@ pub(crate) struct WsDelaySettings {
     pub(crate) inbound_ms: Option<u32>,
     pub(crate) outbound_ms: Option<u32>,
     pub(crate) jitter_ms: Option<u32>,
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) struct PrivateImageEntry {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) mime: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) size: u32,
+    pub(crate) created_at: u64,
+    pub(crate) last_used_at: u64,
+}
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub(crate) struct PrivateImageRefs {
+    pub(crate) hashes: Vec<String>,
+    pub(crate) updated_at: u64,
 }
 
 impl Default for WsDelaySettings {

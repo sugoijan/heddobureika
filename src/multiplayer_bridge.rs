@@ -1,8 +1,10 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gloo::console;
+use js_sys::Date;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::app_core::{AppCore, AppSubscription};
 use crate::core::{
@@ -10,15 +12,22 @@ use crate::core::{
     clear_piece_connections, grid_choice_index, groups_from_connections, is_solved, GridChoice,
     FALLBACK_GRID,
 };
+use crate::persisted::{PrivateImageEntry, PrivateImageRefs};
+use crate::persisted_store;
 use crate::sync_runtime;
-use crate::runtime::{SyncEvent, SyncHooks};
+use crate::runtime::{AssetEvent, SyncEvent, SyncHooks};
 use heddobureika_core::{
     angle_matches, apply_room_update_to_snapshot, ClientId, ClientMsg, CoreSnapshot, GameSnapshot,
-    PuzzleInfo, PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
+    PuzzleImageRef, PuzzleInfo, PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
+    PRIVATE_ASSET_MAX_BYTES,
 };
 
 const PENDING_POS_EPS: f32 = 0.02;
 const PENDING_ROT_EPS: f32 = 0.05;
+
+fn now_ms_u64() -> u64 {
+    Date::now().max(0.0) as u64
+}
 
 #[derive(Clone, Debug)]
 struct LocalSnapshot {
@@ -63,6 +72,16 @@ struct PendingTransform {
     client_seq: u64,
 }
 
+#[derive(Clone, Debug)]
+struct AssetDownload {
+    mime: String,
+    width: u32,
+    height: u32,
+    size: u32,
+    received: u32,
+    bytes: Vec<u8>,
+}
+
 struct MultiplayerBridgeState {
     core: Rc<AppCore>,
     local_snapshot: RefCell<LocalSnapshot>,
@@ -70,6 +89,9 @@ struct MultiplayerBridgeState {
     pending_flips: RefCell<HashMap<u32, bool>>,
     init_pending: Cell<bool>,
     subscription: RefCell<Option<AppSubscription>>,
+    room_id: RefCell<Option<String>>,
+    asset_downloads: RefCell<HashMap<String, AssetDownload>>,
+    requested_assets: RefCell<HashSet<String>>,
 }
 
 impl MultiplayerBridgeState {
@@ -81,6 +103,9 @@ impl MultiplayerBridgeState {
             pending_flips: RefCell::new(HashMap::new()),
             init_pending: Cell::new(false),
             subscription: RefCell::new(None),
+            room_id: RefCell::new(None),
+            asset_downloads: RefCell::new(HashMap::new()),
+            requested_assets: RefCell::new(HashSet::new()),
         }
     }
 
@@ -137,23 +162,31 @@ impl MultiplayerBridgeState {
         let on_remote_update = Rc::new(move |update, seq, source, client_seq| {
             state.handle_update(update, seq, source, client_seq);
         });
+        let state = Rc::clone(self);
+        let on_asset = Rc::new(move |event: AssetEvent| {
+            state.handle_asset(event);
+        });
         SyncHooks {
             on_remote_action: Rc::new(|_| {}),
             on_snapshot: Rc::new(|_| {}),
             on_remote_snapshot,
             on_remote_update,
             on_event,
+            on_asset,
         }
     }
 
     fn handle_welcome(
         &self,
-        _room_id: String,
+        room_id: String,
         _persistence: RoomPersistence,
         initialized: bool,
         _client_id: Option<ClientId>,
     ) {
         self.init_pending.set(!initialized);
+        *self.room_id.borrow_mut() = Some(room_id);
+        self.asset_downloads.borrow_mut().clear();
+        self.requested_assets.borrow_mut().clear();
         if let Some(sync) = sync_runtime::multiplayer_handle() {
             sync.borrow().set_state_applied(false);
         }
@@ -169,13 +202,15 @@ impl MultiplayerBridgeState {
         self.init_pending.set(true);
         self.pending_by_anchor.borrow_mut().clear();
         self.pending_flips.borrow_mut().clear();
+        self.asset_downloads.borrow_mut().clear();
+        self.requested_assets.borrow_mut().clear();
         self.try_send_init();
     }
 
     fn handle_warning(&self, _minutes_idle: u32) {
     }
 
-    fn handle_state(&self, snapshot: GameSnapshot, _seq: u64) {
+    fn handle_state(self: &Rc<Self>, snapshot: GameSnapshot, _seq: u64) {
         let applied = self.apply_room_snapshot(&snapshot);
         if applied {
             self.init_pending.set(false);
@@ -183,6 +218,7 @@ impl MultiplayerBridgeState {
                 sync.borrow().set_state_applied(true);
             }
         }
+        self.request_private_asset_if_missing(&snapshot);
     }
 
     fn handle_update(
@@ -204,6 +240,160 @@ impl MultiplayerBridgeState {
     }
 
     fn handle_error(&self, _code: String, _message: String) {
+    }
+
+    fn handle_asset(self: &Rc<Self>, event: AssetEvent) {
+        match event {
+            AssetEvent::Begin {
+                hash,
+                mime,
+                width,
+                height,
+                size,
+            } => {
+                if size == 0 || size > PRIVATE_ASSET_MAX_BYTES {
+                    return;
+                }
+                self.asset_downloads.borrow_mut().insert(
+                    hash,
+                    AssetDownload {
+                        mime,
+                        width,
+                        height,
+                        size,
+                        received: 0,
+                        bytes: Vec::with_capacity(size as usize),
+                    },
+                );
+            }
+            AssetEvent::Chunk { hash, index, bytes } => {
+                let mut downloads = self.asset_downloads.borrow_mut();
+                let Some(entry) = downloads.get_mut(&hash) else {
+                    return;
+                };
+                let _ = index;
+                let next = entry
+                    .received
+                    .saturating_add(bytes.len().min(u32::MAX as usize) as u32);
+                if next > entry.size || next > PRIVATE_ASSET_MAX_BYTES {
+                    downloads.remove(&hash);
+                    return;
+                }
+                entry.bytes.extend_from_slice(&bytes);
+                entry.received = next;
+            }
+            AssetEvent::End { hash } => {
+                let download = self.asset_downloads.borrow_mut().remove(&hash);
+                let Some(download) = download else {
+                    return;
+                };
+                if download.received != download.size
+                    || download.bytes.len() != download.size as usize
+                {
+                    return;
+                }
+                let scope_key = self.room_scope_key();
+                spawn_local(async move {
+                    let now = now_ms_u64();
+                    let entry = PrivateImageEntry {
+                        bytes: download.bytes,
+                        mime: download.mime,
+                        width: download.width,
+                        height: download.height,
+                        size: download.size,
+                        created_at: now,
+                        last_used_at: now,
+                    };
+                    if let Err(message) =
+                        persisted_store::save_private_image(&hash, entry).await
+                    {
+                        console::warn!("failed to store private image", message);
+                        return;
+                    }
+                    if let Some(scope_key) = scope_key {
+                        let refs = persisted_store::load_private_image_refs(&scope_key)
+                            .await
+                            .ok()
+                            .flatten();
+                        let mut hashes = refs
+                            .map(|refs| refs.hashes)
+                            .unwrap_or_else(Vec::new);
+                        if !hashes.iter().any(|value| value == &hash) {
+                            hashes.push(hash.clone());
+                        }
+                        let refs = PrivateImageRefs {
+                            hashes,
+                            updated_at: now,
+                        };
+                        let _ = persisted_store::save_private_image_refs(&scope_key, refs).await;
+                    }
+                    crate::wgpu_app::request_render();
+                    crate::svg_app::request_render();
+                });
+            }
+            AssetEvent::UploadAck { hash } => {
+                console::log!("upload ack", hash);
+            }
+        }
+    }
+
+    fn room_scope_key(&self) -> Option<String> {
+        self.room_id
+            .borrow()
+            .as_ref()
+            .map(|room_id| format!("room:{room_id}"))
+    }
+
+    fn request_private_asset_if_missing(self: &Rc<Self>, snapshot: &GameSnapshot) {
+        let hash = match &snapshot.puzzle.image_ref {
+            PuzzleImageRef::Private { hash } => hash.clone(),
+            _ => return,
+        };
+        let state = Rc::clone(self);
+        spawn_local(async move {
+            match persisted_store::load_private_image(&hash).await {
+                Ok(Some(_)) => {
+                    if let Some(scope_key) = state.room_scope_key() {
+                        let now = now_ms_u64();
+                        let refs = persisted_store::load_private_image_refs(&scope_key)
+                            .await
+                            .ok()
+                            .flatten();
+                        let mut hashes = refs
+                            .map(|refs| refs.hashes)
+                            .unwrap_or_else(Vec::new);
+                        if !hashes.iter().any(|value| value == &hash) {
+                            hashes.push(hash.clone());
+                        }
+                        let refs = PrivateImageRefs {
+                            hashes,
+                            updated_at: now,
+                        };
+                        let _ = persisted_store::save_private_image_refs(&scope_key, refs).await;
+                    }
+                    return;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    console::warn!("failed to check private image", message);
+                }
+            }
+            let should_request = {
+                let mut requested = state.requested_assets.borrow_mut();
+                if requested.contains(&hash) {
+                    false
+                } else {
+                    requested.insert(hash.clone());
+                    true
+                }
+            };
+            if !should_request {
+                return;
+            }
+            if let Some(sync) = sync_runtime::multiplayer_handle() {
+                sync.borrow().send(ClientMsg::AssetRequest { hash });
+            }
+        });
     }
 
     fn record_pending_transform(
@@ -428,7 +618,7 @@ impl MultiplayerBridgeState {
             .puzzle_info
             .as_ref()
             .map(|info| {
-                info.image_src != snapshot.puzzle.image_src
+                info.image_ref != snapshot.puzzle.image_ref
                     || info.image_width != snapshot.puzzle.image_width
                     || info.image_height != snapshot.puzzle.image_height
                     || info.cols != snapshot.puzzle.cols
@@ -439,7 +629,7 @@ impl MultiplayerBridgeState {
         if should_update_core {
             self.core.set_puzzle_with_grid(
                 snapshot.puzzle.label.clone(),
-                snapshot.puzzle.image_src.clone(),
+                snapshot.puzzle.image_ref.clone(),
                 (snapshot.puzzle.image_width, snapshot.puzzle.image_height),
                 Some(grid_override),
             );

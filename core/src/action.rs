@@ -24,6 +24,7 @@ pub enum CoreAction {
         shift_key: bool,
         rotate_mode: bool,
         right_click: bool,
+        click_slop: f32,
         pointer_id: Option<i32>,
     },
     DragMove {

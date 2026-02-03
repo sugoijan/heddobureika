@@ -1,7 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Cursor;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use image::codecs::avif::AvifEncoder;
+use image::{ExtendedColorType, ImageEncoder, ImageReader};
+use imagesize::{Compression, ImageType};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
     apply_snaps_for_group, clear_piece_connections, collect_group, compute_workspace_layout,
@@ -10,8 +14,10 @@ use heddobureika_core::game::{
     FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
 };
 use heddobureika_core::{
-    AdminMsg, ClientId, ClientMsg, GameRules, GameSnapshot, OwnershipReason, PuzzleInfo,
-    PuzzleStateSnapshot, RoomPersistence, RoomUpdate, ServerMsg, GAME_SNAPSHOT_VERSION,
+    validate_image_ref, AdminMsg, ClientId, ClientMsg, GameRules, GameSnapshot, OwnershipReason,
+    PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
+    ServerMsg, ASSET_CHUNK_BYTES, GAME_SNAPSHOT_VERSION, PRIVATE_ASSET_MAX_BYTES,
+    PRIVATE_UPLOAD_MAX_BYTES,
 };
 use heddobureika_core::{
     best_grid_for_count, logical_image_size, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
@@ -27,6 +33,10 @@ use worker::*;
 const DEFAULT_ROOM_PATH_PREFIX: &str = "/ws/";
 const META_KEY: &str = "room_meta";
 const SNAPSHOT_KEY: &str = "room_snapshot";
+const ASSET_INDEX_KEY: &str = "room_assets";
+const ASSET_META_PREFIX: &str = "asset_meta:";
+const ASSET_CHUNK_PREFIX: &str = "asset_chunk:";
+const ASSET_STORAGE_CHUNK_BYTES: usize = 256 * 1024;
 
 const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
 const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
@@ -96,6 +106,14 @@ fn now_ms() -> i64 {
     Date::now() as i64
 }
 
+fn asset_meta_key(hash: &str) -> String {
+    format!("{ASSET_META_PREFIX}{hash}")
+}
+
+fn asset_chunk_key(hash: &str, index: u32) -> String {
+    format!("{ASSET_CHUNK_PREFIX}{hash}:{index}")
+}
+
 fn auth_protocol_from_request(req: &Request) -> Result<Option<String>> {
     let Some(raw) = req.headers().get("Sec-WebSocket-Protocol")? else {
         return Ok(None);
@@ -131,6 +149,51 @@ fn derive_client_id(pubkey_spki: &[u8]) -> Result<ClientId, ()> {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     Ok(ClientId::from(u64::from_be_bytes(bytes)))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn transcode_to_avif(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|err| err.to_string())?;
+    let image = reader.decode().map_err(|err| err.to_string())?;
+    let rgba = image.to_rgba8();
+    let mut out = Vec::new();
+    let encoder = AvifEncoder::new_with_speed_quality(&mut out, 6, 80)
+        .with_num_threads(Some(1));
+    encoder
+        .write_image(
+            &rgba,
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(out)
+}
+
+fn detect_image_info(bytes: &[u8]) -> Result<(u32, u32, ImageType), String> {
+    let image_type = imagesize::image_type(bytes).map_err(|err| err.to_string())?;
+    let size = imagesize::blob_size(bytes).map_err(|err| err.to_string())?;
+    let width = u32::try_from(size.width).map_err(|_| "image width too large".to_string())?;
+    let height = u32::try_from(size.height).map_err(|_| "image height too large".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("image dimensions are zero".to_string());
+    }
+    Ok((width, height, image_type))
+}
+
+fn is_avif(image_type: ImageType) -> bool {
+    matches!(image_type, ImageType::Heif(Compression::Av1))
 }
 
 fn verify_signature(pubkey_spki: &[u8], message: &[u8], signature: &[u8]) -> Result<bool, ()> {
@@ -208,6 +271,9 @@ struct RoomRuntime {
     owner_by_client: HashMap<ClientId, u32>,
     recent_nonces: HashMap<String, i64>,
     pending_releases: HashMap<ClientId, i64>,
+    assets: HashMap<String, StoredAsset>,
+    asset_index: Vec<String>,
+    pending_uploads: HashMap<ClientId, PendingUpload>,
 }
 
 impl RoomRuntime {
@@ -220,8 +286,39 @@ impl RoomRuntime {
             owner_by_client: HashMap::new(),
             recent_nonces: HashMap::new(),
             pending_releases: HashMap::new(),
+            assets: HashMap::new(),
+            asset_index: Vec::new(),
+            pending_uploads: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct StoredAssetMeta {
+    mime: String,
+    width: u32,
+    height: u32,
+    size: u32,
+    created_at: i64,
+    chunks: u32,
+}
+
+#[derive(Debug, Clone)]
+struct StoredAsset {
+    meta: StoredAssetMeta,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingUpload {
+    size: u32,
+    received: u32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct AssetIndex {
+    hashes: Vec<String>,
 }
 
 #[durable_object]
@@ -337,19 +434,21 @@ impl DurableObject for Room {
         if is_admin {
             if let Some(msg) = decode::<AdminMsg>(&bytes) {
                 match msg {
-                    AdminMsg::Create {
-                        persistence,
-                        puzzle,
-                        pieces,
-                        seed,
-                    } => {
-                        return self
-                            .handle_admin_create(ws, persistence, puzzle, pieces, seed)
-                            .await;
+                    AdminMsg::Create { persistence, puzzle } => {
+                        return self.handle_admin_create(ws, persistence, puzzle).await;
                     }
-                    AdminMsg::ChangePuzzle { puzzle, pieces, seed } => {
+                    AdminMsg::ChangePuzzle { puzzle } => {
+                        return self.handle_admin_change_puzzle(ws, puzzle).await;
+                    }
+                    AdminMsg::UploadPrivateBegin { mime, size } => {
+                        return self.handle_admin_upload_begin(ws, mime, size).await;
+                    }
+                    AdminMsg::UploadPrivateChunk { bytes } => {
+                        return self.handle_admin_upload_chunk(ws, bytes).await;
+                    }
+                    AdminMsg::UploadPrivateEnd { pieces, seed } => {
                         return self
-                            .handle_admin_change_puzzle(ws, puzzle, pieces, seed)
+                            .handle_admin_upload_end(ws, pieces, seed)
                             .await;
                     }
                     AdminMsg::Scramble { seed } => {
@@ -371,6 +470,9 @@ impl DurableObject for Room {
         match msg {
             ClientMsg::Init { puzzle, rules, state } => {
                 self.handle_init(ws, puzzle, rules, state).await?;
+            }
+            ClientMsg::AssetRequest { hash } => {
+                self.handle_asset_request(ws, hash).await?;
             }
             ClientMsg::Select { piece_id } => {
                 self.handle_select(client_id, piece_id).await?;
@@ -519,6 +621,7 @@ impl Room {
         let storage = self.state.storage();
         let meta_bytes: Option<Vec<u8>> = storage.get(META_KEY).await?;
         let snapshot_bytes: Option<Vec<u8>> = storage.get(SNAPSHOT_KEY).await?;
+        let asset_index_bytes: Option<Vec<u8>> = storage.get(ASSET_INDEX_KEY).await?;
 
         let mut inner = self.inner.borrow_mut();
         inner.loaded = true;
@@ -530,6 +633,11 @@ impl Room {
         if let Some(bytes) = snapshot_bytes {
             if let Some(snapshot) = decode::<GameSnapshot>(&bytes) {
                 inner.snapshot = Some(snapshot);
+            }
+        }
+        if let Some(bytes) = asset_index_bytes {
+            if let Some(index) = decode::<AssetIndex>(&bytes) {
+                inner.asset_index = index.hashes;
             }
         }
 
@@ -729,46 +837,39 @@ impl Room {
         })
     }
 
-    async fn handle_admin_create(
+    fn build_puzzle_from_spec(
         &self,
-        ws: WebSocket,
-        persistence: RoomPersistence,
-        puzzle_slug: String,
-        pieces: Option<u32>,
-        seed: Option<u32>,
-    ) -> Result<()> {
-        let now = now_ms();
-        let puzzle_entry = match puzzle_by_slug(&puzzle_slug) {
-            Some(entry) => entry,
-            None => {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "unknown_puzzle".to_string(),
-                        message: format!("unknown puzzle: {}", puzzle_slug),
-                    },
+        spec: PuzzleSpec,
+        rules: &GameRules,
+    ) -> Result<(PuzzleInfo, Option<u32>), String> {
+        validate_image_ref(&spec.image_ref)?;
+        let (label, image_ref, image_width, image_height) = match &spec.image_ref {
+            PuzzleImageRef::BuiltIn { slug } => {
+                let entry = puzzle_by_slug(slug).ok_or_else(|| {
+                    format!("unknown puzzle: {slug}")
+                })?;
+                let (width, height) = logical_image_size(
+                    entry.width,
+                    entry.height,
+                    rules.image_max_dimension,
                 );
-                return Ok(());
+                (
+                    entry.label.to_string(),
+                    PuzzleImageRef::BuiltIn {
+                        slug: entry.slug.to_string(),
+                    },
+                    width,
+                    height,
+                )
+            }
+            PuzzleImageRef::Private { hash } => {
+                let _ = hash;
+                return Err("private puzzles must be uploaded".to_string());
             }
         };
-        let rules = GameRules::default();
-        let (image_width, image_height) = logical_image_size(
-            puzzle_entry.width,
-            puzzle_entry.height,
-            rules.image_max_dimension,
-        );
-        let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
+        let target = spec.pieces.unwrap_or(DEFAULT_TARGET_COUNT);
         let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
-        let puzzle = PuzzleInfo {
-            label: puzzle_entry.label.to_string(),
-            image_src: puzzle_entry.src.to_string(),
-            rows: grid.rows,
-            cols: grid.cols,
-            shape_seed: PUZZLE_SEED,
-            image_width,
-            image_height,
-        };
-        let scramble_override = seed.map(|seed| {
+        let scramble_override = spec.seed.map(|seed| {
             scramble_nonce_from_seed(
                 PUZZLE_SEED,
                 seed,
@@ -776,6 +877,39 @@ impl Room {
                 grid.rows as usize,
             )
         });
+        let puzzle = PuzzleInfo {
+            label,
+            image_ref,
+            rows: grid.rows,
+            cols: grid.cols,
+            shape_seed: PUZZLE_SEED,
+            image_width,
+            image_height,
+        };
+        Ok((puzzle, scramble_override))
+    }
+
+    async fn handle_admin_create(
+        &self,
+        ws: WebSocket,
+        persistence: RoomPersistence,
+        puzzle: PuzzleSpec,
+    ) -> Result<()> {
+        let now = now_ms();
+        let rules = GameRules::default();
+        let (puzzle, scramble_override) = match self.build_puzzle_from_spec(puzzle, &rules) {
+            Ok(result) => result,
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_puzzle".to_string(),
+                        message,
+                    },
+                );
+                return Ok(());
+            }
+        };
         let snapshot = match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
             Some(snapshot) => snapshot,
             None => {
@@ -828,24 +962,9 @@ impl Room {
     async fn handle_admin_change_puzzle(
         &self,
         ws: WebSocket,
-        puzzle_slug: String,
-        pieces: Option<u32>,
-        seed: Option<u32>,
+        puzzle: PuzzleSpec,
     ) -> Result<()> {
         let now = now_ms();
-        let puzzle_entry = match puzzle_by_slug(&puzzle_slug) {
-            Some(entry) => entry,
-            None => {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "unknown_puzzle".to_string(),
-                        message: format!("unknown puzzle: {}", puzzle_slug),
-                    },
-                );
-                return Ok(());
-            }
-        };
         let rules = {
             let inner = self.inner.borrow();
             if !inner.meta.activated {
@@ -864,30 +983,19 @@ impl Room {
                 .map(|snapshot| snapshot.rules.clone())
                 .unwrap_or_default()
         };
-        let (image_width, image_height) = logical_image_size(
-            puzzle_entry.width,
-            puzzle_entry.height,
-            rules.image_max_dimension,
-        );
-        let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
-        let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
-        let puzzle = PuzzleInfo {
-            label: puzzle_entry.label.to_string(),
-            image_src: puzzle_entry.src.to_string(),
-            rows: grid.rows,
-            cols: grid.cols,
-            shape_seed: PUZZLE_SEED,
-            image_width,
-            image_height,
+        let (puzzle, scramble_override) = match self.build_puzzle_from_spec(puzzle, &rules) {
+            Ok(result) => result,
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_puzzle".to_string(),
+                        message,
+                    },
+                );
+                return Ok(());
+            }
         };
-        let scramble_override = seed.map(|seed| {
-            scramble_nonce_from_seed(
-                PUZZLE_SEED,
-                seed,
-                grid.cols as usize,
-                grid.rows as usize,
-            )
-        });
         let mut snapshot =
             match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
                 Some(snapshot) => snapshot,
@@ -915,6 +1023,273 @@ impl Room {
             inner.owner_by_client.clear();
         }
 
+        self.touch_command(now, true).await?;
+        self.persist_snapshot_if_needed().await?;
+        self.broadcast(&ServerMsg::State {
+            seq: snapshot.seq,
+            snapshot,
+        })?;
+        self.schedule_alarm().await?;
+        Ok(())
+    }
+
+    async fn handle_admin_upload_begin(
+        &self,
+        ws: WebSocket,
+        _mime: String,
+        size: u32,
+    ) -> Result<()> {
+        if size == 0 || size > PRIVATE_UPLOAD_MAX_BYTES {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "upload_too_large".to_string(),
+                    message: format!(
+                        "upload exceeds limit (max {} bytes)",
+                        PRIVATE_UPLOAD_MAX_BYTES
+                    ),
+                },
+            );
+            return Ok(());
+        }
+        let tags = self.state.get_tags(&ws);
+        let Some(client_id) = client_id_from_tags(&tags) else {
+            return Ok(());
+        };
+        {
+            let inner = self.inner.borrow();
+            if !inner.meta.activated {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "inactive".to_string(),
+                        message: "room not activated".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.pending_uploads.insert(
+            client_id,
+            PendingUpload {
+                size,
+                received: 0,
+                bytes: Vec::with_capacity(size as usize),
+            },
+        );
+        Ok(())
+    }
+
+    async fn handle_admin_upload_chunk(
+        &self,
+        ws: WebSocket,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let tags = self.state.get_tags(&ws);
+        let Some(client_id) = client_id_from_tags(&tags) else {
+            return Ok(());
+        };
+        let mut inner = self.inner.borrow_mut();
+        let Some(pending) = inner.pending_uploads.get_mut(&client_id) else {
+            return Ok(());
+        };
+        let next = pending
+            .received
+            .saturating_add(bytes.len().min(u32::MAX as usize) as u32);
+        if next > pending.size || next > PRIVATE_UPLOAD_MAX_BYTES {
+            inner.pending_uploads.remove(&client_id);
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "upload_too_large".to_string(),
+                    message: format!(
+                        "upload exceeds limit (max {} bytes)",
+                        PRIVATE_UPLOAD_MAX_BYTES
+                    ),
+                },
+            );
+            return Ok(());
+        }
+        pending.bytes.extend_from_slice(&bytes);
+        pending.received = next;
+        Ok(())
+    }
+
+    async fn handle_admin_upload_end(
+        &self,
+        ws: WebSocket,
+        pieces: Option<u32>,
+        seed: Option<u32>,
+    ) -> Result<()> {
+        let now = now_ms();
+        let tags = self.state.get_tags(&ws);
+        let Some(client_id) = client_id_from_tags(&tags) else {
+            return Ok(());
+        };
+        let pending = {
+            let mut inner = self.inner.borrow_mut();
+            inner.pending_uploads.remove(&client_id)
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        if pending.received != pending.size {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "upload_incomplete".to_string(),
+                    message: "upload incomplete".to_string(),
+                },
+            );
+            return Ok(());
+        }
+        let (raw_width, raw_height, image_type) = match detect_image_info(&pending.bytes) {
+            Ok(info) => info,
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_image".to_string(),
+                        message,
+                    },
+                );
+                return Ok(());
+            }
+        };
+        if matches!(image_type, ImageType::Heif(_)) && !is_avif(image_type) {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "invalid_image".to_string(),
+                    message: "unsupported HEIF compression".to_string(),
+                },
+            );
+            return Ok(());
+        }
+        let stored_bytes = if is_avif(image_type) {
+            pending.bytes
+        } else {
+            match transcode_to_avif(&pending.bytes) {
+                Ok(image) => image,
+                Err(message) => {
+                    let _ = self.send_server_msg(
+                        &ws,
+                        &ServerMsg::Error {
+                            code: "invalid_image".to_string(),
+                            message,
+                        },
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        let stored_mime = "image/avif".to_string();
+        if stored_bytes.len() > PRIVATE_ASSET_MAX_BYTES as usize {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "asset_too_large".to_string(),
+                    message: format!(
+                        "stored asset exceeds limit (max {} bytes)",
+                        PRIVATE_ASSET_MAX_BYTES
+                    ),
+                },
+            );
+            return Ok(());
+        }
+        let rules = {
+            let inner = self.inner.borrow();
+            if !inner.meta.activated {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "inactive".to_string(),
+                        message: "room not activated".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+            inner
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.rules.clone())
+                .unwrap_or_default()
+        };
+        let (image_width, image_height) =
+            logical_image_size(raw_width, raw_height, rules.image_max_dimension);
+        let hash = sha256_hex(&stored_bytes);
+        let size = stored_bytes.len() as u32;
+        let chunks = ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES)
+            as u32;
+        let asset = StoredAsset {
+            meta: StoredAssetMeta {
+                mime: stored_mime.clone(),
+                width: image_width,
+                height: image_height,
+                size,
+                created_at: now,
+                chunks,
+            },
+            bytes: stored_bytes,
+        };
+        if let Err(message) = self.store_asset(&hash, asset).await {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "asset_store_failed".to_string(),
+                    message,
+                },
+            );
+            return Ok(());
+        }
+        let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
+        let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
+        let scramble_override = seed.map(|seed| {
+            scramble_nonce_from_seed(
+                PUZZLE_SEED,
+                seed,
+                grid.cols as usize,
+                grid.rows as usize,
+            )
+        });
+        let puzzle = PuzzleInfo {
+            label: String::new(),
+            image_ref: PuzzleImageRef::Private { hash: hash.clone() },
+            rows: grid.rows,
+            cols: grid.cols,
+            shape_seed: PUZZLE_SEED,
+            image_width,
+            image_height,
+        };
+        let mut snapshot =
+            match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
+                Some(snapshot) => snapshot,
+                None => {
+                    let _ = self.send_server_msg(
+                        &ws,
+                        &ServerMsg::Error {
+                            code: "invalid_init".to_string(),
+                            message: "failed to initialize room".to_string(),
+                        },
+                    );
+                    return Ok(());
+                }
+            };
+        {
+            let mut inner = self.inner.borrow_mut();
+            let next_seq = inner
+                .snapshot
+                .as_ref()
+                .map(|snap| snap.seq.saturating_add(1))
+                .unwrap_or(0);
+            snapshot.seq = next_seq;
+            inner.snapshot = Some(snapshot.clone());
+            inner.owners_by_anchor.clear();
+            inner.owner_by_client.clear();
+        }
+
+        let _ = self.send_server_msg(&ws, &ServerMsg::UploadAck { hash: hash.clone() });
         self.touch_command(now, true).await?;
         self.persist_snapshot_if_needed().await?;
         self.broadcast(&ServerMsg::State {
@@ -992,6 +1367,216 @@ impl Room {
         Ok(())
     }
 
+    async fn handle_asset_request(&self, ws: WebSocket, hash: String) -> Result<()> {
+        let asset = match self.load_asset(&hash).await {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "asset_missing".to_string(),
+                        message: "private image not found".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "asset_missing".to_string(),
+                        message,
+                    },
+                );
+                return Ok(());
+            }
+        };
+        if let Err(message) = self.send_asset(&ws, &hash, &asset) {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "asset_send_failed".to_string(),
+                    message,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn send_asset(
+        &self,
+        ws: &WebSocket,
+        hash: &str,
+        asset: &StoredAsset,
+    ) -> std::result::Result<(), String> {
+        self.send_server_msg(
+            ws,
+            &ServerMsg::AssetBegin {
+                hash: hash.to_string(),
+                mime: asset.meta.mime.clone(),
+                width: asset.meta.width,
+                height: asset.meta.height,
+                size: asset.meta.size,
+            },
+        )
+        .map_err(|err| err.to_string())?;
+        let mut index = 0u32;
+        for chunk in asset.bytes.chunks(ASSET_CHUNK_BYTES) {
+            self.send_server_msg(
+                ws,
+                &ServerMsg::AssetChunk {
+                    hash: hash.to_string(),
+                    index,
+                    bytes: chunk.to_vec(),
+                },
+            )
+            .map_err(|err| err.to_string())?;
+            index = index.saturating_add(1);
+        }
+        self.send_server_msg(
+            ws,
+            &ServerMsg::AssetEnd {
+                hash: hash.to_string(),
+            },
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    async fn store_asset(
+        &self,
+        hash: &str,
+        asset: StoredAsset,
+    ) -> std::result::Result<(), String> {
+        let (should_persist, hashes) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.assets.insert(hash.to_string(), asset.clone());
+            if !inner.asset_index.iter().any(|value| value == hash) {
+                inner.asset_index.push(hash.to_string());
+            }
+            let hashes = inner.asset_index.clone();
+            let should_persist = matches!(inner.meta.persistence, RoomPersistence::Durable);
+            (should_persist, hashes)
+        };
+        if should_persist {
+            self.persist_asset(hash, &asset).await?;
+            self.persist_asset_index(hashes).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_asset(
+        &self,
+        hash: &str,
+    ) -> std::result::Result<Option<StoredAsset>, String> {
+        if let Some(asset) = self.inner.borrow().assets.get(hash).cloned() {
+            return Ok(Some(asset));
+        }
+        let persistence = { self.inner.borrow().meta.persistence };
+        if !matches!(persistence, RoomPersistence::Durable) {
+            return Ok(None);
+        }
+        let storage = self.state.storage();
+        let meta_bytes: Option<Vec<u8>> = storage
+            .get(&asset_meta_key(hash))
+            .await
+            .map_err(|err| err.to_string())?;
+        let Some(bytes) = meta_bytes else {
+            return Ok(None);
+        };
+        let Some(meta) = decode::<StoredAssetMeta>(&bytes) else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::with_capacity(meta.size as usize);
+        for index in 0..meta.chunks {
+            let chunk_key = asset_chunk_key(hash, index);
+            let chunk: Option<Vec<u8>> = storage
+                .get(&chunk_key)
+                .await
+                .map_err(|err| err.to_string())?;
+            let Some(chunk) = chunk else {
+                return Ok(None);
+            };
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != meta.size as usize {
+            return Ok(None);
+        }
+        let asset = StoredAsset { meta, bytes };
+        self.inner
+            .borrow_mut()
+            .assets
+            .insert(hash.to_string(), asset.clone());
+        Ok(Some(asset))
+    }
+
+    async fn persist_asset(
+        &self,
+        hash: &str,
+        asset: &StoredAsset,
+    ) -> std::result::Result<(), String> {
+        let Some(meta_bytes) = encode(&asset.meta) else {
+            return Ok(());
+        };
+        let storage = self.state.storage();
+        storage
+            .put(&asset_meta_key(hash), meta_bytes)
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut index = 0u32;
+        for chunk in asset.bytes.chunks(ASSET_STORAGE_CHUNK_BYTES) {
+            storage
+                .put(&asset_chunk_key(hash, index), chunk.to_vec())
+                .await
+                .map_err(|err| err.to_string())?;
+            index = index.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    async fn persist_asset_index(
+        &self,
+        hashes: Vec<String>,
+    ) -> std::result::Result<(), String> {
+        let Some(bytes) = encode(&AssetIndex { hashes }) else {
+            return Ok(());
+        };
+        let storage = self.state.storage();
+        storage
+            .put(ASSET_INDEX_KEY, bytes)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    async fn clear_assets(
+        &self,
+        hashes: Vec<String>,
+    ) -> std::result::Result<(), String> {
+        let storage = self.state.storage();
+        let _ = storage.delete(ASSET_INDEX_KEY).await;
+        for hash in hashes {
+            let meta_key = asset_meta_key(&hash);
+            let meta_bytes: Option<Vec<u8>> = storage
+                .get(&meta_key)
+                .await
+                .map_err(|err| err.to_string())?;
+            let mut chunks = None;
+            if let Some(bytes) = meta_bytes {
+                if let Some(meta) = decode::<StoredAssetMeta>(&bytes) {
+                    chunks = Some(meta.chunks);
+                }
+            }
+            let _ = storage.delete(&meta_key).await;
+            if let Some(count) = chunks {
+                for index in 0..count {
+                    let _ = storage.delete(&asset_chunk_key(&hash, index)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_init(
         &self,
         ws: WebSocket,
@@ -1023,6 +1608,17 @@ impl Room {
                 );
                 return Ok(());
             }
+        }
+
+        if let Err(message) = validate_image_ref(&puzzle.image_ref) {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "invalid_puzzle".to_string(),
+                    message,
+                },
+            );
+            return Ok(());
         }
 
         let rules = GameRules::default();
@@ -2095,8 +2691,9 @@ impl Room {
     }
 
     async fn expire_room(&self) -> Result<()> {
-        {
+        let (hashes, persistence) = {
             let mut inner = self.inner.borrow_mut();
+            let hashes = inner.asset_index.clone();
             inner.meta.activated = false;
             inner.meta.last_command_at = None;
             inner.meta.last_warning_at = None;
@@ -2106,10 +2703,17 @@ impl Room {
             inner.owner_by_client.clear();
             inner.pending_releases.clear();
             inner.recent_nonces.clear();
-        }
+            inner.assets.clear();
+            inner.asset_index.clear();
+            inner.pending_uploads.clear();
+            (hashes, inner.meta.persistence)
+        };
 
         self.persist_meta().await?;
         let _ = self.state.storage().delete(SNAPSHOT_KEY).await;
+        if matches!(persistence, RoomPersistence::Durable) && !hashes.is_empty() {
+            let _ = self.clear_assets(hashes).await;
+        }
 
         let msg = ServerMsg::Error {
             code: "room_expired".to_string(),

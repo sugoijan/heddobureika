@@ -2,13 +2,24 @@ use std::fmt;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::snapshot::{GameRules, GameSnapshot, PuzzleInfo, PuzzleStateSnapshot};
+use crate::snapshot::{GameRules, GameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleStateSnapshot};
+
+pub const PRIVATE_UPLOAD_MAX_BYTES: u32 = 10 * 1024 * 1024;
+pub const PRIVATE_ASSET_MAX_BYTES: u32 = 3 * 1024 * 1024;
+pub const ASSET_CHUNK_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum RoomPersistence {
     Durable,
     BestEffort,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct PuzzleSpec {
+    pub image_ref: PuzzleImageRef,
+    pub pieces: Option<u32>,
+    pub seed: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Archive, Serialize, Deserialize)]
@@ -86,12 +97,19 @@ pub enum RoomUpdate {
 pub enum AdminMsg {
     Create {
         persistence: RoomPersistence,
-        puzzle: String,
-        pieces: Option<u32>,
-        seed: Option<u32>,
+        puzzle: PuzzleSpec,
     },
     ChangePuzzle {
-        puzzle: String,
+        puzzle: PuzzleSpec,
+    },
+    UploadPrivateBegin {
+        mime: String,
+        size: u32,
+    },
+    UploadPrivateChunk {
+        bytes: Vec<u8>,
+    },
+    UploadPrivateEnd {
         pieces: Option<u32>,
         seed: Option<u32>,
     },
@@ -107,6 +125,7 @@ pub enum ClientMsg {
         rules: Option<GameRules>,
         state: Option<PuzzleStateSnapshot>,
     },
+    AssetRequest { hash: String },
     Select { piece_id: u32 },
     Move {
         anchor_id: u32,
@@ -135,8 +154,24 @@ pub enum ServerMsg {
         client_id: Option<ClientId>,
     },
     AdminAck { room_id: String, persistence: RoomPersistence },
+    UploadAck { hash: String },
     NeedInit,
     Warning { minutes_idle: u32 },
+    AssetBegin {
+        hash: String,
+        mime: String,
+        width: u32,
+        height: u32,
+        size: u32,
+    },
+    AssetChunk {
+        hash: String,
+        index: u32,
+        bytes: Vec<u8>,
+    },
+    AssetEnd {
+        hash: String,
+    },
     State { seq: u64, snapshot: GameSnapshot },
     Update {
         seq: u64,

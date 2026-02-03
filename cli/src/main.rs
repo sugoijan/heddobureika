@@ -1,9 +1,11 @@
-use clap::{Parser, Subcommand};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::codec::{decode_result, encode};
 use heddobureika_core::catalog::{puzzle_by_slug, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG};
-use heddobureika_core::protocol::{AdminMsg, RoomPersistence, ServerMsg};
+use heddobureika_core::protocol::{AdminMsg, PuzzleSpec, RoomPersistence, ServerMsg};
+use heddobureika_core::{PuzzleImageRef, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES};
+use mime_guess::MimeGuess;
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand::Rng;
@@ -14,6 +16,7 @@ use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "heddobureika-cli", version, about = "Admin tools for heddobureika rooms")]
@@ -40,6 +43,8 @@ enum RoomCommand {
         #[arg(long, default_value = DEFAULT_PUZZLE_SLUG)]
         puzzle: String,
         #[arg(long)]
+        puzzle_file: Option<PathBuf>,
+        #[arg(long)]
         pieces: Option<u32>,
         #[arg(long)]
         seed: Option<String>,
@@ -50,6 +55,12 @@ enum RoomCommand {
         #[arg(long)]
         no_connect: bool,
     },
+}
+
+struct UploadPlan {
+    path: PathBuf,
+    pieces: Option<u32>,
+    seed: Option<u32>,
 }
 
 #[tokio::main]
@@ -63,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base_url,
                 admin_token,
                 puzzle,
+                puzzle_file,
                 pieces,
                 seed,
                 room_id,
@@ -78,17 +90,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     RoomPersistence::Durable
                 };
-                if puzzle_by_slug(&puzzle).is_none() {
-                    eprintln!("unknown puzzle: {puzzle}");
-                    eprintln!("available puzzles:");
-                    for entry in PUZZLE_CATALOG {
-                        eprintln!("  {} ({})", entry.slug, entry.label);
-                    }
-                    return Err(err_msg(format!("unknown puzzle: {puzzle}")));
-                }
                 let seed = match seed.as_deref() {
                     Some(raw) => Some(parse_seed_arg(raw)?),
                     None => None,
+                };
+                let (create_spec, upload_plan) = if let Some(path) = puzzle_file {
+                    if puzzle_by_slug(&puzzle).is_none() {
+                        eprintln!("unknown puzzle: {puzzle}");
+                        eprintln!("available puzzles:");
+                        for entry in PUZZLE_CATALOG {
+                            eprintln!("  {} ({})", entry.slug, entry.label);
+                        }
+                        return Err(err_msg(format!("unknown puzzle: {puzzle}")));
+                    }
+                    (
+                        PuzzleSpec {
+                            image_ref: PuzzleImageRef::BuiltIn { slug: puzzle.clone() },
+                            pieces: None,
+                            seed: None,
+                        },
+                        Some(UploadPlan {
+                            path,
+                            pieces,
+                            seed,
+                        }),
+                    )
+                } else {
+                    if puzzle_by_slug(&puzzle).is_none() {
+                        eprintln!("unknown puzzle: {puzzle}");
+                        eprintln!("available puzzles:");
+                        for entry in PUZZLE_CATALOG {
+                            eprintln!("  {} ({})", entry.slug, entry.label);
+                        }
+                        return Err(err_msg(format!("unknown puzzle: {puzzle}")));
+                    }
+                    (
+                        PuzzleSpec {
+                            image_ref: PuzzleImageRef::BuiltIn { slug: puzzle.clone() },
+                            pieces,
+                            seed,
+                        },
+                        None,
+                    )
                 };
 
                 let admin_url = build_admin_url(&base_url, &room_id, &admin_token)?;
@@ -117,9 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let msg = AdminMsg::Create {
                     persistence,
-                    puzzle,
-                    pieces,
-                    seed,
+                    puzzle: create_spec,
                 };
                 let Some(payload) = encode(&msg) else {
                     return Err(err_msg("failed to encode admin create message"));
@@ -172,6 +213,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => return Err(err_msg(err)),
                     Err(_) => return Err(err_msg("timed out waiting for admin create ack")),
+                }
+
+                if let Some(plan) = upload_plan {
+                    let bytes = std::fs::read(&plan.path)?;
+                    if bytes.is_empty() {
+                        return Err(err_msg("puzzle file is empty"));
+                    }
+                    if bytes.len() > PRIVATE_UPLOAD_MAX_BYTES as usize {
+                        return Err(err_msg(format!(
+                            "upload exceeds limit (max {} bytes)",
+                            PRIVATE_UPLOAD_MAX_BYTES
+                        )));
+                    }
+                    let mime = MimeGuess::from_path(&plan.path)
+                        .first_or_octet_stream()
+                        .to_string();
+                    let begin = AdminMsg::UploadPrivateBegin {
+                        mime,
+                        size: bytes.len() as u32,
+                    };
+                    let Some(begin_payload) = encode(&begin) else {
+                        return Err(err_msg("failed to encode upload begin message"));
+                    };
+                    write.send(Message::Binary(begin_payload.into())).await?;
+                    for chunk in bytes.chunks(ASSET_CHUNK_BYTES) {
+                        let msg = AdminMsg::UploadPrivateChunk {
+                            bytes: chunk.to_vec(),
+                        };
+                        let Some(payload) = encode(&msg) else {
+                            return Err(err_msg("failed to encode upload chunk"));
+                        };
+                        write.send(Message::Binary(payload.into())).await?;
+                    }
+                    let end = AdminMsg::UploadPrivateEnd {
+                        pieces: plan.pieces,
+                        seed: plan.seed,
+                    };
+                    let Some(end_payload) = encode(&end) else {
+                        return Err(err_msg("failed to encode upload end message"));
+                    };
+                    write.send(Message::Binary(end_payload.into())).await?;
+
+                    let upload_result = timeout(Duration::from_secs(60), async {
+                        let mut got_ack = false;
+                        let mut got_state = false;
+                        while let Some(message) = read.next().await {
+                            let message = match message {
+                                Ok(message) => message,
+                                Err(err) => return Err(format!("websocket error: {err}")),
+                            };
+                            match message {
+                                Message::Binary(bytes) => {
+                                    let msg = match decode_result::<ServerMsg>(&bytes) {
+                                        Ok(msg) => msg,
+                                        Err(err) => {
+                                            eprintln!(
+                                                "warning: received undecodable binary message ({} bytes): {err}; waiting for upload ack...",
+                                                bytes.len()
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    match msg {
+                                        ServerMsg::UploadAck { .. } => {
+                                            got_ack = true;
+                                            if got_state {
+                                                return Ok(());
+                                            }
+                                        }
+                                        ServerMsg::State { .. } => {
+                                            got_state = true;
+                                            if got_ack {
+                                                return Ok(());
+                                            }
+                                        }
+                                        ServerMsg::Error { code, message } => {
+                                            return Err(format!("server error {code}: {message}"));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Message::Text(text) => {
+                                    return Err(format!("server text message: {text}"));
+                                }
+                                Message::Close(frame) => {
+                                    return Err(format!("server closed connection: {frame:?}"));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err("server closed before acknowledging upload".to_string())
+                    })
+                    .await;
+
+                    match upload_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => return Err(err_msg(err)),
+                        Err(_) => return Err(err_msg("timed out waiting for upload ack")),
+                    }
                 }
 
                 println!("room_id: {room_id}");

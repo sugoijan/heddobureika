@@ -7,6 +7,7 @@ use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
 use taffy::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 use js_sys::{Date, Function, Reflect};
 use web_sys::{Document, Element, Event, HtmlImageElement, PointerEvent, WheelEvent};
 
@@ -14,15 +15,18 @@ use crate::boot;
 use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
 use crate::input::{
-    screen_delta_to_world, screen_scroll_to_world, screen_to_view_coords, ClickGesture,
-    PointerKind, PointerPolicy, WheelIntent, WheelIntentTracker, workspace_to_puzzle_coords,
+    screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
+    workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
+    WheelIntentTracker,
 };
 use crate::core::*;
 use crate::renderer::{build_mask_atlas, MaskAtlasData, UiRotationOrigin, UiTextId, UiTextSpec};
 use crate::runtime::{CoreAction, GameSyncView, GameView, SyncView, ViewHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
-use heddobureika_core::PuzzleInfo;
+use heddobureika_core::{PuzzleImageRef, PuzzleInfo};
+use crate::persisted_store;
+use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
@@ -85,6 +89,14 @@ struct PinchState {
     touch_a: i32,
     touch_b: i32,
     last_distance: f32,
+}
+
+#[derive(Clone, Copy)]
+struct PointerDragGate {
+    pointer_id: i32,
+    start_x: f32,
+    start_y: f32,
+    moved: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -270,7 +282,7 @@ impl DebugOverlay {
 
 #[derive(Clone, PartialEq)]
 struct PuzzleKey {
-    src: String,
+    image_ref: PuzzleImageRef,
     cols: u32,
     rows: u32,
     width: u32,
@@ -280,7 +292,7 @@ struct PuzzleKey {
 impl PuzzleKey {
     fn from_info(info: &PuzzleInfo) -> Self {
         Self {
-            src: info.image_src.clone(),
+            image_ref: info.image_ref.clone(),
             cols: info.cols,
             rows: info.rows,
             width: info.image_width,
@@ -318,6 +330,7 @@ struct SvgView {
     pointer_policy: RefCell<PointerPolicy>,
     pan_state: RefCell<Option<PanState>>,
     pinch_state: RefCell<Option<PinchState>>,
+    drag_gate: RefCell<Option<PointerDragGate>>,
     auto_pan: RefCell<AutoPanState>,
     hooks: RefCell<Option<ViewHooks>>,
     subscription: RefCell<Option<crate::app_core::AppSubscription>>,
@@ -326,6 +339,11 @@ struct SvgView {
     mask_atlas: RefCell<Option<Rc<MaskAtlasData>>>,
     last_assets_ptr: Cell<usize>,
     last_puzzle: RefCell<Option<PuzzleKey>>,
+    private_image_url: RefCell<Option<String>>,
+    private_image_hash: RefCell<Option<String>>,
+    private_image_loading: Cell<bool>,
+    private_image_error: RefCell<Option<String>>,
+    multiplayer_active: Cell<bool>,
     last_z_order: RefCell<Vec<usize>>,
     last_svg_settings: RefCell<Option<SvgRenderSettings>>,
     svg_settings: RefCell<SvgRenderSettings>,
@@ -466,6 +484,16 @@ thread_local! {
     static SVG_VIEW: RefCell<Option<Rc<SvgView>>> = RefCell::new(None);
 }
 
+pub(crate) fn request_render() {
+    SVG_VIEW.with(|slot| {
+        if let Some(view) = slot.borrow().as_ref() {
+            let snapshot = view.core.snapshot();
+            let sync_view = sync_runtime::sync_view();
+            view.queue_render_snapshot(snapshot, sync_view);
+        }
+    });
+}
+
 impl SvgView {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -496,6 +524,7 @@ impl SvgView {
             pointer_policy: RefCell::new(PointerPolicy::new()),
             pan_state: RefCell::new(None),
             pinch_state: RefCell::new(None),
+            drag_gate: RefCell::new(None),
             auto_pan: RefCell::new(AutoPanState::new()),
             hooks: RefCell::new(None),
             subscription: RefCell::new(None),
@@ -504,6 +533,11 @@ impl SvgView {
             mask_atlas: RefCell::new(None),
             last_assets_ptr: Cell::new(0),
             last_puzzle: RefCell::new(None),
+            private_image_url: RefCell::new(None),
+            private_image_hash: RefCell::new(None),
+            private_image_loading: Cell::new(false),
+            private_image_error: RefCell::new(None),
+            multiplayer_active: Cell::new(false),
             last_z_order: RefCell::new(Vec::new()),
             last_svg_settings: RefCell::new(None),
             svg_settings: RefCell::new(svg_settings),
@@ -905,6 +939,22 @@ impl SvgView {
         let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
         if let Some(piece_id) = self.pick_piece(px, py, &snapshot) {
             let right_click = button == 2;
+            if matches!(kind, PointerKind::Touch | PointerKind::Pen) {
+                *self.drag_gate.borrow_mut() = Some(PointerDragGate {
+                    pointer_id,
+                    start_x: px,
+                    start_y: py,
+                    moved: false,
+                });
+            } else {
+                self.drag_gate.borrow_mut().take();
+            }
+            let click_slop = screen_slop_to_puzzle(
+                TOUCH_DRAG_SLOP_PX,
+                svg,
+                snapshot.view,
+                snapshot.layout.puzzle_scale,
+            );
             self.dispatch_action(CoreAction::BeginDrag {
                 piece_id,
                 x: px,
@@ -912,6 +962,7 @@ impl SvgView {
                 shift_key: event.shift_key(),
                 rotate_mode: event.ctrl_key(),
                 right_click,
+                click_slop,
                 pointer_id: Some(pointer_id),
             });
             let drag_snapshot = self.core.snapshot();
@@ -1039,6 +1090,30 @@ impl SvgView {
             };
             let (px, py) =
                 workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+            if let Some(gate) = self.drag_gate.borrow_mut().as_mut() {
+                if let Some(drag_id) = snapshot.drag_pointer_id {
+                    if gate.pointer_id != drag_id {
+                        gate.moved = true;
+                    } else if !gate.moved {
+                        let click_tolerance =
+                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        let slop = screen_slop_to_puzzle(
+                            TOUCH_DRAG_SLOP_PX,
+                            svg,
+                            snapshot.view,
+                            snapshot.layout.puzzle_scale,
+                        );
+                        let drag_tolerance = click_tolerance.max(slop);
+                        let dx = px - gate.start_x;
+                        let dy = py - gate.start_y;
+                        if dx * dx + dy * dy < drag_tolerance * drag_tolerance {
+                            event.prevent_default();
+                            return;
+                        }
+                        gate.moved = true;
+                    }
+                }
+            }
             self.update_auto_pan(screen_x, screen_y, &snapshot);
             self.dispatch_action(CoreAction::DragMove { x: px, y: py });
             event.prevent_default();
@@ -1097,6 +1172,7 @@ impl SvgView {
             policy.clear_active();
         }
         let _ = svg.release_pointer_capture(pointer_id);
+        self.drag_gate.borrow_mut().take();
         let snapshot = self.core.snapshot();
         if kind_changed {
             self.clear_hover_state(&snapshot);
@@ -1172,6 +1248,7 @@ impl SvgView {
         let _ = svg.release_pointer_capture(pointer_id);
         self.pan_state.borrow_mut().take();
         self.pinch_state.borrow_mut().take();
+        self.drag_gate.borrow_mut().take();
         self.stop_auto_pan();
         let snapshot = self.core.snapshot();
         self.update_svg_class(&snapshot);
@@ -1705,6 +1782,8 @@ impl SvgView {
         if snapshot.view.width <= 0.0 || snapshot.view.height <= 0.0 {
             self.ensure_viewport_size();
         }
+        self.multiplayer_active
+            .set(matches!(sync_view.mode(), InitMode::Online));
         let disconnected =
             matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
         if disconnected {
@@ -1714,10 +1793,14 @@ impl SvgView {
         }
         if let Some(preview) = self.preview.borrow().as_ref() {
             if let Some(info) = snapshot.puzzle_info.as_ref() {
-                preview.set_image_src(info.image_src.as_str());
-                preview.set_visible(true);
-                let rect = self.root.get_bounding_client_rect();
-                self.update_preview_overlay(snapshot, &rect);
+                if let Some(src) = self.resolve_image_src(info) {
+                    preview.set_image_src(src.as_str());
+                    preview.set_visible(true);
+                    let rect = self.root.get_bounding_client_rect();
+                    self.update_preview_overlay(snapshot, &rect);
+                } else {
+                    preview.set_visible(false);
+                }
             } else {
                 preview.set_visible(false);
             }
@@ -1747,6 +1830,89 @@ impl SvgView {
         self.preview_velocity.set([0.0, 0.0]);
         self.preview_motion_last_ms.set(0.0);
         self.preview_motion_frame.borrow_mut().take();
+    }
+
+    fn clear_private_image_cache(&self) {
+        if let Some(url) = self.private_image_url.borrow_mut().take() {
+            revoke_object_url(&url);
+        }
+        self.private_image_hash.borrow_mut().take();
+        self.private_image_error.borrow_mut().take();
+        self.private_image_loading.set(false);
+    }
+
+    fn note_private_image_error(&self, hash: &str, message: &str) {
+        let mut last = self.private_image_error.borrow_mut();
+        if last.as_deref() == Some(hash) {
+            return;
+        }
+        *last = Some(hash.to_string());
+        if !self.multiplayer_active.get() {
+            boot::fail("image-missing", message, "Re-upload the image to this browser.");
+        }
+        self.private_image_loading.set(false);
+    }
+
+    fn ensure_private_image_src(self: &Rc<Self>, hash: &str, info: &PuzzleInfo) -> Option<String> {
+        if self.private_image_hash.borrow().as_deref() == Some(hash) {
+            if let Some(url) = self.private_image_url.borrow().as_ref() {
+                return Some(url.clone());
+            }
+        }
+        if self.private_image_loading.get() {
+            return None;
+        }
+        self.private_image_loading.set(true);
+        let hash_value = hash.to_string();
+        let view = Rc::clone(self);
+        let key = PuzzleKey::from_info(info);
+        spawn_local(async move {
+            let entry = match persisted_store::load_private_image(&hash_value).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    view.note_private_image_error(&hash_value, "Private image is missing.");
+                    return;
+                }
+                Err(message) => {
+                    view.note_private_image_error(&hash_value, &message);
+                    return;
+                }
+            };
+            let url = match create_object_url(&entry.bytes, &entry.mime) {
+                Ok(url) => url,
+                Err(_) => {
+                    view.note_private_image_error(&hash_value, "Failed to prepare private image.");
+                    return;
+                }
+            };
+            if view
+                .last_puzzle
+                .borrow()
+                .as_ref()
+                .map(|current| current != &key)
+                .unwrap_or(false)
+            {
+                revoke_object_url(&url);
+                view.private_image_loading.set(false);
+                return;
+            }
+            *view.private_image_url.borrow_mut() = Some(url.clone());
+            *view.private_image_hash.borrow_mut() = Some(hash_value.clone());
+            view.private_image_loading.set(false);
+            let mut updated = entry;
+            updated.last_used_at = js_sys::Date::now().max(0.0) as u64;
+            let _ = persisted_store::save_private_image(&hash_value, updated).await;
+            view.last_assets_ptr.set(0);
+            view.queue_render_snapshot(view.core.snapshot(), sync_runtime::sync_view());
+        });
+        None
+    }
+
+    fn resolve_image_src(self: &Rc<Self>, info: &PuzzleInfo) -> Option<String> {
+        match &info.image_ref {
+            PuzzleImageRef::Private { hash } => self.ensure_private_image_src(hash, info),
+            _ => resolve_puzzle_image_src(&info.image_ref),
+        }
     }
 
     fn update_preview_overlay(&self, snapshot: &AppSnapshot, rect: &web_sys::DomRect) {
@@ -2511,13 +2677,14 @@ impl SvgView {
         self.mask_atlas.borrow_mut().take();
         self.last_assets_ptr.set(0);
         self.last_puzzle.borrow_mut().take();
+        self.clear_private_image_cache();
         self.last_z_order.borrow_mut().clear();
         clear_children(&self.defs);
         clear_children(&self.puzzle_group);
         let _ = self.puzzle_group.append_child(&self.puzzle_bounds);
     }
 
-    fn ensure_scene(&self, snapshot: &AppSnapshot, assets: Rc<PuzzleAssets>) {
+    fn ensure_scene(self: &Rc<Self>, snapshot: &AppSnapshot, assets: Rc<PuzzleAssets>) {
         let ptr = Rc::as_ptr(&assets) as usize;
         let settings_changed = {
             let current = self.svg_settings.borrow().clone();
@@ -2543,9 +2710,13 @@ impl SvgView {
                 .replace(PuzzleKey::from_info(&assets.info));
             if puzzle_changed {
                 self.reset_preview_state();
+                self.clear_private_image_cache();
             }
             self.rebuild_defs(snapshot, &assets);
-            self.rebuild_pieces(snapshot, &assets);
+            let image_src = self
+                .resolve_image_src(&assets.info)
+                .unwrap_or_else(|| "".to_string());
+            self.rebuild_pieces(snapshot, &assets, image_src.as_str());
         }
     }
 
@@ -2650,12 +2821,12 @@ impl SvgView {
         }
     }
 
-    fn rebuild_pieces(&self, snapshot: &AppSnapshot, assets: &PuzzleAssets) {
+    fn rebuild_pieces(&self, snapshot: &AppSnapshot, assets: &PuzzleAssets, image_src: &str) {
         clear_children(&self.puzzle_group);
         let _ = self.puzzle_group.append_child(&self.puzzle_bounds);
         self.pieces.borrow_mut().clear();
         for piece in &assets.pieces {
-            let node = self.build_piece_node(snapshot, assets, piece.id);
+            let node = self.build_piece_node(snapshot, assets, piece.id, image_src);
             let _ = self.puzzle_group.append_child(&node.root);
             self.pieces.borrow_mut().push(node);
         }
@@ -2667,6 +2838,7 @@ impl SvgView {
         _snapshot: &AppSnapshot,
         assets: &PuzzleAssets,
         piece_id: usize,
+        image_src: &str,
     ) -> SvgPieceNodes {
         let root = create_svg_element(&self.document, "g");
         let outline_group = create_svg_element(&self.document, "g");
@@ -2715,7 +2887,7 @@ impl SvgView {
         let _ = back_rect.set_attribute("height", &height);
         let _ = back_rect.set_attribute("fill", "url(#piece-back-pattern)");
         let _ = back_rect.set_attribute("mask", &mask_ref);
-        let _ = image.set_attribute("href", assets.info.image_src.as_str());
+        let _ = image.set_attribute("href", image_src);
         let _ = image.set_attribute("x", &img_x);
         let _ = image.set_attribute("y", &img_y);
         let _ = image.set_attribute("width", &width);

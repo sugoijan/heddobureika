@@ -11,9 +11,9 @@ use crate::persisted_store;
 use web_sys::window;
 use js_sys::decode_uri_component;
 use heddobureika_core::catalog::{
-    logical_image_size, puzzle_by_label, puzzle_by_slug, puzzle_by_src, PuzzleCatalogEntry,
-    DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG,
+    logical_image_size, puzzle_by_slug, PuzzleCatalogEntry, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG,
 };
+use heddobureika_core::PuzzleImageRef;
 use crate::core::{
     best_grid_for_count, build_grid_choices, grid_choice_index, DEFAULT_TARGET_COUNT,
     FALLBACK_GRID, IMAGE_MAX_DIMENSION_MAX, IMAGE_MAX_DIMENSION_MIN, PUZZLE_SEED,
@@ -117,10 +117,7 @@ fn parse_hash_route() -> Option<HashRoute> {
         if key.eq_ignore_ascii_case("puzzle") {
             saw_known = true;
             let decoded = decode_hash_value(value);
-            puzzle_entry = puzzle_by_slug(&decoded)
-                .or_else(|| puzzle_by_label(&decoded))
-                .or_else(|| puzzle_by_src(&decoded))
-                .copied();
+            puzzle_entry = puzzle_by_slug(&decoded).copied();
         } else if key.eq_ignore_ascii_case("pieces") {
             saw_known = true;
             if let Ok(parsed) = value.parse::<u32>() {
@@ -150,7 +147,7 @@ fn parse_hash_route() -> Option<HashRoute> {
 
 fn load_saved_puzzle_selection() -> Option<BootPuzzleSelection> {
     let selection = persisted_store::boot_record().last_puzzle?;
-    if selection.puzzle_src.trim().is_empty() || selection.cols == 0 || selection.rows == 0 {
+    if selection.puzzle_slug.trim().is_empty() || selection.cols == 0 || selection.rows == 0 {
         return None;
     }
     Some(selection)
@@ -163,11 +160,11 @@ fn clear_saved_puzzle_selection() {
 }
 
 fn save_puzzle_selection(entry: PuzzleCatalogEntry, grid: GridChoice) {
-    if entry.src.trim().is_empty() || grid.cols == 0 || grid.rows == 0 {
+    if entry.slug.trim().is_empty() || grid.cols == 0 || grid.rows == 0 {
         return;
     }
     let selection = BootPuzzleSelection {
-        puzzle_src: entry.src.to_string(),
+        puzzle_slug: entry.slug.to_string(),
         cols: grid.cols,
         rows: grid.rows,
     };
@@ -222,27 +219,26 @@ fn resolve_boot_selection() -> Option<BootSelection> {
 
 fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
     if let Some(snapshot) = load_local_snapshot() {
-        if let Some(entry) = puzzle_by_src(&snapshot.puzzle.image_src)
-            .or_else(|| puzzle_by_label(&snapshot.puzzle.label))
-            .copied()
-        {
-            let grid_override = resolve_grid_override(
-                snapshot.puzzle.image_width,
-                snapshot.puzzle.image_height,
-                snapshot.puzzle.cols,
-                snapshot.puzzle.rows,
-            );
-            return Some(BootSelection {
-                entry,
-                grid_override,
-                seed: None,
-                clear_hash,
-                force_new: false,
-            });
+        if let PuzzleImageRef::BuiltIn { slug } = &snapshot.puzzle.image_ref {
+            if let Some(entry) = puzzle_by_slug(slug).copied() {
+                let grid_override = resolve_grid_override(
+                    snapshot.puzzle.image_width,
+                    snapshot.puzzle.image_height,
+                    snapshot.puzzle.cols,
+                    snapshot.puzzle.rows,
+                );
+                return Some(BootSelection {
+                    entry,
+                    grid_override,
+                    seed: None,
+                    clear_hash,
+                    force_new: false,
+                });
+            }
         }
     }
     if let Some(selection) = load_saved_puzzle_selection() {
-        if let Some(entry) = puzzle_by_src(&selection.puzzle_src).copied() {
+        if let Some(entry) = puzzle_by_slug(&selection.puzzle_slug).copied() {
             let grid_override = resolve_grid_override(
                 entry.width,
                 entry.height,
@@ -282,7 +278,9 @@ fn apply_selection(core: Rc<AppCore>, image_max_dim: u32, selection: BootSelecti
         .map(|seed| scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize));
     core.set_puzzle_with_grid_with_nonce(
         selection.entry.label.to_string(),
-        selection.entry.src.to_string(),
+        PuzzleImageRef::BuiltIn {
+            slug: selection.entry.slug.to_string(),
+        },
         (logical_w, logical_h),
         Some(grid),
         scramble_nonce,
@@ -306,7 +304,44 @@ pub(crate) fn request_puzzle_change(
     apply_selection(core, image_max_dim, selection);
 }
 
+fn grid_override_from_snapshot(info: &heddobureika_core::PuzzleInfo) -> GridChoice {
+    resolve_grid_override(info.image_width, info.image_height, info.cols, info.rows).unwrap_or(
+        GridChoice {
+            target_count: info.cols.saturating_mul(info.rows),
+            cols: info.cols,
+            rows: info.rows,
+            actual_count: info.cols.saturating_mul(info.rows),
+        },
+    )
+}
+
 fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
+    let hash_route = parse_hash_route();
+    if let Some(snapshot) = load_local_snapshot() {
+        if !matches!(snapshot.puzzle.image_ref, PuzzleImageRef::BuiltIn { .. }) {
+            if !matches!(
+                hash_route.as_ref().map(|route| &route.mode),
+                Some(HashRouteMode::Puzzle { .. })
+            ) {
+                if hash_route
+                    .as_ref()
+                    .map(|route| route.clear_hash)
+                    .unwrap_or(false)
+                {
+                    app_router::clear_location_hash();
+                }
+                let grid_override = grid_override_from_snapshot(&snapshot.puzzle);
+                core.set_puzzle_with_grid_with_nonce(
+                    snapshot.puzzle.label.clone(),
+                    snapshot.puzzle.image_ref.clone(),
+                    (snapshot.puzzle.image_width, snapshot.puzzle.image_height),
+                    Some(grid_override),
+                    Some(snapshot.state.scramble_nonce),
+                );
+                return;
+            }
+        }
+    }
     let Some(selection) = resolve_boot_selection() else {
         return;
     };

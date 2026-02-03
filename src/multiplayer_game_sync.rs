@@ -6,7 +6,7 @@ use gloo::console;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app_router;
-use crate::runtime::{CoreAction, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView};
+use crate::runtime::{AssetEvent, CoreAction, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView};
 use crate::core::InitMode;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
@@ -170,6 +170,7 @@ impl MultiplayerGameSync {
         let ownership_by_anchor = Rc::clone(&self.ownership_by_anchor);
         let ownership_seq_by_anchor = Rc::clone(&self.ownership_seq_by_anchor);
         let on_event = hooks.on_event.clone();
+        let on_asset = hooks.on_asset.clone();
         let on_remote_snapshot = hooks.on_remote_snapshot.clone();
         let on_remote_update = hooks.on_remote_update.clone();
         Rc::new(move |msg: ServerMsg| match msg {
@@ -213,6 +214,27 @@ impl MultiplayerGameSync {
             ServerMsg::Warning { minutes_idle } => {
                 console::warn!("room idle for", minutes_idle, "minutes");
                 (on_event)(SyncEvent::Warning { minutes_idle });
+            }
+            ServerMsg::AssetBegin {
+                hash,
+                mime,
+                width,
+                height,
+                size,
+            } => {
+                (on_asset)(AssetEvent::Begin {
+                    hash,
+                    mime,
+                    width,
+                    height,
+                    size,
+                });
+            }
+            ServerMsg::AssetChunk { hash, index, bytes } => {
+                (on_asset)(AssetEvent::Chunk { hash, index, bytes });
+            }
+            ServerMsg::AssetEnd { hash } => {
+                (on_asset)(AssetEvent::End { hash });
             }
             ServerMsg::State { seq, snapshot } => {
                 console::log!(
@@ -292,6 +314,9 @@ impl MultiplayerGameSync {
                 (on_remote_update)(update, seq, source, client_seq);
             }
             ServerMsg::Pong { .. } => {}
+            ServerMsg::UploadAck { hash } => {
+                (on_asset)(AssetEvent::UploadAck { hash });
+            }
             ServerMsg::Error { code, message } => {
                 console::warn!("server error", code.clone(), message.clone());
                 (on_event)(SyncEvent::Error { code, message });

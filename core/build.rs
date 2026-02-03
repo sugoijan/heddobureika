@@ -18,8 +18,8 @@ struct PuzzleEntry {
     label: String,
     slug: String,
     src: String,
-    width: u32,
-    height: u32,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 fn main() {
@@ -109,6 +109,8 @@ fn main() {
     .unwrap();
 
     for entry in &catalog.puzzles {
+        let (width, height, src_path) = image_dimensions(entry, workspace_root);
+        println!("cargo:rerun-if-changed={}", src_path.display());
         let src_value = if entry.slug == default_slug {
             "DEFAULT_PUZZLE_SRC".to_string()
         } else {
@@ -118,8 +120,8 @@ fn main() {
         writeln!(&mut output, "        label: {},", rust_string(&entry.label)).unwrap();
         writeln!(&mut output, "        slug: {},", rust_string(&entry.slug)).unwrap();
         writeln!(&mut output, "        src: {},", src_value).unwrap();
-        writeln!(&mut output, "        width: {},", entry.width).unwrap();
-        writeln!(&mut output, "        height: {},", entry.height).unwrap();
+        writeln!(&mut output, "        width: {},", width).unwrap();
+        writeln!(&mut output, "        height: {},", height).unwrap();
         writeln!(&mut output, "    }},").unwrap();
     }
 
@@ -160,12 +162,35 @@ fn validate_entries(entries: &[PuzzleEntry], catalog_path: &Path) {
         if entry.src.trim().is_empty() {
             panic!("puzzle src cannot be empty in {}", catalog_path.display());
         }
-        if entry.width == 0 || entry.height == 0 {
+        if entry.src.starts_with("http://") || entry.src.starts_with("https://") {
             panic!(
-                "puzzle '{}' has invalid dimensions in {}",
+                "puzzle '{}' src cannot be a URL in {}",
                 entry.slug,
                 catalog_path.display()
             );
+        }
+        if entry.src.starts_with("data:") {
+            panic!(
+                "puzzle '{}' src cannot be a data URL in {}",
+                entry.slug,
+                catalog_path.display()
+            );
+        }
+        if entry.width.is_some() ^ entry.height.is_some() {
+            panic!(
+                "puzzle '{}' must set both width and height or neither in {}",
+                entry.slug,
+                catalog_path.display()
+            );
+        }
+        if let (Some(width), Some(height)) = (entry.width, entry.height) {
+            if width == 0 || height == 0 {
+                panic!(
+                    "puzzle '{}' has invalid dimensions in {}",
+                    entry.slug,
+                    catalog_path.display()
+                );
+            }
         }
         if !slugs.insert(entry.slug.clone()) {
             panic!(
@@ -182,4 +207,82 @@ fn validate_entries(entries: &[PuzzleEntry], catalog_path: &Path) {
             );
         }
     }
+}
+
+fn image_dimensions(entry: &PuzzleEntry, workspace_root: &Path) -> (u32, u32, PathBuf) {
+    let src_path = resolve_src_path(&entry.src, workspace_root);
+    match imagesize::size(&src_path) {
+        Ok(size) => {
+            let width = u32::try_from(size.width).unwrap_or_else(|_| {
+                panic!(
+                    "puzzle '{}' resolved to {} with width {} larger than u32",
+                    entry.slug,
+                    src_path.display(),
+                    size.width
+                )
+            });
+            let height = u32::try_from(size.height).unwrap_or_else(|_| {
+                panic!(
+                    "puzzle '{}' resolved to {} with height {} larger than u32",
+                    entry.slug,
+                    src_path.display(),
+                    size.height
+                )
+            });
+            if let (Some(expected_width), Some(expected_height)) = (entry.width, entry.height) {
+                if width != expected_width || height != expected_height {
+                    panic!(
+                        "puzzle '{}' resolved to {} with dimensions {}x{} but catalog expects {}x{}",
+                        entry.slug,
+                        src_path.display(),
+                        width,
+                        height,
+                        expected_width,
+                        expected_height
+                    );
+                }
+            }
+            if width == 0 || height == 0 {
+                panic!(
+                    "puzzle '{}' resolved to {} with invalid dimensions {}x{}",
+                    entry.slug,
+                    src_path.display(),
+                    width,
+                    height
+                );
+            }
+            (width, height, src_path)
+        }
+        Err(err) => {
+            if let (Some(width), Some(height)) = (entry.width, entry.height) {
+                println!(
+                    "cargo:warning=failed to read image size for '{}', falling back to catalog dimensions {}x{}: {}",
+                    entry.src, width, height, err
+                );
+                (width, height, src_path)
+            } else {
+                panic!(
+                    "failed to read image size for '{}' at {}: {err}",
+                    entry.src,
+                    src_path.display()
+                );
+            }
+        }
+    }
+}
+
+fn resolve_src_path(src: &str, workspace_root: &Path) -> PathBuf {
+    let raw_path = PathBuf::from(src);
+    if raw_path.is_absolute() && raw_path.exists() {
+        return raw_path;
+    }
+    let trimmed = src.trim_start_matches('/');
+    let workspace_path = workspace_root.join(trimmed);
+    if workspace_path.exists() {
+        return workspace_path;
+    }
+    if raw_path.is_absolute() {
+        return raw_path;
+    }
+    workspace_path
 }

@@ -2,18 +2,22 @@ use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbTransactionMode};
 
 pub(crate) const IDB_NAME: &str = "heddobureika";
-pub(crate) const IDB_VERSION: u32 = 2;
+pub(crate) const IDB_VERSION: u32 = 3;
 
 pub(crate) const IDB_STORE_BOOT: &str = "boot";
 pub(crate) const IDB_STORE_SETTINGS: &str = "settings";
 pub(crate) const IDB_STORE_SNAPSHOT: &str = "snapshot";
 pub(crate) const IDB_STORE_IDENTITY: &str = "identity";
+pub(crate) const IDB_STORE_PRIVATE_IMAGES: &str = "private_images";
+pub(crate) const IDB_STORE_PRIVATE_IMAGE_REFS: &str = "private_image_refs";
 
 const ALL_STORES: &[&str] = &[
     IDB_STORE_BOOT,
     IDB_STORE_SETTINGS,
     IDB_STORE_SNAPSHOT,
     IDB_STORE_IDENTITY,
+    IDB_STORE_PRIVATE_IMAGES,
+    IDB_STORE_PRIVATE_IMAGE_REFS,
 ];
 
 pub(crate) async fn open_db() -> Result<IdbDatabase, JsValue> {

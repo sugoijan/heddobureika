@@ -65,10 +65,10 @@ pub(crate) fn apply_game_snapshot_to_core(
         }
         return ApplySnapshotResult::NotReady;
     };
-    if info.image_src != snapshot.puzzle.image_src {
+    if info.image_ref != snapshot.puzzle.image_ref {
         #[cfg(target_arch = "wasm32")]
         {
-            gloo::console::log!("local snapshot: restore mismatch image_src");
+            gloo::console::log!("local snapshot: restore mismatch image ref");
         }
         return ApplySnapshotResult::Mismatch;
     }

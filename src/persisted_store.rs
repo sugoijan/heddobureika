@@ -4,8 +4,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::idb;
 use crate::persisted::{
-    BootRecord, SettingsBlob, BOOT_RECORD_KEY, BOOT_RECORD_VERSION, SETTINGS_KEY, SETTINGS_VERSION,
-    SNAPSHOT_KEY,
+    BootRecord, PrivateImageEntry, PrivateImageRefs, SettingsBlob, BOOT_RECORD_KEY,
+    BOOT_RECORD_VERSION, SETTINGS_KEY, SETTINGS_VERSION, SNAPSHOT_KEY,
 };
 use heddobureika_core::{decode, encode, GameSnapshot, GAME_SNAPSHOT_VERSION};
 
@@ -85,6 +85,58 @@ pub(crate) fn set_snapshot(next: Option<GameSnapshot>) {
     spawn_local(async move {
         let _ = save_snapshot(next).await;
     });
+}
+
+pub(crate) async fn load_private_image(hash: &str) -> Result<Option<PrivateImageEntry>, String> {
+    let db = idb::open_db().await.map_err(idb::js_err)?;
+    let bytes = idb::idb_get_bytes(&db, idb::IDB_STORE_PRIVATE_IMAGES, hash)
+        .await
+        .map_err(idb::js_err)?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    Ok(decode::<PrivateImageEntry>(&bytes))
+}
+
+pub(crate) async fn save_private_image(
+    hash: &str,
+    entry: PrivateImageEntry,
+) -> Result<(), String> {
+    let Some(bytes) = encode(&entry) else {
+        return Ok(());
+    };
+    let db = idb::open_db().await.map_err(idb::js_err)?;
+    idb::idb_put_bytes(&db, idb::IDB_STORE_PRIVATE_IMAGES, hash, &bytes)
+        .await
+        .map_err(idb::js_err)?;
+    Ok(())
+}
+
+pub(crate) async fn load_private_image_refs(
+    scope_key: &str,
+) -> Result<Option<PrivateImageRefs>, String> {
+    let db = idb::open_db().await.map_err(idb::js_err)?;
+    let bytes = idb::idb_get_bytes(&db, idb::IDB_STORE_PRIVATE_IMAGE_REFS, scope_key)
+        .await
+        .map_err(idb::js_err)?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    Ok(decode::<PrivateImageRefs>(&bytes))
+}
+
+pub(crate) async fn save_private_image_refs(
+    scope_key: &str,
+    refs: PrivateImageRefs,
+) -> Result<(), String> {
+    let Some(bytes) = encode(&refs) else {
+        return Ok(());
+    };
+    let db = idb::open_db().await.map_err(idb::js_err)?;
+    idb::idb_put_bytes(&db, idb::IDB_STORE_PRIVATE_IMAGE_REFS, scope_key, &bytes)
+        .await
+        .map_err(idb::js_err)?;
+    Ok(())
 }
 
 async fn load_boot_record(db: &web_sys::IdbDatabase) -> Option<BootRecord> {

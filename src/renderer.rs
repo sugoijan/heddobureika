@@ -2467,8 +2467,11 @@ fn image_to_rgba(
         .get_context("2d")?
         .ok_or_else(|| wasm_bindgen::JsValue::from_str("no 2d context"))?
         .dyn_into::<CanvasRenderingContext2d>()?;
-    ctx.draw_image_with_html_image_element(image, 0.0, 0.0)?;
-    let data = ctx.get_image_data(0.0, 0.0, width as f64, height as f64)?;
+    ctx.draw_image_with_html_image_element(image, 0.0, 0.0)
+        .map_err(|_| wasm_bindgen::JsValue::from_str("image_draw_failed"))?;
+    let data = ctx
+        .get_image_data(0.0, 0.0, width as f64, height as f64)
+        .map_err(|_| wasm_bindgen::JsValue::from_str("image_read_failed"))?;
     Ok((data.data().to_vec(), width, height))
 }
 
@@ -2505,8 +2508,11 @@ fn image_to_rgba_scaled(
         0.0,
         target_w as f64,
         target_h as f64,
-    )?;
-    let data = ctx.get_image_data(0.0, 0.0, target_w as f64, target_h as f64)?;
+    )
+    .map_err(|_| wasm_bindgen::JsValue::from_str("image_draw_failed"))?;
+    let data = ctx
+        .get_image_data(0.0, 0.0, target_w as f64, target_h as f64)
+        .map_err(|_| wasm_bindgen::JsValue::from_str("image_read_failed"))?;
     let mut pixels = data.data().to_vec();
     if blur_px > 0.0 {
         // TODO: consider moving preview blur to the GPU to avoid CPU cost.

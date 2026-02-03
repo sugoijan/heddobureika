@@ -5,7 +5,30 @@ use crate::game::{
     SNAP_DISTANCE_RATIO_DEFAULT, WORKSPACE_PADDING_RATIO_DEFAULT,
 };
 
-pub const GAME_SNAPSHOT_VERSION: u32 = 1;
+pub const GAME_SNAPSHOT_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+pub enum PuzzleImageRef {
+    BuiltIn { slug: String },
+    Private { hash: String },
+}
+
+pub fn validate_image_ref(image_ref: &PuzzleImageRef) -> Result<(), String> {
+    match image_ref {
+        PuzzleImageRef::BuiltIn { slug } => {
+            if slug.trim().is_empty() {
+                return Err("missing puzzle slug".to_string());
+            }
+            Ok(())
+        }
+        PuzzleImageRef::Private { hash } => {
+            if hash.trim().is_empty() {
+                return Err("missing image hash".to_string());
+            }
+            Ok(())
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Archive, Serialize, Deserialize)]
 pub struct GameRules {
@@ -33,7 +56,7 @@ impl Default for GameRules {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct PuzzleInfo {
     pub label: String,
-    pub image_src: String,
+    pub image_ref: PuzzleImageRef,
     pub rows: u32,
     pub cols: u32,
     pub shape_seed: u32,

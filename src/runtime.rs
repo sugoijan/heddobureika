@@ -22,6 +22,7 @@ pub struct SyncHooks {
     pub on_remote_snapshot: Rc<dyn Fn(GameSnapshot, u64)>,
     pub on_remote_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
     pub on_event: Rc<dyn Fn(SyncEvent)>,
+    pub on_asset: Rc<dyn Fn(AssetEvent)>,
 }
 
 impl SyncHooks {
@@ -32,6 +33,7 @@ impl SyncHooks {
             on_remote_snapshot: Rc::new(|_, _| {}),
             on_remote_update: Rc::new(|_, _, _, _| {}),
             on_event: Rc::new(|_| {}),
+            on_asset: Rc::new(|_| {}),
         }
     }
 }
@@ -49,6 +51,28 @@ pub enum SyncEvent {
     Ownership { anchor_id: u32, owner: Option<ClientId> },
     DropNotReady,
     Error { code: String, message: String },
+}
+
+#[derive(Clone, Debug)]
+pub enum AssetEvent {
+    Begin {
+        hash: String,
+        mime: String,
+        width: u32,
+        height: u32,
+        size: u32,
+    },
+    Chunk {
+        hash: String,
+        index: u32,
+        bytes: Vec<u8>,
+    },
+    End {
+        hash: String,
+    },
+    UploadAck {
+        hash: String,
+    },
 }
 
 pub trait GameSyncView {
@@ -272,7 +296,7 @@ fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
     }
     let mut hasher = DefaultHasher::new();
     info.label.hash(&mut hasher);
-    info.image_src.hash(&mut hasher);
+    info.image_ref.hash(&mut hasher);
     info.rows.hash(&mut hasher);
     info.cols.hash(&mut hasher);
     info.shape_seed.hash(&mut hasher);

@@ -9,7 +9,7 @@ use wasm_bindgen::JsCast;
 use crate::core::*;
 use crate::input::ClickGesture;
 use crate::runtime::CoreAction;
-use heddobureika_core::{CoreSnapshot, CoreState, GameRules, PuzzleInfo};
+use heddobureika_core::{validate_image_ref, CoreSnapshot, CoreState, GameRules, PuzzleImageRef, PuzzleInfo};
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
 
@@ -23,6 +23,33 @@ pub(crate) struct AppCore {
     state: RefCell<AppState>,
     snapshots: RefCell<SnapshotBuffer>,
     subscribers: Rc<RefCell<Vec<AppSubscriber>>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn log_puzzle_dimensions(
+    label: &str,
+    image_ref: &PuzzleImageRef,
+    width: u32,
+    height: u32,
+    grid: GridChoice,
+) {
+    gloo::console::log!(
+        "puzzle load",
+        label,
+        format!("image_ref={:?}", image_ref),
+        format!("dims={}x{}", width, height),
+        format!("grid={}x{}", grid.cols, grid.rows)
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn log_puzzle_dimensions(
+    _label: &str,
+    _image_ref: &PuzzleImageRef,
+    _width: u32,
+    _height: u32,
+    _grid: GridChoice,
+) {
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +182,7 @@ struct DragState {
     cursor_x: f32,
     cursor_y: f32,
     click_gesture: ClickGesture,
+    click_slop: f32,
     primary_id: usize,
     members: Vec<usize>,
     start_positions: Vec<(f32, f32)>,
@@ -244,17 +272,17 @@ impl AppCore {
     pub(crate) fn set_puzzle_with_grid(
         &self,
         label: String,
-        src: String,
+        image_ref: PuzzleImageRef,
         dims: (u32, u32),
         grid_override: Option<GridChoice>,
     ) {
-        self.set_puzzle_with_grid_with_nonce(label, src, dims, grid_override, None);
+        self.set_puzzle_with_grid_with_nonce(label, image_ref, dims, grid_override, None);
     }
 
     pub(crate) fn set_puzzle_with_grid_with_nonce(
         &self,
         label: String,
-        src: String,
+        image_ref: PuzzleImageRef,
         dims: (u32, u32),
         grid_override: Option<GridChoice>,
         scramble_nonce: Option<u32>,
@@ -263,15 +291,19 @@ impl AppCore {
         if width == 0 || height == 0 {
             return;
         }
+        if validate_image_ref(&image_ref).is_err() {
+            return;
+        }
         let mut state = self.state.borrow_mut();
         let grid = match grid_override {
             Some(grid) if grid.cols > 0 && grid.rows > 0 => grid,
             Some(_) => return,
             None => select_grid(width, height),
         };
+        log_puzzle_dimensions(&label, &image_ref, width, height, grid);
         let info = PuzzleInfo {
             label,
-            image_src: src,
+            image_ref,
             rows: grid.rows,
             cols: grid.cols,
             shape_seed: PUZZLE_SEED,
@@ -411,6 +443,7 @@ impl AppCore {
         shift_key: bool,
         rotate_mode: bool,
         right_click: bool,
+        click_slop: f32,
         pointer_id: Option<i32>,
     ) {
         let mut state = self.state.borrow_mut();
@@ -447,8 +480,9 @@ impl AppCore {
         let piece_width = state.core.piece_width;
         let piece_height = state.core.piece_height;
         let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+        let click_slop = click_slop.max(click_tolerance);
         let now_ms = now_ms_f32();
-        let mut click_gesture = ClickGesture::new_with_slop(click_tolerance);
+        let mut click_gesture = ClickGesture::new_with_slop(click_slop);
         click_gesture.arm(x, y, now_ms);
         let base_pos = state
             .core
@@ -468,6 +502,7 @@ impl AppCore {
             cursor_x: x,
             cursor_y: y,
             click_gesture,
+            click_slop,
             primary_id: piece_id,
             members: members.clone(),
             start_positions,
@@ -659,7 +694,7 @@ impl AppCore {
         let frame_snap_ratio = state.core.rules.frame_snap_ratio;
         let rotation_snap_tolerance = state.core.rules.rotation_snap_tolerance_deg;
         let rotation_enabled = state.core.rules.rotation_enabled;
-        let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+        let click_tolerance = drag.click_slop;
         let click_tolerance_sq = click_tolerance * click_tolerance;
         let moved = drag
             .members
@@ -1375,6 +1410,7 @@ impl AppCore {
                 shift_key,
                 rotate_mode,
                 right_click,
+                click_slop,
                 pointer_id,
             } => self.begin_drag(
                 piece_id,
@@ -1383,6 +1419,7 @@ impl AppCore {
                 shift_key,
                 rotate_mode,
                 right_click,
+                click_slop,
                 pointer_id,
             ),
             CoreAction::DragMove { x, y } => self.drag_move(x, y),

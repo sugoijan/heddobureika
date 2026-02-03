@@ -5,19 +5,13 @@ default_src = "puzzles/zoe-samurai.jpg"
 label = "Zoe Samurai"
 slug = "zoe-samurai"
 src = "puzzles/zoe-samurai.jpg"
-width = 4096
-height = 2194
 
 [[puzzles]]
 label = "Zoe Potter"
 slug = "zoe-potter"
 src = "puzzles/zoe-potter.jpg"
-width = 1200
-height = 840
 
 [[puzzles]]
 label = "Raora by Noy"
 slug = "raora-by-noy"
 src = "puzzles/raora-by-noy.avif"
-width = 2429
-height = 2833
