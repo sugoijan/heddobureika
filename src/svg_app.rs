@@ -10,6 +10,7 @@ use wasm_bindgen::JsCast;
 use js_sys::{Date, Function, Reflect};
 use web_sys::{Document, Element, Event, HtmlImageElement, PointerEvent, WheelEvent};
 
+use crate::boot;
 use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
 use crate::input::{
@@ -367,6 +368,7 @@ pub(crate) fn run(core: Rc<AppCore>) {
             return;
         }
 
+        boot::set_phase("Initializing", "Starting SVG renderer.");
         root.set_class_name("app svg");
         let svg = create_svg_element(&document, "svg");
         let _ = svg.set_attribute("xmlns", SVG_NS);
@@ -1734,6 +1736,7 @@ impl SvgView {
         self.render_ui(snapshot);
         self.render_pieces(snapshot, &assets);
         self.update_z_order(snapshot);
+        boot::ready();
     }
 
     fn reset_preview_state(&self) {
@@ -2623,7 +2626,8 @@ impl SvgView {
         }
 
         if self.mask_atlas.borrow().is_none() {
-            if let Ok(atlas) = build_mask_atlas(
+            boot::set_phase("Preparing pieces", "Building mask atlas.");
+            match build_mask_atlas(
                 &assets.pieces,
                 &assets.paths,
                 assets.piece_width,
@@ -2631,7 +2635,17 @@ impl SvgView {
                 assets.grid,
                 assets.mask_pad,
             ) {
-                *self.mask_atlas.borrow_mut() = Some(Rc::new(atlas));
+                Ok(atlas) => {
+                    *self.mask_atlas.borrow_mut() = Some(Rc::new(atlas));
+                }
+                Err(err) => {
+                    boot::fail(
+                        "mask-atlas",
+                        "Failed to prepare puzzle rendering.",
+                        "Reload the page or try another browser.",
+                    );
+                    web_sys::console::error_1(&err);
+                }
             }
         }
     }

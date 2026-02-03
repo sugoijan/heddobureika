@@ -339,6 +339,28 @@ fn load_theme_mode() -> Option<ThemeMode> {
     Some(persisted_store::settings_blob().theme_mode)
 }
 
+#[cfg(target_arch = "wasm32")]
+const THEME_MODE_KEY: &str = "hb.theme_mode";
+
+#[cfg(target_arch = "wasm32")]
+fn persist_theme_mode(mode: ThemeMode) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return;
+    };
+    let value = match mode {
+        ThemeMode::System => "system",
+        ThemeMode::Light => "light",
+        ThemeMode::Dark => "dark",
+    };
+    let _ = storage.set_item(THEME_MODE_KEY, value);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_theme_mode(_mode: ThemeMode) {}
+
 fn clear_saved_game() {
     crate::sync_runtime::clear_local_snapshot();
 }
@@ -347,6 +369,7 @@ fn save_theme_mode(mode: ThemeMode) {
     persisted_store::update_settings_blob(|settings| {
         settings.theme_mode = mode;
     });
+    persist_theme_mode(mode);
 }
 
 fn load_admin_token() -> Option<String> {

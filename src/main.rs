@@ -2,6 +2,7 @@ mod app_builder;
 mod app_core;
 mod app_router;
 mod app_runtime;
+mod boot;
 mod boot_runtime;
 mod view_runtime;
 mod core;

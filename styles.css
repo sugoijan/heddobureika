@@ -82,6 +82,11 @@ body {
   --piece-outline-edge: #f00;
   --piece-outline-owned: #1e78d2;
   --piece-outline-solved: #2aa84a;
+  --boot-bg: var(--color-bg);
+  --boot-bar-track: rgba(0, 0, 0, 0.12);
+  --boot-bar-fill: rgba(0, 0, 0, 0.7);
+  --boot-error: var(--color-fg);
+  --boot-error-muted: rgba(0, 0, 0, 0.65);
 }
 
 body {
@@ -92,6 +97,101 @@ body {
 
 .hidden {
   display: none;
+}
+
+.boot-shell {
+  opacity: 1;
+  transition: opacity 0.45s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  background: var(--boot-bg, #fff);
+}
+
+.boot-shell.is-ready {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.boot-bar {
+  width: min(320px, 72vw);
+  height: 10px;
+  display: flex;
+  align-items: center;
+}
+
+.boot-bar-track {
+  width: 100%;
+  height: 2px;
+  background: var(--boot-bar-track, rgba(20, 14, 10, 0.12));
+  position: relative;
+}
+
+.boot-bar-fill {
+  position: absolute;
+  left: 0;
+  top: -2px;
+  height: 6px;
+  width: 12%;
+  background: var(--boot-bar-fill, rgba(20, 14, 10, 0.7));
+  transition: width 0.2s ease;
+}
+
+.boot-blocked {
+  display: none;
+  max-width: min(560px, 90vw);
+  font-family: "Iosevka", "Chirufont", monospace;
+  text-align: left;
+  color: var(--boot-error, rgba(20, 14, 10, 0.85));
+}
+
+.boot-blocked-title {
+  font-size: 16px;
+  letter-spacing: 0.02em;
+  margin-bottom: 6px;
+}
+
+.boot-blocked-message {
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.boot-blocked-hint {
+  font-size: 13px;
+  color: var(--boot-error-muted, rgba(20, 14, 10, 0.65));
+}
+
+.boot-shell.is-blocked .boot-blocked {
+  display: block;
+}
+
+.boot-shell.is-blocked .boot-bar {
+  display: none;
+}
+
+.boot-noscript {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--boot-bg, #fff);
+  color: var(--boot-error, rgba(20, 14, 10, 0.85));
+  font-family: "Iosevka", "Chirufont", monospace;
+  z-index: 9999;
+  text-align: left;
+}
+
+.boot-noscript-title {
+  font-size: clamp(22px, 3.4vw, 28px);
+  margin-bottom: 8px;
+  color: var(--boot-error, rgba(20, 14, 10, 0.9));
+}
+
+.boot-noscript-message {
+  font-size: 15px;
+  color: var(--boot-error-muted, rgba(20, 14, 10, 0.7));
 }
 
 .app {
@@ -910,6 +1010,9 @@ body[data-theme="dark"] {
   --control-button-border: rgba(255, 255, 255, 0.18);
   --control-button-color: rgba(255, 255, 255, 0.9);
   --control-button-shadow: 0 6px 12px rgba(0, 0, 0, 0.45);
+  --boot-bar-track: rgba(255, 255, 255, 0.2);
+  --boot-bar-fill: rgba(255, 255, 255, 0.75);
+  --boot-error-muted: rgba(255, 255, 255, 0.6);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -918,6 +1021,9 @@ body[data-theme="dark"] {
     color-scheme: dark;
     --color-bg: #141312;
     --color-fg: rgba(255, 255, 255, 0.88);
+    --boot-bar-track: rgba(255, 255, 255, 0.2);
+    --boot-bar-fill: rgba(255, 255, 255, 0.75);
+    --boot-error-muted: rgba(255, 255, 255, 0.6);
     --workspace-fill: rgba(32, 30, 28, 0.92);
     --workspace-stroke: rgba(255, 255, 255, 0.08);
     --puzzle-bounds-stroke: rgba(255, 255, 255, 0.28);

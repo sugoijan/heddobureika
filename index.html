@@ -4,12 +4,383 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Heddobureika</title>
-    <link data-trunk rel="rust" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"/>
+    <script id="boot-inline">
+      (() => {
+        const STORAGE_RENDERER_KEY = "hb.renderer_preference";
+        const STORAGE_THEME_KEY = "hb.theme_mode";
+        const state = {
+          phase: "Checking compatibility",
+          detail: "Preparing the loading sequence.",
+          progress: 0.08,
+          blocked: null,
+          ready: false,
+        };
+        const dom = {
+          ready: false,
+          shell: null,
+          progressFill: null,
+          blocked: null,
+          blockedMessage: null,
+          blockedHint: null,
+        };
+        const clamp01 = (value) => Math.min(1, Math.max(0, value));
+        const readThemePreference = () => {
+          try {
+            return window.localStorage?.getItem(STORAGE_THEME_KEY) || "system";
+          } catch (err) {
+            return "system";
+          }
+        };
+        const prefersDarkScheme = () =>
+          window.matchMedia &&
+          window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const applyBootTheme = () => {
+          const raw = readThemePreference().toLowerCase();
+          const mode =
+            raw === "dark" || raw === "light" || raw === "system" ? raw : "system";
+          const isDark = mode === "dark" || (mode === "system" && prefersDarkScheme());
+          const root = document.documentElement;
+          root.setAttribute("data-theme", mode);
+          root.style.setProperty("--boot-bg", isDark ? "#141312" : "#fff");
+          root.style.setProperty(
+            "--boot-bar-track",
+            isDark ? "rgba(255, 255, 255, 0.2)" : "rgba(0, 0, 0, 0.12)"
+          );
+          root.style.setProperty(
+            "--boot-bar-fill",
+            isDark ? "rgba(255, 255, 255, 0.75)" : "rgba(0, 0, 0, 0.7)"
+          );
+          root.style.setProperty(
+            "--boot-error",
+            isDark ? "rgba(255, 255, 255, 0.88)" : "rgba(0, 0, 0, 0.85)"
+          );
+          root.style.setProperty(
+            "--boot-error-muted",
+            isDark ? "rgba(255, 255, 255, 0.6)" : "rgba(0, 0, 0, 0.65)"
+          );
+          const applyBody = () => {
+            if (document.body) {
+              document.body.setAttribute("data-theme", mode);
+            }
+          };
+          if (document.body) {
+            applyBody();
+          } else {
+            document.addEventListener("DOMContentLoaded", applyBody, { once: true });
+          }
+        };
+        applyBootTheme();
+        const resolveDom = () => {
+          if (dom.ready) {
+            return dom;
+          }
+          const shell = document.getElementById("boot-shell");
+          if (!shell) {
+            return null;
+          }
+          dom.shell = shell;
+          dom.progressFill = document.getElementById("boot-progress-fill");
+          dom.blocked = document.getElementById("boot-blocked");
+          dom.blockedMessage = document.getElementById("boot-blocked-message");
+          dom.blockedHint = document.getElementById("boot-blocked-hint");
+          dom.ready = true;
+          return dom;
+        };
+        const applyState = () => {
+          const root = resolveDom();
+          if (!root) {
+            return;
+          }
+          if (root.progressFill) {
+            if (state.progress == null) {
+              root.progressFill.style.width = "10%";
+            } else {
+              const clamped = clamp01(state.progress);
+              const pct = Math.round(clamped * 100);
+              root.progressFill.style.width = `${Math.max(4, pct)}%`;
+            }
+          }
+          if (root.shell) {
+            if (state.blocked) {
+              root.shell.classList.add("is-blocked");
+              root.shell.classList.remove("is-loading");
+            } else if (!state.ready) {
+              root.shell.classList.add("is-loading");
+              root.shell.classList.remove("is-blocked");
+            }
+            if (state.ready) {
+              root.shell.classList.add("is-ready");
+            }
+          }
+          if (state.blocked && root.blocked) {
+            root.blocked.classList.remove("hidden");
+            if (root.blockedMessage) {
+              root.blockedMessage.textContent = state.blocked.message;
+            }
+            if (root.blockedHint) {
+              root.blockedHint.textContent = state.blocked.hint || "";
+            }
+          }
+        };
+        const setPhase = (label, detail) => {
+          if (label) {
+            state.phase = label;
+          }
+          if (detail) {
+            state.detail = detail;
+          }
+        };
+        const setProgress = (value) => {
+          state.progress = value;
+          applyState();
+        };
+        const fail = (code, message, hint) => {
+          state.blocked = {
+            code: code || "blocked",
+            message: message || "This browser cannot run the app.",
+            hint: hint || "",
+          };
+          applyState();
+        };
+        const ready = () => {
+          state.ready = true;
+          applyState();
+        };
+        window.__HB_BOOT = {
+          setPhase,
+          setProgress,
+          fail,
+          ready,
+        };
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", applyState, { once: true });
+        } else {
+          applyState();
+        }
+        const readRendererPreference = () => {
+          try {
+            return window.localStorage?.getItem(STORAGE_RENDERER_KEY) || "";
+          } catch (err) {
+            return "";
+          }
+        };
+        const supportsWebGl2 = () => {
+          try {
+            const canvas = document.createElement("canvas");
+            return !!canvas.getContext("webgl2");
+          } catch (err) {
+            return false;
+          }
+        };
+        const checkCompatibility = () => {
+          if (typeof WebAssembly !== "object") {
+            return {
+              ok: false,
+              code: "no-wasm",
+              message: "Your browser doesn't support WebAssembly.",
+              hint: "Try an up-to-date browser.",
+            };
+          }
+          if (typeof window.fetch !== "function" || typeof Promise !== "function") {
+            return {
+              ok: false,
+              code: "no-fetch",
+              message: "Required web APIs are missing.",
+              hint: "Try an up-to-date browser.",
+            };
+          }
+          if (typeof window.TextDecoder !== "function") {
+            return {
+              ok: false,
+              code: "no-textdecoder",
+              message: "TextDecoder is required for the app.",
+              hint: "Try an up-to-date browser.",
+            };
+          }
+          if (typeof window.requestAnimationFrame !== "function") {
+            return {
+              ok: false,
+              code: "no-raf",
+              message: "requestAnimationFrame is required for rendering.",
+              hint: "Try an up-to-date browser.",
+            };
+          }
+          if (typeof window.PointerEvent !== "function") {
+            return {
+              ok: false,
+              code: "no-pointer",
+              message: "Pointer Events are required for input.",
+              hint: "Try a different browser or update it.",
+            };
+          }
+          const preference = readRendererPreference().toLowerCase();
+          const allowSvg = preference === "svg";
+          const hasGpu = !!navigator.gpu || supportsWebGl2();
+          if (!hasGpu && !allowSvg) {
+            return {
+              ok: false,
+              code: "no-gpu",
+              message: "WebGPU or WebGL2 is required.",
+              hint: "Enable hardware acceleration or use a different browser.",
+            };
+          }
+          return { ok: true };
+        };
+        const normalizeProgress = (progress, fallbackTotal) => {
+          if (typeof progress === "number") {
+            return { loaded: progress, total: fallbackTotal || 0 };
+          }
+          if (!progress || typeof progress !== "object") {
+            return null;
+          }
+          const loaded =
+            progress.loaded ??
+            progress.current ??
+            progress.received ??
+            progress.bytes ??
+            progress.position;
+          const total =
+            progress.total ??
+            progress.size ??
+            progress.length ??
+            progress.expected;
+          if (typeof loaded !== "number" || typeof total !== "number") {
+            return null;
+          }
+          return { loaded, total };
+        };
+        window.__HB_TRUNK_INIT = () => {
+          let downloadCompleted = false;
+          return {
+            onStart: () => {
+              const compat = checkCompatibility();
+              if (!compat.ok) {
+                fail(compat.code, compat.message, compat.hint);
+                throw new Error(compat.code || "incompatible");
+              }
+              setProgress(0);
+            },
+            onProgress: (...args) => {
+              const [first, second] = args;
+              let progress = null;
+              if (typeof first === "number" && typeof second === "number") {
+                progress = { loaded: first, total: second };
+              } else {
+                progress = normalizeProgress(first, second);
+              }
+              if (progress && progress.total > 0) {
+                const ratio = progress.loaded / progress.total;
+                setProgress(ratio);
+                if (!downloadCompleted && ratio >= 1) {
+                  downloadCompleted = true;
+                }
+              } else {
+                setProgress(null);
+              }
+            },
+            onComplete: () => {
+              if (!downloadCompleted) {
+                downloadCompleted = true;
+                setProgress(1);
+              }
+            },
+            onSuccess: () => {},
+            onFailure: (error) => {
+              const detail =
+                error && typeof error.message === "string"
+                  ? error.message
+                  : "Initialization failed.";
+              fail(
+                "init-failed",
+                "Something went wrong while starting the app.",
+                detail
+              );
+            },
+          };
+        };
+      })();
+    </script>
+    <style>
+      :root {
+        --boot-bg: #fff;
+        --boot-bar-track: rgba(0, 0, 0, 0.12);
+        --boot-bar-fill: rgba(0, 0, 0, 0.7);
+        --boot-error: rgba(0, 0, 0, 0.85);
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--boot-bg);
+      }
+
+      .boot-shell {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: var(--boot-bg);
+        z-index: 9999;
+      }
+
+      .boot-bar {
+        width: min(320px, 72vw);
+        height: 10px;
+      }
+
+      .boot-bar-track {
+        width: 100%;
+        height: 2px;
+        background: var(--boot-bar-track);
+        position: relative;
+      }
+
+      .boot-bar-fill {
+        position: absolute;
+        left: 0;
+        top: -2px;
+        height: 6px;
+        width: 12%;
+        background: var(--boot-bar-fill);
+      }
+
+      .boot-blocked {
+        text-align: left;
+        font-family: "Iosevka", monospace;
+        color: var(--boot-error);
+      }
+
+      .hidden {
+        display: none;
+      }
+    </style>
+    <link data-trunk rel="rust" data-initializer="boot-init.js" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"/>
     <link data-trunk rel="css" href="styles.css" />
+    <link data-trunk rel="copy-file" href="boot-init.js" />
     <link data-trunk rel="copy-dir" href="puzzles" />
     <link data-trunk rel="copy-dir" href="fonts" />
   </head>
   <body>
+    <div id="boot-shell" class="boot-shell is-loading" data-phase="checking">
+      <div class="boot-bar" aria-hidden="true">
+        <div class="boot-bar-track">
+          <div id="boot-progress-fill" class="boot-bar-fill"></div>
+        </div>
+      </div>
+      <div id="boot-blocked" class="boot-blocked hidden" role="alert">
+        <div class="boot-blocked-title">This browser cannot run Heddobureika.</div>
+        <div class="boot-blocked-message" id="boot-blocked-message"></div>
+        <div class="boot-blocked-hint" id="boot-blocked-hint"></div>
+      </div>
+    </div>
+    <noscript>
+      <div class="boot-noscript" role="alert">
+        <div class="boot-noscript-title">JavaScript is required.</div>
+        <div class="boot-noscript-message">Enable JavaScript to run the app.</div>
+      </div>
+    </noscript>
     <div id="wgpu-root"></div>
     <div id="svg-root"></div>
     <div id="dev-panel-root"></div>

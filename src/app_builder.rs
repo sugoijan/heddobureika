@@ -2,6 +2,7 @@ use crate::app_core::AppCore;
 use crate::app_router;
 use crate::app_runtime;
 use crate::boot_runtime::{self, BootState};
+use crate::boot;
 use crate::sync_runtime;
 use crate::core::{RendererKind, RenderSettings, GridChoice, InitMode};
 use crate::local_snapshot::load_local_snapshot;
@@ -325,9 +326,12 @@ struct BootCoordinator {
 
 impl BootCoordinator {
     async fn run(self) {
+        boot::set_phase("Initializing", "Loading saved preferences.");
         boot_runtime::set_boot_state(BootState::LoadingRoute);
+        boot::set_phase("Initializing", "Loading saved data.");
         boot_runtime::set_boot_state(BootState::LoadingStorage);
         let _ = persisted_store::bootstrap().await;
+        boot::set_phase("Initializing", "Preparing session.");
         let init = app_router::load_init_config();
         let _ = init.mode_preference;
         app_runtime::set_init_config(init.clone());
@@ -346,11 +350,13 @@ impl BootCoordinator {
         }));
         sync_runtime::init_from_config(init.multiplayer.clone());
 
+        boot::set_phase("Initializing", "Starting multiplayer sync.");
         boot_runtime::set_boot_state(BootState::InitSync);
         if init.mode == InitMode::Local {
             boot_local_game(self.core.clone(), &render_settings);
         }
 
+        boot::set_phase("Initializing", "Starting renderer.");
         match renderer {
             RendererKind::Wgpu => {
                 #[cfg(target_arch = "wasm32")]

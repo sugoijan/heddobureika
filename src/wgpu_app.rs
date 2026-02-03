@@ -15,6 +15,7 @@ use web_sys::{
     PointerEvent, WheelEvent,
 };
 
+use crate::boot;
 use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
 use crate::input::{
@@ -369,6 +370,7 @@ pub(crate) fn run(core: Rc<AppCore>) {
             return;
         }
 
+        boot::set_phase("Initializing", "Starting GPU renderer.");
         root.set_class_name("app wgpu");
 
         let canvas = document
@@ -1151,6 +1153,7 @@ impl WgpuView {
         image_max_dim: u32,
         render_scale: f32,
     ) {
+        boot::set_phase("Decoding image", "Loading puzzle artwork.");
         let img = HtmlImageElement::new().expect("create image element");
         let img_clone = img.clone();
         let view = Rc::clone(self);
@@ -2730,6 +2733,7 @@ impl WgpuView {
             None => return,
         };
         if self.mask_atlas.borrow().is_none() {
+            boot::set_phase("Preparing pieces", "Building mask atlas.");
             let mask_atlas_data = match build_mask_atlas(
                 &assets.pieces,
                 &assets.paths,
@@ -2740,6 +2744,11 @@ impl WgpuView {
             ) {
                 Ok(atlas) => Rc::new(atlas),
                 Err(err) => {
+                    boot::fail(
+                        "mask-atlas",
+                        "Failed to prepare puzzle rendering.",
+                        "Reload the page or try another browser.",
+                    );
                     web_sys::console::error_1(&err);
                     return;
                 }
@@ -2908,6 +2917,7 @@ impl WgpuView {
             renderer.set_ui_texts(&ui_specs);
             renderer.set_ui_overlay_sprites(&preview_specs);
             renderer.render();
+            boot::ready();
             return;
         }
         if self.creating.get() {
@@ -2949,6 +2959,7 @@ impl WgpuView {
         let is_dark_theme = is_dark;
         let epoch = self.puzzle_epoch.get();
         let view = Rc::clone(self);
+        boot::set_phase("Initializing", "Preparing GPU renderer.");
         spawn_local(async move {
             let mut refresh_debug = false;
             match WgpuRenderer::new(
@@ -3004,9 +3015,15 @@ impl WgpuView {
                         renderer.set_ui_overlay_sprites(&specs);
                     }
                     renderer.render();
+                    boot::ready();
                     *view.renderer.borrow_mut() = Some(renderer);
                 }
                 Err(err) => {
+                    boot::fail(
+                        "renderer-init",
+                        "Failed to initialize the renderer.",
+                        "Check browser support or try a different browser.",
+                    );
                     web_sys::console::error_1(&err);
                 }
             }

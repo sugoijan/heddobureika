@@ -56,6 +56,7 @@ pub(crate) fn save_renderer_preference(renderer: RendererKind, render_settings: 
     persisted_store::update_boot_record(|record| {
         record.renderer_preference = renderer;
     });
+    persist_renderer_preference(renderer);
 }
 
 pub(crate) fn save_mode_preference(mode: InitMode) {
@@ -155,6 +156,27 @@ fn decode_hash_value(value: &str) -> String {
         .and_then(|decoded| decoded.as_string())
         .unwrap_or_else(|| raw.to_string())
 }
+
+#[cfg(target_arch = "wasm32")]
+const RENDERER_PREF_KEY: &str = "hb.renderer_preference";
+
+#[cfg(target_arch = "wasm32")]
+fn persist_renderer_preference(renderer: RendererKind) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return;
+    };
+    let value = match renderer {
+        RendererKind::Svg => "svg",
+        RendererKind::Wgpu => "wgpu",
+    };
+    let _ = storage.set_item(RENDERER_PREF_KEY, value);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_renderer_preference(_renderer: RendererKind) {}
 
 fn load_multiplayer_config() -> Option<MultiplayerConfig> {
     let window = web_sys::window()?;
