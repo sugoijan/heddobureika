@@ -255,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     write.send(Message::Binary(end_payload.into())).await?;
 
-                    let upload_result = timeout(Duration::from_secs(60), async {
+                    let upload_result = timeout(Duration::from_secs(180), async {
                         let mut got_ack = false;
                         let mut got_state = false;
                         while let Some(message) = read.next().await {

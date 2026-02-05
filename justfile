@@ -20,7 +20,7 @@ dev-vars:
 
 # Run the worker locally (no Cloudflare login required)
 wrangler-dev:
-    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" pnpm exec wrangler dev --local --host 0.0.0.0 --port {{WRANGLER_PORT}} --persist-to .wrangler/state --show-interactive-dev-session=false
+    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" pnpm exec wrangler dev --local --host 127.0.0.1 --port {{WRANGLER_PORT}} --persist-to .wrangler/state --show-interactive-dev-session=false
 
 # Run the frontend locally (requires trunk)
 trunk-serve:
@@ -62,6 +62,10 @@ clean-node:
 worker-build:
     @cd worker && worker-build --release
 
+# One-time setup for local worker build tool
+setup-worker-build:
+    @cargo install -q worker-build
+
 # Cargo-check the worker (wasm target)
 worker-check:
     @cargo check -p heddobureika-worker --target wasm32-unknown-unknown
@@ -73,6 +77,14 @@ cli-check:
 # Check the web app
 app-check:
     @cargo check -p heddobureika --target wasm32-unknown-unknown
+
+# Check the core create
+code-check:
+    @cargo check -p heddobureika-core --target wasm32-unknown-unknown
+
+# Check the image-pipeline crate
+image-pipeline-check:
+    @cargo check -p heddobureika-image-pipeline --target wasm32-unknown-unknown
 
 # Run all checks (worker uses wasm target, CLI uses native)
 check: worker-check cli-check app-check
@@ -120,6 +132,10 @@ wasm-test-mp browser="firefox":
 # Integration test: requires worker running and ADMIN_TOKEN/ROOM_ADMIN_TOKEN set
 mp-test:
     @cargo test -p heddobureika-cli --test multiplayer_sync
+
+# Process-level integration test for CLI private upload flow
+integration-test-cli:
+    @pnpm test:integration:cli
 
 # Create/activate a room via the admin CLI
 create-room *args:

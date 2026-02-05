@@ -1,10 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Cursor;
-
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use image::codecs::avif::AvifEncoder;
-use image::{ExtendedColorType, ImageEncoder, ImageReader};
+use image_pipeline::{AlphaMode, PipelineConfig};
 use imagesize::{Compression, ImageType};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
@@ -33,9 +30,7 @@ use worker::*;
 const DEFAULT_ROOM_PATH_PREFIX: &str = "/ws/";
 const META_KEY: &str = "room_meta";
 const SNAPSHOT_KEY: &str = "room_snapshot";
-const ASSET_INDEX_KEY: &str = "room_assets";
-const ASSET_META_PREFIX: &str = "asset_meta:";
-const ASSET_CHUNK_PREFIX: &str = "asset_chunk:";
+const ROOM_ID_KEY: &str = "room_id";
 const ASSET_STORAGE_CHUNK_BYTES: usize = 256 * 1024;
 
 const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
@@ -106,14 +101,6 @@ fn now_ms() -> i64 {
     Date::now() as i64
 }
 
-fn asset_meta_key(hash: &str) -> String {
-    format!("{ASSET_META_PREFIX}{hash}")
-}
-
-fn asset_chunk_key(hash: &str, index: u32) -> String {
-    format!("{ASSET_CHUNK_PREFIX}{hash}:{index}")
-}
-
 fn auth_protocol_from_request(req: &Request) -> Result<Option<String>> {
     let Some(raw) = req.headers().get("Sec-WebSocket-Protocol")? else {
         return Ok(None);
@@ -161,24 +148,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn transcode_to_avif(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|err| err.to_string())?;
-    let image = reader.decode().map_err(|err| err.to_string())?;
-    let rgba = image.to_rgba8();
-    let mut out = Vec::new();
-    let encoder = AvifEncoder::new_with_speed_quality(&mut out, 6, 80)
-        .with_num_threads(Some(1));
-    encoder
-        .write_image(
-            &rgba,
-            image.width(),
-            image.height(),
-            ExtendedColorType::Rgba8,
-        )
-        .map_err(|err| err.to_string())?;
-    Ok(out)
+fn transcode_to_avif(bytes: &[u8]) -> Result<image_pipeline::TranscodeResult, String> {
+    let mut config = PipelineConfig::default();
+    config.alpha_mode = AlphaMode::Preserve;
+    image_pipeline::transcode_to_avif(bytes, config).map_err(|err| err.to_string())
 }
 
 fn detect_image_info(bytes: &[u8]) -> Result<(u32, u32, ImageType), String> {
@@ -265,6 +238,7 @@ struct Ownership {
 
 struct RoomRuntime {
     loaded: bool,
+    room_id: Option<String>,
     meta: RoomMeta,
     snapshot: Option<GameSnapshot>,
     owners_by_anchor: HashMap<u32, Ownership>,
@@ -272,7 +246,6 @@ struct RoomRuntime {
     recent_nonces: HashMap<String, i64>,
     pending_releases: HashMap<ClientId, i64>,
     assets: HashMap<String, StoredAsset>,
-    asset_index: Vec<String>,
     pending_uploads: HashMap<ClientId, PendingUpload>,
 }
 
@@ -280,6 +253,7 @@ impl RoomRuntime {
     fn new() -> Self {
         Self {
             loaded: false,
+            room_id: None,
             meta: RoomMeta::default(),
             snapshot: None,
             owners_by_anchor: HashMap::new(),
@@ -287,7 +261,6 @@ impl RoomRuntime {
             recent_nonces: HashMap::new(),
             pending_releases: HashMap::new(),
             assets: HashMap::new(),
-            asset_index: Vec::new(),
             pending_uploads: HashMap::new(),
         }
     }
@@ -303,7 +276,7 @@ struct StoredAssetMeta {
     chunks: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 struct StoredAsset {
     meta: StoredAssetMeta,
     bytes: Vec<u8>,
@@ -314,11 +287,6 @@ struct PendingUpload {
     size: u32,
     received: u32,
     bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct AssetIndex {
-    hashes: Vec<String>,
 }
 
 #[durable_object]
@@ -352,6 +320,7 @@ impl DurableObject for Room {
         let room_id = extract_room_id(&path, &prefix).unwrap_or("unknown");
 
         self.ensure_loaded().await?;
+        self.persist_room_id(room_id).await?;
         let auth = match self.authenticate_request(&req, room_id).await {
             Ok(auth) => auth,
             Err(response) => return Ok(response),
@@ -612,6 +581,23 @@ impl Room {
         Ok(self.env.var("ADMIN_TOKEN")?.to_string())
     }
 
+    async fn persist_room_id(&self, room_id: &str) -> Result<()> {
+        let should_persist = {
+            let mut inner = self.inner.borrow_mut();
+            match inner.room_id.as_deref() {
+                Some(existing) if existing == room_id => false,
+                _ => {
+                    inner.room_id = Some(room_id.to_string());
+                    true
+                }
+            }
+        };
+        if should_persist {
+            self.state.storage().put(ROOM_ID_KEY, room_id).await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_loaded(&self) -> Result<()> {
         let loaded = { self.inner.borrow().loaded };
         if loaded {
@@ -621,7 +607,7 @@ impl Room {
         let storage = self.state.storage();
         let meta_bytes: Option<Vec<u8>> = storage.get(META_KEY).await?;
         let snapshot_bytes: Option<Vec<u8>> = storage.get(SNAPSHOT_KEY).await?;
-        let asset_index_bytes: Option<Vec<u8>> = storage.get(ASSET_INDEX_KEY).await?;
+        let room_id: Option<String> = storage.get(ROOM_ID_KEY).await?;
 
         let mut inner = self.inner.borrow_mut();
         inner.loaded = true;
@@ -635,10 +621,8 @@ impl Room {
                 inner.snapshot = Some(snapshot);
             }
         }
-        if let Some(bytes) = asset_index_bytes {
-            if let Some(index) = decode::<AssetIndex>(&bytes) {
-                inner.asset_index = index.hashes;
-            }
+        if let Some(room_id) = room_id {
+            inner.room_id = Some(room_id);
         }
 
         Ok(())
@@ -1167,11 +1151,17 @@ impl Room {
             );
             return Ok(());
         }
+        let mut stored_width = raw_width;
+        let mut stored_height = raw_height;
         let stored_bytes = if is_avif(image_type) {
             pending.bytes
         } else {
             match transcode_to_avif(&pending.bytes) {
-                Ok(image) => image,
+                Ok(result) => {
+                    stored_width = result.width;
+                    stored_height = result.height;
+                    result.bytes
+                }
                 Err(message) => {
                     let _ = self.send_server_msg(
                         &ws,
@@ -1217,7 +1207,7 @@ impl Room {
                 .unwrap_or_default()
         };
         let (image_width, image_height) =
-            logical_image_size(raw_width, raw_height, rules.image_max_dimension);
+            logical_image_size(stored_width, stored_height, rules.image_max_dimension);
         let hash = sha256_hex(&stored_bytes);
         let size = stored_bytes.len() as u32;
         let chunks = ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES)
@@ -1448,19 +1438,13 @@ impl Room {
         hash: &str,
         asset: StoredAsset,
     ) -> std::result::Result<(), String> {
-        let (should_persist, hashes) = {
+        let should_persist = {
             let mut inner = self.inner.borrow_mut();
             inner.assets.insert(hash.to_string(), asset.clone());
-            if !inner.asset_index.iter().any(|value| value == hash) {
-                inner.asset_index.push(hash.to_string());
-            }
-            let hashes = inner.asset_index.clone();
-            let should_persist = matches!(inner.meta.persistence, RoomPersistence::Durable);
-            (should_persist, hashes)
+            matches!(inner.meta.persistence, RoomPersistence::Durable)
         };
         if should_persist {
-            self.persist_asset(hash, &asset).await?;
-            self.persist_asset_index(hashes).await?;
+            self.asset_store_put(hash, &asset).await?;
         }
         Ok(())
     }
@@ -1476,103 +1460,102 @@ impl Room {
         if !matches!(persistence, RoomPersistence::Durable) {
             return Ok(None);
         }
-        let storage = self.state.storage();
-        let meta_bytes: Option<Vec<u8>> = storage
-            .get(&asset_meta_key(hash))
-            .await
-            .map_err(|err| err.to_string())?;
-        let Some(bytes) = meta_bytes else {
-            return Ok(None);
-        };
-        let Some(meta) = decode::<StoredAssetMeta>(&bytes) else {
-            return Ok(None);
-        };
-        let mut bytes = Vec::with_capacity(meta.size as usize);
-        for index in 0..meta.chunks {
-            let chunk_key = asset_chunk_key(hash, index);
-            let chunk: Option<Vec<u8>> = storage
-                .get(&chunk_key)
-                .await
-                .map_err(|err| err.to_string())?;
-            let Some(chunk) = chunk else {
-                return Ok(None);
-            };
-            bytes.extend_from_slice(&chunk);
+        let asset = self.asset_store_get(hash).await?;
+        if let Some(asset) = asset.as_ref() {
+            self.inner
+                .borrow_mut()
+                .assets
+                .insert(hash.to_string(), asset.clone());
+            return Ok(Some(asset.clone()));
         }
-        if bytes.len() != meta.size as usize {
-            return Ok(None);
-        }
-        let asset = StoredAsset { meta, bytes };
-        self.inner
-            .borrow_mut()
-            .assets
-            .insert(hash.to_string(), asset.clone());
-        Ok(Some(asset))
+        Ok(asset)
     }
 
-    async fn persist_asset(
+    fn asset_store_stub(&self) -> std::result::Result<Stub, String> {
+        let room_id = self
+            .inner
+            .borrow()
+            .room_id
+            .clone()
+            .ok_or_else(|| "missing room id".to_string())?;
+        let namespace = self
+            .env
+            .durable_object("ASSETS")
+            .map_err(|err| err.to_string())?;
+        namespace
+            .get_by_name(&room_id)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn asset_store_put(
         &self,
         hash: &str,
         asset: &StoredAsset,
     ) -> std::result::Result<(), String> {
-        let Some(meta_bytes) = encode(&asset.meta) else {
-            return Ok(());
+        let Some(body) = encode(asset) else {
+            return Err("failed to encode asset".to_string());
         };
-        let storage = self.state.storage();
-        storage
-            .put(&asset_meta_key(hash), meta_bytes)
-            .await
+        let stub = self.asset_store_stub()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+        let req = Request::new_with_init(&format!("https://asset/asset/{hash}"), &init)
             .map_err(|err| err.to_string())?;
-        let mut index = 0u32;
-        for chunk in asset.bytes.chunks(ASSET_STORAGE_CHUNK_BYTES) {
-            storage
-                .put(&asset_chunk_key(hash, index), chunk.to_vec())
+        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        if !(200..300).contains(&resp.status_code()) {
+            let message = resp
+                .text()
                 .await
-                .map_err(|err| err.to_string())?;
-            index = index.saturating_add(1);
+                .unwrap_or_else(|_| "asset store failed".to_string());
+            return Err(message);
         }
         Ok(())
     }
 
-    async fn persist_asset_index(
+    async fn asset_store_get(
         &self,
-        hashes: Vec<String>,
-    ) -> std::result::Result<(), String> {
-        let Some(bytes) = encode(&AssetIndex { hashes }) else {
-            return Ok(());
-        };
-        let storage = self.state.storage();
-        storage
-            .put(ASSET_INDEX_KEY, bytes)
-            .await
+        hash: &str,
+    ) -> std::result::Result<Option<StoredAsset>, String> {
+        let stub = self.asset_store_stub()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get);
+        let req = Request::new_with_init(&format!("https://asset/asset/{hash}"), &init)
             .map_err(|err| err.to_string())?;
-        Ok(())
+        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        if resp.status_code() == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&resp.status_code()) {
+            let message = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "asset store failed".to_string());
+            return Err(message);
+        }
+        let bytes = resp.bytes().await.map_err(|err| err.to_string())?;
+        let Some(asset) = decode::<StoredAsset>(&bytes) else {
+            return Err("failed to decode stored asset".to_string());
+        };
+        Ok(Some(asset))
     }
 
-    async fn clear_assets(
-        &self,
-        hashes: Vec<String>,
-    ) -> std::result::Result<(), String> {
-        let storage = self.state.storage();
-        let _ = storage.delete(ASSET_INDEX_KEY).await;
-        for hash in hashes {
-            let meta_key = asset_meta_key(&hash);
-            let meta_bytes: Option<Vec<u8>> = storage
-                .get(&meta_key)
+    async fn clear_assets(&self) -> std::result::Result<(), String> {
+        let persistence = { self.inner.borrow().meta.persistence };
+        if !matches!(persistence, RoomPersistence::Durable) {
+            return Ok(());
+        }
+        let stub = self.asset_store_stub()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        let req = Request::new_with_init("https://asset/clear", &init)
+            .map_err(|err| err.to_string())?;
+        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        if !(200..300).contains(&resp.status_code()) {
+            let message = resp
+                .text()
                 .await
-                .map_err(|err| err.to_string())?;
-            let mut chunks = None;
-            if let Some(bytes) = meta_bytes {
-                if let Some(meta) = decode::<StoredAssetMeta>(&bytes) {
-                    chunks = Some(meta.chunks);
-                }
-            }
-            let _ = storage.delete(&meta_key).await;
-            if let Some(count) = chunks {
-                for index in 0..count {
-                    let _ = storage.delete(&asset_chunk_key(&hash, index)).await;
-                }
-            }
+                .unwrap_or_else(|_| "asset store failed".to_string());
+            return Err(message);
         }
         Ok(())
     }
@@ -2691,9 +2674,8 @@ impl Room {
     }
 
     async fn expire_room(&self) -> Result<()> {
-        let (hashes, persistence) = {
+        let persistence = {
             let mut inner = self.inner.borrow_mut();
-            let hashes = inner.asset_index.clone();
             inner.meta.activated = false;
             inner.meta.last_command_at = None;
             inner.meta.last_warning_at = None;
@@ -2704,15 +2686,14 @@ impl Room {
             inner.pending_releases.clear();
             inner.recent_nonces.clear();
             inner.assets.clear();
-            inner.asset_index.clear();
             inner.pending_uploads.clear();
-            (hashes, inner.meta.persistence)
+            inner.meta.persistence
         };
 
         self.persist_meta().await?;
         let _ = self.state.storage().delete(SNAPSHOT_KEY).await;
-        if matches!(persistence, RoomPersistence::Durable) && !hashes.is_empty() {
-            let _ = self.clear_assets(hashes).await;
+        if matches!(persistence, RoomPersistence::Durable) {
+            let _ = self.clear_assets().await;
         }
 
         let msg = ServerMsg::Error {
@@ -2760,6 +2741,312 @@ impl Room {
         };
         ws.send_with_bytes(bytes)?;
         Ok(())
+    }
+}
+
+struct AssetStoreRuntime {
+    schema_ready: bool,
+}
+
+impl AssetStoreRuntime {
+    fn new() -> Self {
+        Self { schema_ready: false }
+    }
+}
+
+enum AssetStoreRoute {
+    Asset { hash: String },
+    Clear,
+}
+
+impl AssetStoreRoute {
+    fn from_path(path: &str) -> Option<Self> {
+        let trimmed = path.trim_start_matches('/');
+        if trimmed == "clear" {
+            return Some(Self::Clear);
+        }
+        let hash = trimmed.strip_prefix("asset/")?;
+        if hash.is_empty() {
+            return None;
+        }
+        Some(Self::Asset {
+            hash: hash.to_string(),
+        })
+    }
+}
+
+#[durable_object]
+pub struct AssetStore {
+    state: State,
+    inner: RefCell<AssetStoreRuntime>,
+}
+
+impl DurableObject for AssetStore {
+    fn new(state: State, _env: Env) -> Self {
+        Self {
+            state,
+            inner: RefCell::new(AssetStoreRuntime::new()),
+        }
+    }
+
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
+        self.ensure_schema()?;
+        let Some(route) = AssetStoreRoute::from_path(&req.path()) else {
+            return Response::error("not found", 404);
+        };
+        match (req.method(), route) {
+            (Method::Post, AssetStoreRoute::Asset { hash }) => {
+                let bytes = req.bytes().await?;
+                let Some(asset) = decode::<StoredAsset>(&bytes) else {
+                    return Response::error("invalid asset payload", 400);
+                };
+                match self.store_asset_sql(&hash, asset) {
+                    Ok(()) => Response::ok("ok"),
+                    Err(message) => Response::error(&message, 500),
+                }
+            }
+            (Method::Get, AssetStoreRoute::Asset { hash }) => {
+                match self.load_asset_sql(&hash) {
+                    Ok(Some(asset)) => {
+                        let Some(body) = encode(&asset) else {
+                            return Response::error("failed to encode asset", 500);
+                        };
+                        Response::from_bytes(body)
+                    }
+                    Ok(None) => Response::error("not found", 404),
+                    Err(message) => Response::error(&message, 500),
+                }
+            }
+            (Method::Delete, AssetStoreRoute::Asset { hash }) => {
+                match self.delete_asset_sql(&hash) {
+                    Ok(()) => Response::ok("ok"),
+                    Err(message) => Response::error(&message, 500),
+                }
+            }
+            (Method::Post, AssetStoreRoute::Clear) => match self.clear_assets_sql() {
+                Ok(()) => Response::ok("ok"),
+                Err(message) => Response::error(&message, 500),
+            },
+            _ => Response::error("not found", 404),
+        }
+    }
+}
+
+impl AssetStore {
+    fn ensure_schema(&self) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.schema_ready {
+            return Ok(());
+        }
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS asset_meta (
+                hash TEXT PRIMARY KEY,
+                mime TEXT NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                chunks INTEGER NOT NULL
+            )",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS asset_chunks (
+                hash TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                bytes BLOB NOT NULL,
+                PRIMARY KEY (hash, idx)
+            )",
+            None,
+        )?;
+        inner.schema_ready = true;
+        Ok(())
+    }
+
+    fn store_asset_sql(&self, hash: &str, asset: StoredAsset) -> std::result::Result<(), String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let size = asset.bytes.len() as u32;
+        if size != asset.meta.size {
+            return Err("asset size mismatch".to_string());
+        }
+        let expected_chunks = ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1)
+            / ASSET_STORAGE_CHUNK_BYTES) as u32;
+        if expected_chunks != asset.meta.chunks {
+            return Err("asset chunk count mismatch".to_string());
+        }
+
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "INSERT OR REPLACE INTO asset_meta
+                (hash, mime, width, height, size, created_at, chunks)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            Some(vec![
+                hash.into(),
+                asset.meta.mime.clone().into(),
+                (asset.meta.width as i64).into(),
+                (asset.meta.height as i64).into(),
+                (asset.meta.size as i64).into(),
+                asset.meta.created_at.into(),
+                (asset.meta.chunks as i64).into(),
+            ]),
+        )
+        .map_err(|err| err.to_string())?;
+        sql.exec(
+            "DELETE FROM asset_chunks WHERE hash = ?1",
+            Some(vec![hash.into()]),
+        )
+        .map_err(|err| err.to_string())?;
+        let mut index = 0u32;
+        for chunk in asset.bytes.chunks(ASSET_STORAGE_CHUNK_BYTES) {
+            sql.exec(
+                "INSERT INTO asset_chunks (hash, idx, bytes) VALUES (?1, ?2, ?3)",
+                Some(vec![
+                    hash.into(),
+                    (index as i64).into(),
+                    chunk.to_vec().into(),
+                ]),
+            )
+            .map_err(|err| err.to_string())?;
+            index = index.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn load_asset_sql(
+        &self,
+        hash: &str,
+    ) -> std::result::Result<Option<StoredAsset>, String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        let mut meta_rows = sql
+            .exec(
+                "SELECT mime, width, height, size, created_at, chunks
+                    FROM asset_meta
+                    WHERE hash = ?1",
+                Some(vec![hash.into()]),
+            )
+            .map_err(|err| err.to_string())?
+            .raw();
+        let Some(meta_row) = meta_rows.next() else {
+            return Ok(None);
+        };
+        let meta_row = meta_row.map_err(|err| err.to_string())?;
+        let meta = Self::decode_meta_row(meta_row)?;
+
+        let mut bytes = Vec::with_capacity(meta.size as usize);
+        let mut expected_idx = 0u32;
+        let chunks = sql
+            .exec(
+                "SELECT idx, bytes FROM asset_chunks WHERE hash = ?1 ORDER BY idx",
+                Some(vec![hash.into()]),
+            )
+            .map_err(|err| err.to_string())?;
+        for row in chunks.raw() {
+            let row = row.map_err(|err| err.to_string())?;
+            if row.len() != 2 {
+                return Err("invalid asset chunk row".to_string());
+            }
+            let idx = Self::sql_value_u32(&row[0], "chunk index")?;
+            if idx != expected_idx {
+                return Err("missing asset chunk".to_string());
+            }
+            let chunk = Self::sql_value_blob(&row[1], "chunk bytes")?;
+            bytes.extend_from_slice(&chunk);
+            expected_idx = expected_idx.saturating_add(1);
+        }
+        if expected_idx != meta.chunks {
+            return Err("asset chunk count mismatch".to_string());
+        }
+        if bytes.len() != meta.size as usize {
+            return Err("asset size mismatch".to_string());
+        }
+        Ok(Some(StoredAsset { meta, bytes }))
+    }
+
+    fn delete_asset_sql(&self, hash: &str) -> std::result::Result<(), String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "DELETE FROM asset_chunks WHERE hash = ?1",
+            Some(vec![hash.into()]),
+        )
+        .map_err(|err| err.to_string())?;
+        sql.exec(
+            "DELETE FROM asset_meta WHERE hash = ?1",
+            Some(vec![hash.into()]),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn clear_assets_sql(&self) -> std::result::Result<(), String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        sql.exec("DELETE FROM asset_chunks", None)
+            .map_err(|err| err.to_string())?;
+        sql.exec("DELETE FROM asset_meta", None)
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn decode_meta_row(row: Vec<SqlStorageValue>) -> std::result::Result<StoredAssetMeta, String> {
+        if row.len() != 6 {
+            return Err("invalid asset meta row".to_string());
+        }
+        let mime = Self::sql_value_string(&row[0], "mime")?;
+        let width = Self::sql_value_u32(&row[1], "width")?;
+        let height = Self::sql_value_u32(&row[2], "height")?;
+        let size = Self::sql_value_u32(&row[3], "size")?;
+        let created_at = Self::sql_value_i64(&row[4], "created_at")?;
+        let chunks = Self::sql_value_u32(&row[5], "chunks")?;
+        Ok(StoredAssetMeta {
+            mime,
+            width,
+            height,
+            size,
+            created_at,
+            chunks,
+        })
+    }
+
+    fn sql_value_string(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<String, String> {
+        match value {
+            SqlStorageValue::String(value) => Ok(value.clone()),
+            _ => Err(format!("invalid asset {field}")),
+        }
+    }
+
+    fn sql_value_i64(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<i64, String> {
+        match value {
+            SqlStorageValue::Integer(value) => Ok(*value),
+            SqlStorageValue::Float(value) => Ok(*value as i64),
+            _ => Err(format!("invalid asset {field}")),
+        }
+    }
+
+    fn sql_value_u32(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<u32, String> {
+        let raw = Self::sql_value_i64(value, field)?;
+        u32::try_from(raw).map_err(|_| format!("invalid asset {field}"))
+    }
+
+    fn sql_value_blob(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<Vec<u8>, String> {
+        match value {
+            SqlStorageValue::Blob(value) => Ok(value.clone()),
+            _ => Err(format!("invalid asset {field}")),
+        }
     }
 }
 

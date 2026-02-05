@@ -1,8 +1,15 @@
 {
+  "scripts": {
+    "test:integration": "vitest run --config vitest.integration.config.mts",
+    "test:integration:cli": "vitest run --config vitest.integration.config.mts tests/integration/cli-private-upload.test.ts"
+  },
   "devDependencies": {
+    "execa": "^9.6.0",
     "html-minifier-terser": "^7.2.0",
     "lightningcss-cli": "^1.31.1",
     "terser": "^5.46.0",
+    "vitest": "^2.1.9",
+    "wait-on": "^8.0.4",
     "wrangler": "^4.61.1"
   },
   "packageManager": "pnpm@10.28.2",

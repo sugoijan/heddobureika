@@ -1,0 +1,16 @@
+[package]
+name = "heddobureika-image-pipeline"
+version = "0.1.0"
+edition = "2021"
+license = "CC-BY-NC-SA-4.0"
+publish = false
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "avif"] }
+img-parts = "0.4"
+moxcms = "0.8"
+png = "0.17"
+thiserror = "1"
+
+[features]
+default = []

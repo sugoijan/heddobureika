@@ -1,4 +1,5 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
+use gloo::timers::future::TimeoutFuture;
 use js_sys::Date;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -31,6 +32,7 @@ use heddobureika_core::{
     PuzzleInfo, PuzzleSpec, RoomUpdate, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
 };
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
+use image_pipeline::{AlphaMode, PipelineConfig};
 use sha2::{Digest, Sha256};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdminStatus {
@@ -461,6 +463,16 @@ async fn read_file_bytes(file: File) -> Result<Vec<u8>, String> {
     Ok(array.to_vec())
 }
 
+fn is_avif_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    if &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    matches!(&bytes[8..12], b"avif" | b"avis")
+}
+
 async fn load_image_dimensions(file: File) -> Result<(u32, u32), String> {
     let url = web_sys::Url::create_object_url_with_blob(&file)
         .map_err(|_| "failed to read image".to_string())?;
@@ -808,6 +820,8 @@ fn app(props: &AppProps) -> Html {
     let private_label_value = (*private_label).clone();
     let private_error = use_state(|| None::<String>);
     let private_error_value = (*private_error).clone();
+    let private_status = use_state(|| None::<String>);
+    let private_status_value = (*private_status).clone();
     let admin_private_error = use_state(|| None::<String>);
     let admin_private_error_value = (*admin_private_error).clone();
     let admin_private_status = use_state(|| AdminUploadStatus::Idle);
@@ -1735,10 +1749,13 @@ fn app(props: &AppProps) -> Html {
             private_error.set(None);
         })
     };
+    let private_upload_busy = private_status_value.is_some();
     let on_private_file_input = {
         let private_label = private_label.clone();
         let private_error = private_error.clone();
+        let private_status = private_status.clone();
         let app_core = app_core.clone();
+        let image_max_dim = image_max_dim;
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let Some(files) = input.files() else {
@@ -1748,6 +1765,7 @@ fn app(props: &AppProps) -> Html {
                 return;
             };
             private_error.set(None);
+            private_status.set(None);
             let mime = file.type_();
             if !mime.starts_with("image/") {
                 private_error.set(Some("Unsupported file type".to_string()));
@@ -1756,35 +1774,60 @@ fn app(props: &AppProps) -> Html {
             let label = (*private_label).trim().to_string();
             let app_core = app_core.clone();
             let private_error = private_error.clone();
+            let private_status = private_status.clone();
             spawn_local(async move {
+                private_status.set(Some("Reading file...".to_string()));
                 let bytes = match read_file_bytes(file.clone()).await {
                     Ok(bytes) => bytes,
                     Err(message) => {
                         private_error.set(Some(message));
+                        private_status.set(None);
                         return;
                     }
                 };
-                let (width, height) = match load_image_dimensions(file).await {
-                    Ok(value) => value,
-                    Err(message) => {
-                        private_error.set(Some(message));
-                        return;
-                    }
+                private_status.set(Some("Processing image...".to_string()));
+                TimeoutFuture::new(0).await;
+                let is_avif = mime == "image/avif" || is_avif_bytes(&bytes);
+                let (stored_bytes, width, height) = if is_avif {
+                    let (width, height) = match load_image_dimensions(file).await {
+                        Ok(value) => value,
+                        Err(message) => {
+                            private_error.set(Some(message));
+                            private_status.set(None);
+                            return;
+                        }
+                    };
+                    (bytes, width, height)
+                } else {
+                    let mut config = PipelineConfig::default();
+                    config.alpha_mode = AlphaMode::Preserve;
+                    let result = match image_pipeline::transcode_to_avif(&bytes, config) {
+                        Ok(result) => result,
+                        Err(message) => {
+                            private_error.set(Some(format!("transcode failed: {message}")));
+                            private_status.set(None);
+                            return;
+                        }
+                    };
+                    (result.bytes, result.width, result.height)
                 };
-                let hash = sha256_hex(&bytes);
+                let (logical_width, logical_height) =
+                    logical_image_size(width, height, image_max_dim);
+                let hash = sha256_hex(&stored_bytes);
                 let now = now_ms_u64();
-                let size = (bytes.len() as u64).min(u32::MAX as u64) as u32;
+                let size = (stored_bytes.len() as u64).min(u32::MAX as u64) as u32;
                 let entry = PrivateImageEntry {
-                    bytes,
-                    mime: mime.clone(),
-                    width,
-                    height,
+                    bytes: stored_bytes,
+                    mime: "image/avif".to_string(),
+                    width: logical_width,
+                    height: logical_height,
                     size,
                     created_at: now,
                     last_used_at: now,
                 };
                 if let Err(message) = persisted_store::save_private_image(&hash, entry).await {
                     private_error.set(Some(message));
+                    private_status.set(None);
                     return;
                 }
                 let refs = match persisted_store::load_private_image_refs(LOCAL_PRIVATE_SCOPE).await {
@@ -1801,6 +1844,7 @@ fn app(props: &AppProps) -> Html {
                     },
                     Err(message) => {
                         private_error.set(Some(message));
+                        private_status.set(None);
                         return;
                     }
                 };
@@ -1808,11 +1852,18 @@ fn app(props: &AppProps) -> Html {
                     persisted_store::save_private_image_refs(LOCAL_PRIVATE_SCOPE, refs).await
                 {
                     private_error.set(Some(message));
+                    private_status.set(None);
                     return;
                 }
                 clear_saved_game();
                 let image_ref = PuzzleImageRef::Private { hash };
-                app_core.set_puzzle_with_grid(label, image_ref, (width, height), None);
+                app_core.set_puzzle_with_grid(
+                    label,
+                    image_ref,
+                    (logical_width, logical_height),
+                    None,
+                );
+                private_status.set(None);
             });
         })
     };
@@ -2783,7 +2834,7 @@ fn app(props: &AppProps) -> Html {
                                 type="file"
                                 accept="image/*"
                                 onchange={on_private_file_input}
-                                disabled={lock_puzzle_controls}
+                                disabled={lock_puzzle_controls || private_upload_busy}
                             />
                         </div>
                         <div class="control">
@@ -2796,9 +2847,21 @@ fn app(props: &AppProps) -> Html {
                                 type="text"
                                 value={private_label_value.clone()}
                                 oninput={on_private_label_input}
-                                disabled={lock_puzzle_controls}
+                                disabled={lock_puzzle_controls || private_upload_busy}
                             />
                         </div>
+                        { if let Some(message) = private_status_value.clone() {
+                            html! {
+                                <div class="control">
+                                    <label>
+                                        { "Private image status" }
+                                        <span class="control-value">{ message }</span>
+                                    </label>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }}
                         { if let Some(message) = private_error_value.clone() {
                             html! {
                                 <div class="control">

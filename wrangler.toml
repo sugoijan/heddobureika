@@ -4,21 +4,28 @@ compatibility_date = "2026-01-26"
 workers_dev = true
 
 [dev]
-ip = "0.0.0.0"
+ip = "127.0.0.1"
 
 [vars]
 ROOM_PATH_PREFIX = "/ws/"
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "worker-build --release"
 cwd = "worker"
 
 [durable_objects]
-bindings = [{ name = "ROOMS", class_name = "Room" }]
+bindings = [
+  { name = "ROOMS", class_name = "Room" },
+  { name = "ASSETS", class_name = "AssetStore" }
+]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["Room"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["AssetStore"]
 
 [env.production]
 name = 'heddobureika'
@@ -28,7 +35,10 @@ routes = [
 ]
 
 [env.production.durable_objects]
-bindings = [{ name = "ROOMS", class_name = "Room" }]
+bindings = [
+  { name = "ROOMS", class_name = "Room" },
+  { name = "ASSETS", class_name = "AssetStore" }
+]
 
 [env.production.vars]
 ROOM_PATH_PREFIX = "/heddobureika/ws/"
