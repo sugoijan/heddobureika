@@ -4,13 +4,13 @@
     "test:integration:cli": "vitest run --config vitest.integration.config.mts tests/integration/cli-private-upload.test.ts"
   },
   "devDependencies": {
-    "execa": "^9.6.0",
+    "execa": "^9.6.1",
     "html-minifier-terser": "^7.2.0",
     "lightningcss-cli": "^1.31.1",
     "terser": "^5.46.0",
-    "vitest": "^2.1.9",
-    "wait-on": "^8.0.4",
-    "wrangler": "^4.61.1"
+    "vitest": "^4.0.18",
+    "wait-on": "^8.0.5",
+    "wrangler": "^4.63.0"
   },
   "packageManager": "pnpm@10.28.2",
   "dependencies": {

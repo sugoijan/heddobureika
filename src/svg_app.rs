@@ -1817,7 +1817,7 @@ impl SvgView {
         self.update_debug_overlay(snapshot);
         self.render_view(snapshot, &assets);
         self.render_ui(snapshot);
-        self.render_pieces(snapshot, &assets);
+        self.render_pieces(snapshot, &assets, sync_view);
         self.update_z_order(snapshot);
         boot::ready();
     }
@@ -3091,7 +3091,12 @@ impl SvgView {
         }
     }
 
-    fn render_pieces(&self, snapshot: &AppSnapshot, assets: &PuzzleAssets) {
+    fn render_pieces(
+        &self,
+        snapshot: &AppSnapshot,
+        assets: &PuzzleAssets,
+        sync_view: &dyn GameSyncView,
+    ) {
         let total = assets.grid.cols as usize * assets.grid.rows as usize;
         if total == 0 {
             return;
@@ -3232,6 +3237,9 @@ impl SvgView {
             if hovered_mask.get(idx).copied().unwrap_or(false) {
                 class.push_str(" hovered");
             }
+            if piece_owned_by_other(snapshot, sync_view, idx) {
+                class.push_str(" owned-other");
+            }
             let _ = node.root.set_attribute("class", &class);
 
             if self.svg_settings.borrow().emboss && !flipped {
@@ -3346,6 +3354,38 @@ impl SvgView {
             .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
             .unwrap_or(false)
     }
+}
+
+fn piece_owned_by_other(
+    snapshot: &AppSnapshot,
+    sync_view: &dyn GameSyncView,
+    piece_id: usize,
+) -> bool {
+    if matches!(sync_view.mode(), InitMode::Local) {
+        return false;
+    }
+    let ownership = sync_view.ownership_by_anchor();
+    if ownership.is_empty() {
+        return false;
+    }
+    let cols = snapshot.grid.cols as usize;
+    let rows = snapshot.grid.rows as usize;
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+    let total = cols * rows;
+    if piece_id >= total || snapshot.core.connections.len() < total {
+        return false;
+    }
+    let mut members = collect_group(&snapshot.core.connections, piece_id, cols, rows);
+    if members.is_empty() {
+        members.push(piece_id);
+    }
+    let anchor_id = members.iter().copied().min().unwrap_or(piece_id);
+    if let Some(owner_id) = ownership.get(&(anchor_id as u32)) {
+        return Some(*owner_id) != sync_view.client_id();
+    }
+    false
 }
 
 pub(crate) struct SvgViewAdapter {

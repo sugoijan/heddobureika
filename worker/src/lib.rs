@@ -12,8 +12,9 @@ use heddobureika_core::game::{
 };
 use heddobureika_core::{
     validate_image_ref, AdminMsg, ClientId, ClientMsg, GameRules, GameSnapshot, OwnershipReason,
-    PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleStateSnapshot, RoomPersistence, RoomUpdate,
-    ServerMsg, ASSET_CHUNK_BYTES, GAME_SNAPSHOT_VERSION, PRIVATE_ASSET_MAX_BYTES,
+    PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleStateSnapshot, RecordedCommand,
+    RecordedCommandKind, RecordedCommandOutcome, RoomPersistence, RoomUpdate, ServerMsg,
+    ASSET_CHUNK_BYTES, DIR_DOWN, DIR_RIGHT, GAME_SNAPSHOT_VERSION, PRIVATE_ASSET_MAX_BYTES,
     PRIVATE_UPLOAD_MAX_BYTES,
 };
 use heddobureika_core::{
@@ -32,6 +33,7 @@ const META_KEY: &str = "room_meta";
 const SNAPSHOT_KEY: &str = "room_snapshot";
 const ROOM_ID_KEY: &str = "room_id";
 const ASSET_STORAGE_CHUNK_BYTES: usize = 256 * 1024;
+const DEFAULT_RECORDING_MAX_EVENTS: u32 = 200_000;
 
 const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
 const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
@@ -289,6 +291,134 @@ struct PendingUpload {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct ClientCommandRecord {
+    kind: RecordedCommandKind,
+    piece_id: Option<u32>,
+    anchor_id: Option<u32>,
+    pos: Option<(f32, f32)>,
+    rot_deg: Option<f32>,
+    client_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandHandlingResult {
+    outcome: RecordedCommandOutcome,
+    reason: Option<String>,
+    room_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotProgress {
+    groups: u32,
+    largest_group: u32,
+    connected_edges: u32,
+    total_edges: u32,
+    border_done: bool,
+    solved: bool,
+}
+
+impl CommandHandlingResult {
+    fn applied(room_seq: Option<u64>) -> Self {
+        Self {
+            outcome: RecordedCommandOutcome::Applied,
+            reason: None,
+            room_seq,
+        }
+    }
+
+    fn accepted_no_state_change(room_seq: Option<u64>) -> Self {
+        Self {
+            outcome: RecordedCommandOutcome::AcceptedNoStateChange,
+            reason: None,
+            room_seq,
+        }
+    }
+
+    fn ignored(reason: impl Into<String>, room_seq: Option<u64>) -> Self {
+        Self {
+            outcome: RecordedCommandOutcome::Ignored,
+            reason: Some(reason.into()),
+            room_seq,
+        }
+    }
+
+    fn rejected(reason: impl Into<String>, room_seq: Option<u64>) -> Self {
+        Self {
+            outcome: RecordedCommandOutcome::Rejected,
+            reason: Some(reason.into()),
+            room_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreConfig {
+    enabled: bool,
+    capped: bool,
+    max_events: u32,
+    dropped_events: u64,
+}
+
+impl Default for CommandStoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capped: false,
+            max_events: DEFAULT_RECORDING_MAX_EVENTS,
+            dropped_events: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreStatus {
+    enabled: bool,
+    capped: bool,
+    max_events: u32,
+    event_count: u64,
+    dropped_events: u64,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreSetRequest {
+    enabled: bool,
+    max_events: Option<u32>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreAppendRequest {
+    ts_ms: i64,
+    client_id: ClientId,
+    kind: RecordedCommandKind,
+    piece_id: Option<u32>,
+    anchor_id: Option<u32>,
+    pos: Option<(f32, f32)>,
+    rot_deg: Option<f32>,
+    client_seq: Option<u64>,
+    room_seq: Option<u64>,
+    outcome: RecordedCommandOutcome,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreAppendResponse {
+    accepted: bool,
+    capped: bool,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreExportRequest {
+    after_id: Option<u64>,
+    limit: u32,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+struct CommandStoreExportResponse {
+    rows: Vec<RecordedCommand>,
+    next_after_id: Option<u64>,
+}
+
 #[durable_object]
 pub struct Room {
     state: State,
@@ -423,6 +553,22 @@ impl DurableObject for Room {
                     AdminMsg::Scramble { seed } => {
                         return self.handle_admin_scramble(ws, seed).await;
                     }
+                    AdminMsg::RecordingSet { enabled, max_events } => {
+                        return self
+                            .handle_admin_recording_set(ws, enabled, max_events)
+                            .await;
+                    }
+                    AdminMsg::RecordingStatus => {
+                        return self.handle_admin_recording_status(ws).await;
+                    }
+                    AdminMsg::RecordingExport { after_id, limit } => {
+                        return self
+                            .handle_admin_recording_export(ws, after_id, limit)
+                            .await;
+                    }
+                    AdminMsg::RecordingClear => {
+                        return self.handle_admin_recording_clear(ws).await;
+                    }
                 }
             }
             return Ok(());
@@ -436,24 +582,21 @@ impl DurableObject for Room {
             return Ok(());
         };
 
-        match msg {
+        let classify_msg = msg.clone();
+        let record = Self::record_from_client_msg(&msg);
+        let pre_seq = self.current_snapshot_seq();
+        let pre_progress = self.current_snapshot_progress();
+        let dispatch = match msg {
             ClientMsg::Init { puzzle, rules, state } => {
-                self.handle_init(ws, puzzle, rules, state).await?;
+                self.handle_init(ws.clone(), puzzle, rules, state).await
             }
-            ClientMsg::AssetRequest { hash } => {
-                self.handle_asset_request(ws, hash).await?;
-            }
-            ClientMsg::Select { piece_id } => {
-                self.handle_select(client_id, piece_id).await?;
-            }
+            ClientMsg::AssetRequest { hash } => self.handle_asset_request(ws.clone(), hash).await,
+            ClientMsg::Select { piece_id } => self.handle_select(client_id, piece_id).await,
             ClientMsg::Move {
                 anchor_id,
                 pos,
                 client_seq,
-            } => {
-                self.handle_move(client_id, anchor_id, pos, client_seq)
-                    .await?;
-            }
+            } => self.handle_move(client_id, anchor_id, pos, client_seq).await,
             ClientMsg::Transform {
                 anchor_id,
                 pos,
@@ -461,25 +604,37 @@ impl DurableObject for Room {
                 client_seq,
             } => {
                 self.handle_transform(client_id, anchor_id, pos, rot_deg, client_seq)
-                    .await?;
+                    .await
             }
             ClientMsg::Rotate { anchor_id, rot_deg } => {
-                self.handle_rotate(client_id, anchor_id, rot_deg).await?;
+                self.handle_rotate(client_id, anchor_id, rot_deg).await
             }
             ClientMsg::Place { anchor_id, pos, rot_deg } => {
-                self.handle_place(client_id, anchor_id, pos, rot_deg).await?;
+                self.handle_place(client_id, anchor_id, pos, rot_deg).await
             }
             ClientMsg::Flip { piece_id, flipped } => {
-                self.handle_flip(client_id, piece_id, flipped).await?;
+                self.handle_flip(client_id, piece_id, flipped).await
             }
-            ClientMsg::Release { anchor_id } => {
-                self.handle_release(client_id, anchor_id).await?;
-            }
+            ClientMsg::Release { anchor_id } => self.handle_release(client_id, anchor_id).await,
             ClientMsg::Ping { nonce } => {
                 let response = ServerMsg::Pong { nonce };
                 let _ = self.send_server_msg(&ws, &response);
+                Ok(())
             }
-        }
+        };
+        let post_seq = self.current_snapshot_seq();
+        let post_progress = self.current_snapshot_progress();
+        let outcome = match &dispatch {
+            Ok(()) => Self::classify_command_outcome(&classify_msg, pre_seq, post_seq),
+            Err(err) => CommandHandlingResult {
+                outcome: RecordedCommandOutcome::HandlerError,
+                reason: Some(err.to_string()),
+                room_seq: post_seq.or(pre_seq),
+            },
+        };
+        self.record_client_command(client_id, &record, outcome, pre_progress, post_progress)
+            .await?;
+        dispatch?;
 
         Ok(())
     }
@@ -764,6 +919,502 @@ impl Room {
                 self.release_by_client(client_id, OwnershipReason::Released)?;
             }
         }
+        Ok(())
+    }
+
+    fn current_snapshot_seq(&self) -> Option<u64> {
+        self.inner.borrow().snapshot.as_ref().map(|snapshot| snapshot.seq)
+    }
+
+    fn current_snapshot_progress(&self) -> Option<SnapshotProgress> {
+        let inner = self.inner.borrow();
+        let snapshot = inner.snapshot.as_ref()?;
+        Self::progress_for_snapshot(snapshot)
+    }
+
+    fn progress_for_snapshot(snapshot: &GameSnapshot) -> Option<SnapshotProgress> {
+        let cols = snapshot.puzzle.cols as usize;
+        let rows = snapshot.puzzle.rows as usize;
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let total = cols.saturating_mul(rows);
+        if snapshot.state.connections.len() != total {
+            return None;
+        }
+        let groups = groups_from_connections(&snapshot.state.connections, cols, rows);
+        let group_count = groups.len().max(1) as u32;
+        let largest_group = groups
+            .iter()
+            .map(|group| group.len())
+            .max()
+            .unwrap_or(0) as u32;
+        let total_edges =
+            (cols.saturating_sub(1).saturating_mul(rows) + rows.saturating_sub(1).saturating_mul(cols))
+                as u32;
+        let mut connected_edges = 0u32;
+        for row in 0..rows {
+            for col in 0..cols {
+                let idx = row * cols + col;
+                if col + 1 < cols
+                    && snapshot
+                        .state
+                        .connections
+                        .get(idx)
+                        .map(|conn| conn[DIR_RIGHT])
+                        .unwrap_or(false)
+                {
+                    connected_edges = connected_edges.saturating_add(1);
+                }
+                if row + 1 < rows
+                    && snapshot
+                        .state
+                        .connections
+                        .get(idx)
+                        .map(|conn| conn[DIR_DOWN])
+                        .unwrap_or(false)
+                {
+                    connected_edges = connected_edges.saturating_add(1);
+                }
+            }
+        }
+        let anchor_of = anchor_of_from_connections(&snapshot.state.connections, cols, rows);
+        let mut border_anchor = None::<usize>;
+        let mut border_seen = false;
+        let mut border_done = true;
+        for row in 0..rows {
+            for col in 0..cols {
+                if row != 0 && col != 0 && row + 1 != rows && col + 1 != cols {
+                    continue;
+                }
+                border_seen = true;
+                let idx = row * cols + col;
+                let anchor = anchor_of.get(idx).copied().unwrap_or(idx);
+                if let Some(existing) = border_anchor {
+                    if existing != anchor {
+                        border_done = false;
+                        break;
+                    }
+                } else {
+                    border_anchor = Some(anchor);
+                }
+            }
+            if !border_done {
+                break;
+            }
+        }
+        if !border_seen {
+            border_done = false;
+        }
+        Some(SnapshotProgress {
+            groups: group_count,
+            largest_group,
+            connected_edges,
+            total_edges,
+            border_done,
+            solved: group_count <= 1 && total > 0,
+        })
+    }
+
+    fn compose_record_reason(
+        base_reason: Option<String>,
+        pre: Option<SnapshotProgress>,
+        post: Option<SnapshotProgress>,
+    ) -> Option<String> {
+        if pre.is_none() && post.is_none() {
+            return base_reason;
+        }
+        let fallback = pre.or(post)?;
+        let before = pre.unwrap_or(fallback);
+        let after = post.unwrap_or(fallback);
+        let payload = serde_json::json!({
+            "reason": base_reason,
+            "groups_before": before.groups,
+            "groups_after": after.groups,
+            "largest_group_before": before.largest_group,
+            "largest_group_after": after.largest_group,
+            "connected_edges_before": before.connected_edges,
+            "connected_edges_after": after.connected_edges,
+            "total_edges": before.total_edges.max(after.total_edges),
+            "border_done_before": before.border_done,
+            "border_done_after": after.border_done,
+            "solved_before": before.solved,
+            "solved_after": after.solved
+        });
+        Some(payload.to_string())
+    }
+
+    fn record_from_client_msg(msg: &ClientMsg) -> ClientCommandRecord {
+        match msg {
+            ClientMsg::Init { .. } => ClientCommandRecord {
+                kind: RecordedCommandKind::Init,
+                piece_id: None,
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+            ClientMsg::AssetRequest { .. } => ClientCommandRecord {
+                kind: RecordedCommandKind::AssetRequest,
+                piece_id: None,
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+            ClientMsg::Select { piece_id } => ClientCommandRecord {
+                kind: RecordedCommandKind::Select,
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+            ClientMsg::Move {
+                anchor_id,
+                pos,
+                client_seq,
+            } => ClientCommandRecord {
+                kind: RecordedCommandKind::Move,
+                piece_id: None,
+                anchor_id: Some(*anchor_id),
+                pos: Some(*pos),
+                rot_deg: None,
+                client_seq: Some(*client_seq),
+            },
+            ClientMsg::Transform {
+                anchor_id,
+                pos,
+                rot_deg,
+                client_seq,
+            } => ClientCommandRecord {
+                kind: RecordedCommandKind::Transform,
+                piece_id: None,
+                anchor_id: Some(*anchor_id),
+                pos: Some(*pos),
+                rot_deg: Some(*rot_deg),
+                client_seq: Some(*client_seq),
+            },
+            ClientMsg::Rotate { anchor_id, rot_deg } => ClientCommandRecord {
+                kind: RecordedCommandKind::Rotate,
+                piece_id: None,
+                anchor_id: Some(*anchor_id),
+                pos: None,
+                rot_deg: Some(*rot_deg),
+                client_seq: None,
+            },
+            ClientMsg::Place {
+                anchor_id,
+                pos,
+                rot_deg,
+            } => ClientCommandRecord {
+                kind: RecordedCommandKind::Place,
+                piece_id: None,
+                anchor_id: Some(*anchor_id),
+                pos: Some(*pos),
+                rot_deg: Some(*rot_deg),
+                client_seq: None,
+            },
+            ClientMsg::Flip { piece_id, .. } => ClientCommandRecord {
+                kind: RecordedCommandKind::Flip,
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+            ClientMsg::Release { anchor_id } => ClientCommandRecord {
+                kind: RecordedCommandKind::Release,
+                piece_id: None,
+                anchor_id: Some(*anchor_id),
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+            ClientMsg::Ping { .. } => ClientCommandRecord {
+                kind: RecordedCommandKind::Ping,
+                piece_id: None,
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+        }
+    }
+
+    fn classify_command_outcome(
+        msg: &ClientMsg,
+        pre_seq: Option<u64>,
+        post_seq: Option<u64>,
+    ) -> CommandHandlingResult {
+        let applied = match (pre_seq, post_seq) {
+            (Some(before), Some(after)) => after > before,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if applied {
+            return CommandHandlingResult::applied(post_seq);
+        }
+        let seq = post_seq.or(pre_seq);
+        match msg {
+            ClientMsg::Ping { .. } | ClientMsg::AssetRequest { .. } => {
+                CommandHandlingResult::accepted_no_state_change(seq)
+            }
+            ClientMsg::Init { .. } => CommandHandlingResult::rejected("init_not_applied", seq),
+            ClientMsg::Select { .. }
+            | ClientMsg::Move { .. }
+            | ClientMsg::Transform { .. }
+            | ClientMsg::Rotate { .. }
+            | ClientMsg::Place { .. }
+            | ClientMsg::Flip { .. }
+            | ClientMsg::Release { .. } => {
+                CommandHandlingResult::ignored("ignored_or_conflict", seq)
+            }
+        }
+    }
+
+    async fn record_client_command(
+        &self,
+        client_id: ClientId,
+        record: &ClientCommandRecord,
+        outcome: CommandHandlingResult,
+        pre_progress: Option<SnapshotProgress>,
+        post_progress: Option<SnapshotProgress>,
+    ) -> Result<()> {
+        let reason = Self::compose_record_reason(outcome.reason, pre_progress, post_progress);
+        let request = CommandStoreAppendRequest {
+            ts_ms: now_ms(),
+            client_id,
+            kind: record.kind,
+            piece_id: record.piece_id,
+            anchor_id: record.anchor_id,
+            pos: record.pos,
+            rot_deg: record.rot_deg,
+            client_seq: record.client_seq,
+            room_seq: outcome.room_seq,
+            outcome: outcome.outcome,
+            reason,
+        };
+        if let Err(message) = self.command_store_append(&request).await {
+            console_log!(
+                "recording append failed for client {} kind {:?}: {}",
+                client_id,
+                record.kind,
+                message
+            );
+        }
+        Ok(())
+    }
+
+    async fn handle_admin_recording_set(
+        &self,
+        ws: WebSocket,
+        enabled: bool,
+        max_events: Option<u32>,
+    ) -> Result<()> {
+        match self.command_store_set(enabled, max_events).await {
+            Ok(status) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::RecordingStatus {
+                        enabled: status.enabled,
+                        capped: status.capped,
+                        max_events: status.max_events,
+                        event_count: status.event_count,
+                        dropped_events: status.dropped_events,
+                    },
+                );
+            }
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "recording_set_failed".to_string(),
+                        message,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_admin_recording_status(&self, ws: WebSocket) -> Result<()> {
+        match self.command_store_status().await {
+            Ok(status) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::RecordingStatus {
+                        enabled: status.enabled,
+                        capped: status.capped,
+                        max_events: status.max_events,
+                        event_count: status.event_count,
+                        dropped_events: status.dropped_events,
+                    },
+                );
+            }
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "recording_status_failed".to_string(),
+                        message,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_admin_recording_export(
+        &self,
+        ws: WebSocket,
+        after_id: Option<u64>,
+        limit: u32,
+    ) -> Result<()> {
+        match self.command_store_export(after_id, limit).await {
+            Ok(response) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::RecordingRows {
+                        rows: response.rows,
+                        next_after_id: response.next_after_id,
+                    },
+                );
+            }
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "recording_export_failed".to_string(),
+                        message,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_admin_recording_clear(&self, ws: WebSocket) -> Result<()> {
+        match self.command_store_clear().await {
+            Ok(()) => {
+                let _ = self.send_server_msg(&ws, &ServerMsg::RecordingCleared);
+            }
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "recording_clear_failed".to_string(),
+                        message,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn command_store_stub(&self) -> std::result::Result<Stub, String> {
+        let room_id = self
+            .inner
+            .borrow()
+            .room_id
+            .clone()
+            .ok_or_else(|| "missing room id".to_string())?;
+        let namespace = self
+            .env
+            .durable_object("COMMANDS")
+            .map_err(|err| err.to_string())?;
+        namespace
+            .get_by_name(&room_id)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn command_store_post(
+        &self,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let stub = self.command_store_stub()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        if let Some(body) = body {
+            init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+        }
+        let req = Request::new_with_init(path, &init).map_err(|err| err.to_string())?;
+        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        if !(200..300).contains(&resp.status_code()) {
+            let message = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "command store failed".to_string());
+            return Err(message);
+        }
+        resp.bytes().await.map_err(|err| err.to_string())
+    }
+
+    async fn command_store_set(
+        &self,
+        enabled: bool,
+        max_events: Option<u32>,
+    ) -> std::result::Result<CommandStoreStatus, String> {
+        let req = CommandStoreSetRequest {
+            enabled,
+            max_events,
+        };
+        let Some(bytes) = encode(&req) else {
+            return Err("failed to encode recording set request".to_string());
+        };
+        let body = self
+            .command_store_post("https://command/config/set", Some(bytes))
+            .await?;
+        decode::<CommandStoreStatus>(&body)
+            .ok_or_else(|| "failed to decode recording set response".to_string())
+    }
+
+    async fn command_store_status(&self) -> std::result::Result<CommandStoreStatus, String> {
+        let body = self
+            .command_store_post("https://command/config/status", None)
+            .await?;
+        decode::<CommandStoreStatus>(&body)
+            .ok_or_else(|| "failed to decode recording status response".to_string())
+    }
+
+    async fn command_store_append(
+        &self,
+        request: &CommandStoreAppendRequest,
+    ) -> std::result::Result<CommandStoreAppendResponse, String> {
+        let Some(bytes) = encode(request) else {
+            return Err("failed to encode command append request".to_string());
+        };
+        let body = self
+            .command_store_post("https://command/events/append", Some(bytes))
+            .await?;
+        decode::<CommandStoreAppendResponse>(&body)
+            .ok_or_else(|| "failed to decode command append response".to_string())
+    }
+
+    async fn command_store_export(
+        &self,
+        after_id: Option<u64>,
+        limit: u32,
+    ) -> std::result::Result<CommandStoreExportResponse, String> {
+        let req = CommandStoreExportRequest {
+            after_id,
+            limit,
+        };
+        let Some(bytes) = encode(&req) else {
+            return Err("failed to encode command export request".to_string());
+        };
+        let body = self
+            .command_store_post("https://command/events/export", Some(bytes))
+            .await?;
+        decode::<CommandStoreExportResponse>(&body)
+            .ok_or_else(|| "failed to decode command export response".to_string())
+    }
+
+    async fn command_store_clear(&self) -> std::result::Result<(), String> {
+        let _ = self
+            .command_store_post("https://command/events/clear", None)
+            .await?;
         Ok(())
     }
 
@@ -3046,6 +3697,534 @@ impl AssetStore {
         match value {
             SqlStorageValue::Blob(value) => Ok(value.clone()),
             _ => Err(format!("invalid asset {field}")),
+        }
+    }
+}
+
+struct CommandStoreRuntime {
+    schema_ready: bool,
+}
+
+impl CommandStoreRuntime {
+    fn new() -> Self {
+        Self { schema_ready: false }
+    }
+}
+
+enum CommandStoreRoute {
+    ConfigSet,
+    ConfigStatus,
+    EventsAppend,
+    EventsExport,
+    EventsClear,
+}
+
+impl CommandStoreRoute {
+    fn from_path(path: &str) -> Option<Self> {
+        match path.trim_start_matches('/') {
+            "config/set" => Some(Self::ConfigSet),
+            "config/status" => Some(Self::ConfigStatus),
+            "events/append" => Some(Self::EventsAppend),
+            "events/export" => Some(Self::EventsExport),
+            "events/clear" => Some(Self::EventsClear),
+            _ => None,
+        }
+    }
+}
+
+#[durable_object]
+pub struct CommandStore {
+    state: State,
+    inner: RefCell<CommandStoreRuntime>,
+}
+
+impl DurableObject for CommandStore {
+    fn new(state: State, _env: Env) -> Self {
+        Self {
+            state,
+            inner: RefCell::new(CommandStoreRuntime::new()),
+        }
+    }
+
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
+        self.ensure_schema()?;
+        let Some(route) = CommandStoreRoute::from_path(&req.path()) else {
+            return Response::error("not found", 404);
+        };
+        match (req.method(), route) {
+            (Method::Post, CommandStoreRoute::ConfigSet) => {
+                let body = req.bytes().await?;
+                let Some(msg) = decode::<CommandStoreSetRequest>(&body) else {
+                    return Response::error("invalid request", 400);
+                };
+                let status = match self.set_config(msg.enabled, msg.max_events) {
+                    Ok(status) => status,
+                    Err(message) => return Response::error(&message, 500),
+                };
+                let Some(bytes) = encode(&status) else {
+                    return Response::error("failed to encode response", 500);
+                };
+                Response::from_bytes(bytes)
+            }
+            (Method::Post, CommandStoreRoute::ConfigStatus) => {
+                let status = match self.status() {
+                    Ok(status) => status,
+                    Err(message) => return Response::error(&message, 500),
+                };
+                let Some(bytes) = encode(&status) else {
+                    return Response::error("failed to encode response", 500);
+                };
+                Response::from_bytes(bytes)
+            }
+            (Method::Post, CommandStoreRoute::EventsAppend) => {
+                let body = req.bytes().await?;
+                let Some(msg) = decode::<CommandStoreAppendRequest>(&body) else {
+                    return Response::error("invalid request", 400);
+                };
+                let response = match self.append(msg) {
+                    Ok(response) => response,
+                    Err(message) => return Response::error(&message, 500),
+                };
+                let Some(bytes) = encode(&response) else {
+                    return Response::error("failed to encode response", 500);
+                };
+                Response::from_bytes(bytes)
+            }
+            (Method::Post, CommandStoreRoute::EventsExport) => {
+                let body = req.bytes().await?;
+                let Some(msg) = decode::<CommandStoreExportRequest>(&body) else {
+                    return Response::error("invalid request", 400);
+                };
+                let export = match self.export(msg.after_id, msg.limit) {
+                    Ok(export) => export,
+                    Err(message) => return Response::error(&message, 500),
+                };
+                let Some(bytes) = encode(&export) else {
+                    return Response::error("failed to encode response", 500);
+                };
+                Response::from_bytes(bytes)
+            }
+            (Method::Post, CommandStoreRoute::EventsClear) => {
+                match self.clear_events() {
+                    Ok(()) => Response::ok("ok"),
+                    Err(message) => Response::error(&message, 500),
+                }
+            }
+            _ => Response::error("not found", 404),
+        }
+    }
+}
+
+impl CommandStore {
+    fn ensure_schema(&self) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.schema_ready {
+            return Ok(());
+        }
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS command_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL,
+                capped INTEGER NOT NULL,
+                max_events INTEGER NOT NULL,
+                dropped_events INTEGER NOT NULL
+            )",
+            None,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS command_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms INTEGER NOT NULL,
+                client_id TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                piece_id INTEGER,
+                anchor_id INTEGER,
+                pos_x REAL,
+                pos_y REAL,
+                rot_deg REAL,
+                client_seq INTEGER,
+                room_seq INTEGER,
+                outcome INTEGER NOT NULL,
+                reason TEXT
+            )",
+            None,
+        )?;
+        let existing = sql.exec("SELECT id FROM command_config WHERE id = 1", None)?;
+        if existing.raw().next().is_none() {
+            sql.exec(
+                "INSERT INTO command_config
+                    (id, enabled, capped, max_events, dropped_events)
+                    VALUES (1, 0, 0, ?1, 0)",
+                Some(vec![(DEFAULT_RECORDING_MAX_EVENTS as i64).into()]),
+            )?;
+        }
+        inner.schema_ready = true;
+        Ok(())
+    }
+
+    fn load_config(&self) -> std::result::Result<CommandStoreConfig, String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        let mut rows = sql
+            .exec(
+                "SELECT enabled, capped, max_events, dropped_events
+                    FROM command_config
+                    WHERE id = 1",
+                None,
+            )
+            .map_err(|err| err.to_string())?
+            .raw();
+        let Some(row) = rows.next() else {
+            return Ok(CommandStoreConfig::default());
+        };
+        let row = row.map_err(|err| err.to_string())?;
+        if row.len() != 4 {
+            return Err("invalid command config row".to_string());
+        }
+        let enabled = Self::sql_required_i64(&row[0], "enabled")? != 0;
+        let capped = Self::sql_required_i64(&row[1], "capped")? != 0;
+        let max_events = Self::sql_required_u32(&row[2], "max_events")?;
+        let dropped_events = Self::sql_required_u64(&row[3], "dropped_events")?;
+        Ok(CommandStoreConfig {
+            enabled,
+            capped,
+            max_events: max_events.max(1),
+            dropped_events,
+        })
+    }
+
+    fn save_config(&self, config: &CommandStoreConfig) -> std::result::Result<(), String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "INSERT OR REPLACE INTO command_config
+                (id, enabled, capped, max_events, dropped_events)
+                VALUES (1, ?1, ?2, ?3, ?4)",
+            Some(vec![
+                if config.enabled { 1i64 } else { 0i64 }.into(),
+                if config.capped { 1i64 } else { 0i64 }.into(),
+                (config.max_events as i64).into(),
+                (config.dropped_events as i64).into(),
+            ]),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn event_count(&self) -> std::result::Result<u64, String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        let mut rows = sql
+            .exec("SELECT COUNT(1) FROM command_events", None)
+            .map_err(|err| err.to_string())?
+            .raw();
+        let Some(row) = rows.next() else {
+            return Ok(0);
+        };
+        let row = row.map_err(|err| err.to_string())?;
+        if row.len() != 1 {
+            return Err("invalid command count row".to_string());
+        }
+        Self::sql_required_u64(&row[0], "event_count")
+    }
+
+    fn status(&self) -> std::result::Result<CommandStoreStatus, String> {
+        let config = self.load_config()?;
+        let event_count = self.event_count()?;
+        Ok(CommandStoreStatus {
+            enabled: config.enabled,
+            capped: config.capped,
+            max_events: config.max_events,
+            event_count,
+            dropped_events: config.dropped_events,
+        })
+    }
+
+    fn set_config(
+        &self,
+        enabled: bool,
+        max_events: Option<u32>,
+    ) -> std::result::Result<CommandStoreStatus, String> {
+        let mut config = self.load_config()?;
+        if let Some(max_events) = max_events {
+            config.max_events = max_events.max(1);
+        }
+        config.enabled = enabled;
+        if enabled {
+            config.capped = false;
+        }
+        self.save_config(&config)?;
+        self.status()
+    }
+
+    fn append(
+        &self,
+        request: CommandStoreAppendRequest,
+    ) -> std::result::Result<CommandStoreAppendResponse, String> {
+        let mut config = self.load_config()?;
+        if !config.enabled {
+            return Ok(CommandStoreAppendResponse {
+                accepted: false,
+                capped: config.capped,
+            });
+        }
+        let count = self.event_count()?;
+        if count >= config.max_events as u64 {
+            config.enabled = false;
+            config.capped = true;
+            config.dropped_events = config.dropped_events.saturating_add(1);
+            self.save_config(&config)?;
+            return Ok(CommandStoreAppendResponse {
+                accepted: false,
+                capped: true,
+            });
+        }
+
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "INSERT INTO command_events
+                (ts_ms, client_id, kind, piece_id, anchor_id, pos_x, pos_y, rot_deg, client_seq, room_seq, outcome, reason)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            Some(vec![
+                request.ts_ms.into(),
+                format!("u64:{}", request.client_id.as_u64()).into(),
+                (request.kind as i64).into(),
+                Self::opt_i64(request.piece_id.map(|value| value as i64)),
+                Self::opt_i64(request.anchor_id.map(|value| value as i64)),
+                Self::opt_f64(request.pos.map(|value| value.0 as f64)),
+                Self::opt_f64(request.pos.map(|value| value.1 as f64)),
+                Self::opt_f64(request.rot_deg.map(|value| value as f64)),
+                Self::opt_i64(request.client_seq.map(|value| value as i64)),
+                Self::opt_i64(request.room_seq.map(|value| value as i64)),
+                (request.outcome as i64).into(),
+                Self::opt_string(request.reason),
+            ]),
+        )
+        .map_err(|err| err.to_string())?;
+
+        Ok(CommandStoreAppendResponse {
+            accepted: true,
+            capped: false,
+        })
+    }
+
+    fn export(
+        &self,
+        after_id: Option<u64>,
+        limit: u32,
+    ) -> std::result::Result<CommandStoreExportResponse, String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let safe_limit = limit.clamp(1, 5000);
+        let after_id = after_id.unwrap_or(0);
+        let sql = self.state.storage().sql();
+        let rows = sql
+            .exec(
+                "SELECT id, ts_ms, client_id, kind, piece_id, anchor_id, pos_x, pos_y, rot_deg, client_seq, room_seq, outcome, reason
+                    FROM command_events
+                    WHERE id > ?1
+                    ORDER BY id ASC
+                    LIMIT ?2",
+                Some(vec![(after_id as i64).into(), (safe_limit as i64).into()]),
+            )
+            .map_err(|err| err.to_string())?;
+        let mut out = Vec::new();
+        let mut next_after_id = None;
+        for row in rows.raw() {
+            let row = row.map_err(|err| err.to_string())?;
+            if row.len() != 13 {
+                return Err("invalid command event row".to_string());
+            }
+            let id = Self::sql_required_u64(&row[0], "id")?;
+            let ts_ms = Self::sql_required_i64(&row[1], "ts_ms")?;
+            let client_id_raw = Self::sql_required_client_id(&row[2])?;
+            let kind_raw = Self::sql_required_u32(&row[3], "kind")?;
+            let outcome_raw = Self::sql_required_u32(&row[11], "outcome")?;
+            let command = RecordedCommand {
+                id,
+                ts_ms,
+                client_id: ClientId::from(client_id_raw),
+                kind: Self::decode_kind(kind_raw)?,
+                piece_id: Self::sql_optional_u32(&row[4]),
+                anchor_id: Self::sql_optional_u32(&row[5]),
+                pos: match (Self::sql_optional_f32(&row[6]), Self::sql_optional_f32(&row[7])) {
+                    (Some(x), Some(y)) => Some((x, y)),
+                    _ => None,
+                },
+                rot_deg: Self::sql_optional_f32(&row[8]),
+                client_seq: Self::sql_optional_u64(&row[9]),
+                room_seq: Self::sql_optional_u64(&row[10]),
+                outcome: Self::decode_outcome(outcome_raw)?,
+                reason: Self::sql_optional_string(&row[12]),
+            };
+            next_after_id = Some(id);
+            out.push(command);
+        }
+        Ok(CommandStoreExportResponse {
+            rows: out,
+            next_after_id,
+        })
+    }
+
+    fn clear_events(&self) -> std::result::Result<(), String> {
+        self.ensure_schema().map_err(|err| err.to_string())?;
+        let sql = self.state.storage().sql();
+        sql.exec("DELETE FROM command_events", None)
+            .map_err(|err| err.to_string())?;
+        let mut config = self.load_config()?;
+        config.capped = false;
+        config.dropped_events = 0;
+        self.save_config(&config)?;
+        Ok(())
+    }
+
+    fn decode_kind(value: u32) -> std::result::Result<RecordedCommandKind, String> {
+        match value {
+            x if x == RecordedCommandKind::Init as u32 => Ok(RecordedCommandKind::Init),
+            x if x == RecordedCommandKind::AssetRequest as u32 => {
+                Ok(RecordedCommandKind::AssetRequest)
+            }
+            x if x == RecordedCommandKind::Select as u32 => Ok(RecordedCommandKind::Select),
+            x if x == RecordedCommandKind::Move as u32 => Ok(RecordedCommandKind::Move),
+            x if x == RecordedCommandKind::Transform as u32 => Ok(RecordedCommandKind::Transform),
+            x if x == RecordedCommandKind::Rotate as u32 => Ok(RecordedCommandKind::Rotate),
+            x if x == RecordedCommandKind::Place as u32 => Ok(RecordedCommandKind::Place),
+            x if x == RecordedCommandKind::Flip as u32 => Ok(RecordedCommandKind::Flip),
+            x if x == RecordedCommandKind::Release as u32 => Ok(RecordedCommandKind::Release),
+            x if x == RecordedCommandKind::Ping as u32 => Ok(RecordedCommandKind::Ping),
+            _ => Err("invalid command kind".to_string()),
+        }
+    }
+
+    fn decode_outcome(value: u32) -> std::result::Result<RecordedCommandOutcome, String> {
+        match value {
+            x if x == RecordedCommandOutcome::Applied as u32 => {
+                Ok(RecordedCommandOutcome::Applied)
+            }
+            x if x == RecordedCommandOutcome::AcceptedNoStateChange as u32 => {
+                Ok(RecordedCommandOutcome::AcceptedNoStateChange)
+            }
+            x if x == RecordedCommandOutcome::Ignored as u32 => {
+                Ok(RecordedCommandOutcome::Ignored)
+            }
+            x if x == RecordedCommandOutcome::Rejected as u32 => {
+                Ok(RecordedCommandOutcome::Rejected)
+            }
+            x if x == RecordedCommandOutcome::HandlerError as u32 => {
+                Ok(RecordedCommandOutcome::HandlerError)
+            }
+            _ => Err("invalid command outcome".to_string()),
+        }
+    }
+
+    fn opt_i64(value: Option<i64>) -> SqlStorageValue {
+        match value {
+            Some(value) => value.into(),
+            None => SqlStorageValue::Null,
+        }
+    }
+
+    fn opt_f64(value: Option<f64>) -> SqlStorageValue {
+        match value {
+            Some(value) => value.into(),
+            None => SqlStorageValue::Null,
+        }
+    }
+
+    fn opt_string(value: Option<String>) -> SqlStorageValue {
+        match value {
+            Some(value) => value.into(),
+            None => SqlStorageValue::Null,
+        }
+    }
+
+    fn sql_required_i64(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<i64, String> {
+        match value {
+            SqlStorageValue::Integer(value) => Ok(*value),
+            SqlStorageValue::Float(value) => Ok(*value as i64),
+            _ => Err(format!("invalid command {field}")),
+        }
+    }
+
+    fn sql_required_u32(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<u32, String> {
+        let raw = Self::sql_required_i64(value, field)?;
+        u32::try_from(raw).map_err(|_| format!("invalid command {field}"))
+    }
+
+    fn sql_required_u64(
+        value: &SqlStorageValue,
+        field: &str,
+    ) -> std::result::Result<u64, String> {
+        let raw = Self::sql_required_i64(value, field)?;
+        u64::try_from(raw).map_err(|_| format!("invalid command {field}"))
+    }
+
+    fn sql_required_client_id(value: &SqlStorageValue) -> std::result::Result<u64, String> {
+        match value {
+            SqlStorageValue::String(value) => {
+                let trimmed = value.trim();
+                if let Some(rest) = trimmed.strip_prefix("u64:") {
+                    return rest
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| "invalid command client_id".to_string());
+                }
+                if let Ok(parsed) = trimmed.parse::<u64>() {
+                    return Ok(parsed);
+                }
+                if let Ok(parsed) = trimmed.parse::<i64>() {
+                    return Ok(parsed as u64);
+                }
+                Err("invalid command client_id".to_string())
+            }
+            SqlStorageValue::Integer(value) => Ok(*value as u64),
+            SqlStorageValue::Float(value) => {
+                let int = *value as i64;
+                if (*value - int as f64).abs() < f64::EPSILON {
+                    Ok(int as u64)
+                } else {
+                    Err("invalid command client_id".to_string())
+                }
+            }
+            _ => Err("invalid command client_id".to_string()),
+        }
+    }
+
+    fn sql_optional_u32(value: &SqlStorageValue) -> Option<u32> {
+        match value {
+            SqlStorageValue::Integer(value) => u32::try_from(*value).ok(),
+            SqlStorageValue::Float(value) => u32::try_from(*value as i64).ok(),
+            _ => None,
+        }
+    }
+
+    fn sql_optional_u64(value: &SqlStorageValue) -> Option<u64> {
+        match value {
+            SqlStorageValue::Integer(value) => u64::try_from(*value).ok(),
+            SqlStorageValue::Float(value) => u64::try_from(*value as i64).ok(),
+            _ => None,
+        }
+    }
+
+    fn sql_optional_f32(value: &SqlStorageValue) -> Option<f32> {
+        match value {
+            SqlStorageValue::Integer(value) => Some(*value as f32),
+            SqlStorageValue::Float(value) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
+    fn sql_optional_string(value: &SqlStorageValue) -> Option<String> {
+        match value {
+            SqlStorageValue::String(value) => Some(value.clone()),
+            _ => None,
         }
     }
 }

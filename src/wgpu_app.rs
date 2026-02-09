@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use gloo::render::{request_animation_frame, AnimationFrame};
@@ -31,7 +32,7 @@ use crate::renderer::{
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
 use crate::view_runtime;
-use heddobureika_core::{PuzzleImageRef, PuzzleInfo};
+use heddobureika_core::{ClientId, PuzzleImageRef, PuzzleInfo};
 use crate::persisted_store;
 use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 
@@ -61,6 +62,7 @@ const UI_TITLE_FONT_RATIO: f32 = 0.058;
 const DRAG_SCALE: f32 = 1.01;
 const DRAG_ROTATION_DEG: f32 = 1.0;
 const OUTLINE_KIND_HOVER: f32 = 1.0;
+const OUTLINE_KIND_OWNED: f32 = 2.0;
 const OUTLINE_KIND_DEBUG: f32 = 3.0;
 const WGPU_FPS_CAP_DEFAULT: f32 = 60.0;
 const WGPU_FPS_IDLE_RESET_MS: f32 = 800.0;
@@ -1680,6 +1682,12 @@ impl WgpuView {
                 canvas_class.push_str(" pan-ready");
             }
         }
+        if let Some(hovered_id) = snapshot.hovered_id {
+            let sync_view = sync_runtime::sync_view();
+            if piece_owned_by_other(snapshot, &sync_view, hovered_id) {
+                canvas_class.push_str(" owned-other");
+            }
+        }
         if self.ui_credit_hovered.get() || preview_hovered {
             canvas_class.push_str(" ui-link-hover");
         }
@@ -3006,6 +3014,7 @@ impl WgpuView {
         } else {
             0.0
         };
+        let ownership_by_anchor = sync_view.ownership_by_anchor();
         let instances = build_wgpu_instances(
             &snapshot.core.positions,
             &snapshot.core.rotations,
@@ -3022,6 +3031,8 @@ impl WgpuView {
             highlight_members,
             drag_origin,
             drag_dir,
+            ownership_by_anchor.as_ref(),
+            sync_view.client_id(),
         );
         if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
             if force_fps_fallback {
@@ -3321,6 +3332,8 @@ fn build_wgpu_instances(
     highlighted_members: Option<&[usize]>,
     drag_origin: Option<(f32, f32)>,
     drag_dir: f32,
+    ownership_by_anchor: &HashMap<u32, ClientId>,
+    own_client_id: Option<ClientId>,
 ) -> InstanceSet {
     let total = cols * rows;
     if total == 0 {
@@ -3380,8 +3393,10 @@ fn build_wgpu_instances(
     } else {
         None
     };
+    let mut owned_mask = vec![false; total];
     let mut group_id = vec![usize::MAX; total];
     let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_has_owned: Vec<bool> = Vec::new();
     let mut queue = Vec::new();
     for start in 0..total {
         if group_id[start] != usize::MAX {
@@ -3408,7 +3423,18 @@ fn build_wgpu_instances(
                 }
             }
         }
+        let anchor_id = members.iter().copied().min().unwrap_or(start);
+        let owned = ownership_by_anchor
+            .get(&(anchor_id as u32))
+            .map(|owner_id| Some(*owner_id) != own_client_id)
+            .unwrap_or(false);
+        if owned {
+            for member in &members {
+                owned_mask[*member] = true;
+            }
+        }
         groups.push(members);
+        group_has_owned.push(owned);
     }
     let mut group_members: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
     let mut group_order = Vec::new();
@@ -3453,6 +3479,7 @@ fn build_wgpu_instances(
             let rotation = rotations.get(id).copied().unwrap_or(0.0);
             let flipped = flips.get(id).copied().unwrap_or(false);
             let hovered = hovered_mask.get(id).copied().unwrap_or(false);
+            let owned = owned_mask.get(id).copied().unwrap_or(false);
             let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
             instances.push(Instance {
                 pos: [render_pos.0, render_pos.1],
@@ -3461,6 +3488,8 @@ fn build_wgpu_instances(
                 flip: if flipped { 1.0 } else { 0.0 },
                 hover: if show_debug {
                     OUTLINE_KIND_DEBUG
+                } else if owned {
+                    OUTLINE_KIND_OWNED
                 } else if hovered {
                     OUTLINE_KIND_HOVER
                 } else {
@@ -3479,7 +3508,7 @@ fn build_wgpu_instances(
         if count == 0 {
             continue;
         }
-        let draw_outline = show_debug || group_has_hover[gid];
+        let draw_outline = show_debug || group_has_hover[gid] || group_has_owned[gid];
         if !show_debug && !draw_outline {
             if let Some(last) = batches.last_mut() {
                 if !last.draw_outline {
@@ -3495,6 +3524,38 @@ fn build_wgpu_instances(
         });
     }
     InstanceSet { instances, batches }
+}
+
+fn piece_owned_by_other(
+    snapshot: &AppSnapshot,
+    sync_view: &dyn GameSyncView,
+    piece_id: usize,
+) -> bool {
+    if matches!(sync_view.mode(), InitMode::Local) {
+        return false;
+    }
+    let ownership = sync_view.ownership_by_anchor();
+    if ownership.is_empty() {
+        return false;
+    }
+    let cols = snapshot.grid.cols as usize;
+    let rows = snapshot.grid.rows as usize;
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+    let total = cols * rows;
+    if piece_id >= total || snapshot.core.connections.len() < total {
+        return false;
+    }
+    let mut members = collect_group(&snapshot.core.connections, piece_id, cols, rows);
+    if members.is_empty() {
+        members.push(piece_id);
+    }
+    let anchor_id = members.iter().copied().min().unwrap_or(piece_id);
+    if let Some(owner_id) = ownership.get(&(anchor_id as u32)) {
+        return Some(*owner_id) != sync_view.client_id();
+    }
+    false
 }
 
 fn pick_piece_at(

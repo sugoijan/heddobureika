@@ -317,6 +317,9 @@ impl MultiplayerGameSync {
             ServerMsg::UploadAck { hash } => {
                 (on_asset)(AssetEvent::UploadAck { hash });
             }
+            ServerMsg::RecordingStatus { .. }
+            | ServerMsg::RecordingRows { .. }
+            | ServerMsg::RecordingCleared => {}
             ServerMsg::Error { code, message } => {
                 console::warn!("server error", code.clone(), message.clone());
                 (on_event)(SyncEvent::Error { code, message });

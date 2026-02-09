@@ -73,6 +73,47 @@ pub enum OwnershipReason {
     AutoRelease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RecordedCommandKind {
+    Init,
+    AssetRequest,
+    Select,
+    Move,
+    Transform,
+    Rotate,
+    Place,
+    Flip,
+    Release,
+    Ping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RecordedCommandOutcome {
+    Applied,
+    AcceptedNoStateChange,
+    Ignored,
+    Rejected,
+    HandlerError,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct RecordedCommand {
+    pub id: u64,
+    pub ts_ms: i64,
+    pub client_id: ClientId,
+    pub kind: RecordedCommandKind,
+    pub piece_id: Option<u32>,
+    pub anchor_id: Option<u32>,
+    pub pos: Option<(f32, f32)>,
+    pub rot_deg: Option<f32>,
+    pub client_seq: Option<u64>,
+    pub room_seq: Option<u64>,
+    pub outcome: RecordedCommandOutcome,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum RoomUpdate {
     Ownership {
@@ -116,6 +157,16 @@ pub enum AdminMsg {
     Scramble {
         seed: Option<u32>,
     },
+    RecordingSet {
+        enabled: bool,
+        max_events: Option<u32>,
+    },
+    RecordingStatus,
+    RecordingExport {
+        after_id: Option<u64>,
+        limit: u32,
+    },
+    RecordingClear,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -155,6 +206,18 @@ pub enum ServerMsg {
     },
     AdminAck { room_id: String, persistence: RoomPersistence },
     UploadAck { hash: String },
+    RecordingStatus {
+        enabled: bool,
+        capped: bool,
+        max_events: u32,
+        event_count: u64,
+        dropped_events: u64,
+    },
+    RecordingRows {
+        rows: Vec<RecordedCommand>,
+        next_after_id: Option<u64>,
+    },
+    RecordingCleared,
     NeedInit,
     Warning { minutes_idle: u32 },
     AssetBegin {
