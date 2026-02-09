@@ -1,0 +1,9 @@
+[package]
+name = "heddobureika-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smallvec.workspace = true
+typed_floats.workspace = true

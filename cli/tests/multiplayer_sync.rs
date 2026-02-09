@@ -9,7 +9,7 @@ use heddobureika_core::{
 };
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;

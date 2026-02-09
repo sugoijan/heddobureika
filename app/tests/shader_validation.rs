@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use naga::back::glsl;
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use naga::{AddressSpace, Binding, Dim, ShaderStage, TypeInner};
+use naga::{AddressSpace, Binding, ImageDimension, ShaderStage, TypeInner};
 
 const PIECE_SRC: &str = include_str!("../src/wgpu_piece.wgsl");
 const FRAME_SRC: &str = include_str!("../src/wgpu_frame.wgsl");
@@ -176,7 +176,10 @@ fn resource_bindings(module: &naga::Module) -> BTreeMap<(u32, u32), ResourceKind
         let kind = match global.space {
             AddressSpace::Uniform => ResourceKind::Uniform,
             AddressSpace::Handle => match &module.types[global.ty].inner {
-                TypeInner::Image { dim: Dim::D2, .. } => ResourceKind::Texture2d,
+                TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    ..
+                } => ResourceKind::Texture2d,
                 TypeInner::Sampler { .. } => ResourceKind::Sampler,
                 other => panic!("unexpected handle type for binding {binding:?}: {other:?}"),
             },

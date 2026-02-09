@@ -1,15 +1,15 @@
 [package]
 name = "heddobureika-core"
-version = "0.1.0"
-edition = "2021"
-license = "CC-BY-NC-SA-4.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 build = "build.rs"
 
 [dependencies]
-rkyv = "0.8.14"
+rkyv.workspace = true
 
 [build-dependencies]
-dotenvy = "0.15"
-serde = { version = "1", features = ["derive"] }
-toml = "0.9.11"
-imagesize = "0.13.0"
+dotenvy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+imagesize.workspace = true

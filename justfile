@@ -1,5 +1,5 @@
 set dotenv-load
-set shell := ["zsh", "-cu"]
+set shell := ["bash", "-cu"]
 
 ADMIN_TOKEN := env_var_or_default("ADMIN_TOKEN", env_var_or_default("ROOM_ADMIN_TOKEN", ""))
 #ROOM_WS_BASE_URL := env_var_or_default("ROOM_WS_BASE_URL", "ws://127.0.0.1:8787/ws")
@@ -18,22 +18,97 @@ dev-vars:
     @cp -n .dev.vars.example .dev.vars
     @echo "Created .dev.vars if it didn't exist. Update ADMIN_TOKEN inside it."
 
-# Run the worker locally (no Cloudflare login required)
-wrangler-dev:
-    @WRANGLER_LOG_PATH="{{WRANGLER_LOG_PATH}}" pnpm exec wrangler dev --local --host 127.0.0.1 --port {{WRANGLER_PORT}} --persist-to .wrangler/state --show-interactive-dev-session=false
-
 # Run the frontend locally (requires trunk)
-trunk-serve:
+ignore-dirs:
     @mkdir -p .wrangler target node_modules
-    @trunk serve --port {{TRUNK_PORT}}
-
-# Run Caddy dev proxy (serves on CADDY_PUBLIC_PORT)
-caddy-run:
-    @CADDY_PUBLIC_PORT="{{CADDY_PUBLIC_PORT}}" TRUNK_PORT="{{TRUNK_PORT}}" WRANGLER_PORT="{{WRANGLER_PORT}}" caddy run --config {{CADDY_CONFIG}}
 
 # Run worker + frontend + proxy together
-[parallel]
-dev: wrangler-dev trunk-serve caddy-run
+dev: ignore-dirs
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    wrangler_log_path="{{WRANGLER_LOG_PATH}}"
+    wrangler_port="{{WRANGLER_PORT}}"
+    trunk_port="{{TRUNK_PORT}}"
+    caddy_public_port="{{CADDY_PUBLIC_PORT}}"
+    caddy_config="{{CADDY_CONFIG}}"
+
+    pids=()
+    names=()
+    shutting_down=0
+
+    restore_tty() {
+      if [[ -t 0 || -t 1 ]]; then
+        stty sane < /dev/tty > /dev/tty 2>/dev/null || true
+        printf '\033[0m\033[?25h' > /dev/tty 2>/dev/null || true
+      fi
+    }
+
+    terminate_children() {
+      local signal="$1"
+      local pid
+      for pid in "${pids[@]}"; do
+        kill "-${signal}" "$pid" 2>/dev/null || true
+      done
+    }
+
+    cleanup() {
+      local exit_code="${1:-$?}"
+      if [[ "$shutting_down" -eq 0 ]]; then
+        shutting_down=1
+        terminate_children TERM
+        sleep 0.3
+        terminate_children KILL
+        wait 2>/dev/null || true
+        restore_tty
+      fi
+      return "$exit_code"
+    }
+
+    on_interrupt() {
+      cleanup 0
+      exit 0
+    }
+
+    trap on_interrupt INT
+    trap 'cleanup $?' EXIT TERM
+
+    WRANGLER_LOG_PATH="$wrangler_log_path" WORKER_BUILD_ARGS="--dev --no-opt" CI=1 \
+      pnpm exec wrangler dev --local --host 127.0.0.1 --port "$wrangler_port" \
+      --persist-to .wrangler/state --show-interactive-dev-session=false < /dev/null &
+    pids+=("$!")
+    names+=("wrangler-dev")
+
+    CI=1 trunk serve --port "$trunk_port" < /dev/null &
+    pids+=("$!")
+    names+=("trunk-serve")
+
+    CADDY_PUBLIC_PORT="$caddy_public_port" TRUNK_PORT="$trunk_port" WRANGLER_PORT="$wrangler_port" CI=1 \
+      caddy run --config "$caddy_config" < /dev/null &
+    pids+=("$!")
+    names+=("caddy-run")
+
+    while true; do
+      i=0
+      for pid in "${pids[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+          echo "Service '${names[$i]}' exited with status ${status}. Stopping dev stack." >&2
+          if [[ "$status" -eq 130 ]]; then
+            exit 0
+          fi
+          if [[ "$status" -eq 0 ]]; then
+            exit 1
+          fi
+          exit "$status"
+        fi
+        i=$((i + 1))
+      done
+      sleep 0.2
+    done
 
 # Update Rust lockfile to latest versions allowed by manifests
 update-cargo:

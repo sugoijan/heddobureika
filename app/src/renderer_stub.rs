@@ -24,6 +24,16 @@ pub(crate) enum UiRotationOrigin {
     TopRight,
 }
 
+fn touch_rotation_origin_variants() {
+    let _ = (
+        UiRotationOrigin::Center,
+        UiRotationOrigin::BottomLeft,
+        UiRotationOrigin::BottomRight,
+        UiRotationOrigin::TopLeft,
+        UiRotationOrigin::TopRight,
+    );
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct UiTextSpec {
     pub(crate) id: UiTextId,

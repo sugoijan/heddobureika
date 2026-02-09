@@ -22,7 +22,7 @@ use mime_guess::MimeGuess;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};

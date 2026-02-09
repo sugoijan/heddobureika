@@ -1,39 +1,70 @@
-[package]
-name = "heddobureika"
+[workspace]
+resolver = "2"
+members = ["app", "core", "game", "worker", "cli", "image_pipeline"]
+default-members = ["app"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "CC-BY-NC-SA-4.0"
 
-[dependencies]
-yew = { version = "0.22", features = ["csr"], optional = true }
+[workspace.dependencies]
+# local crates
+heddobureika-core.path = "core"
+image-pipeline = { package = "heddobureika-image-pipeline", path = "image_pipeline" }
+
+# app / web
+yew = "0.23"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-gloo = { version = "0.11", features = ["futures"] }
+gloo = "0.12"
 js-sys = "0.3"
-glyphon = "0.10"
-taffy = "0.9"
-wgpu = { version = "28", default-features = false, features = ["std", "webgpu", "webgl", "wgsl"] }
-bytemuck = { version = "1.24", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
+glyphon = "0.11"
+taffy = "0.10"
+wgpu = { version = "29", default-features = false }
+bytemuck = "1.24"
+web-sys = "0.3"
+getrandom_02 = { package = "getrandom", version = "0.2" }
+wasm-bindgen-test = "0.3"
+console_error_panic_hook = "0.1"
+naga = "29"
+
+# shared
+serde = "1"
 serde_json = "1"
 base64 = "0.22"
 rkyv = "0.8.14"
-getrandom = { version = "0.2", features = ["js"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-rand_core = "0.6"
-sha2 = "0.10"
-web-sys = { version = "0.3", features = ["BinaryType", "Blob", "BlobPropertyBag", "CanvasRenderingContext2d", "CloseEvent", "Document", "DomRect", "Element", "ErrorEvent", "Event", "File", "FileList", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "HtmlSelectElement", "IdbDatabase", "IdbFactory", "IdbObjectStore", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbVersionChangeEvent", "ImageData", "InputEvent", "KeyboardEvent", "MessageEvent", "Path2d", "PointerEvent", "Response", "Storage", "Touch", "TouchEvent", "TouchList", "Url", "UrlSearchParams", "WebGl2RenderingContext", "WebGlProgram", "WebGlShader", "WebSocket", "WheelEvent", "Window"] }
-heddobureika-core = { path = "core" }
-image-pipeline = { package = "heddobureika-image-pipeline", path = "image_pipeline" }
+p256 = "0.13"
+sha2 = "0.11"
 
-[dev-dependencies]
-wasm-bindgen-test = "0.3"
-console_error_panic_hook = "0.1"
-naga = { version = "28", features = ["wgsl-in", "glsl-out"] }
+# core build
+dotenvy = "0.15"
+toml = "1"
+imagesize = "0.14"
 
-[features]
-default = ["dev-panel-yew"]
-dev-panel-yew = ["yew"]
+# game
+smallvec = "1.15"
+typed_floats = "1.0"
+
+# cli
+clap = "4"
+rand = "0.10"
+url = "2"
+mime_guess = "2"
+futures-util = "0.3"
+tokio = "1"
+tokio-tungstenite = "0.29"
+rustls = "0.23"
+
+# worker
+worker = "0.8.1"
+
+# image pipeline
+image = { version = "0.25", default-features = false }
+img-parts = "0.4"
+moxcms = "0.8"
+png = "0.18"
+thiserror = "2"
 
 [profile.release]
 opt-level = "z"
@@ -51,7 +82,3 @@ overflow-checks = true
 
 [profile.dev.package."*"]
 opt-level = 2
-
-[workspace]
-members = [".", "core", "worker", "cli", "image_pipeline"]
-default-members = ["."]

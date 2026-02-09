@@ -31,7 +31,7 @@ use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_ob
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
 const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
-const UI_FONT_BYTES: &[u8] = include_bytes!("../fonts/chirufont.ttf");
+const UI_FONT_BYTES: &[u8] = include_bytes!("../../fonts/chirufont.ttf");
 const UI_FONT_FAMILY: &str = "KaoriGel";
 const UI_CREDIT_FONT_RATIO: f32 = 0.026;
 const UI_CREDIT_ROTATION_DEG: f32 = -1.1;

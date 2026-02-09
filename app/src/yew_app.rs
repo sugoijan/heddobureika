@@ -1,6 +1,6 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use gloo::timers::future::TimeoutFuture;
-use js_sys::Date;
+use js_sys::{Date, Math};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -11,27 +11,28 @@ use web_sys::{
 };
 use yew::prelude::*;
 
-use crate::app_core::AppCore;
 use crate::app_builder;
+use crate::app_core::AppCore;
 use crate::app_router;
 use crate::app_runtime;
 use crate::boot_runtime::{self, BootState};
-use crate::sync_runtime;
-use crate::view_runtime;
 use crate::core::*;
 use crate::model::*;
 #[cfg(test)]
 use crate::multiplayer_bridge;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
-use crate::persisted_store;
 use crate::persisted::{PrivateImageEntry, PrivateImageRefs, LOCAL_PRIVATE_SCOPE};
+use crate::persisted_store;
 use crate::runtime::{SyncEvent, SyncHooks};
-use heddobureika_core::{
-    logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleImageRef,
-    PuzzleInfo, PuzzleSpec, RoomUpdate, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
-};
+use crate::sync_runtime;
+use crate::view_runtime;
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
+use heddobureika_core::{
+    is_valid_room_id, logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleImageRef,
+    PuzzleInfo, PuzzleSpec, RoomUpdate, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
+    ROOM_ID_ALPHABET, ROOM_ID_LEN,
+};
 use image_pipeline::{AlphaMode, PipelineConfig};
 use sha2::{Digest, Sha256};
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,22 @@ enum AdminUploadStatus {
     Sending,
     AwaitingAck,
     Done,
+    Failed,
+}
+
+#[derive(Clone)]
+enum AdminSocketEvent {
+    Welcome,
+    AdminAck,
+    Error(String),
+    ConnectionFailed(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomSetupStatus {
+    Idle,
+    Creating,
+    Connecting,
     Failed,
 }
 
@@ -82,7 +99,10 @@ struct PuzzleInfoStore {
 }
 
 impl PuzzleInfoStore {
-    fn new(state: UseStateHandle<Option<PuzzleInfo>>, live: Rc<RefCell<Option<PuzzleInfo>>>) -> Self {
+    fn new(
+        state: UseStateHandle<Option<PuzzleInfo>>,
+        live: Rc<RefCell<Option<PuzzleInfo>>>,
+    ) -> Self {
         Self { state, live }
     }
 
@@ -94,7 +114,6 @@ impl PuzzleInfoStore {
         *self.live.borrow_mut() = info.clone();
         self.state.set(info);
     }
-
 }
 
 struct AdminSocket {
@@ -107,6 +126,7 @@ struct AdminSocket {
     connect_seq: Rc<Cell<u64>>,
     upload_pending: Rc<Cell<bool>>,
     upload_status_hook: Option<Rc<dyn Fn(AdminUploadStatus, Option<String>)>>,
+    event_hook: Option<Rc<dyn Fn(AdminSocketEvent)>>,
 }
 
 impl AdminSocket {
@@ -121,6 +141,7 @@ impl AdminSocket {
             connect_seq: Rc::new(Cell::new(0)),
             upload_pending: Rc::new(Cell::new(false)),
             upload_status_hook: None,
+            event_hook: None,
         }
     }
 
@@ -130,6 +151,10 @@ impl AdminSocket {
 
     fn set_upload_status_hook(&mut self, hook: Rc<dyn Fn(AdminUploadStatus, Option<String>)>) {
         self.upload_status_hook = Some(hook);
+    }
+
+    fn set_event_hook(&mut self, hook: Rc<dyn Fn(AdminSocketEvent)>) {
+        self.event_hook = Some(hook);
     }
 
     fn reset(&mut self) {
@@ -215,6 +240,7 @@ impl AdminSocket {
         let status_on_fail = status_cell.clone();
         let status_on_msg = status_cell.clone();
         let status_hook = self.status_hook.clone();
+        let event_hook = self.event_hook.clone();
         let on_open = Rc::new(move || {
             connected.set(true);
             let messages = pending.borrow_mut().drain(..).collect::<Vec<_>>();
@@ -225,11 +251,17 @@ impl AdminSocket {
         let connected_on_fail = self.connected.clone();
         let upload_pending_on_fail = self.upload_pending.clone();
         let upload_status_hook_on_fail = self.upload_status_hook.clone();
+        let event_hook_on_fail = event_hook.clone();
         let on_fail = Rc::new(move || {
             connected_on_fail.set(false);
             status_on_fail.set(AdminStatus::Failed);
             if let Some(hook) = status_hook.as_ref() {
                 hook(AdminStatus::Failed);
+            }
+            if let Some(hook) = event_hook_on_fail.as_ref() {
+                hook(AdminSocketEvent::ConnectionFailed(
+                    "admin connection failed".to_string(),
+                ));
             }
             if upload_pending_on_fail.get() {
                 upload_pending_on_fail.set(false);
@@ -244,22 +276,28 @@ impl AdminSocket {
         let status_hook = self.status_hook.clone();
         let upload_pending_on_msg = self.upload_pending.clone();
         let upload_status_hook_on_msg = self.upload_status_hook.clone();
+        let event_hook_on_msg = event_hook;
         let on_server_msg = Rc::new(move |msg: ServerMsg| match msg {
-            ServerMsg::AdminAck { room_id, persistence } => {
+            ServerMsg::AdminAck {
+                room_id,
+                persistence,
+            } => {
                 status_on_msg.set(AdminStatus::Accepted);
                 if let Some(hook) = status_hook.as_ref() {
                     hook(AdminStatus::Accepted);
                 }
-                gloo::console::log!(
-                    "admin ack",
-                    room_id,
-                    format!("{persistence:?}")
-                );
+                if let Some(hook) = event_hook_on_msg.as_ref() {
+                    hook(AdminSocketEvent::AdminAck);
+                }
+                gloo::console::log!("admin ack", room_id, format!("{persistence:?}"));
             }
             ServerMsg::Welcome { .. } => {
                 status_on_msg.set(AdminStatus::Accepted);
                 if let Some(hook) = status_hook.as_ref() {
                     hook(AdminStatus::Accepted);
+                }
+                if let Some(hook) = event_hook_on_msg.as_ref() {
+                    hook(AdminSocketEvent::Welcome);
                 }
             }
             ServerMsg::Error { code, message } => {
@@ -268,6 +306,9 @@ impl AdminSocket {
                     hook(AdminStatus::Failed);
                 }
                 let error_message = format!("{code}: {message}");
+                if let Some(hook) = event_hook_on_msg.as_ref() {
+                    hook(AdminSocketEvent::Error(error_message.clone()));
+                }
                 gloo::console::warn!("admin error", code.clone(), message.clone());
                 if upload_pending_on_msg.get() {
                     upload_pending_on_msg.set(false);
@@ -291,14 +332,16 @@ impl AdminSocket {
         connect_seq.set(seq);
         let url_for_connect = url.clone();
         spawn_local(async move {
-            let protocol = match multiplayer_identity::build_auth_protocol(&room_id, Some(&admin_token)).await {
-                Ok(protocol) => protocol,
-                Err(err) => {
-                    gloo::console::warn!("admin auth failed", err);
-                    on_fail();
-                    return;
-                }
-            };
+            let protocol =
+                match multiplayer_identity::build_auth_protocol(&room_id, Some(&admin_token)).await
+                {
+                    Ok(protocol) => protocol,
+                    Err(err) => {
+                        gloo::console::warn!("admin auth failed", err);
+                        on_fail();
+                        return;
+                    }
+                };
             if connect_seq.get() != seq {
                 return;
             }
@@ -356,11 +399,40 @@ fn encode_hash_value(value: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
+fn generate_room_id() -> String {
+    let alphabet = ROOM_ID_ALPHABET.as_bytes();
+    let mut room_id = String::with_capacity(ROOM_ID_LEN);
+    for _ in 0..ROOM_ID_LEN {
+        let idx = (Math::random() * alphabet.len() as f64).floor() as usize;
+        room_id.push(alphabet[idx.min(alphabet.len().saturating_sub(1))] as char);
+    }
+    room_id
+}
+
+fn room_setup_status_label(status: RoomSetupStatus) -> &'static str {
+    match status {
+        RoomSetupStatus::Idle => "",
+        RoomSetupStatus::Creating => "Creating room...",
+        RoomSetupStatus::Connecting => "Connecting...",
+        RoomSetupStatus::Failed => "Setup failed",
+    }
+}
+
 fn base_url_without_hash() -> Option<String> {
     let window = web_sys::window()?;
     let href = window.location().href().ok()?;
     let base = href.split('#').next().unwrap_or(&href).to_string();
     Some(base)
+}
+
+#[cfg(test)]
+fn initial_show_controls() -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn initial_show_controls() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -406,7 +478,6 @@ fn take_mp_warn() -> Option<String> {
 fn log_state_update(label: &str, len: usize, context: &str) {
     gloo::console::log!("state vector updated", label, len, context);
 }
-
 
 fn initial_render_settings() -> RenderSettings {
     #[cfg(test)]
@@ -542,7 +613,11 @@ fn load_admin_token() -> Option<String> {
 fn save_admin_token(token: &str) {
     let token = token.trim().to_string();
     persisted_store::update_settings_blob(|settings| {
-        settings.admin_token = if token.is_empty() { None } else { Some(token.clone()) };
+        settings.admin_token = if token.is_empty() {
+            None
+        } else {
+            Some(token.clone())
+        };
     });
 }
 
@@ -565,13 +640,11 @@ fn save_ws_delay_value(key: &str, raw: &str) {
         trimmed.parse::<u32>().ok()
     };
     if trimmed.is_empty() || value.is_some() {
-        persisted_store::update_settings_blob(|settings| {
-            match key {
-                WS_DELAY_IN_KEY => settings.ws_delay.inbound_ms = value,
-                WS_DELAY_OUT_KEY => settings.ws_delay.outbound_ms = value,
-                WS_DELAY_JITTER_KEY => settings.ws_delay.jitter_ms = value,
-                _ => {}
-            }
+        persisted_store::update_settings_blob(|settings| match key {
+            WS_DELAY_IN_KEY => settings.ws_delay.inbound_ms = value,
+            WS_DELAY_OUT_KEY => settings.ws_delay.outbound_ms = value,
+            WS_DELAY_JITTER_KEY => settings.ws_delay.jitter_ms = value,
+            _ => {}
         });
     }
 }
@@ -589,26 +662,20 @@ fn load_dev_panel_group_open(key: &str, default_value: bool) -> bool {
 }
 
 fn save_dev_panel_group_open(key: &str, value: bool) {
-    persisted_store::update_settings_blob(|settings| {
-        match key {
-            DEV_PANEL_GROUP_PUZZLE_KEY => settings.dev_panel.puzzle_open = value,
-            DEV_PANEL_GROUP_MULTIPLAYER_KEY => settings.dev_panel.multiplayer_open = value,
-            DEV_PANEL_GROUP_GRAPHICS_KEY => settings.dev_panel.graphics_open = value,
-            DEV_PANEL_GROUP_RULES_KEY => settings.dev_panel.rules_open = value,
-            DEV_PANEL_GROUP_SHAPING_KEY => settings.dev_panel.shaping_open = value,
-            _ => {}
-        }
+    persisted_store::update_settings_blob(|settings| match key {
+        DEV_PANEL_GROUP_PUZZLE_KEY => settings.dev_panel.puzzle_open = value,
+        DEV_PANEL_GROUP_MULTIPLAYER_KEY => settings.dev_panel.multiplayer_open = value,
+        DEV_PANEL_GROUP_GRAPHICS_KEY => settings.dev_panel.graphics_open = value,
+        DEV_PANEL_GROUP_RULES_KEY => settings.dev_panel.rules_open = value,
+        DEV_PANEL_GROUP_SHAPING_KEY => settings.dev_panel.shaping_open = value,
+        _ => {}
     });
 }
 
 fn details_toggle(handle: UseStateHandle<bool>, key: &'static str) -> Callback<Event> {
     Callback::from(move |event: Event| {
         let element: Element = event.target_unchecked_into();
-        let details = element
-            .closest("details")
-            .ok()
-            .flatten()
-            .unwrap_or(element);
+        let details = element.closest("details").ok().flatten().unwrap_or(element);
         let open = details.has_attribute("open");
         handle.set(open);
         save_dev_panel_group_open(key, open);
@@ -629,10 +696,7 @@ fn anchor_of_from_state(state: &PuzzleState) -> Vec<usize> {
     state.pieces.iter().map(|piece| piece.group()).collect()
 }
 
-fn group_transforms_from_state(
-    state: &PuzzleState,
-    total: usize,
-) -> (Vec<(f32, f32)>, Vec<f32>) {
+fn group_transforms_from_state(state: &PuzzleState, total: usize) -> (Vec<(f32, f32)>, Vec<f32>) {
     let mut group_pos = vec![(0.0, 0.0); total];
     let mut group_rot = vec![0.0; total];
     for (id, group) in state.groups.iter().enumerate() {
@@ -708,7 +772,10 @@ fn parse_optional_seed(raw: &str) -> Option<u32> {
     if trimmed.is_empty() {
         return None;
     }
-    let (value, radix) = if let Some(rest) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    let (value, radix) = if let Some(rest) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         (rest, 16)
     } else {
         (trimmed, 10)
@@ -727,8 +794,9 @@ fn app(props: &AppProps) -> Html {
     let puzzle_info_live = use_mut_ref(|| None::<PuzzleInfo>);
     let puzzle_info_store = PuzzleInfoStore::new(puzzle_info.clone(), puzzle_info_live.clone());
     let puzzle_info_value = (*puzzle_info).clone();
-    let puzzle_dims_value =
-        puzzle_info_value.as_ref().map(|info| (info.image_width, info.image_height));
+    let puzzle_dims_value = puzzle_info_value
+        .as_ref()
+        .map(|info| (info.image_width, info.image_height));
     let settings = use_state(ShapeSettings::default);
     let settings_value = (*settings).clone();
     let depth_cap = settings_value
@@ -831,6 +899,20 @@ fn app(props: &AppProps) -> Html {
     let init_config = app_runtime::init_config();
     let multiplayer_config = use_state(|| init_config.multiplayer.clone());
     let multiplayer_config_value = (*multiplayer_config).clone();
+    let online_setup = use_state(|| false);
+    let online_setup_value = *online_setup;
+    let room_id_draft = use_state(|| {
+        init_config
+            .multiplayer
+            .as_ref()
+            .map(|config| config.room_id.clone())
+            .unwrap_or_else(generate_room_id)
+    });
+    let room_id_draft_value = (*room_id_draft).clone();
+    let room_setup_status = use_state(|| RoomSetupStatus::Idle);
+    let room_setup_status_value = *room_setup_status;
+    let room_setup_error = use_state(|| None::<String>);
+    let room_setup_error_value = (*room_setup_error).clone();
     let admin_token_input = use_state(|| load_admin_token().unwrap_or_default());
     let admin_token_input_value = (*admin_token_input).clone();
     let admin_token_active = use_state(|| load_admin_token().unwrap_or_default());
@@ -842,18 +924,24 @@ fn app(props: &AppProps) -> Html {
     let admin_pieces_index = use_state(|| 0usize);
     let admin_pieces_index_value = *admin_pieces_index;
     let admin_socket = use_mut_ref(AdminSocket::new);
+    let room_transition_seq = use_mut_ref(|| 0u64);
+    let pending_created_room = use_mut_ref(|| None::<String>);
     let ws_delay_in = use_state(|| load_ws_delay_value(WS_DELAY_IN_KEY));
     let ws_delay_in_value = (*ws_delay_in).clone();
     let ws_delay_out = use_state(|| load_ws_delay_value(WS_DELAY_OUT_KEY));
     let ws_delay_out_value = (*ws_delay_out).clone();
     let ws_delay_jitter = use_state(|| load_ws_delay_value(WS_DELAY_JITTER_KEY));
     let ws_delay_jitter_value = (*ws_delay_jitter).clone();
-    let puzzle_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_PUZZLE_KEY, true));
+    let puzzle_group_open =
+        use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_PUZZLE_KEY, true));
     let multiplayer_group_open =
         use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_MULTIPLAYER_KEY, true));
-    let graphics_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_GRAPHICS_KEY, false));
-    let rules_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_RULES_KEY, false));
-    let shaping_group_open = use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_SHAPING_KEY, false));
+    let graphics_group_open =
+        use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_GRAPHICS_KEY, false));
+    let rules_group_open =
+        use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_RULES_KEY, false));
+    let shaping_group_open =
+        use_state(|| load_dev_panel_group_open(DEV_PANEL_GROUP_SHAPING_KEY, false));
     let sync_revision = use_state(|| 0u32);
     let boot_ready = use_state(|| matches!(boot_runtime::boot_state(), BootState::Ready));
     {
@@ -871,52 +959,64 @@ fn app(props: &AppProps) -> Html {
     let boot_ready_value = *boot_ready;
     let sync_view = sync_runtime::sync_view();
     let multiplayer_active = matches!(sync_view.mode(), InitMode::Online);
+    let multiplayer_controls_online = multiplayer_active || online_setup_value;
+    let show_online_setup = online_setup_value && !multiplayer_active;
     let mp_init_required_value = sync_view.init_required();
-    let lock_puzzle_controls =
-        !boot_ready_value || (multiplayer_active && !mp_init_required_value);
+    let lock_puzzle_controls = !boot_ready_value || (multiplayer_active && !mp_init_required_value);
     let _ = *sync_revision;
-    let tab_width_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.tab_width = value.clamp(TAB_WIDTH_MIN, TAB_WIDTH_MAX);
-    });
-    let tab_depth_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.tab_depth = value.clamp(TAB_DEPTH_MIN, TAB_DEPTH_MAX);
-    });
-    let tab_size_scale_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.tab_size_scale = value.clamp(TAB_SIZE_SCALE_MIN, TAB_SIZE_SCALE_MAX);
-    });
-    let tab_size_min_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        let max_allowed = settings
-            .tab_size_max
-            .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
-        settings.tab_size_min = value.clamp(TAB_SIZE_MIN_LIMIT, max_allowed);
-    });
-    let tab_size_max_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        let min_allowed = settings
-            .tab_size_min
-            .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
-        settings.tab_size_max = value.clamp(min_allowed, TAB_SIZE_MAX_LIMIT);
-    });
+    let tab_width_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.tab_width = value.clamp(TAB_WIDTH_MIN, TAB_WIDTH_MAX);
+        });
+    let tab_depth_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.tab_depth = value.clamp(TAB_DEPTH_MIN, TAB_DEPTH_MAX);
+        });
+    let tab_size_scale_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.tab_size_scale = value.clamp(TAB_SIZE_SCALE_MIN, TAB_SIZE_SCALE_MAX);
+        });
+    let tab_size_min_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            let max_allowed = settings
+                .tab_size_max
+                .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
+            settings.tab_size_min = value.clamp(TAB_SIZE_MIN_LIMIT, max_allowed);
+        });
+    let tab_size_max_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            let min_allowed = settings
+                .tab_size_min
+                .clamp(TAB_SIZE_MIN_LIMIT, TAB_SIZE_MAX_LIMIT);
+            settings.tab_size_max = value.clamp(min_allowed, TAB_SIZE_MAX_LIMIT);
+        });
     let skew_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
         settings.skew_range = value.clamp(0.0, SKEW_RANGE_MAX);
     });
-    let jitter_strength_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.jitter_strength = value.clamp(JITTER_STRENGTH_MIN, JITTER_STRENGTH_MAX);
-    });
-    let jitter_len_bias_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.jitter_len_bias = value.clamp(JITTER_LEN_BIAS_MIN, JITTER_LEN_BIAS_MAX);
-    });
-    let tab_depth_cap_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.tab_depth_cap = value.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-    });
-    let curve_detail_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.curve_detail = value.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
-    });
-    let variation_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.variation = value.clamp(VARIATION_MIN, VARIATION_MAX);
-    });
-    let line_bend_input = on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
-        settings.line_bend_ratio = value.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
-    });
+    let jitter_strength_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.jitter_strength = value.clamp(JITTER_STRENGTH_MIN, JITTER_STRENGTH_MAX);
+        });
+    let jitter_len_bias_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.jitter_len_bias = value.clamp(JITTER_LEN_BIAS_MIN, JITTER_LEN_BIAS_MAX);
+        });
+    let tab_depth_cap_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.tab_depth_cap = value.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+        });
+    let curve_detail_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.curve_detail = value.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
+        });
+    let variation_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.variation = value.clamp(VARIATION_MIN, VARIATION_MAX);
+        });
+    let line_bend_input =
+        on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
+            settings.line_bend_ratio = value.clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
+        });
     let puzzle_state = use_state(PuzzleState::empty);
     let ui_revision = use_state(|| 0u32);
     let bump_ui_revision: Rc<dyn Fn()> = {
@@ -976,24 +1076,26 @@ fn app(props: &AppProps) -> Html {
             { "Default pieces" }
         </option>
     })
-    .chain(admin_grid_choices.iter().enumerate().map(|(index, choice)| {
-        let value = (index + 1).to_string();
-        html! {
-            <option value={value} selected={admin_pieces_index_value == index + 1}>
-                { grid_choice_label(choice) }
-            </option>
-        }
-    }))
+    .chain(
+        admin_grid_choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let value = (index + 1).to_string();
+                html! {
+                    <option value={value} selected={admin_pieces_index_value == index + 1}>
+                        { grid_choice_label(choice) }
+                    </option>
+                }
+            }),
+    )
     .collect();
     {
         let admin_pieces_index = admin_pieces_index.clone();
-        use_effect_with(
-            (admin_puzzle_index_value, image_max_dim),
-            move |_| {
-                admin_pieces_index.set(0);
-                || ()
-            },
-        );
+        use_effect_with((admin_puzzle_index_value, image_max_dim), move |_| {
+            admin_pieces_index.set(0);
+            || ()
+        });
     }
     let renderer_kind = render_settings_value.renderer;
     let svg_settings_value = render_settings_value.svg.clone();
@@ -1040,10 +1142,12 @@ fn app(props: &AppProps) -> Html {
     let shareable_slug = if multiplayer_active {
         None
     } else {
-        puzzle_info_value.as_ref().and_then(|info| match &info.image_ref {
-            PuzzleImageRef::BuiltIn { slug } => Some(slug.clone()),
-            _ => None,
-        })
+        puzzle_info_value
+            .as_ref()
+            .and_then(|info| match &info.image_ref {
+                PuzzleImageRef::BuiltIn { slug } => Some(slug.clone()),
+                _ => None,
+            })
     };
     let shareable_local = shareable_slug.is_some();
     let share_seed_value = if shareable_slug.is_some() && include_share_seed_value {
@@ -1056,7 +1160,11 @@ fn app(props: &AppProps) -> Html {
     } else {
         None
     };
-    let share_link_label = if multiplayer_active { "Room link" } else { "Share link" };
+    let share_link_label = if multiplayer_active {
+        "Room link"
+    } else {
+        "Share link"
+    };
     let share_link = if let Some(config) = multiplayer_config_value.as_ref() {
         base_url_without_hash()
             .map(|base| {
@@ -1084,7 +1192,11 @@ fn app(props: &AppProps) -> Html {
     let mp_room_label = sync_view
         .room_id()
         .map(|room_id| room_id.to_string())
-        .or_else(|| multiplayer_config_value.as_ref().map(|config| config.room_id.clone()))
+        .or_else(|| {
+            multiplayer_config_value
+                .as_ref()
+                .map(|config| config.room_id.clone())
+        })
         .unwrap_or_else(|| "—".to_string());
     let mp_connection_label = if sync_view.connected() {
         "Connected"
@@ -1094,7 +1206,138 @@ fn app(props: &AppProps) -> Html {
     let admin_room_id = sync_view
         .room_id()
         .map(|room_id| room_id.to_string())
-        .or_else(|| multiplayer_config_value.as_ref().map(|config| config.room_id.clone()));
+        .or_else(|| {
+            multiplayer_config_value
+                .as_ref()
+                .map(|config| config.room_id.clone())
+        });
+    let room_id_draft_trimmed = room_id_draft_value.trim().to_string();
+    let room_id_draft_valid = is_valid_room_id(&room_id_draft_trimmed);
+    let next_room_draft = admin_room_id
+        .clone()
+        .or_else(|| {
+            if room_id_draft_trimmed.is_empty() {
+                None
+            } else {
+                Some(room_id_draft_trimmed.clone())
+            }
+        })
+        .unwrap_or_else(generate_room_id);
+    let room_setup_busy = matches!(
+        room_setup_status_value,
+        RoomSetupStatus::Creating | RoomSetupStatus::Connecting
+    );
+    let cancel_online_setup: Rc<dyn Fn()> = {
+        let online_setup = online_setup.clone();
+        let room_setup_status = room_setup_status.clone();
+        let room_setup_error = room_setup_error.clone();
+        let admin_socket = admin_socket.clone();
+        let room_transition_seq = room_transition_seq.clone();
+        let pending_created_room = pending_created_room.clone();
+        Rc::new(move || {
+            {
+                let mut seq = room_transition_seq.borrow_mut();
+                *seq = seq.wrapping_add(1);
+            }
+            pending_created_room.borrow_mut().take();
+            online_setup.set(false);
+            room_setup_status.set(RoomSetupStatus::Idle);
+            room_setup_error.set(None);
+            admin_socket.borrow_mut().reset();
+        })
+    };
+    let leave_online_room: Rc<dyn Fn(Option<String>)> = {
+        let room_id_draft = room_id_draft.clone();
+        let next_room_draft = next_room_draft.clone();
+        let online_setup = online_setup.clone();
+        let multiplayer_config = multiplayer_config.clone();
+        let room_setup_status = room_setup_status.clone();
+        let room_setup_error = room_setup_error.clone();
+        let admin_socket = admin_socket.clone();
+        let room_transition_seq = room_transition_seq.clone();
+        let pending_created_room = pending_created_room.clone();
+        Rc::new(move |error: Option<String>| {
+            let show_setup = error.is_some();
+            {
+                let mut seq = room_transition_seq.borrow_mut();
+                *seq = seq.wrapping_add(1);
+            }
+            pending_created_room.borrow_mut().take();
+            room_id_draft.set(next_room_draft.clone());
+            online_setup.set(show_setup);
+            multiplayer_config.set(None);
+            admin_socket.borrow_mut().reset();
+            app_router::clear_room_session();
+            app_router::save_mode_preference(InitMode::Local);
+            app_router::clear_location_hash();
+            sync_runtime::init_from_config(None);
+            room_setup_status.set(if error.is_some() {
+                RoomSetupStatus::Failed
+            } else {
+                RoomSetupStatus::Idle
+            });
+            room_setup_error.set(error);
+        })
+    };
+    let connect_room_live: Rc<dyn Fn(String)> = {
+        let online_setup = online_setup.clone();
+        let multiplayer_config = multiplayer_config.clone();
+        let room_setup_status = room_setup_status.clone();
+        let room_setup_error = room_setup_error.clone();
+        let room_transition_seq = room_transition_seq.clone();
+        let leave_online_room = leave_online_room.clone();
+        let pending_created_room = pending_created_room.clone();
+        Rc::new(move |room_id: String| {
+            {
+                let mut seq = room_transition_seq.borrow_mut();
+                *seq = seq.wrapping_add(1);
+            }
+            let seq = *room_transition_seq.borrow();
+            pending_created_room.borrow_mut().take();
+            room_setup_status.set(RoomSetupStatus::Connecting);
+            room_setup_error.set(None);
+            online_setup.set(false);
+            multiplayer_config.set(Some(app_router::MultiplayerConfig {
+                room_id: room_id.clone(),
+                clear_hash: false,
+            }));
+            app_router::save_room_session(&room_id);
+            app_router::save_mode_preference(InitMode::Online);
+            sync_runtime::init_from_config(Some(app_router::MultiplayerConfig {
+                room_id: room_id.clone(),
+                clear_hash: false,
+            }));
+            let room_transition_seq = room_transition_seq.clone();
+            let room_setup_status = room_setup_status.clone();
+            let room_setup_error = room_setup_error.clone();
+            let leave_online_room = leave_online_room.clone();
+            spawn_local(async move {
+                let mut waited_ms = 0u32;
+                loop {
+                    if *room_transition_seq.borrow() != seq {
+                        return;
+                    }
+                    let view = sync_runtime::sync_view();
+                    if matches!(view.mode(), InitMode::Online)
+                        && view.connected()
+                        && view.room_id() == Some(room_id.as_str())
+                    {
+                        room_setup_status.set(RoomSetupStatus::Idle);
+                        room_setup_error.set(None);
+                        return;
+                    }
+                    if waited_ms >= 5_000 {
+                        if *room_transition_seq.borrow() == seq {
+                            leave_online_room(Some(format!("failed to connect to room {room_id}")));
+                        }
+                        return;
+                    }
+                    TimeoutFuture::new(25).await;
+                    waited_ms = waited_ms.saturating_add(25);
+                }
+            });
+        })
+    };
     {
         let admin_socket = admin_socket.clone();
         let admin_status = admin_status.clone();
@@ -1122,8 +1365,40 @@ fn app(props: &AppProps) -> Html {
                         if let Some(message) = message {
                             admin_private_error.set(Some(message));
                         }
-                    } else if status == AdminUploadStatus::Done || status == AdminUploadStatus::Idle {
+                    } else if status == AdminUploadStatus::Done || status == AdminUploadStatus::Idle
+                    {
                         admin_private_error.set(None);
+                    }
+                }));
+            || ()
+        });
+    }
+    {
+        let admin_socket = admin_socket.clone();
+        let connect_room_live = connect_room_live.clone();
+        let pending_created_room = pending_created_room.clone();
+        let room_setup_status = room_setup_status.clone();
+        let room_setup_error = room_setup_error.clone();
+        use_effect_with((), move |_| {
+            admin_socket
+                .borrow_mut()
+                .set_event_hook(Rc::new(move |event| {
+                    let pending_room_id = pending_created_room.borrow().clone();
+                    match event {
+                        AdminSocketEvent::AdminAck => {
+                            if let Some(room_id) = pending_room_id {
+                                connect_room_live(room_id);
+                            }
+                        }
+                        AdminSocketEvent::Error(message)
+                        | AdminSocketEvent::ConnectionFailed(message) => {
+                            if pending_room_id.is_some() {
+                                pending_created_room.borrow_mut().take();
+                                room_setup_status.set(RoomSetupStatus::Failed);
+                                room_setup_error.set(Some(message));
+                            }
+                        }
+                        AdminSocketEvent::Welcome => {}
                     }
                 }));
             || ()
@@ -1135,17 +1410,21 @@ fn app(props: &AppProps) -> Html {
         let admin_room_id = admin_room_id.clone();
         let admin_token_value = admin_token_active_value.clone();
         let multiplayer_active = multiplayer_active;
+        let online_setup_value = online_setup_value;
         use_effect_with(
             (
                 admin_token_value.clone(),
                 admin_room_id.clone(),
                 multiplayer_active,
+                online_setup_value,
             ),
-            move |(token, room_id, active)| {
+            move |(token, room_id, active, setup_active)| {
                 let cleanup = || ();
                 if !*active {
-                    admin_socket.borrow_mut().reset();
-                    admin_status.set(AdminStatus::Idle);
+                    if !*setup_active {
+                        admin_socket.borrow_mut().reset();
+                        admin_status.set(AdminStatus::Idle);
+                    }
                     return cleanup;
                 }
                 let Some(room_id) = room_id.as_ref() else {
@@ -1162,9 +1441,11 @@ fn app(props: &AppProps) -> Html {
                 let Some(ws_base) = app_router::default_ws_base() else {
                     return cleanup;
                 };
-                admin_socket
-                    .borrow_mut()
-                    .ensure_connected(ws_base, room_id.clone(), token.to_string());
+                admin_socket.borrow_mut().ensure_connected(
+                    ws_base,
+                    room_id.clone(),
+                    token.to_string(),
+                );
                 cleanup
             },
         );
@@ -1176,6 +1457,7 @@ fn app(props: &AppProps) -> Html {
         AdminStatus::Accepted => "Admin token accepted",
         AdminStatus::Failed => "Admin token rejected",
     };
+    let room_setup_status_text = room_setup_status_label(room_setup_status_value);
     let admin_private_status_label = match admin_private_status_value {
         AdminUploadStatus::Idle => "Idle",
         AdminUploadStatus::Reading => "Reading file...",
@@ -1366,9 +1648,12 @@ fn app(props: &AppProps) -> Html {
                 return;
             };
             let seed = parse_optional_seed(&admin_seed_value);
-            admin_socket
-                .borrow_mut()
-                .send(ws_base, room_id.clone(), token.to_string(), AdminMsg::Scramble { seed });
+            admin_socket.borrow_mut().send(
+                ws_base,
+                room_id.clone(),
+                token.to_string(),
+                AdminMsg::Scramble { seed },
+            );
         })
     };
     let save_revision = use_state(|| 0u32);
@@ -1376,7 +1661,7 @@ fn app(props: &AppProps) -> Html {
     let frame_snap_ratio_value = *frame_snap_ratio;
     let solved = use_state(|| false);
     let solved_value = *solved;
-    let show_controls = use_state(|| false);
+    let show_controls = use_state(initial_show_controls);
     let show_controls_value = *show_controls && boot_ready_value;
     let menu_visible = use_state(|| false);
     let menu_visible_value = *menu_visible && boot_ready_value;
@@ -1400,35 +1685,38 @@ fn app(props: &AppProps) -> Html {
         let puzzle_state = puzzle_state.clone();
         let app_core = app_core.clone();
         let multiplayer_active = multiplayer_active;
-        Rc::new(move |next_state: PuzzleState, cols: usize, piece_width: f32, piece_height: f32| {
-            let derived = derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
-            let next_flips = next_state.flips.clone();
-            let next_connections = next_state.connections.clone();
-            let next_scramble = next_state.scramble_nonce;
-            log_state_update("positions", derived.positions.len(), "apply_puzzle_state");
-            log_state_update("rotations", derived.rotations.len(), "apply_puzzle_state");
-            log_state_update("flips", next_flips.len(), "apply_puzzle_state");
-            log_state_update("connections", next_connections.len(), "apply_puzzle_state");
-            let derived_z_order = derived.z_order.clone();
-            bump_ui_revision();
-            group_anchor.set(derived.anchor_of);
-            group_pos.set(derived.group_pos);
-            group_rot.set(derived.group_rot);
-            group_order.set(derived.group_order);
-            z_order.set(derived_z_order.clone());
-            scramble_nonce.set(next_scramble);
-            puzzle_state.set(next_state);
-            if !multiplayer_active {
-                app_core.apply_snapshot(
-                    derived.positions.clone(),
-                    derived.rotations.clone(),
-                    next_flips,
-                    next_connections,
-                    derived_z_order,
-                    next_scramble,
-                );
-            }
-        })
+        Rc::new(
+            move |next_state: PuzzleState, cols: usize, piece_width: f32, piece_height: f32| {
+                let derived =
+                    derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
+                let next_flips = next_state.flips.clone();
+                let next_connections = next_state.connections.clone();
+                let next_scramble = next_state.scramble_nonce;
+                log_state_update("positions", derived.positions.len(), "apply_puzzle_state");
+                log_state_update("rotations", derived.rotations.len(), "apply_puzzle_state");
+                log_state_update("flips", next_flips.len(), "apply_puzzle_state");
+                log_state_update("connections", next_connections.len(), "apply_puzzle_state");
+                let derived_z_order = derived.z_order.clone();
+                bump_ui_revision();
+                group_anchor.set(derived.anchor_of);
+                group_pos.set(derived.group_pos);
+                group_rot.set(derived.group_rot);
+                group_order.set(derived.group_order);
+                z_order.set(derived_z_order.clone());
+                scramble_nonce.set(next_scramble);
+                puzzle_state.set(next_state);
+                if !multiplayer_active {
+                    app_core.apply_snapshot(
+                        derived.positions.clone(),
+                        derived.rotations.clone(),
+                        next_flips,
+                        next_connections,
+                        derived_z_order,
+                        next_scramble,
+                    );
+                }
+            },
+        )
     };
     let bump_sync_revision: Rc<dyn Fn()> = {
         let sync_revision = sync_revision.clone();
@@ -1436,6 +1724,15 @@ fn app(props: &AppProps) -> Html {
             sync_revision.set(sync_revision.wrapping_add(1));
         })
     };
+    {
+        let bump_sync_revision = bump_sync_revision.clone();
+        use_effect(move || {
+            let hook = sync_runtime::register_sync_view_hook(Rc::new(move || {
+                bump_sync_revision();
+            }));
+            move || drop(hook)
+        });
+    }
     let on_remote_snapshot = {
         let bump_sync_revision = bump_sync_revision.clone();
         Rc::new(move |_snapshot: GameSnapshot, _seq: u64| {
@@ -1631,7 +1928,11 @@ fn app(props: &AppProps) -> Html {
         RendererKind::Wgpu => "wgpu",
         RendererKind::Svg => "svg",
     };
-    let mode_value = if multiplayer_active { "online" } else { "local" };
+    let mode_value = if multiplayer_controls_online {
+        "online"
+    } else {
+        "local"
+    };
     {
         let render_settings_value = render_settings_value.clone();
         let app_core = app_core.clone();
@@ -1651,7 +1952,11 @@ fn app(props: &AppProps) -> Html {
             || ()
         });
     }
-    let status_label = if solved_value { "Solved" } else { "In progress" };
+    let status_label = if solved_value {
+        "Solved"
+    } else {
+        "In progress"
+    };
     let status_class = if solved_value {
         "status status-solved"
     } else {
@@ -1670,11 +1975,8 @@ fn app(props: &AppProps) -> Html {
     let (connections_label, border_connections_label) = if puzzle_info_value.is_some() {
         let connections_value = app_snapshot_value.core.connections.as_slice();
         if connections_value.len() == total {
-            let (connected, border_connected, total_expected, border_expected) = count_connections(
-                connections_value,
-                grid.cols as usize,
-                grid.rows as usize,
-            );
+            let (connected, border_connected, total_expected, border_expected) =
+                count_connections(connections_value, grid.cols as usize, grid.rows as usize);
             (
                 format_progress(connected, total_expected),
                 format_progress(border_connected, border_expected),
@@ -1830,7 +2132,8 @@ fn app(props: &AppProps) -> Html {
                     private_status.set(None);
                     return;
                 }
-                let refs = match persisted_store::load_private_image_refs(LOCAL_PRIVATE_SCOPE).await {
+                let refs = match persisted_store::load_private_image_refs(LOCAL_PRIVATE_SCOPE).await
+                {
                     Ok(Some(mut refs)) => {
                         if !refs.hashes.iter().any(|value| value == &hash) {
                             refs.hashes.push(hash.clone());
@@ -1886,6 +2189,19 @@ fn app(props: &AppProps) -> Html {
             admin_token_active.set(trimmed);
             admin_socket.borrow_mut().reset();
             admin_status.set(AdminStatus::Idle);
+        })
+    };
+    let on_room_id_draft_input = {
+        let room_id_draft = room_id_draft.clone();
+        let room_setup_error = room_setup_error.clone();
+        let room_setup_status = room_setup_status.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            room_id_draft.set(input.value());
+            room_setup_error.set(None);
+            if *room_setup_status == RoomSetupStatus::Failed {
+                room_setup_status.set(RoomSetupStatus::Idle);
+            }
         })
     };
     let on_admin_puzzle_change = {
@@ -1961,10 +2277,7 @@ fn app(props: &AppProps) -> Html {
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
-                let value = value.clamp(
-                    WORKSPACE_PADDING_RATIO_MIN,
-                    WORKSPACE_PADDING_RATIO_MAX,
-                );
+                let value = value.clamp(WORKSPACE_PADDING_RATIO_MIN, WORKSPACE_PADDING_RATIO_MAX);
                 workspace_padding_ratio.set(value);
                 app_core.set_workspace_padding_ratio(value);
             }
@@ -2020,10 +2333,7 @@ fn app(props: &AppProps) -> Html {
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
-                let value = value.clamp(
-                    SNAP_DISTANCE_RATIO_MIN,
-                    SNAP_DISTANCE_RATIO_MAX,
-                );
+                let value = value.clamp(SNAP_DISTANCE_RATIO_MIN, SNAP_DISTANCE_RATIO_MAX);
                 snap_distance_ratio.set(value);
                 app_core.set_snap_distance_ratio(value);
             }
@@ -2152,15 +2462,106 @@ fn app(props: &AppProps) -> Html {
                     .len()
                     .max(ROTATION_LOCK_THRESHOLD_MIN);
                 let rounded = value.round() as usize;
-                let clamped = rounded
-                    .max(ROTATION_LOCK_THRESHOLD_MIN)
-                    .min(max_value);
+                let clamped = rounded.max(ROTATION_LOCK_THRESHOLD_MIN).min(max_value);
                 rotation_lock_threshold.set(clamped);
             }
         })
     };
+    let on_create_room = {
+        let admin_token_input = admin_token_input.clone();
+        let admin_token_active = admin_token_active.clone();
+        let admin_status = admin_status.clone();
+        let admin_socket = admin_socket.clone();
+        let room_setup_status = room_setup_status.clone();
+        let room_setup_error = room_setup_error.clone();
+        let pending_created_room = pending_created_room.clone();
+        let room_id_draft_trimmed = room_id_draft_trimmed.clone();
+        let room_id_draft_valid = room_id_draft_valid;
+        let admin_seed_value = admin_seed_value.clone();
+        let admin_grid_choices = admin_grid_choices.clone();
+        let admin_pieces_index_value = admin_pieces_index_value;
+        Callback::from(move |_: MouseEvent| {
+            let room_id = room_id_draft_trimmed.trim().to_string();
+            if !room_id_draft_valid {
+                room_setup_status.set(RoomSetupStatus::Failed);
+                room_setup_error.set(Some(format!(
+                    "room id must be {ROOM_ID_LEN} alphanumeric characters"
+                )));
+                return;
+            }
+            let token_value = (*admin_token_input).clone();
+            let token = token_value.trim().to_string();
+            if token.is_empty() {
+                room_setup_status.set(RoomSetupStatus::Failed);
+                room_setup_error.set(Some("admin token required to create a room".to_string()));
+                return;
+            }
+            let Some(ws_base) = app_router::default_ws_base() else {
+                room_setup_status.set(RoomSetupStatus::Failed);
+                room_setup_error.set(Some("Missing websocket base".to_string()));
+                return;
+            };
+            save_admin_token(&token_value);
+            admin_token_active.set(token.clone());
+            admin_socket.borrow_mut().reset();
+            admin_status.set(AdminStatus::Idle);
+            pending_created_room.borrow_mut().replace(room_id.clone());
+            room_setup_status.set(RoomSetupStatus::Creating);
+            room_setup_error.set(None);
+            let entry = PUZZLE_ARTS
+                .get(admin_puzzle_index_value)
+                .copied()
+                .unwrap_or(PUZZLE_ARTS[0]);
+            let pieces = if admin_pieces_index_value == 0 {
+                None
+            } else {
+                admin_grid_choices
+                    .get(admin_pieces_index_value.saturating_sub(1))
+                    .map(|choice| choice.target_count)
+            };
+            let seed = parse_optional_seed(&admin_seed_value);
+            admin_socket.borrow_mut().send(
+                ws_base,
+                room_id,
+                token,
+                AdminMsg::Create {
+                    persistence: heddobureika_core::RoomPersistence::Durable,
+                    puzzle: PuzzleSpec {
+                        image_ref: PuzzleImageRef::BuiltIn {
+                            slug: entry.slug.to_string(),
+                        },
+                        pieces,
+                        seed,
+                    },
+                },
+            );
+        })
+    };
+    let on_join_room = {
+        let room_setup_status = room_setup_status.clone();
+        let room_setup_error = room_setup_error.clone();
+        let connect_room_live = connect_room_live.clone();
+        let room_id_draft_trimmed = room_id_draft_trimmed.clone();
+        let room_id_draft_valid = room_id_draft_valid;
+        Callback::from(move |_: MouseEvent| {
+            let room_id = room_id_draft_trimmed.trim().to_string();
+            if !room_id_draft_valid {
+                room_setup_status.set(RoomSetupStatus::Failed);
+                room_setup_error.set(Some(format!(
+                    "room id must be {ROOM_ID_LEN} alphanumeric characters"
+                )));
+                return;
+            }
+            connect_room_live(room_id);
+        })
+    };
     let on_mode_change = {
         let multiplayer_active = multiplayer_active;
+        let show_online_setup = show_online_setup;
+        let online_setup = online_setup.clone();
+        let room_id_draft = room_id_draft.clone();
+        let cancel_online_setup = cancel_online_setup.clone();
+        let leave_online_room = leave_online_room.clone();
         Callback::from(move |event: Event| {
             let input: HtmlSelectElement = event.target_unchecked_into();
             let next_mode = match input.value().as_str() {
@@ -2168,6 +2569,13 @@ fn app(props: &AppProps) -> Html {
                 "local" => InitMode::Local,
                 _ => InitMode::Local,
             };
+            if show_online_setup {
+                if matches!(next_mode, InitMode::Online) {
+                    return;
+                }
+                cancel_online_setup();
+                return;
+            }
             let current_mode = if multiplayer_active {
                 InitMode::Online
             } else {
@@ -2176,24 +2584,24 @@ fn app(props: &AppProps) -> Html {
             if next_mode == current_mode {
                 return;
             }
-            app_router::save_mode_preference(next_mode);
             if matches!(next_mode, InitMode::Local) {
-                app_router::clear_room_session();
-                app_router::clear_location_hash();
+                if multiplayer_active {
+                    leave_online_room(None);
+                } else {
+                    cancel_online_setup();
+                }
+                return;
             }
-            if let Some(window) = web_sys::window() {
-                let _ = window.location().reload();
+            if (*room_id_draft).trim().is_empty() {
+                room_id_draft.set(generate_room_id());
             }
+            online_setup.set(true);
         })
     };
     let on_leave_room = {
+        let leave_online_room = leave_online_room.clone();
         Callback::from(move |_| {
-            app_router::clear_room_session();
-            app_router::save_mode_preference(InitMode::Local);
-            app_router::clear_location_hash();
-            if let Some(window) = web_sys::window() {
-                let _ = window.location().reload();
-            }
+            leave_online_room(None);
         })
     };
     let on_renderer_change = {
@@ -2228,8 +2636,7 @@ fn app(props: &AppProps) -> Html {
             let mut next = (*render_settings).clone();
             next.svg.animations = enabled;
             render_settings.set(next);
-            if !enabled {
-            }
+            if !enabled {}
         })
     };
     let on_emboss_toggle = {
@@ -2270,8 +2677,7 @@ fn app(props: &AppProps) -> Html {
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<u32>() {
-                let value = value
-                    .clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
+                let value = value.clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
                 let mut next = (*render_settings).clone();
                 next.image_max_dim = value;
                 render_settings.set(next);
@@ -2364,8 +2770,7 @@ fn app(props: &AppProps) -> Html {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
                 let min_value = (*auto_pan_outer_ratio).max(AUTO_PAN_INNER_RATIO_MIN);
-                let value = value
-                    .clamp(min_value, AUTO_PAN_INNER_RATIO_MAX);
+                let value = value.clamp(min_value, AUTO_PAN_INNER_RATIO_MAX);
                 auto_pan_inner_ratio.set(value);
                 app_core.set_auto_pan_inner_ratio(value);
             }
@@ -2436,45 +2841,42 @@ fn app(props: &AppProps) -> Html {
 
     {
         let show_controls = show_controls.clone();
-        use_effect_with(
-            show_controls_value,
-            move |show_controls_value| {
-                let current = *show_controls_value;
-                let window = web_sys::window().expect("window available");
-                let options = EventListenerOptions {
-                    phase: EventListenerPhase::Capture,
-                    passive: false,
-                };
-                let listener = EventListener::new_with_options(
-                    &window,
-                    "keydown",
-                    options,
-                    move |event: &Event| {
-                        if let Some(event) = event.dyn_ref::<KeyboardEvent>() {
-                            if event.repeat() {
-                                return;
-                            }
-                            let key = event.key();
-                            let code = event.code();
-                            let toggle = matches!(key.as_str(), "?" | "d" | "D")
-                                || matches!(code.as_str(), "KeyD" | "Slash");
-                            if toggle {
-                                let next = !current;
-                                gloo::console::log!(
-                                    "controls",
-                                    format!("{} -> {}", current, next),
-                                    key,
-                                    code
-                                );
-                                show_controls.set(next);
-                                event.prevent_default();
-                            }
+        use_effect_with(show_controls_value, move |show_controls_value| {
+            let current = *show_controls_value;
+            let window = web_sys::window().expect("window available");
+            let options = EventListenerOptions {
+                phase: EventListenerPhase::Capture,
+                passive: false,
+            };
+            let listener = EventListener::new_with_options(
+                &window,
+                "keydown",
+                options,
+                move |event: &Event| {
+                    if let Some(event) = event.dyn_ref::<KeyboardEvent>() {
+                        if event.repeat() {
+                            return;
                         }
-                    },
-                );
-                || drop(listener)
-            },
-        );
+                        let key = event.key();
+                        let code = event.code();
+                        let toggle = matches!(key.as_str(), "?" | "d" | "D")
+                            || matches!(code.as_str(), "KeyD" | "Slash");
+                        if toggle {
+                            let next = !current;
+                            gloo::console::log!(
+                                "controls",
+                                format!("{} -> {}", current, next),
+                                key,
+                                code
+                            );
+                            show_controls.set(next);
+                            event.prevent_default();
+                        }
+                    }
+                },
+            );
+            || drop(listener)
+        });
     }
 
     // Legacy SVG/WGPU input + image scaling removed.
@@ -2560,10 +2962,8 @@ fn app(props: &AppProps) -> Html {
                     let mut next_positions = Vec::with_capacity(total);
                     for row in 0..rows {
                         for col in 0..cols {
-                            next_positions.push((
-                                col as f32 * piece_width,
-                                row as f32 * piece_height,
-                            ));
+                            next_positions
+                                .push((col as f32 * piece_width, row as f32 * piece_height));
                         }
                     }
                     let order: Vec<usize> = (0..total).collect();
@@ -2611,123 +3011,112 @@ fn app(props: &AppProps) -> Html {
                     let order_snapshot = (*z_order).clone();
                     let order_opt = if order_snapshot.len() == total {
                         Some(order_snapshot.as_slice())
-                } else {
-                    None
-                };
-                let next_state = PuzzleState::rebuild_from_piece_state(
-                    &positions_snapshot,
-                    &zeroed,
-                    &flips_snapshot,
-                    &connections_snapshot,
-                    cols,
-                    rows,
-                    order_opt,
-                    *scramble_nonce,
-                );
-                let derived = derive_ui_state_from_puzzle(
-                    &next_state,
-                    cols,
-                    piece_width,
-                    piece_height,
-                );
-                let solved_now = is_solved(
-                    &derived.positions,
-                    &derived.rotations,
-                    &next_state.flips,
-                    &next_state.connections,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    rotation_enabled_value,
-                );
-                apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                solved.set(solved_now);
-                save_revision.set(save_revision.wrapping_add(1));
-            })
+                    } else {
+                        None
+                    };
+                    let next_state = PuzzleState::rebuild_from_piece_state(
+                        &positions_snapshot,
+                        &zeroed,
+                        &flips_snapshot,
+                        &connections_snapshot,
+                        cols,
+                        rows,
+                        order_opt,
+                        *scramble_nonce,
+                    );
+                    let derived =
+                        derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
+                    let solved_now = is_solved(
+                        &derived.positions,
+                        &derived.rotations,
+                        &next_state.flips,
+                        &next_state.connections,
+                        cols,
+                        rows,
+                        piece_width,
+                        piece_height,
+                        rotation_enabled_value,
+                    );
+                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
+                    solved.set(solved_now);
+                    save_revision.set(save_revision.wrapping_add(1));
+                })
+            };
+            let on_unflip = {
+                let app_snapshot = app_snapshot.clone();
+                let z_order = z_order.clone();
+                let apply_puzzle_state = apply_puzzle_state.clone();
+                let scramble_nonce = scramble_nonce.clone();
+                let solved = solved.clone();
+                let save_revision = save_revision.clone();
+                Callback::from(move |_: MouseEvent| {
+                    let cols = grid.cols as usize;
+                    let rows = grid.rows as usize;
+                    let total = cols * rows;
+                    if total == 0 {
+                        return;
+                    }
+                    let (positions_snapshot, rotations_snapshot, connections_snapshot) = {
+                        let snapshot = &*app_snapshot;
+                        (
+                            snapshot.core.positions.clone(),
+                            snapshot.core.rotations.clone(),
+                            snapshot.core.connections.clone(),
+                        )
+                    };
+                    let cleared = vec![false; total];
+                    let order_snapshot = (*z_order).clone();
+                    let order_opt = if order_snapshot.len() == total {
+                        Some(order_snapshot.as_slice())
+                    } else {
+                        None
+                    };
+                    let next_state = PuzzleState::rebuild_from_piece_state(
+                        &positions_snapshot,
+                        &rotations_snapshot,
+                        &cleared,
+                        &connections_snapshot,
+                        cols,
+                        rows,
+                        order_opt,
+                        *scramble_nonce,
+                    );
+                    let derived =
+                        derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
+                    let solved_now = is_solved(
+                        &derived.positions,
+                        &derived.rotations,
+                        &next_state.flips,
+                        &next_state.connections,
+                        cols,
+                        rows,
+                        piece_width,
+                        piece_height,
+                        rotation_enabled_value,
+                    );
+                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
+                    solved.set(solved_now);
+                    save_revision.set(save_revision.wrapping_add(1));
+                })
+            };
+            (on_scramble, on_solve, on_solve_rotation, on_unflip, false)
+        } else {
+            (
+                Callback::from(|_: MouseEvent| {}),
+                Callback::from(|_: MouseEvent| {}),
+                Callback::from(|_: MouseEvent| {}),
+                Callback::from(|_: MouseEvent| {}),
+                true,
+            )
         };
-        let on_unflip = {
-            let app_snapshot = app_snapshot.clone();
-            let z_order = z_order.clone();
-            let apply_puzzle_state = apply_puzzle_state.clone();
-            let scramble_nonce = scramble_nonce.clone();
-            let solved = solved.clone();
-            let save_revision = save_revision.clone();
-            Callback::from(move |_: MouseEvent| {
-                let cols = grid.cols as usize;
-                let rows = grid.rows as usize;
-                let total = cols * rows;
-                if total == 0 {
-                    return;
-                }
-                let (positions_snapshot, rotations_snapshot, connections_snapshot) = {
-                    let snapshot = &*app_snapshot;
-                    (
-                        snapshot.core.positions.clone(),
-                        snapshot.core.rotations.clone(),
-                        snapshot.core.connections.clone(),
-                    )
-                };
-                let cleared = vec![false; total];
-                let order_snapshot = (*z_order).clone();
-                let order_opt = if order_snapshot.len() == total {
-                    Some(order_snapshot.as_slice())
-                } else {
-                    None
-                };
-                let next_state = PuzzleState::rebuild_from_piece_state(
-                    &positions_snapshot,
-                    &rotations_snapshot,
-                    &cleared,
-                    &connections_snapshot,
-                    cols,
-                    rows,
-                    order_opt,
-                    *scramble_nonce,
-                );
-                let derived = derive_ui_state_from_puzzle(
-                    &next_state,
-                    cols,
-                    piece_width,
-                    piece_height,
-                );
-                let solved_now = is_solved(
-                    &derived.positions,
-                    &derived.rotations,
-                    &next_state.flips,
-                    &next_state.connections,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    rotation_enabled_value,
-                );
-                apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                solved.set(solved_now);
-                save_revision.set(save_revision.wrapping_add(1));
-            })
-        };
-        (
-            on_scramble,
-            on_solve,
-            on_solve_rotation,
-            on_unflip,
-            false,
-        )
-    } else {
-        (
-            Callback::from(|_: MouseEvent| {}),
-            Callback::from(|_: MouseEvent| {}),
-            Callback::from(|_: MouseEvent| {}),
-            Callback::from(|_: MouseEvent| {}),
-            true,
-        )
-    };
 
     let on_puzzle_toggle = details_toggle(puzzle_group_open.clone(), DEV_PANEL_GROUP_PUZZLE_KEY);
-    let on_multiplayer_toggle =
-        details_toggle(multiplayer_group_open.clone(), DEV_PANEL_GROUP_MULTIPLAYER_KEY);
-    let on_graphics_toggle = details_toggle(graphics_group_open.clone(), DEV_PANEL_GROUP_GRAPHICS_KEY);
+    let on_multiplayer_toggle = details_toggle(
+        multiplayer_group_open.clone(),
+        DEV_PANEL_GROUP_MULTIPLAYER_KEY,
+    );
+    let on_graphics_toggle =
+        details_toggle(graphics_group_open.clone(), DEV_PANEL_GROUP_GRAPHICS_KEY);
     let on_rules_toggle = details_toggle(rules_group_open.clone(), DEV_PANEL_GROUP_RULES_KEY);
     let on_shaping_toggle = details_toggle(shaping_group_open.clone(), DEV_PANEL_GROUP_SHAPING_KEY);
     let puzzle_controls = html! {
@@ -2938,25 +3327,128 @@ fn app(props: &AppProps) -> Html {
                     value={mode_value}
                     onchange={on_mode_change}
                 >
-                    <option value="local" selected={!multiplayer_active}>
+                    <option value="local" selected={!multiplayer_controls_online}>
                         { "Local" }
                     </option>
-                    <option value="online" selected={multiplayer_active}>
+                    <option value="online" selected={multiplayer_controls_online}>
                         { "Online" }
                     </option>
                 </select>
             </div>
-            { if multiplayer_active {
+            <div class="control">
+                <label for="admin-token">
+                    { "Admin token" }
+                </label>
+                <input
+                    id="admin-token"
+                    type="password"
+                    value={admin_token_input_value.clone()}
+                    oninput={on_admin_token_input}
+                />
+                <button
+                    class="control-button"
+                    type="button"
+                    onclick={on_admin_token_apply}
+                >
+                    { "Apply" }
+                </button>
+                <span class="control-value">{ admin_status_label }</span>
+            </div>
+            { if show_online_setup {
                 html! {
-                    <div class="control">
-                        <button
-                            class="control-button"
-                            type="button"
-                            onclick={on_leave_room}
-                        >
-                            { "Leave room" }
-                        </button>
-                    </div>
+                    <>
+                        <div class="control">
+                            <label for="room-id-draft">{ "Room id" }</label>
+                            <input
+                                id="room-id-draft"
+                                type="text"
+                                value={room_id_draft_value.clone()}
+                                oninput={on_room_id_draft_input}
+                                disabled={room_setup_busy}
+                            />
+                        </div>
+                        <div class="control">
+                            <label for="admin-puzzle">
+                                { "Admin puzzle" }
+                            </label>
+                            <select
+                                id="admin-puzzle"
+                                onchange={on_admin_puzzle_change.clone()}
+                                disabled={room_setup_busy}
+                            >
+                                {admin_puzzle_options.clone()}
+                            </select>
+                        </div>
+                        <div class="control">
+                            <label for="admin-pieces">
+                                { "Admin pieces" }
+                            </label>
+                            <select
+                                id="admin-pieces"
+                                onchange={on_admin_pieces_change.clone()}
+                                disabled={room_setup_busy}
+                            >
+                                {admin_pieces_options.clone()}
+                            </select>
+                        </div>
+                        <div class="control">
+                            <label for="admin-seed">
+                                { "Admin seed (optional)" }
+                            </label>
+                            <input
+                                id="admin-seed"
+                                type="text"
+                                value={admin_seed_value.clone()}
+                                placeholder="0x1234"
+                                oninput={on_admin_seed_input.clone()}
+                                disabled={room_setup_busy}
+                            />
+                        </div>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_create_room}
+                                disabled={room_setup_busy}
+                            >
+                                { "Create room" }
+                            </button>
+                        </div>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_join_room}
+                                disabled={room_setup_busy}
+                            >
+                                { "Join room" }
+                            </button>
+                        </div>
+                        { if !room_setup_status_text.is_empty() {
+                            html! {
+                                <div class="control">
+                                    <label>
+                                        { "Room setup" }
+                                        <span class="control-value">{ room_setup_status_text }</span>
+                                    </label>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }}
+                        { if let Some(message) = room_setup_error_value.clone() {
+                            html! {
+                                <div class="control">
+                                    <label>
+                                        { "Room setup error" }
+                                        <span class="control-value">{ message }</span>
+                                    </label>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }}
+                    </>
                 }
             } else {
                 html! {}
@@ -2964,6 +3456,15 @@ fn app(props: &AppProps) -> Html {
             { if multiplayer_active {
                 html! {
                     <>
+                        <div class="control">
+                            <button
+                                class="control-button"
+                                type="button"
+                                onclick={on_leave_room}
+                            >
+                                { "Leave room" }
+                            </button>
+                        </div>
                         <div class="control">
                             <label>
                                 { "Room" }
@@ -2975,25 +3476,6 @@ fn app(props: &AppProps) -> Html {
                                 { "Connection" }
                                 <span class="control-value">{ mp_connection_label }</span>
                             </label>
-                        </div>
-                        <div class="control">
-                            <label for="admin-token">
-                                { "Admin token" }
-                            </label>
-                            <input
-                                id="admin-token"
-                                type="password"
-                                value={admin_token_input_value.clone()}
-                                oninput={on_admin_token_input}
-                            />
-                            <button
-                                class="control-button"
-                                type="button"
-                                onclick={on_admin_token_apply}
-                            >
-                                { "Apply" }
-                            </button>
-                            <span class="control-value">{ admin_status_label }</span>
                         </div>
                         { if admin_enabled {
                             html! {
@@ -3769,13 +4251,7 @@ pub(crate) fn run_dev_panel(core: Rc<AppCore>) {
     let Some(root) = document.get_element_by_id("dev-panel-root") else {
         return;
     };
-    let _app_handle = yew::Renderer::<App>::with_root_and_props(
-        root,
-        AppProps {
-            core,
-        },
-    )
-    .render();
+    let _app_handle = yew::Renderer::<App>::with_root_and_props(root, AppProps { core }).render();
 }
 
 #[cfg(test)]
@@ -3784,7 +4260,9 @@ mod tests {
     use console_error_panic_hook::set_once as set_panic_hook;
     use gloo::timers::future::TimeoutFuture;
     use js_sys::Date;
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
+    use web_sys::{Event, HtmlInputElement, HtmlSelectElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -3850,6 +4328,16 @@ mod tests {
         assert_close(center.1, expected_center.1);
     }
 
+    #[wasm_bindgen_test]
+    fn generated_room_ids_are_valid() {
+        set_panic_hook();
+        for _ in 0..32 {
+            let room_id = generate_room_id();
+            assert_eq!(room_id.len(), ROOM_ID_LEN);
+            assert!(is_valid_room_id(&room_id), "invalid room id: {room_id}");
+        }
+    }
+
     #[wasm_bindgen_test(async)]
     async fn multiplayer_warns_when_image_missing() {
         set_panic_hook();
@@ -3857,16 +4345,20 @@ mod tests {
         let document = web_sys::window()
             .and_then(|window| window.document())
             .expect("document available");
-        let root = document
-            .create_element("div")
-            .expect("create test root");
+        let root = document.create_element("div").expect("create test root");
         root.set_id("wasm-test-root");
         document
             .body()
             .expect("body available")
             .append_child(&root)
             .expect("append test root");
-        let _app_handle = yew::Renderer::<App>::with_root(root).render();
+        let _app_handle = yew::Renderer::<App>::with_root_and_props(
+            root,
+            AppProps {
+                core: AppCore::new(),
+            },
+        )
+        .render();
         gloo::console::log!("mp test rendered app");
         let start = Date::now();
         let hooks = loop {
@@ -3899,6 +4391,70 @@ mod tests {
         TimeoutFuture::new(0).await;
         let warn = take_mp_warn();
         assert_eq!(warn.as_deref(), Some("puzzle info not ready"));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn switching_to_online_shows_room_setup_without_reload() {
+        set_panic_hook();
+        boot_runtime::set_boot_state(BootState::Ready);
+        let document = web_sys::window()
+            .and_then(|window| window.document())
+            .expect("document available");
+        let root = document.create_element("div").expect("create test root");
+        root.set_id("wasm-test-mode-root");
+        document
+            .body()
+            .expect("body available")
+            .append_child(&root)
+            .expect("append test root");
+        let _app_handle = yew::Renderer::<App>::with_root_and_props(
+            root.clone(),
+            AppProps {
+                core: AppCore::new(),
+            },
+        )
+        .render();
+
+        let mode_select = loop {
+            if let Some(select) = document
+                .get_element_by_id("mode-select")
+                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+            {
+                break select;
+            }
+            TimeoutFuture::new(10).await;
+        };
+        assert_eq!(mode_select.value(), "local");
+
+        mode_select.set_value("online");
+        mode_select
+            .dispatch_event(&Event::new("change").expect("change event"))
+            .expect("dispatch change");
+        TimeoutFuture::new(0).await;
+
+        let room_input = loop {
+            if let Some(input) = document
+                .get_element_by_id("room-id-draft")
+                .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
+            {
+                break input;
+            }
+            TimeoutFuture::new(10).await;
+        };
+        assert!(!room_input.value().trim().is_empty());
+        assert_eq!(
+            document
+                .get_element_by_id("mode-select")
+                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+                .expect("mode select after switch")
+                .value(),
+            "online"
+        );
+        let text = root.text_content().unwrap_or_default();
+        assert!(text.contains("Create room"));
+        assert!(text.contains("Join room"));
+
+        root.remove();
     }
 
     #[wasm_bindgen_test]

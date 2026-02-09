@@ -716,10 +716,13 @@ impl WgpuRenderer {
         canvas.set_width(canvas_width);
         canvas.set_height(canvas_height);
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            ..Default::default()
-        });
+        let instance = wgpu::util::new_instance_with_webgpu_detection(
+            wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            },
+        )
+        .await;
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
             .map_err(|err| {
@@ -960,7 +963,7 @@ impl WgpuRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("piece-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -1089,7 +1092,7 @@ impl WgpuRenderer {
         let frame_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("frame-pipeline-layout"),
-                bind_group_layouts: &[&frame_bind_group_layout],
+                bind_group_layouts: &[Some(&frame_bind_group_layout)],
                 immediate_size: 0,
             });
         let frame_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1250,7 +1253,10 @@ impl WgpuRenderer {
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-pipeline-layout"),
-            bind_group_layouts: &[&ui_globals_bind_group_layout, &ui_texture_bind_group_layout],
+            bind_group_layouts: &[
+                Some(&ui_globals_bind_group_layout),
+                Some(&ui_texture_bind_group_layout),
+            ],
             immediate_size: 0,
         });
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1466,8 +1472,15 @@ impl WgpuRenderer {
 
     pub(crate) fn render(&mut self) {
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(_) => return,
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self._config);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

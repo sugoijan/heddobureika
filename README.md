@@ -21,7 +21,7 @@ Requirements:
 - Rust toolchain (cargo)
 - `just`
 - `trunk` (for frontend dev)
-- `wrangler` (for worker dev)
+- `pnpm` (for JS tooling, including `pnpm exec wrangler` for worker dev)
 - `worker-build` (`cargo install worker-build`)
 
 Dev tasks live in `justfile` (run `just --list`). Common flow:

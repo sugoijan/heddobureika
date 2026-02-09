@@ -1,23 +1,22 @@
 [package]
 name = "heddobureika-cli"
-version = "0.1.0"
-edition = "2021"
-license = "CC-BY-NC-SA-4.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-heddobureika-core = { path = "../core" }
-clap = { version = "4", features = ["derive", "env"] }
-rand = "0.9"
-url = "2"
-base64 = "0.22"
-p256 = { version = "0.13", features = ["ecdsa"] }
-rand_core = "0.6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-mime_guess = "2"
+heddobureika-core.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+rand.workspace = true
+url.workspace = true
+base64.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+mime_guess.workspace = true
 
-futures-util = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
-rustls = { version = "0.23", features = ["ring"] }
+futures-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+rustls = { workspace = true, features = ["ring"] }
