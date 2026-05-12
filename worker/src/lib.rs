@@ -1,36 +1,39 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use image_pipeline::{AlphaMode, PipelineConfig};
-use imagesize::{Compression, ImageType};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
-    apply_snaps_for_group, clear_piece_connections, collect_group, compute_workspace_layout,
-    groups_from_connections, piece_local_offset, rotate_vec, scramble_flips, scramble_layout,
-    scramble_nonce_from_seed, scramble_rotations, scramble_seed, splitmix32, DEFAULT_TAB_DEPTH_CAP,
-    FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
+    compute_workspace_layout, rotate_vec, safety_corrections_after_detach, scramble_flips,
+    scramble_layout, scramble_nonce_from_seed, scramble_rotations, scramble_seed, splitmix32,
+    DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
 };
-use heddobureika_core::{
-    validate_image_ref, AdminMsg, ClientId, ClientMsg, GameRules, GameSnapshot, OwnershipReason,
-    PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleStateSnapshot, RecordedCommand,
-    RecordedCommandKind, RecordedCommandOutcome, RoomPersistence, RoomUpdate, ServerMsg,
-    ASSET_CHUNK_BYTES, DIR_DOWN, DIR_RIGHT, GAME_SNAPSHOT_VERSION, PRIVATE_ASSET_MAX_BYTES,
-    PRIVATE_UPLOAD_MAX_BYTES,
-};
+use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
 use heddobureika_core::{
     best_grid_for_count, logical_image_size, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
 };
-use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
+use heddobureika_core::{
+    validate_image_ref, ActionId, AdminMsg, ClientId, ClientMsg, GameBridgeError, GameRules,
+    MergePolicy, OwnershipReason, PlayableGameSnapshot, PlayablePoseSnapshot,
+    PlayablePositionSnapshot, PlayableRoomUpdate, PlayableRoomUpdateKind, PlayableTopologySnapshot,
+    PlayableUpdateBatch, PuzzleImageRef, PuzzleInfo, PuzzleSpec, RecordedCommand,
+    RecordedCommandKind, RecordedCommandOutcome, RoomControlUpdate, RoomPersistence, ServerMsg,
+    ASSET_CHUNK_BYTES, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
+};
+use heddobureika_game::{
+    AngleDeg, FlipState, GridTopology, GroupId, LogicalState, PlayableAction, PlayableState, Pose2,
+};
+use image_pipeline::{AlphaMode, PipelineConfig};
+use imagesize::{Compression, ImageType};
 use js_sys::Date;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::Deserialize as SerdeDeserialize;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use worker::*;
 
 const DEFAULT_ROOM_PATH_PREFIX: &str = "/ws/";
 const META_KEY: &str = "room_meta";
-const SNAPSHOT_KEY: &str = "room_snapshot";
+const SNAPSHOT_KEY: &str = "playable_room_snapshot_v4";
 const ROOM_ID_KEY: &str = "room_id";
 const ASSET_STORAGE_CHUNK_BYTES: usize = 256 * 1024;
 const DEFAULT_RECORDING_MAX_EVENTS: u32 = 200_000;
@@ -39,7 +42,6 @@ const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
 const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
 const FULL_STATE_INTERVAL_MS: i64 = 30 * 1000;
 const OWNERSHIP_TIMEOUT_MS: i64 = 30 * 1000;
-const SNAPSHOT_VERSION: u32 = GAME_SNAPSHOT_VERSION;
 const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
 const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
 const AUTH_WINDOW_MS: i64 = 5 * 60 * 1000;
@@ -118,7 +120,8 @@ fn auth_protocol_from_request(req: &Request) -> Result<Option<String>> {
 
 fn error_response(message: &str, status: u16) -> Response {
     Response::error(message, status).unwrap_or_else(|_| {
-        Response::error("server error", 500).unwrap_or_else(|_| Response::error("error", 500).unwrap())
+        Response::error("server error", 500)
+            .unwrap_or_else(|_| Response::error("error", 500).unwrap())
     })
 }
 
@@ -238,11 +241,68 @@ struct Ownership {
     since_ms: i64,
 }
 
+/// In-memory live puzzle state for the durable-object worker.
+///
+/// `playable` is the authoritative live state — every action mutates it
+/// directly. `snapshot` is the transport/persistence shadow; we resync
+/// `snapshot.state` from `playable` whenever we are about to broadcast a
+/// `ServerMsg::State` or persist to KV. Other snapshot fields (`puzzle`,
+/// `rules`, `scramble_nonce`, `seq`) are owned by the snapshot and copied
+/// or read in place.
+struct RoomLivePuzzle {
+    snapshot: PlayableGameSnapshot,
+    playable: heddobureika_game::PlayableState<heddobureika_game::GridTopology>,
+}
+
+impl RoomLivePuzzle {
+    fn from_snapshot(snapshot: PlayableGameSnapshot) -> Option<Self> {
+        let playable = match snapshot.restore_playable_from_spec().ok()? {
+            heddobureika_core::RestoredPlayableState::Grid(p) => p,
+            _ => return None,
+        };
+        Some(Self { snapshot, playable })
+    }
+
+    fn sync_snapshot_from_playable(&mut self) {
+        let focused_piece = self.snapshot.state.focused_piece;
+        self.snapshot.state = heddobureika_core::PlayableGameStateSnapshot::from_playable(
+            &self.playable,
+            focused_piece,
+        );
+        self.snapshot.seq = self.snapshot.state.revision;
+    }
+
+    /// Bumps the wire sequence number used for ordering room messages.
+    ///
+    /// All three of `snapshot.seq`, `state.revision`, and `playable.revision`
+    /// are kept identical so that the next action's wire
+    /// `revision_before` matches whatever the client has tracked from the
+    /// latest control or playable update. Clients must mirror this by
+    /// advancing their local `playable.revision` on every control update too.
+    fn set_seq(&mut self, seq: u64) {
+        self.snapshot.seq = seq;
+        self.snapshot.state.revision = seq;
+        self.playable.revision = seq;
+    }
+
+    /// Reorders `playable.z_order` so that the given anchor piece ids' groups
+    /// come last (i.e. on top). Anchor ids that don't resolve to alive groups
+    /// are ignored. Returns true when the order changed; re-syncs the snapshot
+    /// shadow on change. Delegates to `PlayableState::set_z_order_by_anchors`.
+    fn apply_group_order_by_anchors(&mut self, anchors: &[u32]) -> bool {
+        let changed = self.playable.set_z_order_by_anchors(anchors);
+        if changed {
+            self.sync_snapshot_from_playable();
+        }
+        changed
+    }
+}
+
 struct RoomRuntime {
     loaded: bool,
     room_id: Option<String>,
     meta: RoomMeta,
-    snapshot: Option<GameSnapshot>,
+    live: Option<RoomLivePuzzle>,
     owners_by_anchor: HashMap<u32, Ownership>,
     owner_by_client: HashMap<ClientId, u32>,
     recent_nonces: HashMap<String, i64>,
@@ -257,7 +317,7 @@ impl RoomRuntime {
             loaded: false,
             room_id: None,
             meta: RoomMeta::default(),
-            snapshot: None,
+            live: None,
             owners_by_anchor: HashMap::new(),
             owner_by_client: HashMap::new(),
             recent_nonces: HashMap::new(),
@@ -265,6 +325,261 @@ impl RoomRuntime {
             assets: HashMap::new(),
             pending_uploads: HashMap::new(),
         }
+    }
+}
+
+fn bridge_action_id(client_id: ClientId, client_seq: Option<u64>, room_seq: u64) -> ActionId {
+    let sequence = client_seq.filter(|value| *value != 0).unwrap_or(room_seq);
+    let mixed = mix_bridge_action_id(
+        client_id.as_u64().wrapping_add(0x9e37_79b9_7f4a_7c15)
+            ^ sequence.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+    );
+    ActionId(if mixed == 0 { 1 } else { mixed })
+}
+
+fn mix_bridge_action_id(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn apply_bridge_live_move(
+    live: &mut RoomLivePuzzle,
+    anchor_id: u32,
+    drop_pos: PlayablePositionSnapshot,
+    action_id: ActionId,
+) -> Result<PlayableUpdateBatch, GameBridgeError> {
+    let group = playable_group_for_anchor(&live.playable, anchor_id)?;
+    let action = PlayableAction::TranslateGroup {
+        group,
+        drop_pos: drop_pos.to_position()?,
+    };
+    let batch = live.playable.apply_action_only(action, Some(action_id));
+    live.sync_snapshot_from_playable();
+    Ok(batch)
+}
+
+fn apply_bridge_live_transform(
+    live: &mut RoomLivePuzzle,
+    anchor_id: u32,
+    drop_pose: PlayablePoseSnapshot,
+    action_id: ActionId,
+) -> Result<PlayableUpdateBatch, GameBridgeError> {
+    let group = playable_group_for_anchor(&live.playable, anchor_id)?;
+    let pose = drop_pose.to_pose()?;
+    let action = PlayableAction::TransformGroupTo {
+        group,
+        drop_pos: heddobureika_game::Position2 {
+            x: pose.x,
+            y: pose.y,
+        },
+        drop_rotation: pose.rotation,
+    };
+    let batch = live.playable.apply_action_only(action, Some(action_id));
+    live.sync_snapshot_from_playable();
+    Ok(batch)
+}
+
+fn apply_bridge_finalize(
+    live: &mut RoomLivePuzzle,
+    anchor_id: u32,
+    drop_pos: Option<PlayablePositionSnapshot>,
+    rot_deg: Option<f32>,
+    action_id: ActionId,
+) -> Result<PlayableUpdateBatch, GameBridgeError> {
+    let group = playable_group_for_anchor(&live.playable, anchor_id)?;
+    let action = match (drop_pos, rot_deg) {
+        (Some(drop_pos), Some(rot_deg)) => {
+            let drop_rotation =
+                AngleDeg::try_new(rot_deg).ok_or(GameBridgeError::InvalidActionPose)?;
+            PlayableAction::TransformGroupTo {
+                group,
+                drop_pos: drop_pos.to_position()?,
+                drop_rotation,
+            }
+        }
+        (Some(drop_pos), None) => PlayableAction::TranslateGroup {
+            group,
+            drop_pos: drop_pos.to_position()?,
+        },
+        (None, Some(rot_deg)) => {
+            let drop_rotation =
+                AngleDeg::try_new(rot_deg).ok_or(GameBridgeError::InvalidActionPose)?;
+            PlayableAction::RotateGroupTo {
+                group,
+                drop_rotation,
+            }
+        }
+        (None, None) => PlayableAction::RotateGroupTo {
+            group,
+            drop_rotation: live
+                .playable
+                .pose_of(group)
+                .ok_or(GameBridgeError::InvalidPieceId {
+                    piece_id: anchor_id,
+                })?
+                .rotation,
+        },
+    };
+    let batch =
+        live.playable
+            .apply_action_with_snap(action, Some(action_id), MergePolicy::KeepFixedGroup);
+    live.sync_snapshot_from_playable();
+    Ok(batch)
+}
+
+fn playable_group_for_anchor(
+    playable: &heddobureika_game::PlayableState<heddobureika_game::GridTopology>,
+    anchor_id: u32,
+) -> Result<GroupId, GameBridgeError> {
+    playable
+        .logical
+        .group_of(heddobureika_game::PieceId(anchor_id))
+        .ok_or(GameBridgeError::InvalidPieceId {
+            piece_id: anchor_id,
+        })
+}
+
+fn apply_bridge_flip(
+    live: &mut RoomLivePuzzle,
+    piece_id: u32,
+    flipped: bool,
+    action_id: ActionId,
+) -> Result<PlayableUpdateBatch, GameBridgeError> {
+    let piece = heddobureika_game::PieceId(piece_id);
+    if piece.as_usize() >= live.playable.piece_count() {
+        return Err(GameBridgeError::InvalidPieceId { piece_id });
+    }
+    let target_pose = live
+        .playable
+        .piece_world_pose(piece)
+        .ok_or(GameBridgeError::InvalidPieceId { piece_id })?;
+    let target_flip = if flipped {
+        heddobureika_game::FlipState::Flipped
+    } else {
+        heddobureika_game::FlipState::Normal
+    };
+    let action = heddobureika_game::RestrictedPlayableAction::DetachPieceAsGroup {
+        piece,
+        target_pose,
+        target_flip,
+    };
+    let batch = live
+        .playable
+        .apply_restricted_action_batch(action, Some(action_id));
+    live.sync_snapshot_from_playable();
+    Ok(batch)
+}
+
+fn apply_bridge_detach(
+    live: &mut RoomLivePuzzle,
+    piece_id: u32,
+    action_id: ActionId,
+) -> Result<PlayableUpdateBatch, GameBridgeError> {
+    let piece = heddobureika_game::PieceId(piece_id);
+    if piece.as_usize() >= live.playable.piece_count() {
+        return Err(GameBridgeError::InvalidPieceId { piece_id });
+    }
+    let group = live
+        .playable
+        .logical
+        .group_of(piece)
+        .ok_or(GameBridgeError::InvalidPieceId { piece_id })?;
+    let target_pose = live
+        .playable
+        .piece_world_pose(piece)
+        .ok_or(GameBridgeError::InvalidPieceId { piece_id })?;
+    let target_flip = live.playable.flip_of(group).unwrap_or_default();
+    // Capture the original group's members before the detach so we can
+    // visit every component the detach may produce and apply safety
+    // corrections.
+    let original_members: Vec<heddobureika_game::PieceId> =
+        live.playable.logical.members_of(group).collect();
+    let action = heddobureika_game::RestrictedPlayableAction::DetachPieceAsGroup {
+        piece,
+        target_pose,
+        target_flip,
+    };
+    let mut batch = live
+        .playable
+        .apply_restricted_action_batch(action, Some(action_id));
+    // Force-move each resulting group whose anchor sits outside its applicable
+    // safety bound (loose for singletons, tight for multi-piece). The
+    // corrections are merged into the detach batch's dirty-group set so the
+    // wire update carries the post-correction poses atomically — a client
+    // receiving the update sees the final state directly, no intermediate
+    // "unsafe" pose flash.
+    let puzzle = live.snapshot.puzzle.clone();
+    let rules = live.snapshot.rules;
+    let corrections =
+        safety_corrections_after_detach(&live.playable, &original_members, &puzzle, &rules);
+    for (corr_group, drop_pos) in corrections {
+        let correction_batch = live.playable.apply_action_only(
+            PlayableAction::TranslateGroup {
+                group: corr_group,
+                drop_pos,
+            },
+            None,
+        );
+        for dirty_group in correction_batch.delta.dirty_groups.iter().copied() {
+            if !batch.delta.dirty_groups.contains(&dirty_group) {
+                batch.delta.dirty_groups.push(dirty_group);
+            }
+        }
+        batch.revision_after = correction_batch.revision_after;
+    }
+    live.sync_snapshot_from_playable();
+    Ok(batch)
+}
+
+fn encode_stored_snapshot(snapshot: &PlayableGameSnapshot) -> Option<Vec<u8>> {
+    encode(snapshot)
+}
+
+fn decode_stored_snapshot(bytes: &[u8]) -> Option<PlayableGameSnapshot> {
+    decode::<PlayableGameSnapshot>(bytes)
+}
+
+fn state_msg_from_snapshot(snapshot: &PlayableGameSnapshot) -> ServerMsg {
+    ServerMsg::State {
+        seq: snapshot.seq,
+        snapshot: snapshot.clone(),
+    }
+}
+
+fn set_playable_snapshot_seq(snapshot: &mut PlayableGameSnapshot, seq: u64) {
+    snapshot.seq = seq;
+    snapshot.state.revision = seq;
+}
+
+fn playable_update_msg_from_batch(
+    snapshot: &PlayableGameSnapshot,
+    batch: &PlayableUpdateBatch,
+    kind: PlayableRoomUpdateKind,
+    source: Option<ClientId>,
+    client_seq: Option<u64>,
+) -> ServerMsg {
+    ServerMsg::PlayableUpdate {
+        seq: snapshot.seq,
+        update: PlayableRoomUpdate::from_batch_and_state(kind, batch, &snapshot.state),
+        source,
+        client_seq,
+    }
+}
+
+fn control_update_msg(
+    seq: u64,
+    update: RoomControlUpdate,
+    source: Option<ClientId>,
+    client_seq: Option<u64>,
+) -> ServerMsg {
+    ServerMsg::ControlUpdate {
+        seq,
+        update,
+        source,
+        client_seq,
     }
 }
 
@@ -484,7 +799,7 @@ impl DurableObject for Room {
         if activated {
             let (persistence, initialized) = {
                 let inner = self.inner.borrow();
-                (inner.meta.persistence, inner.snapshot.is_some())
+                (inner.meta.persistence, inner.live.is_some())
             };
             let welcome = ServerMsg::Welcome {
                 room_id: room_id.to_string(),
@@ -495,11 +810,14 @@ impl DurableObject for Room {
             let _ = self.send_server_msg(&server, &welcome);
 
             if initialized {
-                if let Some(snapshot) = self.inner.borrow().snapshot.clone() {
-                    let msg = ServerMsg::State {
-                        seq: snapshot.seq,
-                        snapshot,
-                    };
+                let snapshot_clone = self
+                    .inner
+                    .borrow()
+                    .live
+                    .as_ref()
+                    .map(|live| live.snapshot.clone());
+                if let Some(snapshot) = snapshot_clone {
+                    let msg = state_msg_from_snapshot(&snapshot);
                     let _ = self.send_server_msg(&server, &msg);
                 }
             } else if !is_admin {
@@ -533,7 +851,10 @@ impl DurableObject for Room {
         if is_admin {
             if let Some(msg) = decode::<AdminMsg>(&bytes) {
                 match msg {
-                    AdminMsg::Create { persistence, puzzle } => {
+                    AdminMsg::Create {
+                        persistence,
+                        puzzle,
+                    } => {
                         return self.handle_admin_create(ws, persistence, puzzle).await;
                     }
                     AdminMsg::ChangePuzzle { puzzle } => {
@@ -546,14 +867,15 @@ impl DurableObject for Room {
                         return self.handle_admin_upload_chunk(ws, bytes).await;
                     }
                     AdminMsg::UploadPrivateEnd { pieces, seed } => {
-                        return self
-                            .handle_admin_upload_end(ws, pieces, seed)
-                            .await;
+                        return self.handle_admin_upload_end(ws, pieces, seed).await;
                     }
                     AdminMsg::Scramble { seed } => {
                         return self.handle_admin_scramble(ws, seed).await;
                     }
-                    AdminMsg::RecordingSet { enabled, max_events } => {
+                    AdminMsg::RecordingSet {
+                        enabled,
+                        max_events,
+                    } => {
                         return self
                             .handle_admin_recording_set(ws, enabled, max_events)
                             .await;
@@ -587,35 +909,54 @@ impl DurableObject for Room {
         let pre_seq = self.current_snapshot_seq();
         let pre_progress = self.current_snapshot_progress();
         let dispatch = match msg {
-            ClientMsg::Init { puzzle, rules, state } => {
-                self.handle_init(ws.clone(), puzzle, rules, state).await
-            }
+            ClientMsg::Init { snapshot } => self.handle_init(ws.clone(), snapshot).await,
             ClientMsg::AssetRequest { hash } => self.handle_asset_request(ws.clone(), hash).await,
             ClientMsg::Select { piece_id } => self.handle_select(client_id, piece_id).await,
             ClientMsg::Move {
-                anchor_id,
-                pos,
+                piece_id,
+                drop_pos,
                 client_seq,
-            } => self.handle_move(client_id, anchor_id, pos, client_seq).await,
-            ClientMsg::Transform {
-                anchor_id,
-                pos,
-                rot_deg,
-                client_seq,
+                base_revision: _,
             } => {
-                self.handle_transform(client_id, anchor_id, pos, rot_deg, client_seq)
+                self.handle_move(client_id, piece_id, drop_pos, client_seq)
                     .await
             }
-            ClientMsg::Rotate { anchor_id, rot_deg } => {
-                self.handle_rotate(client_id, anchor_id, rot_deg).await
+            ClientMsg::Transform {
+                piece_id,
+                drop_pose,
+                client_seq,
+                base_revision: _,
+            } => {
+                self.handle_transform(client_id, piece_id, drop_pose, client_seq)
+                    .await
             }
-            ClientMsg::Place { anchor_id, pos, rot_deg } => {
-                self.handle_place(client_id, anchor_id, pos, rot_deg).await
+            ClientMsg::Rotate {
+                piece_id,
+                drop_rotation_deg,
+                base_revision: _,
+            } => {
+                self.handle_rotate(client_id, piece_id, drop_rotation_deg)
+                    .await
             }
-            ClientMsg::Flip { piece_id, flipped } => {
-                self.handle_flip(client_id, piece_id, flipped).await
+            ClientMsg::Place {
+                piece_id,
+                drop_pose,
+                client_seq,
+                base_revision: _,
+            } => {
+                self.handle_place(client_id, piece_id, drop_pose, client_seq)
+                    .await
             }
-            ClientMsg::Release { anchor_id } => self.handle_release(client_id, anchor_id).await,
+            ClientMsg::Flip {
+                piece_id,
+                flipped,
+                base_revision: _,
+            } => self.handle_flip(client_id, piece_id, flipped).await,
+            ClientMsg::Detach {
+                piece_id,
+                base_revision: _,
+            } => self.handle_detach(client_id, piece_id).await,
+            ClientMsg::Release { piece_id } => self.handle_release(client_id, piece_id).await,
             ClientMsg::Ping { nonce } => {
                 let response = ServerMsg::Pong { nonce };
                 let _ = self.send_server_msg(&ws, &response);
@@ -672,7 +1013,7 @@ impl DurableObject for Room {
                 inner.meta.last_command_at,
                 inner.meta.last_warning_at,
                 inner.meta.last_full_state_at,
-                inner.snapshot.is_some(),
+                inner.live.is_some(),
             )
         };
         if !activated {
@@ -717,18 +1058,10 @@ struct RoomGeometry {
     rows: usize,
     piece_width: f32,
     piece_height: f32,
-    view_min_x: f32,
-    view_min_y: f32,
-    view_width: f32,
-    view_height: f32,
     center_min_x: f32,
     center_max_x: f32,
     center_min_y: f32,
     center_max_y: f32,
-    snap_distance: f32,
-    frame_snap_ratio: f32,
-    rotation_snap_tolerance: f32,
-    rotation_enabled: bool,
 }
 
 impl Room {
@@ -772,8 +1105,8 @@ impl Room {
             }
         }
         if let Some(bytes) = snapshot_bytes {
-            if let Some(snapshot) = decode::<GameSnapshot>(&bytes) {
-                inner.snapshot = Some(snapshot);
+            if let Some(snapshot) = decode_stored_snapshot(&bytes) {
+                inner.live = RoomLivePuzzle::from_snapshot(snapshot);
             }
         }
         if let Some(room_id) = room_id {
@@ -798,8 +1131,8 @@ impl Room {
         };
         let payload_bytes =
             decode_base64_url(payload_b64).map_err(|_| error_response("invalid auth", 401))?;
-        let payload: AuthPayload =
-            serde_json::from_slice(&payload_bytes).map_err(|_| error_response("invalid auth", 401))?;
+        let payload: AuthPayload = serde_json::from_slice(&payload_bytes)
+            .map_err(|_| error_response("invalid auth", 401))?;
         if payload.v != 1 {
             return Err(error_response("invalid auth", 401));
         }
@@ -828,9 +1161,8 @@ impl Room {
             return Err(error_response("invalid auth", 401));
         }
         let message = auth_message(room_id, payload.ts, &payload.nonce);
-        let valid =
-            verify_signature(&pubkey_bytes, &message, &sig_bytes)
-                .map_err(|_| error_response("invalid auth", 401))?;
+        let valid = verify_signature(&pubkey_bytes, &message, &sig_bytes)
+            .map_err(|_| error_response("invalid auth", 401))?;
         if !valid {
             return Err(error_response("invalid auth", 401));
         }
@@ -923,65 +1255,71 @@ impl Room {
     }
 
     fn current_snapshot_seq(&self) -> Option<u64> {
-        self.inner.borrow().snapshot.as_ref().map(|snapshot| snapshot.seq)
+        self.inner
+            .borrow()
+            .live
+            .as_ref()
+            .map(|live| live.snapshot.seq)
     }
 
     fn current_snapshot_progress(&self) -> Option<SnapshotProgress> {
         let inner = self.inner.borrow();
-        let snapshot = inner.snapshot.as_ref()?;
-        Self::progress_for_snapshot(snapshot)
+        let live = inner.live.as_ref()?;
+        Self::progress_for_snapshot(&live.snapshot)
     }
 
-    fn progress_for_snapshot(snapshot: &GameSnapshot) -> Option<SnapshotProgress> {
-        let cols = snapshot.puzzle.cols as usize;
-        let rows = snapshot.puzzle.rows as usize;
-        if cols == 0 || rows == 0 {
+    fn progress_for_snapshot(snapshot: &PlayableGameSnapshot) -> Option<SnapshotProgress> {
+        let total = snapshot.state.topology_piece_count as usize;
+        if total == 0 || snapshot.state.piece_group.len() != total {
             return None;
+        }
+
+        let mut group_sizes = HashMap::<u32, u32>::new();
+        for group in snapshot.state.piece_group.iter().copied() {
+            *group_sizes.entry(group).or_insert(0) += 1;
+        }
+        let group_count = group_sizes.len().max(1) as u32;
+        let largest_group = group_sizes.values().copied().max().unwrap_or(0);
+        let connected_edges = snapshot
+            .state
+            .edge_active
+            .iter()
+            .filter(|active| **active)
+            .count()
+            .min(u32::MAX as usize) as u32;
+        let total_edges = snapshot.state.topology_edge_count;
+
+        let border_done = match snapshot.state.topology {
+            heddobureika_core::PlayableTopologySnapshot::Grid { cols, rows } => {
+                Self::grid_border_done_from_playable(snapshot, cols as usize, rows as usize)
+            }
+            _ => false,
+        };
+
+        Some(SnapshotProgress {
+            groups: group_count,
+            largest_group,
+            connected_edges,
+            total_edges,
+            border_done,
+            solved: group_count <= 1,
+        })
+    }
+
+    fn grid_border_done_from_playable(
+        snapshot: &PlayableGameSnapshot,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        if cols == 0 || rows == 0 {
+            return false;
         }
         let total = cols.saturating_mul(rows);
-        if snapshot.state.connections.len() != total {
-            return None;
+        if snapshot.state.piece_group.len() != total {
+            return false;
         }
-        let groups = groups_from_connections(&snapshot.state.connections, cols, rows);
-        let group_count = groups.len().max(1) as u32;
-        let largest_group = groups
-            .iter()
-            .map(|group| group.len())
-            .max()
-            .unwrap_or(0) as u32;
-        let total_edges =
-            (cols.saturating_sub(1).saturating_mul(rows) + rows.saturating_sub(1).saturating_mul(cols))
-                as u32;
-        let mut connected_edges = 0u32;
-        for row in 0..rows {
-            for col in 0..cols {
-                let idx = row * cols + col;
-                if col + 1 < cols
-                    && snapshot
-                        .state
-                        .connections
-                        .get(idx)
-                        .map(|conn| conn[DIR_RIGHT])
-                        .unwrap_or(false)
-                {
-                    connected_edges = connected_edges.saturating_add(1);
-                }
-                if row + 1 < rows
-                    && snapshot
-                        .state
-                        .connections
-                        .get(idx)
-                        .map(|conn| conn[DIR_DOWN])
-                        .unwrap_or(false)
-                {
-                    connected_edges = connected_edges.saturating_add(1);
-                }
-            }
-        }
-        let anchor_of = anchor_of_from_connections(&snapshot.state.connections, cols, rows);
-        let mut border_anchor = None::<usize>;
+        let mut border_group = None::<u32>;
         let mut border_seen = false;
-        let mut border_done = true;
         for row in 0..rows {
             for col in 0..cols {
                 if row != 0 && col != 0 && row + 1 != rows && col + 1 != cols {
@@ -989,31 +1327,19 @@ impl Room {
                 }
                 border_seen = true;
                 let idx = row * cols + col;
-                let anchor = anchor_of.get(idx).copied().unwrap_or(idx);
-                if let Some(existing) = border_anchor {
-                    if existing != anchor {
-                        border_done = false;
-                        break;
+                let Some(group) = snapshot.state.piece_group.get(idx).copied() else {
+                    return false;
+                };
+                if let Some(existing) = border_group {
+                    if existing != group {
+                        return false;
                     }
                 } else {
-                    border_anchor = Some(anchor);
+                    border_group = Some(group);
                 }
             }
-            if !border_done {
-                break;
-            }
         }
-        if !border_seen {
-            border_done = false;
-        }
-        Some(SnapshotProgress {
-            groups: group_count,
-            largest_group,
-            connected_edges,
-            total_edges,
-            border_done,
-            solved: group_count <= 1 && total > 0,
-        })
+        border_seen
     }
 
     fn compose_record_reason(
@@ -1071,49 +1397,55 @@ impl Room {
                 client_seq: None,
             },
             ClientMsg::Move {
-                anchor_id,
-                pos,
+                piece_id,
+                drop_pos,
                 client_seq,
+                ..
             } => ClientCommandRecord {
                 kind: RecordedCommandKind::Move,
-                piece_id: None,
-                anchor_id: Some(*anchor_id),
-                pos: Some(*pos),
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: Some((drop_pos.x_mm, drop_pos.y_mm)),
                 rot_deg: None,
                 client_seq: Some(*client_seq),
             },
             ClientMsg::Transform {
-                anchor_id,
-                pos,
-                rot_deg,
+                piece_id,
+                drop_pose,
                 client_seq,
+                ..
             } => ClientCommandRecord {
                 kind: RecordedCommandKind::Transform,
-                piece_id: None,
-                anchor_id: Some(*anchor_id),
-                pos: Some(*pos),
-                rot_deg: Some(*rot_deg),
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: Some((drop_pose.x_mm, drop_pose.y_mm)),
+                rot_deg: Some(drop_pose.rotation_deg),
                 client_seq: Some(*client_seq),
             },
-            ClientMsg::Rotate { anchor_id, rot_deg } => ClientCommandRecord {
+            ClientMsg::Rotate {
+                piece_id,
+                drop_rotation_deg,
+                ..
+            } => ClientCommandRecord {
                 kind: RecordedCommandKind::Rotate,
-                piece_id: None,
-                anchor_id: Some(*anchor_id),
+                piece_id: Some(*piece_id),
+                anchor_id: None,
                 pos: None,
-                rot_deg: Some(*rot_deg),
+                rot_deg: Some(*drop_rotation_deg),
                 client_seq: None,
             },
             ClientMsg::Place {
-                anchor_id,
-                pos,
-                rot_deg,
+                piece_id,
+                drop_pose,
+                client_seq,
+                ..
             } => ClientCommandRecord {
                 kind: RecordedCommandKind::Place,
-                piece_id: None,
-                anchor_id: Some(*anchor_id),
-                pos: Some(*pos),
-                rot_deg: Some(*rot_deg),
-                client_seq: None,
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: Some((drop_pose.x_mm, drop_pose.y_mm)),
+                rot_deg: Some(drop_pose.rotation_deg),
+                client_seq: Some(*client_seq),
             },
             ClientMsg::Flip { piece_id, .. } => ClientCommandRecord {
                 kind: RecordedCommandKind::Flip,
@@ -1123,10 +1455,18 @@ impl Room {
                 rot_deg: None,
                 client_seq: None,
             },
-            ClientMsg::Release { anchor_id } => ClientCommandRecord {
+            ClientMsg::Detach { piece_id, .. } => ClientCommandRecord {
+                kind: RecordedCommandKind::Detach,
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
+            ClientMsg::Release { piece_id } => ClientCommandRecord {
                 kind: RecordedCommandKind::Release,
-                piece_id: None,
-                anchor_id: Some(*anchor_id),
+                piece_id: Some(*piece_id),
+                anchor_id: None,
                 pos: None,
                 rot_deg: None,
                 client_seq: None,
@@ -1167,6 +1507,7 @@ impl Room {
             | ClientMsg::Rotate { .. }
             | ClientMsg::Place { .. }
             | ClientMsg::Flip { .. }
+            | ClientMsg::Detach { .. }
             | ClientMsg::Release { .. } => {
                 CommandHandlingResult::ignored("ignored_or_conflict", seq)
             }
@@ -1340,7 +1681,10 @@ impl Room {
             init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
         }
         let req = Request::new_with_init(path, &init).map_err(|err| err.to_string())?;
-        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
+            .map_err(|err| err.to_string())?;
         if !(200..300).contains(&resp.status_code()) {
             let message = resp
                 .text()
@@ -1397,10 +1741,7 @@ impl Room {
         after_id: Option<u64>,
         limit: u32,
     ) -> std::result::Result<CommandStoreExportResponse, String> {
-        let req = CommandStoreExportRequest {
-            after_id,
-            limit,
-        };
+        let req = CommandStoreExportRequest { after_id, limit };
         let Some(bytes) = encode(&req) else {
             return Err("failed to encode command export request".to_string());
         };
@@ -1418,10 +1759,18 @@ impl Room {
         Ok(())
     }
 
-    fn geometry_for_snapshot(snapshot: &GameSnapshot) -> Option<RoomGeometry> {
-        let cols = snapshot.puzzle.cols as usize;
-        let rows = snapshot.puzzle.rows as usize;
+    fn geometry_for_playable_snapshot(snapshot: &PlayableGameSnapshot) -> Option<RoomGeometry> {
+        let (cols, rows) = match snapshot.state.topology {
+            PlayableTopologySnapshot::Grid { cols, rows } => (cols as usize, rows as usize),
+            _ => return None,
+        };
         if cols == 0 || rows == 0 {
+            return None;
+        }
+        if snapshot.puzzle.cols as usize != cols
+            || snapshot.puzzle.rows as usize != rows
+            || snapshot.state.topology_piece_count as usize != cols.saturating_mul(rows)
+        {
             return None;
         }
         let image_width = snapshot.puzzle.image_width as f32;
@@ -1451,24 +1800,15 @@ impl Room {
         if center_max_y < center_min_y {
             center_max_y = center_min_y;
         }
-        let snap_distance = piece_width.min(piece_height) * snapshot.rules.snap_distance_ratio;
         Some(RoomGeometry {
             cols,
             rows,
             piece_width,
             piece_height,
-            view_min_x: puzzle_view_min_x,
-            view_min_y: puzzle_view_min_y,
-            view_width: puzzle_view_width,
-            view_height: puzzle_view_height,
             center_min_x,
             center_max_x,
             center_min_y,
             center_max_y,
-            snap_distance,
-            frame_snap_ratio: snapshot.rules.frame_snap_ratio,
-            rotation_snap_tolerance: snapshot.rules.rotation_snap_tolerance_deg,
-            rotation_enabled: snapshot.rules.rotation_enabled,
         })
     }
 
@@ -1480,14 +1820,10 @@ impl Room {
         validate_image_ref(&spec.image_ref)?;
         let (label, image_ref, image_width, image_height) = match &spec.image_ref {
             PuzzleImageRef::BuiltIn { slug } => {
-                let entry = puzzle_by_slug(slug).ok_or_else(|| {
-                    format!("unknown puzzle: {slug}")
-                })?;
-                let (width, height) = logical_image_size(
-                    entry.width,
-                    entry.height,
-                    rules.image_max_dimension,
-                );
+                let entry =
+                    puzzle_by_slug(slug).ok_or_else(|| format!("unknown puzzle: {slug}"))?;
+                let (width, height) =
+                    logical_image_size(entry.width, entry.height, rules.image_max_dimension);
                 (
                     entry.label.to_string(),
                     PuzzleImageRef::BuiltIn {
@@ -1505,12 +1841,7 @@ impl Room {
         let target = spec.pieces.unwrap_or(DEFAULT_TARGET_COUNT);
         let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
         let scramble_override = spec.seed.map(|seed| {
-            scramble_nonce_from_seed(
-                PUZZLE_SEED,
-                seed,
-                grid.cols as usize,
-                grid.rows as usize,
-            )
+            scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
         });
         let puzzle = PuzzleInfo {
             label,
@@ -1545,7 +1876,7 @@ impl Room {
                 return Ok(());
             }
         };
-        let snapshot = match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
+        let snapshot = match self.build_initial_snapshot(puzzle, rules, scramble_override) {
             Some(snapshot) => snapshot,
             None => {
                 let _ = self.send_server_msg(
@@ -1575,7 +1906,7 @@ impl Room {
             inner.meta.last_command_at = Some(now);
             inner.meta.last_warning_at = None;
             inner.meta.last_full_state_at = None;
-            inner.snapshot = Some(snapshot);
+            inner.live = RoomLivePuzzle::from_snapshot(snapshot);
             inner.owners_by_anchor.clear();
             inner.owner_by_client.clear();
         }
@@ -1594,11 +1925,7 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_admin_change_puzzle(
-        &self,
-        ws: WebSocket,
-        puzzle: PuzzleSpec,
-    ) -> Result<()> {
+    async fn handle_admin_change_puzzle(&self, ws: WebSocket, puzzle: PuzzleSpec) -> Result<()> {
         let now = now_ms();
         let rules = {
             let inner = self.inner.borrow();
@@ -1613,9 +1940,9 @@ impl Room {
                 return Ok(());
             }
             inner
-                .snapshot
+                .live
                 .as_ref()
-                .map(|snapshot| snapshot.rules.clone())
+                .map(|live| live.snapshot.rules.clone())
                 .unwrap_or_default()
         };
         let (puzzle, scramble_override) = match self.build_puzzle_from_spec(puzzle, &rules) {
@@ -1631,39 +1958,35 @@ impl Room {
                 return Ok(());
             }
         };
-        let mut snapshot =
-            match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
-                Some(snapshot) => snapshot,
-                None => {
-                    let _ = self.send_server_msg(
-                        &ws,
-                        &ServerMsg::Error {
-                            code: "invalid_init".to_string(),
-                            message: "failed to initialize room".to_string(),
-                        },
-                    );
-                    return Ok(());
-                }
-            };
+        let mut snapshot = match self.build_initial_snapshot(puzzle, rules, scramble_override) {
+            Some(snapshot) => snapshot,
+            None => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_init".to_string(),
+                        message: "failed to initialize room".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        };
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .snapshot
+                .live
                 .as_ref()
-                .map(|snap| snap.seq.saturating_add(1))
+                .map(|live| live.snapshot.seq.saturating_add(1))
                 .unwrap_or(0);
-            snapshot.seq = next_seq;
-            inner.snapshot = Some(snapshot.clone());
+            set_playable_snapshot_seq(&mut snapshot, next_seq);
+            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
             inner.owners_by_anchor.clear();
             inner.owner_by_client.clear();
         }
 
         self.touch_command(now, true).await?;
         self.persist_snapshot_if_needed().await?;
-        self.broadcast(&ServerMsg::State {
-            seq: snapshot.seq,
-            snapshot,
-        })?;
+        self.broadcast(&state_msg_from_snapshot(&snapshot))?;
         self.schedule_alarm().await?;
         Ok(())
     }
@@ -1716,11 +2039,7 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_admin_upload_chunk(
-        &self,
-        ws: WebSocket,
-        bytes: Vec<u8>,
-    ) -> Result<()> {
+    async fn handle_admin_upload_chunk(&self, ws: WebSocket, bytes: Vec<u8>) -> Result<()> {
         let tags = self.state.get_tags(&ws);
         let Some(client_id) = client_id_from_tags(&tags) else {
             return Ok(());
@@ -1852,17 +2171,17 @@ impl Room {
                 return Ok(());
             }
             inner
-                .snapshot
+                .live
                 .as_ref()
-                .map(|snapshot| snapshot.rules.clone())
+                .map(|live| live.snapshot.rules.clone())
                 .unwrap_or_default()
         };
         let (image_width, image_height) =
             logical_image_size(stored_width, stored_height, rules.image_max_dimension);
         let hash = sha256_hex(&stored_bytes);
         let size = stored_bytes.len() as u32;
-        let chunks = ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES)
-            as u32;
+        let chunks =
+            ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES) as u32;
         let asset = StoredAsset {
             meta: StoredAssetMeta {
                 mime: stored_mime.clone(),
@@ -1887,12 +2206,7 @@ impl Room {
         let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
         let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
         let scramble_override = seed.map(|seed| {
-            scramble_nonce_from_seed(
-                PUZZLE_SEED,
-                seed,
-                grid.cols as usize,
-                grid.rows as usize,
-            )
+            scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
         });
         let puzzle = PuzzleInfo {
             label: String::new(),
@@ -1903,29 +2217,28 @@ impl Room {
             image_width,
             image_height,
         };
-        let mut snapshot =
-            match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
-                Some(snapshot) => snapshot,
-                None => {
-                    let _ = self.send_server_msg(
-                        &ws,
-                        &ServerMsg::Error {
-                            code: "invalid_init".to_string(),
-                            message: "failed to initialize room".to_string(),
-                        },
-                    );
-                    return Ok(());
-                }
-            };
+        let mut snapshot = match self.build_initial_snapshot(puzzle, rules, scramble_override) {
+            Some(snapshot) => snapshot,
+            None => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_init".to_string(),
+                        message: "failed to initialize room".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        };
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .snapshot
+                .live
                 .as_ref()
-                .map(|snap| snap.seq.saturating_add(1))
+                .map(|live| live.snapshot.seq.saturating_add(1))
                 .unwrap_or(0);
-            snapshot.seq = next_seq;
-            inner.snapshot = Some(snapshot.clone());
+            set_playable_snapshot_seq(&mut snapshot, next_seq);
+            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
             inner.owners_by_anchor.clear();
             inner.owner_by_client.clear();
         }
@@ -1933,10 +2246,7 @@ impl Room {
         let _ = self.send_server_msg(&ws, &ServerMsg::UploadAck { hash: hash.clone() });
         self.touch_command(now, true).await?;
         self.persist_snapshot_if_needed().await?;
-        self.broadcast(&ServerMsg::State {
-            seq: snapshot.seq,
-            snapshot,
-        })?;
+        self.broadcast(&state_msg_from_snapshot(&snapshot))?;
         self.schedule_alarm().await?;
         Ok(())
     }
@@ -1955,7 +2265,7 @@ impl Room {
                 );
                 return Ok(());
             }
-            let Some(snapshot) = inner.snapshot.as_ref() else {
+            let Some(snapshot) = inner.live.as_ref() else {
                 let _ = self.send_server_msg(
                     &ws,
                     &ServerMsg::Error {
@@ -1965,45 +2275,44 @@ impl Room {
                 );
                 return Ok(());
             };
-            (snapshot.puzzle.clone(), snapshot.rules.clone())
+            (
+                snapshot.snapshot.puzzle.clone(),
+                snapshot.snapshot.rules.clone(),
+            )
         };
         let cols = puzzle.cols as usize;
         let rows = puzzle.rows as usize;
         let scramble_override =
             seed.map(|seed| scramble_nonce_from_seed(PUZZLE_SEED, seed, cols, rows));
-        let mut snapshot =
-            match self.build_initial_snapshot(puzzle, rules, None, scramble_override) {
-                Some(snapshot) => snapshot,
-                None => {
-                    let _ = self.send_server_msg(
-                        &ws,
-                        &ServerMsg::Error {
-                            code: "invalid_init".to_string(),
-                            message: "failed to scramble room".to_string(),
-                        },
-                    );
-                    return Ok(());
-                }
-            };
+        let mut snapshot = match self.build_initial_snapshot(puzzle, rules, scramble_override) {
+            Some(snapshot) => snapshot,
+            None => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_init".to_string(),
+                        message: "failed to scramble room".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        };
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .snapshot
+                .live
                 .as_ref()
-                .map(|snap| snap.seq.saturating_add(1))
+                .map(|live| live.snapshot.seq.saturating_add(1))
                 .unwrap_or(0);
-            snapshot.seq = next_seq;
-            inner.snapshot = Some(snapshot.clone());
+            set_playable_snapshot_seq(&mut snapshot, next_seq);
+            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
             inner.owners_by_anchor.clear();
             inner.owner_by_client.clear();
         }
 
         self.touch_command(now, true).await?;
         self.persist_snapshot_if_needed().await?;
-        self.broadcast(&ServerMsg::State {
-            seq: snapshot.seq,
-            snapshot,
-        })?;
+        self.broadcast(&state_msg_from_snapshot(&snapshot))?;
         self.schedule_alarm().await?;
         Ok(())
     }
@@ -2084,11 +2393,7 @@ impl Room {
         Ok(())
     }
 
-    async fn store_asset(
-        &self,
-        hash: &str,
-        asset: StoredAsset,
-    ) -> std::result::Result<(), String> {
+    async fn store_asset(&self, hash: &str, asset: StoredAsset) -> std::result::Result<(), String> {
         let should_persist = {
             let mut inner = self.inner.borrow_mut();
             inner.assets.insert(hash.to_string(), asset.clone());
@@ -2100,10 +2405,7 @@ impl Room {
         Ok(())
     }
 
-    async fn load_asset(
-        &self,
-        hash: &str,
-    ) -> std::result::Result<Option<StoredAsset>, String> {
+    async fn load_asset(&self, hash: &str) -> std::result::Result<Option<StoredAsset>, String> {
         if let Some(asset) = self.inner.borrow().assets.get(hash).cloned() {
             return Ok(Some(asset));
         }
@@ -2152,7 +2454,10 @@ impl Room {
         init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
         let req = Request::new_with_init(&format!("https://asset/asset/{hash}"), &init)
             .map_err(|err| err.to_string())?;
-        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
+            .map_err(|err| err.to_string())?;
         if !(200..300).contains(&resp.status_code()) {
             let message = resp
                 .text()
@@ -2172,7 +2477,10 @@ impl Room {
         init.with_method(Method::Get);
         let req = Request::new_with_init(&format!("https://asset/asset/{hash}"), &init)
             .map_err(|err| err.to_string())?;
-        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
+            .map_err(|err| err.to_string())?;
         if resp.status_code() == 404 {
             return Ok(None);
         }
@@ -2198,9 +2506,12 @@ impl Room {
         let stub = self.asset_store_stub()?;
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
-        let req = Request::new_with_init("https://asset/clear", &init)
+        let req =
+            Request::new_with_init("https://asset/clear", &init).map_err(|err| err.to_string())?;
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
             .map_err(|err| err.to_string())?;
-        let mut resp = stub.fetch_with_request(req).await.map_err(|err| err.to_string())?;
         if !(200..300).contains(&resp.status_code()) {
             let message = resp
                 .text()
@@ -2211,15 +2522,8 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_init(
-        &self,
-        ws: WebSocket,
-        puzzle: PuzzleInfo,
-        rules: Option<GameRules>,
-        state: Option<PuzzleStateSnapshot>,
-    ) -> Result<()> {
+    async fn handle_init(&self, ws: WebSocket, mut snapshot: PlayableGameSnapshot) -> Result<()> {
         let now = now_ms();
-        let _ = rules;
         {
             let inner = self.inner.borrow();
             if !inner.meta.activated {
@@ -2232,7 +2536,7 @@ impl Room {
                 );
                 return Ok(());
             }
-            if inner.snapshot.is_some() {
+            if inner.live.is_some() {
                 let _ = self.send_server_msg(
                     &ws,
                     &ServerMsg::Error {
@@ -2244,7 +2548,7 @@ impl Room {
             }
         }
 
-        if let Err(message) = validate_image_ref(&puzzle.image_ref) {
+        if let Err(message) = validate_image_ref(&snapshot.puzzle.image_ref) {
             let _ = self.send_server_msg(
                 &ws,
                 &ServerMsg::Error {
@@ -2255,32 +2559,34 @@ impl Room {
             return Ok(());
         }
 
-        let rules = GameRules::default();
-        let snapshot = match self.build_initial_snapshot(puzzle, rules, state, None) {
-            Some(snapshot) => snapshot,
-            None => {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "invalid_init".to_string(),
-                        message: "invalid puzzle info".to_string(),
-                    },
-                );
-                return Ok(());
-            }
-        };
+        if snapshot.puzzle.cols == 0
+            || snapshot.puzzle.rows == 0
+            || snapshot.puzzle.image_width == 0
+            || snapshot.puzzle.image_height == 0
+            || snapshot.restore_playable_from_spec().is_err()
+        {
+            let _ = self.send_server_msg(
+                &ws,
+                &ServerMsg::Error {
+                    code: "invalid_init".to_string(),
+                    message: "invalid playable snapshot".to_string(),
+                },
+            );
+            return Ok(());
+        }
+        snapshot.seq = snapshot.state.revision;
 
+        let stored_snapshot = snapshot.clone();
         {
             let mut inner = self.inner.borrow_mut();
-            inner.snapshot = Some(snapshot.clone());
+            inner.live = RoomLivePuzzle::from_snapshot(stored_snapshot);
+            inner.owners_by_anchor.clear();
+            inner.owner_by_client.clear();
         }
 
         self.touch_command(now, true).await?;
         self.persist_snapshot_if_needed().await?;
-        self.broadcast(&ServerMsg::State {
-            seq: snapshot.seq,
-            snapshot,
-        })?;
+        self.broadcast(&state_msg_from_snapshot(&snapshot))?;
         self.schedule_alarm().await?;
         Ok(())
     }
@@ -2289,9 +2595,8 @@ impl Room {
         &self,
         puzzle: PuzzleInfo,
         rules: GameRules,
-        state: Option<PuzzleStateSnapshot>,
         scramble_override: Option<u32>,
-    ) -> Option<GameSnapshot> {
+    ) -> Option<PlayableGameSnapshot> {
         let cols = puzzle.cols as usize;
         let rows = puzzle.rows as usize;
         if cols == 0 || rows == 0 {
@@ -2306,11 +2611,8 @@ impl Room {
         let total = cols * rows;
         let piece_width = image_width / cols as f32;
         let piece_height = image_height / rows as f32;
-        let layout = compute_workspace_layout(
-            image_width,
-            image_height,
-            rules.workspace_padding_ratio,
-        );
+        let layout =
+            compute_workspace_layout(image_width, image_height, rules.workspace_padding_ratio);
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
         let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
         let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
@@ -2318,107 +2620,112 @@ impl Room {
         let puzzle_view_height = layout.view_height / puzzle_scale;
         let margin = piece_width.max(piece_height) * (DEFAULT_TAB_DEPTH_CAP + MAX_LINE_BEND_RATIO);
 
-        let (positions, rotations, flips, connections, mut group_order, scramble_nonce) =
-            if let Some(state) = state {
-                if state.positions.len() != total
-                    || state.rotations.len() != total
-                    || state.flips.len() != total
-                    || state.connections.len() != total
-                {
-                    return None;
-                }
-                (
-                    state.positions,
-                    state.rotations,
-                    state.flips,
-                    state.connections,
-                    state.group_order,
-                    state.scramble_nonce,
-                )
-            } else {
-                let scramble_nonce = match scramble_override {
-                    Some(value) => value,
-                    None => {
-                        let now_seed = splitmix32(now_ms() as u32 ^ splitmix32(total as u32));
-                        splitmix32(now_seed ^ 0xA5A5_55AA)
-                    }
+        let scramble_nonce = match scramble_override {
+            Some(value) => value,
+            None => {
+                let now_seed = splitmix32(now_ms() as u32 ^ splitmix32(total as u32));
+                splitmix32(now_seed ^ 0xA5A5_55AA)
+            }
+        };
+        let seed = scramble_seed(PUZZLE_SEED, scramble_nonce, cols, rows);
+        let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
+        let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
+        let (positions, order) = scramble_layout(
+            seed,
+            cols,
+            rows,
+            piece_width,
+            piece_height,
+            puzzle_view_min_x,
+            puzzle_view_min_y,
+            puzzle_view_width,
+            puzzle_view_height,
+            margin,
+        );
+        let rotations = scramble_rotations(rotation_seed, total, rules.rotation_enabled);
+        let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
+        let topology = GridTopology::try_new(puzzle.cols, puzzle.rows)?;
+        let play_rules = rules.to_play_rules().ok()?;
+        let mut playable = PlayableState::new(LogicalState::new(topology), play_rules);
+        for idx in 0..total {
+            let (x, y) = *positions.get(idx)?;
+            let rotation = *rotations.get(idx)?;
+            let pose = Pose2::try_from_mm_degrees(
+                (x + piece_width * 0.5) / piece_width,
+                (y + piece_height * 0.5) / piece_height,
+                rotation,
+            )?;
+            if let Some(group_pose) = playable.group_pose.get_mut(idx) {
+                *group_pose = pose;
+            }
+            if let Some(group_flip) = playable.group_flip.get_mut(idx) {
+                *group_flip = if flips.get(idx).copied().unwrap_or(false) {
+                    FlipState::Flipped
+                } else {
+                    FlipState::Normal
                 };
-                let seed = scramble_seed(PUZZLE_SEED, scramble_nonce, cols, rows);
-                let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
-                let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-                let (positions, order) = scramble_layout(
-                    seed,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    puzzle_view_min_x,
-                    puzzle_view_min_y,
-                    puzzle_view_width,
-                    puzzle_view_height,
-                    margin,
-                );
-                let rotations = scramble_rotations(rotation_seed, total, rules.rotation_enabled);
-                let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
-                let connections = vec![[false; 4]; total];
-                let group_order = order.into_iter().map(|id| id as u32).collect();
-                (positions, rotations, flips, connections, group_order, scramble_nonce)
-            };
-        let anchor_of = anchor_of_from_connections(&connections, cols, rows);
-        group_order = reconcile_group_order(&group_order, &anchor_of);
-
-        Some(GameSnapshot {
-            version: SNAPSHOT_VERSION,
-            seq: 0,
-            rules,
+            }
+        }
+        playable.z_order = order
+            .into_iter()
+            .filter(|id| *id < total)
+            .map(|id| GroupId(id as u32))
+            .collect();
+        if playable.z_order.len() != total {
+            return None;
+        }
+        for slot in playable.z_index_of.iter_mut() {
+            *slot = u32::MAX;
+        }
+        for (idx, group) in playable.z_order.iter().copied().enumerate() {
+            if let Some(slot) = playable.z_index_of.get_mut(group.as_usize()) {
+                *slot = idx as u32;
+            }
+        }
+        playable.validate().ok()?;
+        Some(PlayableGameSnapshot::from_playable(
             puzzle,
-            state: PuzzleStateSnapshot {
-                positions,
-                rotations,
-                flips,
-                connections,
-                group_order,
-                scramble_nonce,
-            },
-        })
+            rules,
+            scramble_nonce,
+            &playable,
+            None,
+        ))
     }
 
     async fn handle_select(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
         let now = now_ms();
         let (pending_updates, update_msg, group_order_update) = {
             let mut inner = self.inner.borrow_mut();
-            let mut snapshot = match inner.snapshot.take() {
+            let mut runtime_snapshot = match inner.live.take() {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-            let geometry = match Self::geometry_for_snapshot(&snapshot) {
+            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
                 Some(geometry) => geometry,
                 None => {
-                    inner.snapshot = Some(snapshot);
+                    inner.live = Some(runtime_snapshot);
                     return Ok(());
                 }
             };
             let total = geometry.cols * geometry.rows;
             if piece_id as usize >= total {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let members = collect_group(
-                &snapshot.state.connections,
-                piece_id as usize,
-                geometry.cols,
-                geometry.rows,
-            );
-            let mut members = members;
-            if members.is_empty() {
-                members.push(piece_id as usize);
-            }
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
             members.sort_unstable();
             let anchor_id = members[0] as u32;
 
             if let Some(existing) = inner.owners_by_anchor.get(&anchor_id) {
                 if existing.owner_id != client_id {
-                    inner.snapshot = Some(snapshot);
+                    inner.live = Some(runtime_snapshot);
                     return Ok(());
                 }
             }
@@ -2433,17 +2740,18 @@ impl Room {
                         client_id,
                         prev_anchor
                     );
-                    let seq = self.bump_seq(&mut snapshot);
-                    pending_updates.push(ServerMsg::Update {
+                    let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
+                    runtime_snapshot.set_seq(seq);
+                    pending_updates.push(control_update_msg(
                         seq,
-                        update: RoomUpdate::Ownership {
-                            anchor_id: prev_anchor,
+                        RoomControlUpdate::Ownership {
+                            group_anchor: prev_anchor,
                             owner: None,
                             reason: OwnershipReason::AutoRelease,
                         },
-                        source: Some(client_id),
-                        client_seq: None,
-                    });
+                        Some(client_id),
+                        None,
+                    ));
                 }
             }
 
@@ -2457,30 +2765,31 @@ impl Room {
             );
             inner.owner_by_client.insert(client_id, anchor_id);
 
-            let mut group_order = snapshot.state.group_order.clone();
+            let mut group_order = playable_group_order_anchors(&runtime_snapshot.snapshot);
             group_order.retain(|id| *id != anchor_id);
             group_order.push(anchor_id);
-            snapshot.state.group_order = group_order.clone();
+            let _ = runtime_snapshot.apply_group_order_by_anchors(&group_order);
 
-            let seq = self.bump_seq(&mut snapshot);
-            let update_msg = ServerMsg::Update {
+            let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
+            runtime_snapshot.set_seq(seq);
+            let update_msg = control_update_msg(
                 seq,
-                update: RoomUpdate::Ownership {
-                    anchor_id,
+                RoomControlUpdate::Ownership {
+                    group_anchor: anchor_id,
                     owner: Some(client_id),
                     reason: OwnershipReason::Granted,
                 },
-                source: Some(client_id),
-                client_seq: None,
-            };
-            let group_order_update = ServerMsg::Update {
+                Some(client_id),
+                None,
+            );
+            let group_order_update = control_update_msg(
                 seq,
-                update: RoomUpdate::GroupOrder { order: group_order },
-                source: Some(client_id),
-                client_seq: None,
-            };
+                RoomControlUpdate::GroupOrder { order: group_order },
+                Some(client_id),
+                None,
+            );
 
-            inner.snapshot = Some(snapshot);
+            inner.live = Some(runtime_snapshot);
             (pending_updates, update_msg, group_order_update)
         };
 
@@ -2500,13 +2809,13 @@ impl Room {
         &self,
         client_id: ClientId,
         anchor_id: u32,
-        pos: (f32, f32),
+        drop_pos: PlayablePositionSnapshot,
         client_seq: u64,
     ) -> Result<()> {
         let now = now_ms();
         let update = {
             let mut inner = self.inner.borrow_mut();
-            let mut snapshot = match inner.snapshot.take() {
+            let mut runtime_snapshot = match inner.live.take() {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
@@ -2521,32 +2830,33 @@ impl Room {
                     client_id,
                     anchor_id
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let geometry = match Self::geometry_for_snapshot(&snapshot) {
+            if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
+                owner.since_ms = now;
+            }
+            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
                 Some(geometry) => geometry,
                 None => {
-                    inner.snapshot = Some(snapshot);
+                    inner.live = Some(runtime_snapshot);
                     return Ok(());
                 }
             };
             let total = geometry.cols * geometry.rows;
             if anchor_id as usize >= total {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            let members = collect_group(
-                &snapshot.state.connections,
-                anchor_id as usize,
-                geometry.cols,
-                geometry.rows,
-            );
-            let mut members = members;
-            if members.is_empty() {
-                members.push(anchor_id as usize);
-            }
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
             members.sort_unstable();
             let anchor_id_usize = members[0];
             if anchor_id_usize as u32 != anchor_id {
@@ -2556,23 +2866,27 @@ impl Room {
                     anchor_id,
                     anchor_id_usize
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let anchor_rot = snapshot.state.rotations.get(anchor_id_usize).copied().unwrap_or(0.0);
-
-            let mut next_positions = Vec::with_capacity(members.len());
-            for &id in &members {
-                let (dx, dy) = piece_local_offset(
-                    id,
-                    anchor_id_usize,
-                    geometry.cols,
-                    geometry.piece_width,
-                    geometry.piece_height,
-                );
-                let (rx, ry) = rotate_vec(dx, dy, anchor_rot);
-                next_positions.push((id, (pos.0 + rx, pos.1 + ry)));
-            }
+            let Some((_anchor_pos, anchor_rot)) =
+                playable_piece_grid_pose(&runtime_snapshot.snapshot, anchor_id_usize, &geometry)
+            else {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            };
+            let pos = legacy_top_left_from_playable_position(drop_pos, &geometry);
+            let Some(next_positions) = playable_projected_group_positions(
+                &runtime_snapshot.snapshot,
+                &members,
+                anchor_id_usize,
+                pos,
+                anchor_rot,
+                &geometry,
+            ) else {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            };
 
             if !self.group_in_bounds(&members, &next_positions, &geometry) {
                 console_log!(
@@ -2580,31 +2894,36 @@ impl Room {
                     client_id,
                     anchor_id
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            for (id, next_pos) in next_positions {
-                if let Some(slot) = snapshot.state.positions.get_mut(id) {
-                    *slot = next_pos;
-                }
-                if let Some(rot) = snapshot.state.rotations.get_mut(id) {
-                    *rot = anchor_rot;
-                }
-            }
+            let action_id =
+                bridge_action_id(client_id, Some(client_seq), runtime_snapshot.snapshot.seq);
+            let batch =
+                match apply_bridge_live_move(&mut runtime_snapshot, anchor_id, drop_pos, action_id)
+                {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        console_log!(
+                            "move ignored: bridge error (client={} anchor={} err={:?})",
+                            client_id,
+                            anchor_id,
+                            err
+                        );
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
 
-            let seq = self.bump_seq(&mut snapshot);
-            let update = Some(ServerMsg::Update {
-                seq,
-                update: RoomUpdate::GroupTransform {
-                    anchor_id,
-                    pos,
-                    rot_deg: anchor_rot,
-                },
-                source: Some(client_id),
-                client_seq: Some(client_seq).filter(|value| *value != 0),
-            });
-            inner.snapshot = Some(snapshot);
+            let update = Some(playable_update_msg_from_batch(
+                &runtime_snapshot.snapshot,
+                &batch,
+                PlayableRoomUpdateKind::ActionOnly,
+                Some(client_id),
+                Some(client_seq).filter(|value| *value != 0),
+            ));
+            inner.live = Some(runtime_snapshot);
             update
         };
 
@@ -2616,7 +2935,7 @@ impl Room {
                 client_id,
                 anchor_id,
                 match &update {
-                    ServerMsg::Update { seq, .. } => *seq,
+                    ServerMsg::PlayableUpdate { seq, .. } => *seq,
                     _ => 0,
                 }
             );
@@ -2630,14 +2949,13 @@ impl Room {
         &self,
         client_id: ClientId,
         anchor_id: u32,
-        pos: (f32, f32),
-        rot_deg: f32,
+        drop_pose: PlayablePoseSnapshot,
         client_seq: u64,
     ) -> Result<()> {
         let now = now_ms();
         let update = {
             let mut inner = self.inner.borrow_mut();
-            let mut snapshot = match inner.snapshot.take() {
+            let mut runtime_snapshot = match inner.live.take() {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
@@ -2647,32 +2965,33 @@ impl Room {
                 .map(|owner| owner.owner_id == client_id)
                 .unwrap_or(false);
             if !owns_anchor {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let geometry = match Self::geometry_for_snapshot(&snapshot) {
+            if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
+                owner.since_ms = now;
+            }
+            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
                 Some(geometry) => geometry,
                 None => {
-                    inner.snapshot = Some(snapshot);
+                    inner.live = Some(runtime_snapshot);
                     return Ok(());
                 }
             };
             let total = geometry.cols * geometry.rows;
             if anchor_id as usize >= total {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            let members = collect_group(
-                &snapshot.state.connections,
-                anchor_id as usize,
-                geometry.cols,
-                geometry.rows,
-            );
-            let mut members = members;
-            if members.is_empty() {
-                members.push(anchor_id as usize);
-            }
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
             members.sort_unstable();
             let anchor_id_usize = members[0];
             if anchor_id_usize as u32 != anchor_id {
@@ -2682,22 +3001,28 @@ impl Room {
                     anchor_id,
                     anchor_id_usize
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            let mut next_positions = Vec::with_capacity(members.len());
-            for &id in &members {
-                let (dx, dy) = piece_local_offset(
-                    id,
-                    anchor_id_usize,
-                    geometry.cols,
-                    geometry.piece_width,
-                    geometry.piece_height,
-                );
-                let (rx, ry) = rotate_vec(dx, dy, rot_deg);
-                next_positions.push((id, (pos.0 + rx, pos.1 + ry)));
-            }
+            let pos = legacy_top_left_from_playable_position(
+                PlayablePositionSnapshot {
+                    x_mm: drop_pose.x_mm,
+                    y_mm: drop_pose.y_mm,
+                },
+                &geometry,
+            );
+            let Some(next_positions) = playable_projected_group_positions(
+                &runtime_snapshot.snapshot,
+                &members,
+                anchor_id_usize,
+                pos,
+                drop_pose.rotation_deg,
+                &geometry,
+            ) else {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            };
 
             if !self.group_in_bounds(&members, &next_positions, &geometry) {
                 console_log!(
@@ -2705,31 +3030,39 @@ impl Room {
                     client_id,
                     anchor_id
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            for (id, next_pos) in next_positions {
-                if let Some(slot) = snapshot.state.positions.get_mut(id) {
-                    *slot = next_pos;
+            let action_id =
+                bridge_action_id(client_id, Some(client_seq), runtime_snapshot.snapshot.seq);
+            let batch = match apply_bridge_live_transform(
+                &mut runtime_snapshot,
+                anchor_id,
+                drop_pose,
+                action_id,
+            ) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    console_log!(
+                        "transform ignored: bridge error (client={} anchor={} err={:?})",
+                        client_id,
+                        anchor_id,
+                        err
+                    );
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
                 }
-                if let Some(rot) = snapshot.state.rotations.get_mut(id) {
-                    *rot = rot_deg;
-                }
-            }
+            };
 
-            let seq = self.bump_seq(&mut snapshot);
-            let update = Some(ServerMsg::Update {
-                seq,
-                update: RoomUpdate::GroupTransform {
-                    anchor_id,
-                    pos,
-                    rot_deg,
-                },
-                source: Some(client_id),
-                client_seq: Some(client_seq).filter(|value| *value != 0),
-            });
-            inner.snapshot = Some(snapshot);
+            let update = Some(playable_update_msg_from_batch(
+                &runtime_snapshot.snapshot,
+                &batch,
+                PlayableRoomUpdateKind::ActionOnly,
+                Some(client_id),
+                Some(client_seq).filter(|value| *value != 0),
+            ));
+            inner.live = Some(runtime_snapshot);
             update
         };
 
@@ -2741,7 +3074,7 @@ impl Room {
                 client_id,
                 anchor_id,
                 match &update {
-                    ServerMsg::Update { seq, .. } => *seq,
+                    ServerMsg::PlayableUpdate { seq, .. } => *seq,
                     _ => 0,
                 }
             );
@@ -2755,32 +3088,31 @@ impl Room {
         let now = now_ms();
         let updates = {
             let mut inner = self.inner.borrow_mut();
-            let mut snapshot = match inner.snapshot.take() {
+            let mut runtime_snapshot = match inner.live.take() {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-            let geometry = match Self::geometry_for_snapshot(&snapshot) {
+            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
                 Some(geometry) => geometry,
                 None => {
-                    inner.snapshot = Some(snapshot);
+                    inner.live = Some(runtime_snapshot);
                     return Ok(());
                 }
             };
             let total = geometry.cols * geometry.rows;
             if piece_id as usize >= total {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            let mut members = collect_group(
-                &snapshot.state.connections,
-                piece_id as usize,
-                geometry.cols,
-                geometry.rows,
-            );
-            if members.is_empty() {
-                members.push(piece_id as usize);
-            }
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
             members.sort_unstable();
             let anchor_id = members[0] as u32;
             if members.len() != 1 || anchor_id != piece_id {
@@ -2791,7 +3123,7 @@ impl Room {
                     anchor_id,
                     members.len()
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
@@ -2807,51 +3139,47 @@ impl Room {
                     piece_id,
                     anchor_id
                 );
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            if let Some(slot) = snapshot.state.flips.get_mut(piece_id as usize) {
-                *slot = flipped;
-            } else {
-                inner.snapshot = Some(snapshot);
-                return Ok(());
-            }
-            clear_piece_connections(
-                &mut snapshot.state.connections,
-                piece_id as usize,
-                geometry.cols,
-                geometry.rows,
-            );
-            let anchor_of = anchor_of_from_connections(
-                &snapshot.state.connections,
-                geometry.cols,
-                geometry.rows,
-            );
-            snapshot.state.group_order =
-                reconcile_group_order(&snapshot.state.group_order, &anchor_of);
+            let action_id = bridge_action_id(client_id, None, runtime_snapshot.snapshot.seq);
+            let batch = match apply_bridge_flip(&mut runtime_snapshot, piece_id, flipped, action_id)
+            {
+                Ok(batch) => batch,
+                Err(err) => {
+                    console_log!(
+                        "flip rejected: bridge error (client={} piece={} err={:?})",
+                        client_id,
+                        piece_id,
+                        err
+                    );
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                }
+            };
 
             inner.owner_by_client.remove(&client_id);
             inner.owners_by_anchor.remove(&anchor_id);
 
-            let seq = self.bump_seq(&mut snapshot);
-            let flip_update = ServerMsg::Update {
-                seq,
-                update: RoomUpdate::Flip { piece_id, flipped },
-                source: Some(client_id),
-                client_seq: None,
-            };
-            let ownership_update = ServerMsg::Update {
-                seq,
-                update: RoomUpdate::Ownership {
-                    anchor_id,
+            let flip_update = playable_update_msg_from_batch(
+                &runtime_snapshot.snapshot,
+                &batch,
+                PlayableRoomUpdateKind::RestrictedAction,
+                Some(client_id),
+                None,
+            );
+            let ownership_update = control_update_msg(
+                runtime_snapshot.snapshot.seq,
+                RoomControlUpdate::Ownership {
+                    group_anchor: anchor_id,
                     owner: None,
                     reason: OwnershipReason::Released,
                 },
-                source: Some(client_id),
-                client_seq: None,
-            };
-            inner.snapshot = Some(snapshot);
+                Some(client_id),
+                None,
+            );
+            inner.live = Some(runtime_snapshot);
             Some((flip_update, ownership_update))
         };
 
@@ -2871,8 +3199,141 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_rotate(&self, client_id: ClientId, anchor_id: u32, rot_deg: f32) -> Result<()> {
-        self.handle_finalize(client_id, anchor_id, None, Some(rot_deg))
+    async fn handle_detach(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
+        let now = now_ms();
+        let updates = {
+            let mut inner = self.inner.borrow_mut();
+            let mut runtime_snapshot = match inner.live.take() {
+                Some(snapshot) => snapshot,
+                None => return Ok(()),
+            };
+            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
+                Some(geometry) => geometry,
+                None => {
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                }
+            };
+            let total = geometry.cols * geometry.rows;
+            if piece_id as usize >= total {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            }
+
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
+            members.sort_unstable();
+            let anchor_id = members[0] as u32;
+            if members.len() == 1 && anchor_id == piece_id {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            }
+
+            let owns_anchor = inner
+                .owners_by_anchor
+                .get(&anchor_id)
+                .map(|owner| owner.owner_id == client_id)
+                .unwrap_or(false);
+            if !owns_anchor {
+                console_log!(
+                    "detach rejected: not owner (client={} piece={} anchor={})",
+                    client_id,
+                    piece_id,
+                    anchor_id
+                );
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            }
+
+            let action_id = bridge_action_id(client_id, None, runtime_snapshot.snapshot.seq);
+            let batch = match apply_bridge_detach(&mut runtime_snapshot, piece_id, action_id) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    console_log!(
+                        "detach rejected: bridge error (client={} piece={} err={:?})",
+                        client_id,
+                        piece_id,
+                        err
+                    );
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                }
+            };
+
+            inner.owner_by_client.insert(client_id, piece_id);
+            if anchor_id != piece_id {
+                inner.owners_by_anchor.remove(&anchor_id);
+            }
+            inner.owners_by_anchor.insert(
+                piece_id,
+                Ownership {
+                    owner_id: client_id,
+                    anchor_id: piece_id,
+                    since_ms: now,
+                },
+            );
+
+            let detach_update = playable_update_msg_from_batch(
+                &runtime_snapshot.snapshot,
+                &batch,
+                PlayableRoomUpdateKind::RestrictedAction,
+                Some(client_id),
+                None,
+            );
+            let seq = runtime_snapshot.snapshot.seq;
+            let mut ownership_updates = Vec::new();
+            if anchor_id != piece_id {
+                ownership_updates.push(control_update_msg(
+                    seq,
+                    RoomControlUpdate::Ownership {
+                        group_anchor: anchor_id,
+                        owner: None,
+                        reason: OwnershipReason::Released,
+                    },
+                    Some(client_id),
+                    None,
+                ));
+            }
+            ownership_updates.push(control_update_msg(
+                seq,
+                RoomControlUpdate::Ownership {
+                    group_anchor: piece_id,
+                    owner: Some(client_id),
+                    reason: OwnershipReason::Granted,
+                },
+                Some(client_id),
+                None,
+            ));
+            inner.live = Some(runtime_snapshot);
+            Some((detach_update, ownership_updates))
+        };
+
+        self.touch_command(now, true).await?;
+        self.persist_snapshot_if_needed().await?;
+        if let Some((detach_update, ownership_updates)) = updates {
+            console_log!("detach accepted: client={} piece={}", client_id, piece_id);
+            let _ = self.broadcast(&detach_update);
+            for update in ownership_updates {
+                let _ = self.broadcast(&update);
+            }
+        }
+        self.schedule_alarm().await?;
+        Ok(())
+    }
+
+    async fn handle_rotate(
+        &self,
+        client_id: ClientId,
+        anchor_id: u32,
+        drop_rotation_deg: f32,
+    ) -> Result<()> {
+        self.handle_finalize(client_id, anchor_id, None, Some(drop_rotation_deg), None)
             .await
     }
 
@@ -2880,24 +3341,34 @@ impl Room {
         &self,
         client_id: ClientId,
         anchor_id: u32,
-        pos: (f32, f32),
-        rot_deg: f32,
+        drop_pose: PlayablePoseSnapshot,
+        client_seq: u64,
     ) -> Result<()> {
-        self.handle_finalize(client_id, anchor_id, Some(pos), Some(rot_deg))
-            .await
+        self.handle_finalize(
+            client_id,
+            anchor_id,
+            Some(PlayablePositionSnapshot {
+                x_mm: drop_pose.x_mm,
+                y_mm: drop_pose.y_mm,
+            }),
+            Some(drop_pose.rotation_deg),
+            Some(client_seq),
+        )
+        .await
     }
 
     async fn handle_finalize(
         &self,
         client_id: ClientId,
         anchor_id: u32,
-        pos: Option<(f32, f32)>,
+        drop_pos: Option<PlayablePositionSnapshot>,
         rot_deg: Option<f32>,
+        client_seq: Option<u64>,
     ) -> Result<()> {
         let now = now_ms();
-        let (snapshot, released_anchor) = {
+        let (playable_update, released_anchor) = {
             let mut inner = self.inner.borrow_mut();
-            let mut snapshot = match inner.snapshot.take() {
+            let mut runtime_snapshot = match inner.live.take() {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
@@ -2907,165 +3378,95 @@ impl Room {
                 .map(|owner| owner.owner_id == client_id)
                 .unwrap_or(false);
             if !owns_anchor {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let geometry = match Self::geometry_for_snapshot(&snapshot) {
+            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
                 Some(geometry) => geometry,
                 None => {
-                    inner.snapshot = Some(snapshot);
+                    inner.live = Some(runtime_snapshot);
                     return Ok(());
                 }
             };
             let total = geometry.cols * geometry.rows;
             if anchor_id as usize >= total {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let members = collect_group(
-                &snapshot.state.connections,
-                anchor_id as usize,
-                geometry.cols,
-                geometry.rows,
-            );
-            let mut members = members;
-            if members.is_empty() {
-                members.push(anchor_id as usize);
-            }
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
             members.sort_unstable();
             let anchor_id_usize = members[0];
             if anchor_id_usize as u32 != anchor_id {
-                inner.snapshot = Some(snapshot);
+                inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
 
-            let anchor_rot = rot_deg.unwrap_or_else(|| {
-                snapshot
-                    .state
-                    .rotations
-                    .get(anchor_id_usize)
-                    .copied()
-                    .unwrap_or(0.0)
-            });
-            let anchor_pos = pos.unwrap_or_else(|| {
-                snapshot
-                    .state
-                    .positions
-                    .get(anchor_id_usize)
-                    .copied()
-                    .unwrap_or((0.0, 0.0))
-            });
-
-            for &id in &members {
-                let (dx, dy) = piece_local_offset(
-                    id,
-                    anchor_id_usize,
-                    geometry.cols,
-                    geometry.piece_width,
-                    geometry.piece_height,
-                );
-                let (rx, ry) = rotate_vec(dx, dy, anchor_rot);
-                if let Some(slot) = snapshot.state.positions.get_mut(id) {
-                    *slot = (anchor_pos.0 + rx, anchor_pos.1 + ry);
+            let action_id = bridge_action_id(client_id, client_seq, runtime_snapshot.snapshot.seq);
+            let batch = match apply_bridge_finalize(
+                &mut runtime_snapshot,
+                anchor_id,
+                drop_pos,
+                rot_deg,
+                action_id,
+            ) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    console_log!(
+                        "finalize ignored: bridge error (client={} anchor={} err={:?})",
+                        client_id,
+                        anchor_id,
+                        err
+                    );
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
                 }
-                if let Some(slot) = snapshot.state.rotations.get_mut(id) {
-                    *slot = anchor_rot;
-                }
-            }
-
-            let mut positions = snapshot.state.positions.clone();
-            let mut rotations = snapshot.state.rotations.clone();
-            let mut connections = snapshot.state.connections.clone();
-            let group_after = apply_snaps_for_group(
-                &members,
-                &mut positions,
-                &mut rotations,
-                &snapshot.state.flips,
-                &mut connections,
-                geometry.cols,
-                geometry.rows,
-                geometry.piece_width,
-                geometry.piece_height,
-                geometry.snap_distance,
-                geometry.frame_snap_ratio,
-                true,
-                geometry.center_min_x,
-                geometry.center_max_x,
-                geometry.center_min_y,
-                geometry.center_max_y,
-                geometry.view_min_x,
-                geometry.view_min_y,
-                geometry.view_width,
-                geometry.view_height,
-                geometry.rotation_snap_tolerance,
-                geometry.rotation_enabled,
-            );
-            if group_after.is_empty() {
-                let fallback_seed =
-                    scramble_seed(PUZZLE_SEED, splitmix32(now as u32 ^ anchor_id_usize as u32), geometry.cols, geometry.rows);
-                let margin =
-                    geometry.piece_width.max(geometry.piece_height) * (DEFAULT_TAB_DEPTH_CAP + MAX_LINE_BEND_RATIO);
-                let (fallback_positions, _) = scramble_layout(
-                    fallback_seed,
-                    geometry.cols,
-                    geometry.rows,
-                    geometry.piece_width,
-                    geometry.piece_height,
-                    geometry.view_min_x,
-                    geometry.view_min_y,
-                    geometry.view_width,
-                    geometry.view_height,
-                    margin,
-                );
-                if let Some(fallback_pos) = fallback_positions.get(anchor_id_usize) {
-                    if let Some(slot) = positions.get_mut(anchor_id_usize) {
-                        *slot = *fallback_pos;
-                    }
-                    if let Some(slot) = rotations.get_mut(anchor_id_usize) {
-                        *slot = anchor_rot;
-                    }
-                }
-                clear_piece_connections(&mut connections, anchor_id_usize, geometry.cols, geometry.rows);
-            }
-            snapshot.state.positions = positions;
-            snapshot.state.rotations = rotations;
-            snapshot.state.connections = connections;
-
-            let anchor_of = anchor_of_from_connections(
-                &snapshot.state.connections,
-                geometry.cols,
-                geometry.rows,
-            );
-            snapshot.state.group_order =
-                reconcile_group_order(&snapshot.state.group_order, &anchor_of);
+            };
 
             let released_anchor = inner.owner_by_client.remove(&client_id);
             if let Some(released_anchor) = released_anchor {
                 inner.owners_by_anchor.remove(&released_anchor);
             }
-            self.bump_seq(&mut snapshot);
-            let snapshot_clone = snapshot.clone();
-            inner.snapshot = Some(snapshot);
-            (snapshot_clone, released_anchor)
+            let playable_update = playable_update_msg_from_batch(
+                &runtime_snapshot.snapshot,
+                &batch,
+                PlayableRoomUpdateKind::Snap,
+                Some(client_id),
+                client_seq.filter(|value| *value != 0),
+            );
+            inner.live = Some(runtime_snapshot);
+            (playable_update, released_anchor)
         };
 
         self.touch_command(now, true).await?;
         self.persist_snapshot_if_needed().await?;
         if let Some(anchor_id) = released_anchor {
-            let update = ServerMsg::Update {
-                seq: snapshot.seq,
-                update: RoomUpdate::Ownership {
-                    anchor_id,
+            let update = control_update_msg(
+                match &playable_update {
+                    ServerMsg::PlayableUpdate { seq, .. } => *seq,
+                    _ => 0,
+                },
+                RoomControlUpdate::Ownership {
+                    group_anchor: anchor_id,
                     owner: None,
                     reason: OwnershipReason::Released,
                 },
-                source: Some(client_id),
-                client_seq: None,
-            };
+                Some(client_id),
+                client_seq.filter(|value| *value != 0),
+            );
             let _ = self.broadcast(&update);
         }
-        let seq = snapshot.seq;
-        self.broadcast(&ServerMsg::State { seq, snapshot })?;
+        let seq = match &playable_update {
+            ServerMsg::PlayableUpdate { seq, .. } => *seq,
+            _ => 0,
+        };
+        self.broadcast(&playable_update)?;
         console_log!(
             "finalize accepted: client={} anchor={} seq={}",
             client_id,
@@ -3142,16 +3543,16 @@ impl Room {
     fn release_by_client(&self, client_id: ClientId, reason: OwnershipReason) -> Result<()> {
         if let Some(anchor_id) = self.clear_ownership_for_client(client_id) {
             let seq = self.bump_seq_for_update();
-            let msg = ServerMsg::Update {
+            let msg = control_update_msg(
                 seq,
-                update: RoomUpdate::Ownership {
-                    anchor_id,
+                RoomControlUpdate::Ownership {
+                    group_anchor: anchor_id,
                     owner: None,
                     reason,
                 },
-                source: Some(client_id),
-                client_seq: None,
-            };
+                Some(client_id),
+                None,
+            );
             let _ = self.broadcast(&msg);
         }
         Ok(())
@@ -3187,33 +3588,28 @@ impl Room {
                 owner.owner_id,
                 owner.anchor_id
             );
-            let update = RoomUpdate::Ownership {
-                anchor_id: owner.anchor_id,
-                owner: None,
-                reason: OwnershipReason::Timeout,
-            };
             let seq = self.bump_seq_for_update();
-            let msg = ServerMsg::Update {
+            let msg = control_update_msg(
                 seq,
-                update,
-                source: None,
-                client_seq: None,
-            };
+                RoomControlUpdate::Ownership {
+                    group_anchor: owner.anchor_id,
+                    owner: None,
+                    reason: OwnershipReason::Timeout,
+                },
+                None,
+                None,
+            );
             let _ = self.broadcast(&msg);
         }
         Ok(())
     }
 
-    fn bump_seq(&self, snapshot: &mut GameSnapshot) -> u64 {
-        snapshot.seq = snapshot.seq.saturating_add(1);
-        snapshot.seq
-    }
-
     fn bump_seq_for_update(&self) -> u64 {
         let mut inner = self.inner.borrow_mut();
-        if let Some(snapshot) = inner.snapshot.as_mut() {
-            snapshot.seq = snapshot.seq.saturating_add(1);
-            snapshot.seq
+        if let Some(live) = inner.live.as_mut() {
+            let next = live.snapshot.seq.saturating_add(1);
+            live.set_seq(next);
+            next
         } else {
             0
         }
@@ -3242,12 +3638,15 @@ impl Room {
     async fn persist_snapshot_if_needed(&self) -> Result<()> {
         let (persistence, snapshot) = {
             let inner = self.inner.borrow();
-            (inner.meta.persistence, inner.snapshot.clone())
+            (
+                inner.meta.persistence,
+                inner.live.as_ref().map(|live| live.snapshot.clone()),
+            )
         };
 
         if matches!(persistence, RoomPersistence::Durable) {
             if let Some(snapshot) = snapshot {
-                if let Some(bytes) = encode(&snapshot) {
+                if let Some(bytes) = encode_stored_snapshot(&snapshot) {
                     self.state.storage().put(SNAPSHOT_KEY, bytes).await?;
                 }
             }
@@ -3271,7 +3670,7 @@ impl Room {
             (
                 inner.meta.last_command_at,
                 inner.meta.last_full_state_at,
-                inner.snapshot.is_some(),
+                inner.live.is_some(),
                 inner.owners_by_anchor.values().copied().collect::<Vec<_>>(),
                 inner.pending_releases.values().copied().collect::<Vec<_>>(),
             )
@@ -3331,7 +3730,7 @@ impl Room {
             inner.meta.last_command_at = None;
             inner.meta.last_warning_at = None;
             inner.meta.last_full_state_at = None;
-            inner.snapshot = None;
+            inner.live = None;
             inner.owners_by_anchor.clear();
             inner.owner_by_client.clear();
             inner.pending_releases.clear();
@@ -3363,7 +3762,7 @@ impl Room {
     async fn broadcast_full_state(&self) -> Result<()> {
         let snapshot = {
             let mut inner = self.inner.borrow_mut();
-            let Some(snapshot) = inner.snapshot.clone() else {
+            let Some(snapshot) = inner.live.as_ref().map(|live| live.snapshot.clone()) else {
                 return Ok(());
             };
             inner.meta.last_full_state_at = Some(now_ms());
@@ -3371,7 +3770,8 @@ impl Room {
         };
         self.persist_meta().await?;
         let seq = snapshot.seq;
-        let result = self.broadcast(&ServerMsg::State { seq, snapshot });
+        let msg = state_msg_from_snapshot(&snapshot);
+        let result = self.broadcast(&msg);
         console_log!("full state broadcast seq={}", seq);
         result
     }
@@ -3401,7 +3801,9 @@ struct AssetStoreRuntime {
 
 impl AssetStoreRuntime {
     fn new() -> Self {
-        Self { schema_ready: false }
+        Self {
+            schema_ready: false,
+        }
     }
 }
 
@@ -3456,18 +3858,16 @@ impl DurableObject for AssetStore {
                     Err(message) => Response::error(&message, 500),
                 }
             }
-            (Method::Get, AssetStoreRoute::Asset { hash }) => {
-                match self.load_asset_sql(&hash) {
-                    Ok(Some(asset)) => {
-                        let Some(body) = encode(&asset) else {
-                            return Response::error("failed to encode asset", 500);
-                        };
-                        Response::from_bytes(body)
-                    }
-                    Ok(None) => Response::error("not found", 404),
-                    Err(message) => Response::error(&message, 500),
+            (Method::Get, AssetStoreRoute::Asset { hash }) => match self.load_asset_sql(&hash) {
+                Ok(Some(asset)) => {
+                    let Some(body) = encode(&asset) else {
+                        return Response::error("failed to encode asset", 500);
+                    };
+                    Response::from_bytes(body)
                 }
-            }
+                Ok(None) => Response::error("not found", 404),
+                Err(message) => Response::error(&message, 500),
+            },
             (Method::Delete, AssetStoreRoute::Asset { hash }) => {
                 match self.delete_asset_sql(&hash) {
                     Ok(()) => Response::ok("ok"),
@@ -3521,8 +3921,8 @@ impl AssetStore {
         if size != asset.meta.size {
             return Err("asset size mismatch".to_string());
         }
-        let expected_chunks = ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1)
-            / ASSET_STORAGE_CHUNK_BYTES) as u32;
+        let expected_chunks =
+            ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES) as u32;
         if expected_chunks != asset.meta.chunks {
             return Err("asset chunk count mismatch".to_string());
         }
@@ -3564,10 +3964,7 @@ impl AssetStore {
         Ok(())
     }
 
-    fn load_asset_sql(
-        &self,
-        hash: &str,
-    ) -> std::result::Result<Option<StoredAsset>, String> {
+    fn load_asset_sql(&self, hash: &str) -> std::result::Result<Option<StoredAsset>, String> {
         self.ensure_schema().map_err(|err| err.to_string())?;
         let sql = self.state.storage().sql();
         let mut meta_rows = sql
@@ -3671,10 +4068,7 @@ impl AssetStore {
         }
     }
 
-    fn sql_value_i64(
-        value: &SqlStorageValue,
-        field: &str,
-    ) -> std::result::Result<i64, String> {
+    fn sql_value_i64(value: &SqlStorageValue, field: &str) -> std::result::Result<i64, String> {
         match value {
             SqlStorageValue::Integer(value) => Ok(*value),
             SqlStorageValue::Float(value) => Ok(*value as i64),
@@ -3682,10 +4076,7 @@ impl AssetStore {
         }
     }
 
-    fn sql_value_u32(
-        value: &SqlStorageValue,
-        field: &str,
-    ) -> std::result::Result<u32, String> {
+    fn sql_value_u32(value: &SqlStorageValue, field: &str) -> std::result::Result<u32, String> {
         let raw = Self::sql_value_i64(value, field)?;
         u32::try_from(raw).map_err(|_| format!("invalid asset {field}"))
     }
@@ -3707,7 +4098,9 @@ struct CommandStoreRuntime {
 
 impl CommandStoreRuntime {
     fn new() -> Self {
-        Self { schema_ready: false }
+        Self {
+            schema_ready: false,
+        }
     }
 }
 
@@ -3804,12 +4197,10 @@ impl DurableObject for CommandStore {
                 };
                 Response::from_bytes(bytes)
             }
-            (Method::Post, CommandStoreRoute::EventsClear) => {
-                match self.clear_events() {
-                    Ok(()) => Response::ok("ok"),
-                    Err(message) => Response::error(&message, 500),
-                }
-            }
+            (Method::Post, CommandStoreRoute::EventsClear) => match self.clear_events() {
+                Ok(()) => Response::ok("ok"),
+                Err(message) => Response::error(&message, 500),
+            },
             _ => Response::error("not found", 404),
         }
     }
@@ -4048,7 +4439,10 @@ impl CommandStore {
                 kind: Self::decode_kind(kind_raw)?,
                 piece_id: Self::sql_optional_u32(&row[4]),
                 anchor_id: Self::sql_optional_u32(&row[5]),
-                pos: match (Self::sql_optional_f32(&row[6]), Self::sql_optional_f32(&row[7])) {
+                pos: match (
+                    Self::sql_optional_f32(&row[6]),
+                    Self::sql_optional_f32(&row[7]),
+                ) {
                     (Some(x), Some(y)) => Some((x, y)),
                     _ => None,
                 },
@@ -4093,21 +4487,18 @@ impl CommandStore {
             x if x == RecordedCommandKind::Flip as u32 => Ok(RecordedCommandKind::Flip),
             x if x == RecordedCommandKind::Release as u32 => Ok(RecordedCommandKind::Release),
             x if x == RecordedCommandKind::Ping as u32 => Ok(RecordedCommandKind::Ping),
+            x if x == RecordedCommandKind::Detach as u32 => Ok(RecordedCommandKind::Detach),
             _ => Err("invalid command kind".to_string()),
         }
     }
 
     fn decode_outcome(value: u32) -> std::result::Result<RecordedCommandOutcome, String> {
         match value {
-            x if x == RecordedCommandOutcome::Applied as u32 => {
-                Ok(RecordedCommandOutcome::Applied)
-            }
+            x if x == RecordedCommandOutcome::Applied as u32 => Ok(RecordedCommandOutcome::Applied),
             x if x == RecordedCommandOutcome::AcceptedNoStateChange as u32 => {
                 Ok(RecordedCommandOutcome::AcceptedNoStateChange)
             }
-            x if x == RecordedCommandOutcome::Ignored as u32 => {
-                Ok(RecordedCommandOutcome::Ignored)
-            }
+            x if x == RecordedCommandOutcome::Ignored as u32 => Ok(RecordedCommandOutcome::Ignored),
             x if x == RecordedCommandOutcome::Rejected as u32 => {
                 Ok(RecordedCommandOutcome::Rejected)
             }
@@ -4139,10 +4530,7 @@ impl CommandStore {
         }
     }
 
-    fn sql_required_i64(
-        value: &SqlStorageValue,
-        field: &str,
-    ) -> std::result::Result<i64, String> {
+    fn sql_required_i64(value: &SqlStorageValue, field: &str) -> std::result::Result<i64, String> {
         match value {
             SqlStorageValue::Integer(value) => Ok(*value),
             SqlStorageValue::Float(value) => Ok(*value as i64),
@@ -4150,18 +4538,12 @@ impl CommandStore {
         }
     }
 
-    fn sql_required_u32(
-        value: &SqlStorageValue,
-        field: &str,
-    ) -> std::result::Result<u32, String> {
+    fn sql_required_u32(value: &SqlStorageValue, field: &str) -> std::result::Result<u32, String> {
         let raw = Self::sql_required_i64(value, field)?;
         u32::try_from(raw).map_err(|_| format!("invalid command {field}"))
     }
 
-    fn sql_required_u64(
-        value: &SqlStorageValue,
-        field: &str,
-    ) -> std::result::Result<u64, String> {
+    fn sql_required_u64(value: &SqlStorageValue, field: &str) -> std::result::Result<u64, String> {
         let raw = Self::sql_required_i64(value, field)?;
         u64::try_from(raw).map_err(|_| format!("invalid command {field}"))
     }
@@ -4229,42 +4611,638 @@ impl CommandStore {
     }
 }
 
-fn anchor_of_from_connections(connections: &[[bool; 4]], cols: usize, rows: usize) -> Vec<usize> {
-    let total = cols * rows;
-    let mut anchor_of = vec![0usize; total];
-    for group in groups_from_connections(connections, cols, rows) {
-        if group.is_empty() {
-            continue;
-        }
-        let anchor = group[0];
-        for id in group {
-            if id < total {
-                anchor_of[id] = anchor;
-            }
-        }
+fn playable_group_members(snapshot: &PlayableGameSnapshot, piece_id: usize) -> Option<Vec<usize>> {
+    let total = snapshot.state.topology_piece_count as usize;
+    if piece_id >= total || snapshot.state.piece_group.len() != total {
+        return None;
     }
-    anchor_of
+    let group = *snapshot.state.piece_group.get(piece_id)?;
+    let mut members = snapshot
+        .state
+        .piece_group
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(idx, candidate)| (candidate == group).then_some(idx))
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    (!members.is_empty()).then_some(members)
 }
 
-fn reconcile_group_order(prev: &[u32], anchor_of: &[usize]) -> Vec<u32> {
-    let total = anchor_of.len();
-    let mut seen = vec![false; total];
-    let mut order = Vec::new();
-    for &anchor in prev {
-        let anchor_idx = anchor as usize;
-        if anchor_idx >= total {
+fn playable_group_anchor(snapshot: &PlayableGameSnapshot, group: u32) -> Option<usize> {
+    snapshot
+        .state
+        .piece_group
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(idx, candidate)| (candidate == group).then_some(idx))
+        .min()
+}
+
+fn playable_group_order_anchors(snapshot: &PlayableGameSnapshot) -> Vec<u32> {
+    let mut order = Vec::with_capacity(snapshot.state.z_order.len());
+    for group in snapshot.state.z_order.iter().copied() {
+        let Some(anchor) = playable_group_anchor(snapshot, group) else {
             continue;
-        }
-        let mapped = anchor_of[anchor_idx];
-        if mapped < total && !seen[mapped] {
-            seen[mapped] = true;
-            order.push(mapped as u32);
-        }
-    }
-    for anchor in 0..total {
-        if anchor_of[anchor] == anchor && !seen[anchor] {
-            order.push(anchor as u32);
+        };
+        let anchor = anchor as u32;
+        if !order.contains(&anchor) {
+            order.push(anchor);
         }
     }
     order
+}
+
+fn playable_piece_grid_pose(
+    snapshot: &PlayableGameSnapshot,
+    piece_id: usize,
+    geometry: &RoomGeometry,
+) -> Option<((f32, f32), f32)> {
+    let group = *snapshot.state.piece_group.get(piece_id)? as usize;
+    let group_pose = *snapshot.state.group_pose.get(group)?;
+    let anchor = playable_group_anchor(snapshot, group as u32)?;
+    let anchor_local = *snapshot.state.piece_local_pose.get(anchor)?;
+    let piece_local = *snapshot.state.piece_local_pose.get(piece_id)?;
+    let mut dx = piece_local.x_mm - anchor_local.x_mm;
+    let dy = piece_local.y_mm - anchor_local.y_mm;
+    if snapshot
+        .state
+        .group_flip
+        .get(group)
+        .copied()
+        .unwrap_or(false)
+    {
+        dx = -dx;
+    }
+    let (rx, ry) = rotate_vec(dx, dy, group_pose.rotation_deg);
+    let center_x = group_pose.x_mm + rx;
+    let center_y = group_pose.y_mm + ry;
+    Some((
+        (
+            center_x * geometry.piece_width - geometry.piece_width * 0.5,
+            center_y * geometry.piece_height - geometry.piece_height * 0.5,
+        ),
+        group_pose.rotation_deg + piece_local.rotation_deg - anchor_local.rotation_deg,
+    ))
+}
+
+fn playable_projected_group_positions(
+    snapshot: &PlayableGameSnapshot,
+    members: &[usize],
+    anchor_id: usize,
+    anchor_pos: (f32, f32),
+    anchor_rot_deg: f32,
+    geometry: &RoomGeometry,
+) -> Option<Vec<(usize, (f32, f32))>> {
+    let group = *snapshot.state.piece_group.get(anchor_id)? as usize;
+    let anchor_local = *snapshot.state.piece_local_pose.get(anchor_id)?;
+    let flipped = snapshot
+        .state
+        .group_flip
+        .get(group)
+        .copied()
+        .unwrap_or(false);
+    let mut next_positions = Vec::with_capacity(members.len());
+    for &id in members {
+        let piece_local = *snapshot.state.piece_local_pose.get(id)?;
+        let mut dx = (piece_local.x_mm - anchor_local.x_mm) * geometry.piece_width;
+        let dy = (piece_local.y_mm - anchor_local.y_mm) * geometry.piece_height;
+        if flipped {
+            dx = -dx;
+        }
+        let (rx, ry) = rotate_vec(dx, dy, anchor_rot_deg);
+        next_positions.push((id, (anchor_pos.0 + rx, anchor_pos.1 + ry)));
+    }
+    Some(next_positions)
+}
+
+fn legacy_top_left_from_playable_position(
+    pos: PlayablePositionSnapshot,
+    geometry: &RoomGeometry,
+) -> (f32, f32) {
+    (
+        pos.x_mm * geometry.piece_width - geometry.piece_width * 0.5,
+        pos.y_mm * geometry.piece_height - geometry.piece_height * 0.5,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heddobureika_core::{
+        EdgeId, FlipState, GridTopology, LogicalState, PieceId, PlayRules, PlayableState, Pose2,
+        PuzzleTopology, RestoredPlayableState,
+    };
+
+    /// Per-piece fixture data used by the 2x1 test builder.
+    struct LegacyFixture {
+        positions: Vec<(f32, f32)>,
+        rotations: Vec<f32>,
+        flips: Vec<bool>,
+        connections: Vec<[bool; 4]>,
+        group_order: Vec<u32>,
+        scramble_nonce: u32,
+    }
+
+    /// Restores the playable state from a `PlayableGameSnapshot` so tests
+    /// can read per-piece world poses, flips, and connectivity directly
+    /// without going through a legacy projection helper.
+    fn restore_grid(snapshot: &PlayableGameSnapshot) -> PlayableState<GridTopology> {
+        match snapshot
+            .restore_playable_from_spec()
+            .expect("restore playable")
+        {
+            RestoredPlayableState::Grid(p) => p,
+            _ => panic!("expected grid topology"),
+        }
+    }
+
+    fn piece_position_px(playable: &PlayableState<GridTopology>, piece: u32) -> (f32, f32) {
+        let pose = playable
+            .piece_world_pose(PieceId(piece))
+            .expect("piece world pose");
+        (pose.x_mm() * 100.0 - 50.0, pose.y_mm() * 100.0 - 50.0)
+    }
+
+    fn piece_rotation_deg(playable: &PlayableState<GridTopology>, piece: u32) -> f32 {
+        playable
+            .piece_world_pose(PieceId(piece))
+            .expect("piece world pose")
+            .rotation_degrees()
+    }
+
+    fn piece_flipped(playable: &PlayableState<GridTopology>, piece: u32) -> bool {
+        let group = playable
+            .logical
+            .group_of(PieceId(piece))
+            .expect("piece group");
+        playable.flip_of(group) == Some(FlipState::Flipped)
+    }
+
+    fn group_order_anchors(playable: &PlayableState<GridTopology>) -> Vec<u32> {
+        playable
+            .iter_z_asc()
+            .filter_map(|group| playable.anchor_piece_of_group(group))
+            .map(|piece| piece.as_u32())
+            .collect()
+    }
+
+    fn edge_active_between(playable: &PlayableState<GridTopology>, a: u32, b: u32) -> bool {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        for edge_idx in 0..playable.logical.edge_count() {
+            let edge = EdgeId(edge_idx as u32);
+            if playable.logical.is_edge_active(edge) != Some(true) {
+                continue;
+            }
+            let (e_a, e_b) = playable.logical.topology.edge_endpoints(edge);
+            let (e_lo, e_hi) = if e_a.as_u32() <= e_b.as_u32() {
+                (e_a.as_u32(), e_b.as_u32())
+            } else {
+                (e_b.as_u32(), e_a.as_u32())
+            };
+            if e_lo == lo && e_hi == hi {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn bridge_action_id_is_deterministic_and_uses_client_sequence_when_present() {
+        let client = ClientId::from(42);
+
+        let from_client_seq = bridge_action_id(client, Some(7), 100);
+        assert_eq!(from_client_seq, bridge_action_id(client, Some(7), 200));
+        assert_ne!(from_client_seq, bridge_action_id(client, Some(8), 100));
+        assert_ne!(
+            from_client_seq,
+            bridge_action_id(ClientId::from(43), Some(7), 100)
+        );
+
+        let from_room_seq = bridge_action_id(client, None, 100);
+        assert_eq!(from_room_seq, bridge_action_id(client, Some(0), 100));
+        assert_ne!(from_room_seq, bridge_action_id(client, None, 101));
+        assert_ne!(from_room_seq.0, 0);
+    }
+
+    #[test]
+    fn bridge_live_move_updates_connected_group_positions_without_snapping() {
+        // Start from the canonical solved state (pose `(0.5, 0.5)` →
+        // piece 0 top-left at pixel `(0, 0)`) and move to a target far
+        // enough from `(0.5, 0.5)` to stay outside the frame snap radius.
+        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
+            positions: vec![(0.0, 0.0), (100.0, 0.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false, true, false, false], [false; 4]],
+            group_order: vec![0],
+            scramble_nonce: 7,
+        }))
+        .expect("live puzzle");
+        let action_id = ActionId(11);
+
+        let batch =
+            apply_bridge_live_move(&mut live, 0, playable_position((200.0, 250.0)), action_id)
+                .expect("move should apply");
+
+        assert_eq!(batch.proposal.action_id, Some(action_id));
+        assert_eq!(batch.revision_before, 5);
+        assert_eq!(batch.revision_after, 6);
+        assert_eq!(batch.delta.revision, 6);
+        assert_eq!(live.snapshot.seq, 6);
+        assert_eq!(live.snapshot.scramble_nonce, 7);
+        let restored = restore_grid(&live.snapshot);
+        let p0 = piece_position_px(&restored, 0);
+        let p1 = piece_position_px(&restored, 1);
+        assert_approx(p0.0, 200.0);
+        assert_approx(p0.1, 250.0);
+        assert_approx(p1.0, 300.0);
+        assert_approx(p1.1, 250.0);
+        assert_approx(piece_rotation_deg(&restored, 0), 0.0);
+        assert_approx(piece_rotation_deg(&restored, 1), 0.0);
+        assert!(edge_active_between(&restored, 0, 1));
+    }
+
+    #[test]
+    fn bridge_live_transform_rotates_connected_group_without_snapping() {
+        // Same baseline as the live-move test: start at the canonical pose
+        // `(0.5, 0.5)` and transform to a far target so no frame snap fires.
+        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
+            positions: vec![(0.0, 0.0), (100.0, 0.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false, true, false, false], [false; 4]],
+            group_order: vec![0],
+            scramble_nonce: 8,
+        }))
+        .expect("live puzzle");
+        let action_id = ActionId(12);
+
+        let batch = apply_bridge_live_transform(
+            &mut live,
+            0,
+            playable_pose((200.0, 250.0), 90.0),
+            action_id,
+        )
+        .expect("transform should apply");
+
+        assert_eq!(batch.proposal.action_id, Some(action_id));
+        assert_eq!(batch.revision_before, 5);
+        assert_eq!(batch.revision_after, 6);
+        assert_eq!(batch.delta.revision, 6);
+        assert_eq!(live.snapshot.seq, 6);
+        let restored = restore_grid(&live.snapshot);
+        let p0 = piece_position_px(&restored, 0);
+        let p1 = piece_position_px(&restored, 1);
+        assert_approx(p0.0, 200.0);
+        assert_approx(p0.1, 250.0);
+        assert_approx(p1.0, 200.0);
+        assert_approx(p1.1, 350.0);
+        assert_approx(piece_rotation_deg(&restored, 0), 90.0);
+        assert_approx(piece_rotation_deg(&restored, 1), 90.0);
+        assert_eq!(group_order_anchors(&restored), vec![0]);
+    }
+
+    #[test]
+    fn bridge_finalize_keeps_fixed_group_pose_and_snaps_neighbor() {
+        // Two singletons positioned so piece 0 is already at the canonical
+        // workspace TL (pose `(0.5, 0.5)`) and piece 1 sits slightly past
+        // its solved neighbor pose. Finalize joins them; the completed
+        // group then identity-snaps to anchor pose `(0.5, 0.5)` →
+        // piece 0 TL `(0, 0)`, piece 1 TL `(100, 0)`.
+        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
+            positions: vec![(0.0, 0.0), (105.0, 0.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false; 4]; 2],
+            group_order: vec![0, 1],
+            scramble_nonce: 9,
+        }))
+        .expect("live puzzle");
+        let action_id = ActionId(13);
+
+        let batch = apply_bridge_finalize(
+            &mut live,
+            1,
+            Some(playable_position((105.0, 0.0))),
+            Some(0.0),
+            action_id,
+        )
+        .expect("finalize should apply");
+
+        assert_eq!(batch.proposal.action_id, Some(action_id));
+        assert_eq!(batch.revision_before, 5);
+        assert_eq!(batch.revision_after, 6);
+        assert_eq!(batch.delta.revision, 6);
+        assert_eq!(live.snapshot.seq, 6);
+        let restored = restore_grid(&live.snapshot);
+        assert!(edge_active_between(&restored, 0, 1));
+        let p0 = piece_position_px(&restored, 0);
+        let p1 = piece_position_px(&restored, 1);
+        assert_approx(p0.0, 0.0);
+        assert_approx(p0.1, 0.0);
+        assert_approx(p1.0, 100.0);
+        assert_approx(p1.1, 0.0);
+        assert_eq!(group_order_anchors(&restored), vec![0]);
+    }
+
+    #[test]
+    fn bridge_flip_updates_singleton_with_playable_snapshot() {
+        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
+            positions: vec![(-50.0, -50.0), (50.0, -50.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false; 4]; 2],
+            group_order: vec![0, 1],
+            scramble_nonce: 10,
+        }))
+        .expect("live puzzle");
+        let action_id = ActionId(14);
+
+        let batch = apply_bridge_flip(&mut live, 1, true, action_id).expect("flip should apply");
+
+        assert_eq!(batch.proposal.action_id, Some(action_id));
+        assert_eq!(batch.revision_before, 5);
+        assert_eq!(batch.revision_after, 6);
+        assert_eq!(batch.delta.revision, 6);
+        assert_eq!(live.snapshot.seq, 6);
+        assert_eq!(live.snapshot.scramble_nonce, 10);
+        let restored = restore_grid(&live.snapshot);
+        assert!(!piece_flipped(&restored, 0));
+        assert!(piece_flipped(&restored, 1));
+        assert!(!edge_active_between(&restored, 0, 1));
+        assert_eq!(group_order_anchors(&restored), vec![0, 1]);
+        let p1 = piece_position_px(&restored, 1);
+        assert_approx(p1.0, 50.0);
+        assert_approx(p1.1, -50.0);
+    }
+
+    #[test]
+    fn bridge_detach_splits_piece_without_moving_original_group() {
+        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
+            positions: vec![(20.0, 30.0), (120.0, 30.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false, true, false, false], [false; 4]],
+            group_order: vec![0],
+            scramble_nonce: 11,
+        }))
+        .expect("live puzzle");
+        let action_id = ActionId(15);
+
+        let batch = apply_bridge_detach(&mut live, 1, action_id).expect("detach should apply");
+
+        assert_eq!(batch.proposal.action_id, Some(action_id));
+        assert_eq!(batch.revision_before, 5);
+        assert_eq!(batch.revision_after, 6);
+        assert_eq!(batch.delta.revision, 6);
+        assert_eq!(live.snapshot.seq, 6);
+        let restored = restore_grid(&live.snapshot);
+        assert!(!edge_active_between(&restored, 0, 1));
+        assert_eq!(group_order_anchors(&restored), vec![0, 1]);
+        let p0 = piece_position_px(&restored, 0);
+        let p1 = piece_position_px(&restored, 1);
+        assert_approx(p0.0, 20.0);
+        assert_approx(p0.1, 30.0);
+        assert_approx(p1.0, 120.0);
+        assert_approx(p1.1, 30.0);
+    }
+
+    #[test]
+    fn stored_snapshot_codec_writes_v4_playable_snapshot() {
+        let snapshot = snapshot_2x1(LegacyFixture {
+            positions: vec![(-50.0, -50.0), (50.0, -50.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false, true, false, false], [false; 4]],
+            group_order: vec![0],
+            scramble_nonce: 21,
+        });
+
+        let bytes = encode_stored_snapshot(&snapshot).expect("snapshot should encode");
+        let playable_snapshot =
+            decode::<PlayableGameSnapshot>(&bytes).expect("stored bytes should be V4 playable");
+        assert_eq!(
+            playable_snapshot.version,
+            heddobureika_core::PLAYABLE_GAME_SNAPSHOT_VERSION
+        );
+        assert_eq!(playable_snapshot.seq, 5);
+        assert_eq!(playable_snapshot.scramble_nonce, 21);
+
+        let restored = decode_stored_snapshot(&bytes).expect("stored snapshot should restore");
+        assert_eq!(
+            restored.version,
+            heddobureika_core::PLAYABLE_GAME_SNAPSHOT_VERSION
+        );
+        assert_eq!(restored.seq, snapshot.seq);
+        assert_eq!(restored.puzzle, snapshot.puzzle);
+        assert_eq!(restored.scramble_nonce, 21);
+        let restored_playable = restore_grid(&restored);
+        assert_eq!(group_order_anchors(&restored_playable), vec![0]);
+        assert!(edge_active_between(&restored_playable, 0, 1));
+    }
+
+    #[test]
+    fn stored_snapshot_codec_rejects_legacy_snapshot_bytes() {
+        // Encode an arbitrary non-PlayableGameSnapshot value. The decoder
+        // should reject anything that isn't the V4 playable snapshot.
+        let bogus_bytes = encode(&(22u32, 7u32, 99u32)).expect("encode bogus payload");
+        assert!(decode_stored_snapshot(&bogus_bytes).is_none());
+    }
+
+    #[test]
+    fn state_message_uses_v4_playable_snapshot() {
+        let snapshot = snapshot_2x1(LegacyFixture {
+            positions: vec![(-50.0, -50.0), (50.0, -50.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false; 4]; 2],
+            group_order: vec![0, 1],
+            scramble_nonce: 23,
+        });
+
+        let msg = state_msg_from_snapshot(&snapshot);
+        let ServerMsg::State { seq, snapshot } = msg else {
+            panic!("expected state message");
+        };
+        assert_eq!(seq, 5);
+        assert_eq!(
+            snapshot.version,
+            heddobureika_core::PLAYABLE_GAME_SNAPSHOT_VERSION
+        );
+        assert_eq!(snapshot.seq, 5);
+        assert_eq!(snapshot.scramble_nonce, 23);
+        assert_eq!(snapshot.state.topology_piece_count, 2);
+    }
+
+    #[test]
+    fn playable_update_message_carries_group_changes_and_revision() {
+        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
+            positions: vec![(-50.0, -50.0), (50.0, -50.0)],
+            rotations: vec![0.0, 0.0],
+            flips: vec![false, false],
+            connections: vec![[false, true, false, false], [false; 4]],
+            group_order: vec![0],
+            scramble_nonce: 24,
+        }))
+        .expect("live puzzle");
+        let action_id = ActionId(15);
+        let batch =
+            apply_bridge_live_move(&mut live, 0, playable_position((10.0, 20.0)), action_id)
+                .expect("move should apply");
+
+        let msg = playable_update_msg_from_batch(
+            &live.snapshot,
+            &batch,
+            PlayableRoomUpdateKind::ActionOnly,
+            Some(ClientId::from(7)),
+            Some(99),
+        );
+
+        let ServerMsg::PlayableUpdate {
+            seq,
+            update,
+            source,
+            client_seq,
+        } = msg
+        else {
+            panic!("expected playable update");
+        };
+        assert_eq!(seq, 6);
+        assert_eq!(source, Some(ClientId::from(7)));
+        assert_eq!(client_seq, Some(99));
+        assert_eq!(update.kind, PlayableRoomUpdateKind::ActionOnly);
+        assert_eq!(update.action_id, Some(action_id.0));
+        assert_eq!(update.revision_before, 5);
+        assert_eq!(update.revision_after, 6);
+        assert!(!update.group_changes.is_empty());
+    }
+
+    #[test]
+    fn control_update_message_carries_ownership_without_room_update() {
+        let msg = control_update_msg(
+            12,
+            RoomControlUpdate::Ownership {
+                group_anchor: 3,
+                owner: Some(ClientId::from(9)),
+                reason: OwnershipReason::Granted,
+            },
+            Some(ClientId::from(9)),
+            None,
+        );
+
+        let ServerMsg::ControlUpdate {
+            seq,
+            update,
+            source,
+            client_seq,
+        } = msg
+        else {
+            panic!("expected control update");
+        };
+        assert_eq!(seq, 12);
+        assert_eq!(source, Some(ClientId::from(9)));
+        assert_eq!(client_seq, None);
+        assert!(matches!(
+            update,
+            RoomControlUpdate::Ownership {
+                group_anchor: 3,
+                owner: Some(owner),
+                reason: OwnershipReason::Granted,
+            } if owner == ClientId::from(9)
+        ));
+    }
+
+    fn snapshot_2x1(state: LegacyFixture) -> PlayableGameSnapshot {
+        let puzzle = PuzzleInfo {
+            label: "test".to_string(),
+            image_ref: PuzzleImageRef::BuiltIn {
+                slug: "test".to_string(),
+            },
+            rows: 1,
+            cols: 2,
+            shape_seed: 1,
+            image_width: 200,
+            image_height: 100,
+        };
+        let scramble_nonce = state.scramble_nonce;
+        let topology = GridTopology::try_new(puzzle.cols, puzzle.rows).expect("valid grid");
+        let mut logical = LogicalState::new(topology);
+        // 2x1 grid has exactly one horizontal edge (id 0) between piece 0 and 1.
+        let edge_between_0_and_1 = state.connections[0][heddobureika_core::DIR_RIGHT]
+            || state.connections[1][heddobureika_core::DIR_LEFT];
+        if edge_between_0_and_1 {
+            assert!(logical.activate_edge(EdgeId(0)));
+        }
+        let mut playable = PlayableState::new(logical, PlayRules::default());
+        for group in playable.logical.active_group_ids().collect::<Vec<_>>() {
+            let anchor = playable
+                .anchor_piece_of_group(group)
+                .expect("group has anchor");
+            let idx = anchor.as_usize();
+            let pose = Pose2::try_from_mm_degrees(
+                (state.positions[idx].0 + 50.0) / 100.0,
+                (state.positions[idx].1 + 50.0) / 100.0,
+                state.rotations[idx],
+            )
+            .expect("finite pose");
+            playable.group_pose[group.as_usize()] = pose;
+            playable.group_flip[group.as_usize()] = if state.flips[idx] {
+                FlipState::Flipped
+            } else {
+                FlipState::Normal
+            };
+        }
+        // Apply group_order if it differs from the default (anchor-ascending).
+        if !state.group_order.is_empty() {
+            let mut z: Vec<heddobureika_core::GroupId> = Vec::new();
+            for anchor_id in &state.group_order {
+                if let Some(group) = playable.logical.group_of(PieceId(*anchor_id)) {
+                    if !z.contains(&group) {
+                        z.push(group);
+                    }
+                }
+            }
+            for group in playable.logical.active_group_ids() {
+                if !z.contains(&group) {
+                    z.push(group);
+                }
+            }
+            playable.z_order = z;
+            playable.rebuild_z_indices_from_snapshot();
+        }
+        let mut snapshot = PlayableGameSnapshot::from_playable(
+            puzzle,
+            GameRules::default(),
+            scramble_nonce,
+            &playable,
+            None,
+        );
+        set_playable_snapshot_seq(&mut snapshot, 5);
+        snapshot
+    }
+
+    fn playable_position(pos: (f32, f32)) -> PlayablePositionSnapshot {
+        PlayablePositionSnapshot {
+            x_mm: (pos.0 + 50.0) / 100.0,
+            y_mm: (pos.1 + 50.0) / 100.0,
+        }
+    }
+
+    fn playable_pose(pos: (f32, f32), rot_deg: f32) -> PlayablePoseSnapshot {
+        let drop_pos = playable_position(pos);
+        PlayablePoseSnapshot {
+            x_mm: drop_pos.x_mm,
+            y_mm: drop_pos.y_mm,
+            rotation_deg: rot_deg,
+        }
+    }
+
+    fn assert_approx(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-4,
+            "expected {expected}, got {actual}"
+        );
+    }
 }

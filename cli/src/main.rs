@@ -2,37 +2,30 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::codec::{decode_result, encode};
-use heddobureika_core::groups_from_connections;
-use heddobureika_core::room::apply_room_update_to_snapshot;
 use heddobureika_core::room_id::{RoomId, ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
-    angle_delta, compute_workspace_layout, is_fully_connected, neighbor_id, normalize_angle,
-    piece_local_offset, puzzle_by_slug, rotate_vec, AdminMsg, ClientId, ClientMsg, GameSnapshot,
-    PuzzleImageRef, PuzzleSpec, RecordedCommand, RecordedCommandKind, RecordedCommandOutcome,
-    RoomUpdate, ServerMsg, ASSET_CHUNK_BYTES, DEFAULT_PUZZLE_SLUG, DIR_DOWN, DIR_LEFT, DIR_RIGHT,
-    DIR_UP, PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG,
+    puzzle_by_slug, AdminMsg, PuzzleImageRef, PuzzleSpec, RecordedCommand, RecordedCommandKind,
+    RecordedCommandOutcome, ServerMsg, ASSET_CHUNK_BYTES, DEFAULT_PUZZLE_SLUG,
+    PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG,
 };
 use mime_guess::MimeGuess;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
-
-mod bot;
 
 #[derive(Parser)]
 #[command(
@@ -78,10 +71,6 @@ enum RoomCommand {
         best_effort: bool,
         #[arg(long)]
         no_connect: bool,
-    },
-    Bot {
-        #[command(subcommand)]
-        command: bot::BotCommand,
     },
     Recording {
         #[command(subcommand)]
@@ -303,7 +292,6 @@ struct ReasonProgress {
 struct DragSample {
     start_ts: i64,
     updates: u32,
-    avg_update_interval_ms: Option<f32>,
     drag_duration_ms: Option<f32>,
     distance_px: Option<f32>,
     path_distance_px: Option<f32>,
@@ -340,9 +328,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     no_connect,
                 )
                 .await?;
-            }
-            RoomCommand::Bot { command } => {
-                bot::run(command).await?;
             }
             RoomCommand::Recording { command } => match command {
                 RecordingCommand::Enable { room, max_events } => {
@@ -1035,16 +1020,6 @@ fn summarize_file(path: &PathBuf) -> Result<StatsSummary, Box<dyn std::error::Er
 
         if matches!(row.kind.as_str(), "Place" | "Release" | "Flip") {
             if let Some(active) = active_by_client.remove(&row.client_id) {
-                let avg_update_interval_ms = match (
-                    active.first_update_ts,
-                    active.last_update_ts,
-                    active.update_count,
-                ) {
-                    (Some(first), Some(last), updates) if updates > 1 && last > first => {
-                        Some((last - first) as f32 / (updates - 1) as f32)
-                    }
-                    _ => None,
-                };
                 let drag_duration_ms = match (active.first_update_ts, active.last_update_ts) {
                     (Some(first), Some(last)) if last > first => Some((last - first) as f32),
                     _ => None,
@@ -1058,7 +1033,6 @@ fn summarize_file(path: &PathBuf) -> Result<StatsSummary, Box<dyn std::error::Er
                 let sample = DragSample {
                     start_ts: active.start_ts,
                     updates: active.update_count,
-                    avg_update_interval_ms,
                     drag_duration_ms,
                     distance_px,
                     path_distance_px: if active.update_count > 1 {
@@ -1950,17 +1924,6 @@ async fn send_admin_msg(
     Ok(())
 }
 
-async fn send_client_msg(
-    write: &mut WsWrite,
-    msg: ClientMsg,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(payload) = encode(&msg) else {
-        return Err(err_msg("failed to encode client message"));
-    };
-    write.send(Message::Binary(payload.into())).await?;
-    Ok(())
-}
-
 async fn recv_server_msg(
     read: &mut WsRead,
 ) -> Result<Option<ServerMsg>, Box<dyn std::error::Error>> {
@@ -1984,16 +1947,6 @@ async fn recv_server_msg(
         }
     }
     Ok(None)
-}
-
-async fn recv_server_msg_timeout(
-    read: &mut WsRead,
-    dur: Duration,
-) -> Result<Option<ServerMsg>, Box<dyn std::error::Error>> {
-    match timeout(dur, recv_server_msg(read)).await {
-        Ok(value) => value,
-        Err(_) => Ok(None),
-    }
 }
 
 fn generate_room_id() -> String {

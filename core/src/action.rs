@@ -1,6 +1,9 @@
 #[derive(Clone, Debug)]
 pub enum SyncAction {
-    Move { anchor_id: usize, pos: (f32, f32) },
+    Move {
+        anchor_id: usize,
+        pos: (f32, f32),
+    },
     Transform {
         anchor_id: usize,
         pos: (f32, f32),
@@ -11,8 +14,13 @@ pub enum SyncAction {
         pos: (f32, f32),
         rot_deg: f32,
     },
-    Flip { piece_id: usize, flipped: bool },
-    Release { anchor_id: usize },
+    Flip {
+        piece_id: usize,
+        flipped: bool,
+    },
+    Release {
+        anchor_id: usize,
+    },
 }
 
 #[derive(Clone, Debug)]

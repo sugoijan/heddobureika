@@ -18,7 +18,7 @@ use crate::app_runtime;
 use crate::boot_runtime::{self, BootState};
 use crate::core::*;
 use crate::model::*;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "wasm32"))]
 use crate::multiplayer_bridge;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
@@ -29,9 +29,9 @@ use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
 use heddobureika_core::{
-    is_valid_room_id, logical_image_size, AdminMsg, ClientId, GameSnapshot, PuzzleImageRef,
-    PuzzleInfo, PuzzleSpec, RoomUpdate, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
-    ROOM_ID_ALPHABET, ROOM_ID_LEN,
+    is_valid_room_id, logical_image_size, AdminMsg, ClientId, PlayableGameSnapshot, PuzzleImageRef,
+    PuzzleInfo, PuzzleSpec, RoomControlUpdate, ServerMsg, ASSET_CHUNK_BYTES,
+    PRIVATE_UPLOAD_MAX_BYTES, ROOM_ID_ALPHABET, ROOM_ID_LEN,
 };
 use image_pipeline::{AlphaMode, PipelineConfig};
 use sha2::{Digest, Sha256};
@@ -106,6 +106,7 @@ impl PuzzleInfoStore {
         Self { state, live }
     }
 
+    #[cfg(test)]
     fn get(&self) -> Option<PuzzleInfo> {
         self.live.borrow().clone()
     }
@@ -475,16 +476,16 @@ fn take_mp_warn() -> Option<String> {
     MP_TEST_LAST_WARN.with(|slot| slot.borrow_mut().take())
 }
 
-fn log_state_update(label: &str, len: usize, context: &str) {
-    gloo::console::log!("state vector updated", label, len, context);
-}
-
 fn initial_render_settings() -> RenderSettings {
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "wasm32"))]
     {
         let mut settings = RenderSettings::default();
         settings.renderer = RendererKind::Svg;
         settings
+    }
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    {
+        RenderSettings::default()
     }
     #[cfg(not(test))]
     {
@@ -762,11 +763,6 @@ where
     })
 }
 
-fn time_nonce(previous: u32) -> u32 {
-    let now = Date::now() as u32;
-    splitmix32(now ^ previous.wrapping_add(0x9E37_79B9))
-}
-
 fn parse_optional_seed(raw: &str) -> Option<u32> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -799,9 +795,6 @@ fn app(props: &AppProps) -> Html {
         .map(|info| (info.image_width, info.image_height));
     let settings = use_state(ShapeSettings::default);
     let settings_value = (*settings).clone();
-    let depth_cap = settings_value
-        .tab_depth_cap
-        .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
     let mut grid_choices = if let Some(info) = puzzle_info_value.as_ref() {
         build_grid_choices(info.image_width, info.image_height)
     } else {
@@ -1674,50 +1667,6 @@ fn app(props: &AppProps) -> Html {
     let auto_pan_speed_ratio = use_state(|| AUTO_PAN_SPEED_RATIO_DEFAULT);
     let auto_pan_speed_ratio_value = *auto_pan_speed_ratio;
     let app_snapshot_value = (*app_snapshot).clone();
-    let apply_puzzle_state: Rc<dyn Fn(PuzzleState, usize, f32, f32)> = {
-        let bump_ui_revision = bump_ui_revision.clone();
-        let z_order = z_order.clone();
-        let group_anchor = group_anchor.clone();
-        let group_pos = group_pos.clone();
-        let group_rot = group_rot.clone();
-        let group_order = group_order.clone();
-        let scramble_nonce = scramble_nonce.clone();
-        let puzzle_state = puzzle_state.clone();
-        let app_core = app_core.clone();
-        let multiplayer_active = multiplayer_active;
-        Rc::new(
-            move |next_state: PuzzleState, cols: usize, piece_width: f32, piece_height: f32| {
-                let derived =
-                    derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
-                let next_flips = next_state.flips.clone();
-                let next_connections = next_state.connections.clone();
-                let next_scramble = next_state.scramble_nonce;
-                log_state_update("positions", derived.positions.len(), "apply_puzzle_state");
-                log_state_update("rotations", derived.rotations.len(), "apply_puzzle_state");
-                log_state_update("flips", next_flips.len(), "apply_puzzle_state");
-                log_state_update("connections", next_connections.len(), "apply_puzzle_state");
-                let derived_z_order = derived.z_order.clone();
-                bump_ui_revision();
-                group_anchor.set(derived.anchor_of);
-                group_pos.set(derived.group_pos);
-                group_rot.set(derived.group_rot);
-                group_order.set(derived.group_order);
-                z_order.set(derived_z_order.clone());
-                scramble_nonce.set(next_scramble);
-                puzzle_state.set(next_state);
-                if !multiplayer_active {
-                    app_core.apply_snapshot(
-                        derived.positions.clone(),
-                        derived.rotations.clone(),
-                        next_flips,
-                        next_connections,
-                        derived_z_order,
-                        next_scramble,
-                    );
-                }
-            },
-        )
-    };
     let bump_sync_revision: Rc<dyn Fn()> = {
         let sync_revision = sync_revision.clone();
         Rc::new(move || {
@@ -1735,7 +1684,7 @@ fn app(props: &AppProps) -> Html {
     }
     let on_remote_snapshot = {
         let bump_sync_revision = bump_sync_revision.clone();
-        Rc::new(move |_snapshot: GameSnapshot, _seq: u64| {
+        Rc::new(move |_snapshot: PlayableGameSnapshot, _seq: u64| {
             bump_sync_revision();
         })
     };
@@ -1744,7 +1693,7 @@ fn app(props: &AppProps) -> Html {
         #[cfg(test)]
         let puzzle_info = puzzle_info_store.clone();
         Rc::new(
-            move |_update: RoomUpdate,
+            move |_update: RoomControlUpdate,
                   _seq: u64,
                   _source: Option<ClientId>,
                   _client_seq: Option<u64>| {
@@ -1814,14 +1763,17 @@ fn app(props: &AppProps) -> Html {
                 let cols = snapshot.grid.cols as usize;
                 let rows = snapshot.grid.rows as usize;
                 let total = cols * rows;
+                let positions = snapshot.piece_positions_px();
+                let rotations = snapshot.piece_rotations_deg();
+                let connections = snapshot.piece_connections();
                 if total == 0
-                    || snapshot.core.positions.len() != total
-                    || snapshot.core.rotations.len() != total
-                    || snapshot.core.flips.len() != total
-                    || snapshot.core.connections.len() != total
+                    || positions.len() != total
+                    || rotations.len() != total
+                    || snapshot.piece_flipped.len() != total
+                    || connections.len() != total
                 {
                     z_order.set(snapshot.z_order.clone());
-                    scramble_nonce.set(snapshot.core.scramble_nonce);
+                    scramble_nonce.set(snapshot.scramble_nonce);
                     solved.set(snapshot.solved);
                     puzzle_state.set(PuzzleState::empty());
                     bump_ui_revision();
@@ -1833,14 +1785,14 @@ fn app(props: &AppProps) -> Html {
                     (0..total).collect()
                 };
                 let next_state = PuzzleState::rebuild_from_piece_state(
-                    &snapshot.core.positions,
-                    &snapshot.core.rotations,
-                    &snapshot.core.flips,
-                    &snapshot.core.connections,
+                    &positions,
+                    &rotations,
+                    &snapshot.piece_flipped,
+                    &connections,
                     cols,
                     rows,
                     Some(piece_order.as_slice()),
-                    snapshot.core.scramble_nonce,
+                    snapshot.scramble_nonce,
                 );
                 let derived = derive_ui_state_from_puzzle(
                     &next_state,
@@ -1853,7 +1805,7 @@ fn app(props: &AppProps) -> Html {
                 group_rot.set(derived.group_rot.clone());
                 group_order.set(derived.group_order.clone());
                 z_order.set(derived.z_order.clone());
-                scramble_nonce.set(snapshot.core.scramble_nonce);
+                scramble_nonce.set(snapshot.scramble_nonce);
                 solved.set(snapshot.solved);
                 puzzle_state.set(next_state);
                 *positions_live.borrow_mut() = derived.positions;
@@ -1871,6 +1823,7 @@ fn app(props: &AppProps) -> Html {
                 }),
                 on_remote_snapshot: on_remote_snapshot.clone(),
                 on_remote_update: on_remote_update.clone(),
+                on_remote_playable_update: Rc::new(|_, _, _, _| {}),
                 on_event: on_event.clone(),
                 on_asset: Rc::new(|_| {}),
             });
@@ -1881,7 +1834,7 @@ fn app(props: &AppProps) -> Html {
     }
     // Legacy Yew renderer tick removed.
     // Legacy renderer sync dispatch removed.
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "wasm32"))]
     {
         let send_msg = {
             let multiplayer_hooks = multiplayer_bridge::hooks_for_tests(app_core.clone());
@@ -1973,10 +1926,10 @@ fn app(props: &AppProps) -> Html {
         "--".to_string()
     };
     let (connections_label, border_connections_label) = if puzzle_info_value.is_some() {
-        let connections_value = app_snapshot_value.core.connections.as_slice();
+        let connections_value = app_snapshot_value.piece_connections();
         if connections_value.len() == total {
             let (connected, border_connected, total_expected, border_expected) =
-                count_connections(connections_value, grid.cols as usize, grid.rows as usize);
+                count_connections(&connections_value, grid.cols as usize, grid.rows as usize);
             (
                 format_progress(connected, total_expected),
                 format_progress(border_connected, border_expected),
@@ -2341,12 +2294,6 @@ fn app(props: &AppProps) -> Html {
     };
     let on_rotation_toggle = {
         let rotation_enabled = rotation_enabled.clone();
-        let app_snapshot = app_snapshot.clone();
-        let z_order = z_order.clone();
-        let apply_puzzle_state = apply_puzzle_state.clone();
-        let scramble_nonce = scramble_nonce.clone();
-        let puzzle_info = puzzle_info_store.clone();
-        let solved = solved.clone();
         let save_revision = save_revision.clone();
         let app_core = app_core.clone();
         Callback::from(move |event: Event| {
@@ -2354,73 +2301,10 @@ fn app(props: &AppProps) -> Html {
             let enabled = input.checked();
             rotation_enabled.set(enabled);
             app_core.set_rotation_enabled(enabled);
-            let (positions_snapshot, rotations_snapshot, flips_snapshot, connections_snapshot) = {
-                let snapshot = &*app_snapshot;
-                let total = snapshot.core.positions.len();
-                let rotations_snapshot = if enabled {
-                    snapshot.core.rotations.clone()
-                } else {
-                    vec![0.0; total]
-                };
-                (
-                    snapshot.core.positions.clone(),
-                    rotations_snapshot,
-                    snapshot.core.flips.clone(),
-                    snapshot.core.connections.clone(),
-                )
-            };
-            if let Some(info) = puzzle_info.get() {
-                let cols = info.cols as usize;
-                let rows = info.rows as usize;
-                let piece_width = info.image_width as f32 / info.cols as f32;
-                let piece_height = info.image_height as f32 / info.rows as f32;
-                let order_snapshot = (*z_order).clone();
-                let order_opt = if order_snapshot.len() == cols * rows {
-                    Some(order_snapshot.as_slice())
-                } else {
-                    None
-                };
-                let (
-                    _anchor_of,
-                    _group_positions,
-                    _group_rotations,
-                    _group_order_value,
-                    derived_positions,
-                    derived_rotations,
-                    piece_order,
-                ) = rebuild_group_state(
-                    &positions_snapshot,
-                    &rotations_snapshot,
-                    &connections_snapshot,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    order_opt,
-                );
-                let solved_now = is_solved(
-                    &derived_positions,
-                    &derived_rotations,
-                    &flips_snapshot,
-                    &connections_snapshot,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    enabled,
-                );
-                let next_state = PuzzleState::rebuild_from_piece_state(
-                    &derived_positions,
-                    &derived_rotations,
-                    &flips_snapshot,
-                    &connections_snapshot,
-                    cols,
-                    rows,
-                    Some(piece_order.as_slice()),
-                    *scramble_nonce,
-                );
-                apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                solved.set(solved_now);
+            if !enabled {
+                // Match the prior behavior: disabling rotation zeros every
+                // group's rotation in addition to changing the rule.
+                app_core.clear_all_group_rotations();
             }
             save_revision.set(save_revision.wrapping_add(1));
         })
@@ -2457,8 +2341,7 @@ fn app(props: &AppProps) -> Html {
             if let Ok(value) = input.value().parse::<f32>() {
                 let snapshot = &*app_snapshot;
                 let max_value = snapshot
-                    .core
-                    .positions
+                    .piece_world_poses
                     .len()
                     .max(ROTATION_LOCK_THRESHOLD_MIN);
                 let rounded = value.round() as usize;
@@ -2882,220 +2765,36 @@ fn app(props: &AppProps) -> Html {
     // Legacy SVG/WGPU input + image scaling removed.
 
     let (on_scramble, on_solve, on_solve_rotation, on_unflip, scramble_disabled) =
-        if let Some((width, height)) = puzzle_dims_value {
-            let width_f = width as f32;
-            let height_f = height as f32;
-            let layout = app_snapshot_value.layout;
-            let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
-            let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
-            let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
-            let puzzle_view_width = layout.view_width / puzzle_scale;
-            let puzzle_view_height = layout.view_height / puzzle_scale;
-            let piece_width = width_f / grid.cols as f32;
-            let piece_height = height_f / grid.rows as f32;
-            let max_depth = piece_width.max(piece_height) * depth_cap;
-            let bend_ratio = settings_value
-                .line_bend_ratio
-                .clamp(LINE_BEND_MIN, MAX_LINE_BEND_RATIO);
-            let max_bend = piece_width.max(piece_height) * bend_ratio;
-            let mask_pad = (max_depth + max_bend).ceil();
-
+        if puzzle_dims_value.is_some() {
             let on_scramble = {
-                let apply_puzzle_state = apply_puzzle_state.clone();
-                let scramble_nonce = scramble_nonce.clone();
-                let solved = solved.clone();
+                let app_core = app_core.clone();
                 let save_revision = save_revision.clone();
                 Callback::from(move |_: MouseEvent| {
-                    let cols = grid.cols as usize;
-                    let rows = grid.rows as usize;
-                    let total = cols * rows;
-                    if total == 0 {
-                        return;
-                    }
-                    let next_nonce = time_nonce(*scramble_nonce);
-                    let seed = scramble_seed(PUZZLE_SEED, next_nonce, cols, rows);
-                    let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
-                    let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-                    let (next_positions, order) = scramble_layout(
-                        seed,
-                        cols,
-                        rows,
-                        piece_width,
-                        piece_height,
-                        puzzle_view_min_x,
-                        puzzle_view_min_y,
-                        puzzle_view_width,
-                        puzzle_view_height,
-                        mask_pad,
-                    );
-                    let next_rotations =
-                        scramble_rotations(rotation_seed, total, rotation_enabled_value);
-                    let next_connections = vec![[false; 4]; total];
-                    let next_flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
-                    let next_state = PuzzleState::rebuild_from_piece_state(
-                        &next_positions,
-                        &next_rotations,
-                        &next_flips,
-                        &next_connections,
-                        cols,
-                        rows,
-                        Some(order.as_slice()),
-                        next_nonce,
-                    );
-                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                    solved.set(false);
+                    app_core.rescramble();
                     save_revision.set(save_revision.wrapping_add(1));
                 })
             };
             let on_solve = {
-                let apply_puzzle_state = apply_puzzle_state.clone();
-                let scramble_nonce = scramble_nonce.clone();
-                let solved = solved.clone();
+                let app_core = app_core.clone();
                 let save_revision = save_revision.clone();
                 Callback::from(move |_: MouseEvent| {
-                    let cols = grid.cols as usize;
-                    let rows = grid.rows as usize;
-                    let total = cols * rows;
-                    if total == 0 {
-                        return;
-                    }
-                    let mut next_positions = Vec::with_capacity(total);
-                    for row in 0..rows {
-                        for col in 0..cols {
-                            next_positions
-                                .push((col as f32 * piece_width, row as f32 * piece_height));
-                        }
-                    }
-                    let order: Vec<usize> = (0..total).collect();
-                    let next_rotations = vec![0.0; total];
-                    let next_connections = build_full_connections(cols, rows);
-                    let next_flips = vec![false; total];
-                    let next_state = PuzzleState::rebuild_from_piece_state(
-                        &next_positions,
-                        &next_rotations,
-                        &next_flips,
-                        &next_connections,
-                        cols,
-                        rows,
-                        Some(order.as_slice()),
-                        *scramble_nonce,
-                    );
-                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                    solved.set(true);
+                    app_core.solve_puzzle();
                     save_revision.set(save_revision.wrapping_add(1));
                 })
             };
             let on_solve_rotation = {
-                let app_snapshot = app_snapshot.clone();
-                let z_order = z_order.clone();
-                let apply_puzzle_state = apply_puzzle_state.clone();
-                let scramble_nonce = scramble_nonce.clone();
-                let solved = solved.clone();
+                let app_core = app_core.clone();
                 let save_revision = save_revision.clone();
                 Callback::from(move |_: MouseEvent| {
-                    let cols = grid.cols as usize;
-                    let rows = grid.rows as usize;
-                    let total = cols * rows;
-                    if total == 0 {
-                        return;
-                    }
-                    let (positions_snapshot, flips_snapshot, connections_snapshot) = {
-                        let snapshot = &*app_snapshot;
-                        (
-                            snapshot.core.positions.clone(),
-                            snapshot.core.flips.clone(),
-                            snapshot.core.connections.clone(),
-                        )
-                    };
-                    let zeroed = vec![0.0; total];
-                    let order_snapshot = (*z_order).clone();
-                    let order_opt = if order_snapshot.len() == total {
-                        Some(order_snapshot.as_slice())
-                    } else {
-                        None
-                    };
-                    let next_state = PuzzleState::rebuild_from_piece_state(
-                        &positions_snapshot,
-                        &zeroed,
-                        &flips_snapshot,
-                        &connections_snapshot,
-                        cols,
-                        rows,
-                        order_opt,
-                        *scramble_nonce,
-                    );
-                    let derived =
-                        derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
-                    let solved_now = is_solved(
-                        &derived.positions,
-                        &derived.rotations,
-                        &next_state.flips,
-                        &next_state.connections,
-                        cols,
-                        rows,
-                        piece_width,
-                        piece_height,
-                        rotation_enabled_value,
-                    );
-                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                    solved.set(solved_now);
+                    app_core.clear_all_group_rotations();
                     save_revision.set(save_revision.wrapping_add(1));
                 })
             };
             let on_unflip = {
-                let app_snapshot = app_snapshot.clone();
-                let z_order = z_order.clone();
-                let apply_puzzle_state = apply_puzzle_state.clone();
-                let scramble_nonce = scramble_nonce.clone();
-                let solved = solved.clone();
+                let app_core = app_core.clone();
                 let save_revision = save_revision.clone();
                 Callback::from(move |_: MouseEvent| {
-                    let cols = grid.cols as usize;
-                    let rows = grid.rows as usize;
-                    let total = cols * rows;
-                    if total == 0 {
-                        return;
-                    }
-                    let (positions_snapshot, rotations_snapshot, connections_snapshot) = {
-                        let snapshot = &*app_snapshot;
-                        (
-                            snapshot.core.positions.clone(),
-                            snapshot.core.rotations.clone(),
-                            snapshot.core.connections.clone(),
-                        )
-                    };
-                    let cleared = vec![false; total];
-                    let order_snapshot = (*z_order).clone();
-                    let order_opt = if order_snapshot.len() == total {
-                        Some(order_snapshot.as_slice())
-                    } else {
-                        None
-                    };
-                    let next_state = PuzzleState::rebuild_from_piece_state(
-                        &positions_snapshot,
-                        &rotations_snapshot,
-                        &cleared,
-                        &connections_snapshot,
-                        cols,
-                        rows,
-                        order_opt,
-                        *scramble_nonce,
-                    );
-                    let derived =
-                        derive_ui_state_from_puzzle(&next_state, cols, piece_width, piece_height);
-                    let solved_now = is_solved(
-                        &derived.positions,
-                        &derived.rotations,
-                        &next_state.flips,
-                        &next_state.connections,
-                        cols,
-                        rows,
-                        piece_width,
-                        piece_height,
-                        rotation_enabled_value,
-                    );
-                    apply_puzzle_state(next_state, cols, piece_width, piece_height);
-                    solved.set(solved_now);
+                    app_core.clear_all_group_flips();
                     save_revision.set(save_revision.wrapping_add(1));
                 })
             };
@@ -4278,57 +3977,6 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn align_group_sets_uniform_rotation() {
-        let cols = 3usize;
-        let piece_width = 100.0;
-        let piece_height = 100.0;
-        let mut positions = vec![(0.0, 0.0); 4];
-        let mut rotations = vec![0.0; 4];
-        rotations[0] = 11.027;
-        rotations[1] = 359.504;
-        positions[0] = (12.0, -44.0);
-        positions[1] = (180.0, 36.0);
-        let members = vec![0usize, 1usize];
-        let anchor_id = 0usize;
-        let anchor_center = (50.0, 50.0);
-        let target_rot = 11.027;
-
-        align_group_to_anchor(
-            &mut positions,
-            &mut rotations,
-            &members,
-            anchor_id,
-            anchor_center,
-            target_rot,
-            cols,
-            piece_width,
-            piece_height,
-        );
-
-        for id in &members {
-            assert_close(rotations[*id], normalize_angle(target_rot));
-        }
-
-        let base_rotation = rotations[members[0]];
-        for id in &members[1..] {
-            assert_close(rotations[*id], base_rotation);
-        }
-
-        for id in 0..rotations.len() {
-            if !members.contains(&id) {
-                assert_close(rotations[id], 0.0);
-            }
-        }
-
-        let (dx, dy) = rotate_vec(piece_width, 0.0, normalize_angle(target_rot));
-        let expected_center = (anchor_center.0 + dx, anchor_center.1 + dy);
-        let pos = positions[1];
-        let center = (pos.0 + piece_width * 0.5, pos.1 + piece_height * 0.5);
-        assert_close(center.0, expected_center.0);
-        assert_close(center.1, expected_center.1);
-    }
-
-    #[wasm_bindgen_test]
     fn generated_room_ids_are_valid() {
         set_panic_hook();
         for _ in 0..32 {
@@ -4376,12 +4024,8 @@ mod tests {
         (hooks.set_puzzle_info)(None);
         MP_TEST_LAST_WARN.with(|slot| slot.borrow_mut().take());
 
-        let update = RoomUpdate::GroupTransform {
-            anchor_id: 0,
-            pos: (10.0, 12.0),
-            rot_deg: 0.0,
-        };
-        (hooks.send_msg)(ServerMsg::Update {
+        let update = RoomControlUpdate::GroupOrder { order: vec![0] };
+        (hooks.send_msg)(ServerMsg::ControlUpdate {
             seq: 1,
             update,
             source: None,

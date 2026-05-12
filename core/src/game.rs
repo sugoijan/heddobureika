@@ -1,5 +1,11 @@
 use std::collections::VecDeque;
 
+use heddobureika_game::{
+    GroupId, PieceId, PlayableState, Position2, PuzzleTopology,
+};
+
+use crate::snapshot::{GameRules, PuzzleInfo};
+
 pub const PUZZLE_SEED: u32 = 0x5EED_2520;
 pub const MAX_LINE_BEND_RATIO: f32 = 0.2;
 
@@ -50,10 +56,8 @@ pub fn compute_workspace_layout(width: f32, height: f32, padding_ratio: f32) -> 
     let safe_width = width.max(1.0);
     let safe_height = height.max(1.0);
     let min_dim = safe_width.min(safe_height).max(1.0);
-    let padding_ratio = padding_ratio.clamp(
-        WORKSPACE_PADDING_RATIO_MIN,
-        WORKSPACE_PADDING_RATIO_MAX,
-    );
+    let padding_ratio =
+        padding_ratio.clamp(WORKSPACE_PADDING_RATIO_MIN, WORKSPACE_PADDING_RATIO_MAX);
     let padding = (min_dim * padding_ratio).max(0.0);
     let workspace_width = safe_width + padding;
     let workspace_height = safe_height + padding;
@@ -185,7 +189,10 @@ pub fn update_group_members_state(
     }
 }
 
-pub fn build_group_order_from_piece_order(piece_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
+pub fn build_group_order_from_piece_order(
+    piece_order: &[usize],
+    anchor_of: &[usize],
+) -> Vec<usize> {
     let total = anchor_of.len();
     let mut seen = vec![false; total];
     let mut group_order = Vec::new();
@@ -316,16 +323,16 @@ pub fn rebuild_group_state(
     Vec<f32>,
     Vec<usize>,
 ) {
-    let (anchor_of, group_pos, group_rot, group_order) = rebuild_groups_from_piece_state(
-        positions,
-        rotations,
-        connections,
+    let (anchor_of, group_pos, group_rot, group_order) =
+        rebuild_groups_from_piece_state(positions, rotations, connections, cols, rows, piece_order);
+    let (derived_positions, derived_rotations) = derive_piece_state(
+        &anchor_of,
+        &group_pos,
+        &group_rot,
         cols,
-        rows,
-        piece_order,
+        piece_width,
+        piece_height,
     );
-    let (derived_positions, derived_rotations) =
-        derive_piece_state(&anchor_of, &group_pos, &group_rot, cols, piece_width, piece_height);
     let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
     (
         anchor_of,
@@ -411,7 +418,12 @@ pub fn clear_piece_connections(
     }
 }
 
-pub fn collect_group(connections: &[[bool; 4]], start: usize, cols: usize, rows: usize) -> Vec<usize> {
+pub fn collect_group(
+    connections: &[[bool; 4]],
+    start: usize,
+    cols: usize,
+    rows: usize,
+) -> Vec<usize> {
     let total = cols * rows;
     if start >= total {
         return Vec::new();
@@ -425,11 +437,7 @@ pub fn collect_group(connections: &[[bool; 4]], start: usize, cols: usize, rows:
     while let Some(id) = queue.pop_front() {
         group.push(id);
         for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-            if connections
-                .get(id)
-                .map(|edges| edges[dir])
-                .unwrap_or(false)
-            {
+            if connections.get(id).map(|edges| edges[dir]).unwrap_or(false) {
                 if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
                     if !visited[neighbor] {
                         visited[neighbor] = true;
@@ -464,11 +472,7 @@ pub fn groups_from_connections(
         while let Some(id) = queue.pop_front() {
             group.push(id);
             for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-                if connections
-                    .get(id)
-                    .map(|edges| edges[dir])
-                    .unwrap_or(false)
-                {
+                if connections.get(id).map(|edges| edges[dir]).unwrap_or(false) {
                     if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
                         if !visited[neighbor] {
                             visited[neighbor] = true;
@@ -541,771 +545,6 @@ pub fn align_group_to_anchor(
             *rot = target_rot;
         }
     }
-}
-
-pub fn connect_aligned_neighbors(
-    members: &[usize],
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-    flips: &[bool],
-    connections: &mut Vec<[bool; 4]>,
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
-    snap_distance: f32,
-    rotation_snap_tolerance: f32,
-    rotation_enabled: bool,
-) {
-    let group_rot = members
-        .first()
-        .and_then(|id| rotations.get(*id))
-        .copied()
-        .unwrap_or(0.0);
-    for member in members {
-        if *member >= positions.len() {
-            continue;
-        }
-        if flips.get(*member).copied().unwrap_or(false) {
-            continue;
-        }
-        let current = positions[*member];
-        let center_a = (
-            current.0 + piece_width * 0.5,
-            current.1 + piece_height * 0.5,
-        );
-        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-            if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
-                if flips.get(neighbor).copied().unwrap_or(false) {
-                    continue;
-                }
-                let rot_b = rotations.get(neighbor).copied().unwrap_or(0.0);
-                if rotation_enabled && !angle_matches(group_rot, rot_b, rotation_snap_tolerance) {
-                    continue;
-                }
-                let base = match dir {
-                    DIR_LEFT => (-piece_width, 0.0),
-                    DIR_RIGHT => (piece_width, 0.0),
-                    DIR_UP => (0.0, -piece_height),
-                    DIR_DOWN => (0.0, piece_height),
-                    _ => (0.0, 0.0),
-                };
-                let expected_rot = if rotation_enabled { group_rot } else { 0.0 };
-                let (vx, vy) = rotate_vec(base.0, base.1, expected_rot);
-                let neighbor_pos = positions[neighbor];
-                let center_b = (
-                    neighbor_pos.0 + piece_width * 0.5,
-                    neighbor_pos.1 + piece_height * 0.5,
-                );
-                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
-                let dx = actual.0 - vx;
-                let dy = actual.1 - vy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist <= snap_distance {
-                    set_connection(connections, *member, dir, true, cols, rows);
-                }
-            }
-        }
-    }
-}
-
-pub fn frame_center_bounds_for_rotation(
-    frame_width: f32,
-    frame_height: f32,
-    piece_width: f32,
-    piece_height: f32,
-    rotation: f32,
-) -> (f32, f32, f32, f32) {
-    let rotation = normalize_angle(rotation);
-    let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
-    let (rot_w, rot_h) = if swap {
-        (piece_height, piece_width)
-    } else {
-        (piece_width, piece_height)
-    };
-    let min_x = rot_w * 0.5;
-    let min_y = rot_h * 0.5;
-    let mut max_x = frame_width - rot_w * 0.5;
-    let mut max_y = frame_height - rot_h * 0.5;
-    if max_x < min_x {
-        max_x = min_x;
-    }
-    if max_y < min_y {
-        max_y = min_y;
-    }
-    (min_x, max_x, min_y, max_y)
-}
-
-pub fn apply_snaps_for_group(
-    members: &[usize],
-    positions: &mut Vec<(f32, f32)>,
-    rotations: &mut Vec<f32>,
-    flips: &[bool],
-    connections: &mut Vec<[bool; 4]>,
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
-    snap_distance: f32,
-    frame_snap_ratio: f32,
-    complete_snap: bool,
-    center_min_x: f32,
-    center_max_x: f32,
-    center_min_y: f32,
-    center_max_y: f32,
-    _view_min_x: f32,
-    _view_min_y: f32,
-    _view_width: f32,
-    _view_height: f32,
-    rotation_snap_tolerance: f32,
-    rotation_enabled: bool,
-) -> Vec<usize> {
-    let total = cols * rows;
-    if members.is_empty() || total == 0 {
-        return Vec::new();
-    }
-    let (bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y) = if members.len() > 1 {
-        let mut min_x = center_min_x + piece_width;
-        let mut max_x = center_max_x - piece_width;
-        let mut min_y = center_min_y + piece_height;
-        let mut max_y = center_max_y - piece_height;
-        if max_x < min_x {
-            let mid = (center_min_x + center_max_x) * 0.5;
-            min_x = mid;
-            max_x = mid;
-        }
-        if max_y < min_y {
-            let mid = (center_min_y + center_max_y) * 0.5;
-            min_y = mid;
-            max_y = mid;
-        }
-        (min_x, max_x, min_y, max_y)
-    } else {
-        (center_min_x, center_max_x, center_min_y, center_max_y)
-    };
-    let mut in_group = vec![false; total];
-    for member in members {
-        if *member < in_group.len() {
-            in_group[*member] = true;
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct SnapCandidate {
-        member: usize,
-        dir: usize,
-        center_b: (f32, f32),
-        rot_b: f32,
-        base: (f32, f32),
-        dist: f32,
-    }
-
-    let mut candidates = Vec::new();
-    for member in members {
-        if *member >= positions.len() {
-            continue;
-        }
-        if flips.get(*member).copied().unwrap_or(false) {
-            continue;
-        }
-        let current = positions[*member];
-        let center_a = (
-            current.0 + piece_width * 0.5,
-            current.1 + piece_height * 0.5,
-        );
-        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-            if let Some(neighbor) = neighbor_id(*member, cols, rows, dir) {
-                if in_group.get(neighbor).copied().unwrap_or(false) {
-                    continue;
-                }
-                if flips.get(neighbor).copied().unwrap_or(false) {
-                    continue;
-                }
-                let neighbor_pos = positions.get(neighbor).copied().unwrap_or((0.0, 0.0));
-                let center_b = (
-                    neighbor_pos.0 + piece_width * 0.5,
-                    neighbor_pos.1 + piece_height * 0.5,
-                );
-                let base = match dir {
-                    DIR_LEFT => (-piece_width, 0.0),
-                    DIR_RIGHT => (piece_width, 0.0),
-                    DIR_UP => (0.0, -piece_height),
-                    DIR_DOWN => (0.0, piece_height),
-                    _ => (0.0, 0.0),
-                };
-                let rot_b = rotations.get(neighbor).copied().unwrap_or(0.0);
-                let actual = (center_b.0 - center_a.0, center_b.1 - center_a.1);
-                let expected_rot = if rotation_enabled {
-                    rotations.get(*member).copied().unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                let (vx, vy) = rotate_vec(base.0, base.1, expected_rot);
-                let dx = actual.0 - vx;
-                let dy = actual.1 - vy;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist <= snap_distance {
-                    candidates.push(SnapCandidate {
-                        member: *member,
-                        dir,
-                        center_b,
-                        rot_b,
-                        base,
-                        dist,
-                    });
-                }
-            }
-        }
-    }
-
-    let mut snap_anchor: Option<(usize, (f32, f32), f32)> = None;
-    if !candidates.is_empty() {
-        let mut best_candidate: Option<SnapCandidate> = None;
-        let mut best_dist = f32::INFINITY;
-        for candidate in candidates {
-            if rotation_enabled
-                && !angle_matches(
-                    rotations.get(candidate.member).copied().unwrap_or(0.0),
-                    candidate.rot_b,
-                    rotation_snap_tolerance,
-                )
-            {
-                continue;
-            }
-            let expected_rot = if rotation_enabled {
-                rotations.get(candidate.member).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            let (vx, vy) = rotate_vec(candidate.base.0, candidate.base.1, expected_rot);
-            let dx = candidate.center_b.0 - vx;
-            let dy = candidate.center_b.1 - vy;
-            let expected_center = (dx, dy);
-            let mut min_cx = f32::INFINITY;
-            let mut max_cx = f32::NEG_INFINITY;
-            let mut min_cy = f32::INFINITY;
-            let mut max_cy = f32::NEG_INFINITY;
-            let anchor_row = (candidate.member / cols) as i32;
-            let anchor_col = (candidate.member % cols) as i32;
-            for member in members {
-                let center = aligned_center_from_anchor(
-                    anchor_row,
-                    anchor_col,
-                    expected_center,
-                    *member,
-                    cols,
-                    piece_width,
-                    piece_height,
-                    expected_rot,
-                );
-                min_cx = min_cx.min(center.0);
-                max_cx = max_cx.max(center.0);
-                min_cy = min_cy.min(center.1);
-                max_cy = max_cy.max(center.1);
-            }
-            let can_snap = min_cx.is_finite()
-                && min_cy.is_finite()
-                && min_cx >= bounds_min_x
-                && max_cx <= bounds_max_x
-                && min_cy >= bounds_min_y
-                && max_cy <= bounds_max_y;
-            if !can_snap {
-                continue;
-            }
-            if candidate.dist < best_dist {
-                best_dist = candidate.dist;
-                best_candidate = Some(candidate);
-            }
-        }
-        if let Some(candidate) = best_candidate {
-            let expected_rot = if rotation_enabled {
-                rotations.get(candidate.member).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            let (vx, vy) = rotate_vec(candidate.base.0, candidate.base.1, expected_rot);
-            let dx = candidate.center_b.0 - vx;
-            let dy = candidate.center_b.1 - vy;
-            let expected_center = (dx, dy);
-            align_group_to_anchor(
-                positions,
-                rotations,
-                members,
-                candidate.member,
-                expected_center,
-                expected_rot,
-                cols,
-                piece_width,
-                piece_height,
-            );
-            set_connection(
-                connections,
-                candidate.member,
-                candidate.dir,
-                true,
-                cols,
-                rows,
-            );
-            snap_anchor = Some((candidate.member, expected_center, expected_rot));
-        }
-    }
-
-    let mut group_after = members
-        .first()
-        .map(|id| collect_group(connections, *id, cols, rows))
-        .unwrap_or_default();
-    if rotation_enabled {
-        if let Some((anchor_id, anchor_center, target_rot)) = snap_anchor {
-            if !group_after.is_empty() {
-                align_group_to_anchor(
-                    positions,
-                    rotations,
-                    &group_after,
-                    anchor_id,
-                    anchor_center,
-                    target_rot,
-                    cols,
-                    piece_width,
-                    piece_height,
-                );
-            }
-        }
-    }
-    if !group_after.is_empty() {
-        let frame_width = cols as f32 * piece_width;
-        let frame_height = rows as f32 * piece_height;
-        let corner_snap_distance = snap_distance * frame_snap_ratio;
-        let frame_snap_slop = corner_snap_distance * 0.25;
-        let group_rot = group_after
-            .first()
-            .and_then(|id| rotations.get(*id))
-            .copied()
-            .unwrap_or(0.0);
-        let mut corner_snapped = false;
-        if group_after.len() < total && corner_snap_distance > 0.0 {
-            let mut best_corner = None;
-            let target_center_for = |corner: usize, rotation: f32| {
-                let rotation = normalize_angle(rotation);
-                let swap = ((rotation / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
-                let (offset_x, offset_y) = if swap {
-                    (piece_height * 0.5, piece_width * 0.5)
-                } else {
-                    (piece_width * 0.5, piece_height * 0.5)
-                };
-                match corner {
-                    0 => (offset_x, offset_y),
-                    1 => (frame_width - offset_x, offset_y),
-                    2 => (frame_width - offset_x, frame_height - offset_y),
-                    3 => (offset_x, frame_height - offset_y),
-                    _ => (offset_x, offset_y),
-                }
-            };
-            for id in &group_after {
-                if *id >= positions.len() {
-                    continue;
-                }
-                if flips.get(*id).copied().unwrap_or(false) {
-                    continue;
-                }
-                let row = *id / cols;
-                let col = *id % cols;
-                let piece_corner = if row == 0 && col == 0 {
-                    Some(0usize)
-                } else if row == 0 && col + 1 == cols {
-                    Some(1usize)
-                } else if row + 1 == rows && col + 1 == cols {
-                    Some(2usize)
-                } else if row + 1 == rows && col == 0 {
-                    Some(3usize)
-                } else {
-                    None
-                };
-                let piece_corner = match piece_corner {
-                    Some(value) => value,
-                    None => continue,
-                };
-                let current = positions[*id];
-                let current_center = (
-                    current.0 + piece_width * 0.5,
-                    current.1 + piece_height * 0.5,
-                );
-                for target_corner in 0..4usize {
-                    let steps = (target_corner + 4 - piece_corner) % 4;
-                    let target_rot = normalize_angle(steps as f32 * ROTATION_STEP_DEG);
-                    if rotation_enabled
-                        && !angle_matches(group_rot, target_rot, rotation_snap_tolerance)
-                    {
-                        continue;
-                    }
-                    let target_center = target_center_for(target_corner, target_rot);
-                    let dx = current_center.0 - target_center.0;
-                    let dy = current_center.1 - target_center.1;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    if dist > corner_snap_distance {
-                        continue;
-                    }
-                    let anchor_row = (*id / cols) as i32;
-                    let anchor_col = (*id % cols) as i32;
-                    let (frame_min_x, frame_max_x, frame_min_y, frame_max_y) =
-                        frame_center_bounds_for_rotation(
-                            frame_width,
-                            frame_height,
-                            piece_width,
-                            piece_height,
-                            target_rot,
-                        );
-                    let mut min_cx = f32::INFINITY;
-                    let mut max_cx = f32::NEG_INFINITY;
-                    let mut min_cy = f32::INFINITY;
-                    let mut max_cy = f32::NEG_INFINITY;
-                    for member in &group_after {
-                        let center = aligned_center_from_anchor(
-                            anchor_row,
-                            anchor_col,
-                            target_center,
-                            *member,
-                            cols,
-                            piece_width,
-                            piece_height,
-                            target_rot,
-                        );
-                        min_cx = min_cx.min(center.0);
-                        max_cx = max_cx.max(center.0);
-                        min_cy = min_cy.min(center.1);
-                        max_cy = max_cy.max(center.1);
-                    }
-                    let can_snap = min_cx.is_finite()
-                        && min_cy.is_finite()
-                        && min_cx >= frame_min_x - frame_snap_slop
-                        && max_cx <= frame_max_x + frame_snap_slop
-                        && min_cy >= frame_min_y - frame_snap_slop
-                        && max_cy <= frame_max_y + frame_snap_slop;
-                    if !can_snap {
-                        continue;
-                    }
-                    let should_replace = match best_corner {
-                        None => true,
-                        Some((_best_id, _best_center, _best_rot, best_dist)) => dist < best_dist,
-                    };
-                    if should_replace {
-                        best_corner = Some((*id, target_center, target_rot, dist));
-                    }
-                }
-            }
-            if let Some((anchor_id, anchor_center, target_rot, _)) = best_corner {
-                align_group_to_anchor(
-                    positions,
-                    rotations,
-                    &group_after,
-                    anchor_id,
-                    anchor_center,
-                    target_rot,
-                    cols,
-                    piece_width,
-                    piece_height,
-                );
-                corner_snapped = true;
-            }
-        }
-        if !corner_snapped && group_after.len() < total && corner_snap_distance > 0.0 {
-            let mut best_edge = None;
-            for id in &group_after {
-                if *id >= positions.len() {
-                    continue;
-                }
-                if flips.get(*id).copied().unwrap_or(false) {
-                    continue;
-                }
-                let row = *id / cols;
-                let col = *id % cols;
-                let is_corner = (row == 0 || row + 1 == rows) && (col == 0 || col + 1 == cols);
-                if is_corner {
-                    continue;
-                }
-                let edge_side = if row == 0 {
-                    Some(DIR_UP)
-                } else if row + 1 == rows {
-                    Some(DIR_DOWN)
-                } else if col == 0 {
-                    Some(DIR_LEFT)
-                } else if col + 1 == cols {
-                    Some(DIR_RIGHT)
-                } else {
-                    None
-                };
-                let edge_side = match edge_side {
-                    Some(value) => value,
-                    None => continue,
-                };
-                let current = positions[*id];
-                let current_center = (
-                    current.0 + piece_width * 0.5,
-                    current.1 + piece_height * 0.5,
-                );
-                for target_edge in 0..4usize {
-                    let steps = (target_edge + 4 - edge_side) % 4;
-                    let target_rot = normalize_angle(steps as f32 * ROTATION_STEP_DEG);
-                    if rotation_enabled
-                        && !angle_matches(group_rot, target_rot, rotation_snap_tolerance)
-                    {
-                        continue;
-                    }
-                    let swap = ((target_rot / ROTATION_STEP_DEG).round() as i32) % 2 != 0;
-                    let (rot_w, rot_h) = if swap {
-                        (piece_height, piece_width)
-                    } else {
-                        (piece_width, piece_height)
-                    };
-                    let target_center = match target_edge {
-                        DIR_UP => (current_center.0, rot_h * 0.5),
-                        DIR_RIGHT => (frame_width - rot_w * 0.5, current_center.1),
-                        DIR_DOWN => (current_center.0, frame_height - rot_h * 0.5),
-                        DIR_LEFT => (rot_w * 0.5, current_center.1),
-                        _ => (current_center.0, current_center.1),
-                    };
-                    let dist = if target_edge == DIR_UP || target_edge == DIR_DOWN {
-                        (current_center.1 - target_center.1).abs()
-                    } else {
-                        (current_center.0 - target_center.0).abs()
-                    };
-                    if dist > corner_snap_distance {
-                        continue;
-                    }
-                    let anchor_row = (*id / cols) as i32;
-                    let anchor_col = (*id % cols) as i32;
-                    let (frame_min_x, frame_max_x, frame_min_y, frame_max_y) =
-                        frame_center_bounds_for_rotation(
-                            frame_width,
-                            frame_height,
-                            piece_width,
-                            piece_height,
-                            target_rot,
-                        );
-                    let mut min_cx = f32::INFINITY;
-                    let mut max_cx = f32::NEG_INFINITY;
-                    let mut min_cy = f32::INFINITY;
-                    let mut max_cy = f32::NEG_INFINITY;
-                    for member in &group_after {
-                        let center = aligned_center_from_anchor(
-                            anchor_row,
-                            anchor_col,
-                            target_center,
-                            *member,
-                            cols,
-                            piece_width,
-                            piece_height,
-                            target_rot,
-                        );
-                        min_cx = min_cx.min(center.0);
-                        max_cx = max_cx.max(center.0);
-                        min_cy = min_cy.min(center.1);
-                        max_cy = max_cy.max(center.1);
-                    }
-                    let can_snap = min_cx.is_finite()
-                        && min_cy.is_finite()
-                        && min_cx >= frame_min_x - frame_snap_slop
-                        && max_cx <= frame_max_x + frame_snap_slop
-                        && min_cy >= frame_min_y - frame_snap_slop
-                        && max_cy <= frame_max_y + frame_snap_slop;
-                    if !can_snap {
-                        continue;
-                    }
-                    let should_replace = match best_edge {
-                        None => true,
-                        Some((_best_id, _best_center, _best_rot, best_dist)) => dist < best_dist,
-                    };
-                    if should_replace {
-                        best_edge = Some((*id, target_center, target_rot, dist));
-                    }
-                }
-            }
-            if let Some((anchor_id, anchor_center, target_rot, _)) = best_edge {
-                align_group_to_anchor(
-                    positions,
-                    rotations,
-                    &group_after,
-                    anchor_id,
-                    anchor_center,
-                    target_rot,
-                    cols,
-                    piece_width,
-                    piece_height,
-                );
-            }
-        }
-
-        if group_after.len() == total {
-            let target_center = (piece_width * 0.5, piece_height * 0.5);
-            let anchor_id = 0usize;
-            if let Some(anchor_pos) = positions.get(anchor_id) {
-                let current_center = (
-                    anchor_pos.0 + piece_width * 0.5,
-                    anchor_pos.1 + piece_height * 0.5,
-                );
-                let dx = current_center.0 - target_center.0;
-                let dy = current_center.1 - target_center.1;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let rotation_ok =
-                    !rotation_enabled || angle_matches(group_rot, 0.0, rotation_snap_tolerance);
-                let frame_snap_distance =
-                    snap_distance * frame_snap_ratio * COMPLETE_SNAP_MULTIPLIER;
-                let should_snap = complete_snap
-                    || (frame_snap_distance > 0.0 && rotation_ok && dist <= frame_snap_distance);
-                if should_snap {
-                    align_group_to_anchor(
-                        positions,
-                        rotations,
-                        &group_after,
-                        anchor_id,
-                        target_center,
-                        0.0,
-                        cols,
-                        piece_width,
-                        piece_height,
-                    );
-                }
-            }
-        } else {
-            let mut in_group = vec![false; total];
-            for id in &group_after {
-                if *id < in_group.len() {
-                    in_group[*id] = true;
-                }
-            }
-            let mut has_borders = true;
-            'border_check: for row in 0..rows {
-                for col in 0..cols {
-                    if row == 0 || row + 1 == rows || col == 0 || col + 1 == cols {
-                        let id = row * cols + col;
-                        if !in_group[id] {
-                            has_borders = false;
-                            break 'border_check;
-                        }
-                    }
-                }
-            }
-            if has_borders {
-                let frame_snap_distance = snap_distance * frame_snap_ratio;
-                let anchor_id = 0usize;
-                if let Some(anchor_pos) = positions.get(anchor_id) {
-                    let current_center = (
-                        anchor_pos.0 + piece_width * 0.5,
-                        anchor_pos.1 + piece_height * 0.5,
-                    );
-                    let target_center = (piece_width * 0.5, piece_height * 0.5);
-                    let dx = current_center.0 - target_center.0;
-                    let dy = current_center.1 - target_center.1;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    let rotation_ok =
-                        !rotation_enabled || angle_matches(group_rot, 0.0, rotation_snap_tolerance);
-                    if dist <= frame_snap_distance && rotation_ok {
-                        align_group_to_anchor(
-                            positions,
-                            rotations,
-                            &group_after,
-                            anchor_id,
-                            target_center,
-                            0.0,
-                            cols,
-                            piece_width,
-                            piece_height,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let clamp_ids: &[usize] = if group_after.is_empty() { members } else { &group_after };
-    if !clamp_ids.is_empty() {
-        let mut min_cx = f32::INFINITY;
-        let mut max_cx = f32::NEG_INFINITY;
-        let mut min_cy = f32::INFINITY;
-        let mut max_cy = f32::NEG_INFINITY;
-        for id in clamp_ids {
-            if let Some(pos) = positions.get(*id) {
-                let center_x = pos.0 + piece_width * 0.5;
-                let center_y = pos.1 + piece_height * 0.5;
-                min_cx = min_cx.min(center_x);
-                max_cx = max_cx.max(center_x);
-                min_cy = min_cy.min(center_y);
-                max_cy = max_cy.max(center_y);
-            }
-        }
-        if min_cx.is_finite() && min_cy.is_finite() {
-            let mut any_inside = false;
-            for id in clamp_ids {
-                if let Some(pos) = positions.get(*id) {
-                    let center_x = pos.0 + piece_width * 0.5;
-                    let center_y = pos.1 + piece_height * 0.5;
-                    if center_x >= bounds_min_x
-                        && center_x <= bounds_max_x
-                        && center_y >= bounds_min_y
-                        && center_y <= bounds_max_y
-                    {
-                        any_inside = true;
-                        break;
-                    }
-                }
-            }
-            if !any_inside {
-                let mut best_shift = (0.0, 0.0);
-                let mut best_dist = f32::INFINITY;
-                for id in clamp_ids {
-                    if let Some(pos) = positions.get(*id) {
-                        let center_x = pos.0 + piece_width * 0.5;
-                        let center_y = pos.1 + piece_height * 0.5;
-                        let mut shift_x = 0.0;
-                        let mut shift_y = 0.0;
-                        if center_x < bounds_min_x {
-                            shift_x = bounds_min_x - center_x;
-                        } else if center_x > bounds_max_x {
-                            shift_x = bounds_max_x - center_x;
-                        }
-                        if center_y < bounds_min_y {
-                            shift_y = bounds_min_y - center_y;
-                        } else if center_y > bounds_max_y {
-                            shift_y = bounds_max_y - center_y;
-                        }
-                        let dist = shift_x * shift_x + shift_y * shift_y;
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_shift = (shift_x, shift_y);
-                        }
-                    }
-                }
-                if best_dist.is_finite() && (best_shift.0 != 0.0 || best_shift.1 != 0.0) {
-                    for id in clamp_ids {
-                        if let Some(pos) = positions.get_mut(*id) {
-                            *pos = (pos.0 + best_shift.0, pos.1 + best_shift.1);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !clamp_ids.is_empty() {
-        connect_aligned_neighbors(
-            clamp_ids,
-            positions,
-            rotations,
-            flips,
-            connections,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
-            snap_distance,
-            rotation_snap_tolerance,
-            rotation_enabled,
-        );
-        if let Some(anchor_id) = clamp_ids.first() {
-            group_after = collect_group(connections, *anchor_id, cols, rows);
-        }
-    }
-
-    group_after
 }
 
 pub fn build_full_connections(cols: usize, rows: usize) -> Vec<[bool; 4]> {
@@ -1397,4 +636,262 @@ pub fn scramble_flips(seed: u32, total: usize, chance: f32) -> Vec<bool> {
         flips.push(rand_unit(seed, salt) < threshold);
     }
     flips
+}
+
+/// Computes any safety-bound corrections that need to be applied to groups
+/// resulting from a just-applied detach. For each affected group:
+///   * singletons must keep their anchor within the loose single-piece bound,
+///   * multi-piece groups must keep their anchor within the tight one-piece
+///     inset of that bound.
+///
+/// A group whose anchor is already inside its applicable bound is reported as
+/// no correction (omitted from the result). Otherwise the anchor center is
+/// clamped to the nearest in-bounds position and returned as `(group_id,
+/// new_anchor_pos)`. The helper is pure — it does not mutate `playable`. The
+/// caller applies each correction via
+/// `apply_action_only(PlayableAction::TranslateGroup { group, drop_pos })`.
+///
+/// `affected_pieces` should contain every piece that belonged to the original
+/// group before the detach, so the helper visits every component the detach
+/// could have produced.
+pub fn safety_corrections_after_detach<T: PuzzleTopology>(
+    playable: &PlayableState<T>,
+    affected_pieces: &[PieceId],
+    puzzle: &PuzzleInfo,
+    rules: &GameRules,
+) -> Vec<(GroupId, Position2)> {
+    if puzzle.cols == 0 || puzzle.rows == 0 {
+        return Vec::new();
+    }
+    let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
+    let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+    if piece_width <= 0.0 || piece_height <= 0.0 {
+        return Vec::new();
+    }
+    let layout = compute_workspace_layout(
+        puzzle.image_width as f32,
+        puzzle.image_height as f32,
+        rules.workspace_padding_ratio,
+    );
+    let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
+    let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
+    let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
+    let puzzle_view_width = layout.view_width / puzzle_scale;
+    let puzzle_view_height = layout.view_height / puzzle_scale;
+    let center_min_x = puzzle_view_min_x + piece_width * 0.5;
+    let center_min_y = puzzle_view_min_y + piece_height * 0.5;
+    let mut center_max_x = puzzle_view_min_x + puzzle_view_width - piece_width * 0.5;
+    let mut center_max_y = puzzle_view_min_y + puzzle_view_height - piece_height * 0.5;
+    if center_max_x < center_min_x {
+        center_max_x = center_min_x;
+    }
+    if center_max_y < center_min_y {
+        center_max_y = center_min_y;
+    }
+    let mut tight_min_x = center_min_x + piece_width;
+    let mut tight_max_x = center_max_x - piece_width;
+    let mut tight_min_y = center_min_y + piece_height;
+    let mut tight_max_y = center_max_y - piece_height;
+    if tight_max_x < tight_min_x {
+        let mid = (center_min_x + center_max_x) * 0.5;
+        tight_min_x = mid;
+        tight_max_x = mid;
+    }
+    if tight_max_y < tight_min_y {
+        let mid = (center_min_y + center_max_y) * 0.5;
+        tight_min_y = mid;
+        tight_max_y = mid;
+    }
+
+    let mut corrections = Vec::new();
+    let mut seen_groups: Vec<GroupId> = Vec::new();
+    for piece in affected_pieces {
+        let Some(group) = playable.logical.group_of(*piece) else {
+            continue;
+        };
+        if seen_groups.contains(&group) {
+            continue;
+        }
+        seen_groups.push(group);
+
+        let Some(pose) = playable.pose_of(group) else {
+            continue;
+        };
+
+        let is_singleton = playable.logical.members_of(group).nth(1).is_none();
+        let (min_x, max_x, min_y, max_y) = if is_singleton {
+            (center_min_x, center_max_x, center_min_y, center_max_y)
+        } else {
+            (tight_min_x, tight_max_x, tight_min_y, tight_max_y)
+        };
+
+        let cx = pose.x_mm() * piece_width;
+        let cy = pose.y_mm() * piece_height;
+        let new_cx = cx.clamp(min_x, max_x);
+        let new_cy = cy.clamp(min_y, max_y);
+        if (new_cx - cx).abs() < 1.0e-3 && (new_cy - cy).abs() < 1.0e-3 {
+            continue;
+        }
+
+        let new_x_mm = new_cx / piece_width;
+        let new_y_mm = new_cy / piece_height;
+        let Some(new_pos) = Position2::try_from_mm(new_x_mm, new_y_mm) else {
+            continue;
+        };
+        corrections.push((group, new_pos));
+    }
+    corrections
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use crate::snapshot::PuzzleImageRef;
+    use heddobureika_game::{
+        GridTopology, LogicalState, PieceId, PlayRules, Pose2, RestrictedPlayableAction,
+    };
+
+    fn puzzle_3x1() -> PuzzleInfo {
+        PuzzleInfo {
+            label: "test".to_string(),
+            image_ref: PuzzleImageRef::BuiltIn {
+                slug: "test".to_string(),
+            },
+            rows: 1,
+            cols: 3,
+            shape_seed: 0,
+            image_width: 300,
+            image_height: 100,
+        }
+    }
+
+    /// Build a 3x1 puzzle in the "all connected" state with the anchor at the
+    /// given mm-space pose. Useful for setting up unsafe placements.
+    fn solved_3x1_at(anchor_pose: Pose2) -> PlayableState<GridTopology> {
+        let topology = GridTopology::try_new(3, 1).expect("3x1 topology");
+        let mut logical = LogicalState::new(topology);
+        logical.activate_all_edges();
+        let mut playable = PlayableState::new(logical, PlayRules::default());
+        for slot in playable.group_pose.iter_mut() {
+            *slot = anchor_pose;
+        }
+        playable
+    }
+
+    #[test]
+    fn detach_endpiece_force_moves_remaining_multi_piece_group_to_tight_bound() {
+        // 3x1 puzzle: workspace center bounds are roughly x in [10..290],
+        // y in [10..90]. Tight (multi-piece) bound for x is [110..190]; for
+        // y the inset collapses to the midpoint 50 (because the workspace is
+        // narrower than 3 piece-heights). Place the anchor at center (50,
+        // 50) — well outside the tight x bound. Detach the END piece (id 2)
+        // so the remaining group {0, 1} is still multi-piece.
+        let anchor_pose = Pose2::try_from_mm_degrees(0.5, 0.5, 0.0).expect("finite pose");
+        let mut playable = solved_3x1_at(anchor_pose);
+
+        // Capture original members BEFORE the detach.
+        let original_group = playable
+            .logical
+            .group_of(PieceId(0))
+            .expect("piece 0 grouped");
+        let original_members: Vec<PieceId> = playable.logical.members_of(original_group).collect();
+
+        let _ = playable.apply_restricted_action_batch(
+            RestrictedPlayableAction::DetachPieceAsGroup {
+                piece: PieceId(2),
+                target_pose: playable
+                    .piece_world_pose(PieceId(2))
+                    .expect("piece 2 pose"),
+                target_flip: heddobureika_game::FlipState::Normal,
+            },
+            None,
+        );
+
+        let puzzle = puzzle_3x1();
+        let rules = GameRules::default();
+        let corrections =
+            safety_corrections_after_detach(&playable, &original_members, &puzzle, &rules);
+
+        // The remaining {0, 1} group should be force-moved. The singleton {2}
+        // sits at (250, 50) in pixel-center coords — inside the loose bound
+        // x in [10..290] — so no correction is reported for it.
+        assert_eq!(
+            corrections.len(),
+            1,
+            "expected one correction (for the remaining {{0, 1}} group)"
+        );
+        let (group, new_pos) = corrections[0];
+        assert_eq!(
+            playable.anchor_piece_of_group(group),
+            Some(PieceId(0)),
+            "correction should target the remaining group whose anchor is piece 0"
+        );
+        // New anchor center x should be clamped to the tight-min x (110) —
+        // i.e. 110 / piece_width = 110/100 = 1.1.
+        assert!(
+            (new_pos.x_mm() - 1.1).abs() < 1.0e-3,
+            "anchor x should clamp to tight_min_x: got {}",
+            new_pos.x_mm()
+        );
+        // y stays at the tight midpoint (50px -> 0.5mm).
+        assert!(
+            (new_pos.y_mm() - 0.5).abs() < 1.0e-3,
+            "anchor y should sit at tight midpoint: got {}",
+            new_pos.y_mm()
+        );
+    }
+
+    #[test]
+    fn detach_produces_no_corrections_when_resulting_singletons_are_in_bounds() {
+        // 2x1 puzzle. After a detach, both resulting groups are singletons —
+        // they use the loose bound only. With anchor at (0.5, 0.5) the two
+        // pieces sit at pixel centers (50, 50) and (150, 50), both well
+        // inside the loose bound, so no corrections should fire.
+        let puzzle = PuzzleInfo {
+            label: "test".to_string(),
+            image_ref: PuzzleImageRef::BuiltIn {
+                slug: "test".to_string(),
+            },
+            rows: 1,
+            cols: 2,
+            shape_seed: 0,
+            image_width: 200,
+            image_height: 100,
+        };
+        let topology = GridTopology::try_new(2, 1).expect("2x1 topology");
+        let mut logical = LogicalState::new(topology);
+        logical.activate_all_edges();
+        let mut playable = PlayableState::new(logical, PlayRules::default());
+        let anchor_pose = Pose2::try_from_mm_degrees(0.5, 0.5, 0.0).expect("finite pose");
+        for slot in playable.group_pose.iter_mut() {
+            *slot = anchor_pose;
+        }
+
+        let original_group = playable
+            .logical
+            .group_of(PieceId(0))
+            .expect("piece 0 grouped");
+        let original_members: Vec<PieceId> = playable.logical.members_of(original_group).collect();
+
+        let _ = playable.apply_restricted_action_batch(
+            RestrictedPlayableAction::DetachPieceAsGroup {
+                piece: PieceId(1),
+                target_pose: playable
+                    .piece_world_pose(PieceId(1))
+                    .expect("piece 1 pose"),
+                target_flip: heddobureika_game::FlipState::Normal,
+            },
+            None,
+        );
+
+        let rules = GameRules::default();
+        let corrections =
+            safety_corrections_after_detach(&playable, &original_members, &puzzle, &rules);
+
+        assert!(
+            corrections.is_empty(),
+            "no correction expected when everything is already in bounds, got {:?}",
+            corrections
+        );
+    }
 }

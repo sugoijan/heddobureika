@@ -3,30 +3,30 @@ use std::rc::Rc;
 
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use gloo::render::{request_animation_frame, AnimationFrame};
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use js_sys::{Date, Function, Reflect};
 use taffy::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use js_sys::{Date, Function, Reflect};
 use web_sys::{Document, Element, Event, HtmlImageElement, PointerEvent, WheelEvent};
 
-use crate::boot;
 use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
+use crate::boot;
+use crate::core::*;
 use crate::input::{
     screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
     workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
     WheelIntentTracker,
 };
-use crate::core::*;
+use crate::persisted_store;
+use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 use crate::renderer::{build_mask_atlas, MaskAtlasData, UiRotationOrigin, UiTextId, UiTextSpec};
 use crate::runtime::{CoreAction, GameSyncView, GameView, SyncView, ViewHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::{PuzzleImageRef, PuzzleInfo};
-use crate::persisted_store;
-use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
@@ -408,9 +408,7 @@ pub(crate) fn run(core: Rc<AppCore>) {
         let _ = svg.append_child(&puzzle_group);
         let _ = root.append_child(&svg);
 
-        let sync_status = document
-            .create_element("div")
-            .expect("create sync status");
+        let sync_status = document.create_element("div").expect("create sync status");
         sync_status.set_class_name("sync-status");
         let _ = sync_status.set_attribute("title", "Server disconnected");
         sync_status.set_text_content(Some("!"));
@@ -462,7 +460,9 @@ pub(crate) fn run(core: Rc<AppCore>) {
             move || {
                 let snapshot = core.snapshot();
                 let sync_view = sync_runtime::sync_view();
-                adapter_for_render.borrow_mut().render(&snapshot, &sync_view);
+                adapter_for_render
+                    .borrow_mut()
+                    .render(&snapshot, &sync_view);
             }
         })));
         view.install_listeners();
@@ -747,7 +747,10 @@ impl SvgView {
         {
             let (point_a, point_b) = {
                 let policy = self.pointer_policy.borrow();
-                (policy.pointer_sample(touch_a), policy.pointer_sample(touch_b))
+                (
+                    policy.pointer_sample(touch_a),
+                    policy.pointer_sample(touch_b),
+                )
             };
             if let (Some(a), Some(b)) = (point_a, point_b) {
                 if self.update_preview_pinch(
@@ -812,8 +815,9 @@ impl SvgView {
         self.update_preview_click_movement(Some(pointer_id), local_x, local_y);
         let preview_clicked = self.consume_preview_click(Some(pointer_id));
         let mut preview_dragged = false;
-        if let Some(PreviewDragState::Pinch { touch_a, touch_b, .. }) =
-            *self.preview_drag.borrow()
+        if let Some(PreviewDragState::Pinch {
+            touch_a, touch_b, ..
+        }) = *self.preview_drag.borrow()
         {
             if pointer_id == touch_a || pointer_id == touch_b {
                 preview_dragged = self.end_preview_drag(None);
@@ -931,8 +935,7 @@ impl SvgView {
                 return;
             }
         }
-        let Some((view_x, view_y)) =
-            screen_to_view_coords(screen_x, screen_y, svg, snapshot.view)
+        let Some((view_x, view_y)) = screen_to_view_coords(screen_x, screen_y, svg, snapshot.view)
         else {
             return;
         };
@@ -1088,8 +1091,7 @@ impl SvgView {
             else {
                 return;
             };
-            let (px, py) =
-                workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
             if let Some(gate) = self.drag_gate.borrow_mut().as_mut() {
                 if let Some(drag_id) = snapshot.drag_pointer_id {
                     if gate.pointer_id != drag_id {
@@ -1133,8 +1135,7 @@ impl SvgView {
             self.dispatch_action(CoreAction::SetHovered { hovered: None });
             return;
         };
-        let (px, py) =
-            workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+        let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
         let hovered = self.pick_piece(px, py, &snapshot);
         if hovered.is_some() {
             if self.ui_credit_hovered.get() {
@@ -1211,7 +1212,19 @@ impl SvgView {
             {
                 let (px, py) =
                     workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-                self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+                let should_send_move = snapshot
+                    .drag_cursor
+                    .map(|(last_x, last_y)| {
+                        let dx = px - last_x;
+                        let dy = py - last_y;
+                        let slop =
+                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        dx * dx + dy * dy > slop * slop
+                    })
+                    .unwrap_or(true);
+                if should_send_move {
+                    self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+                }
             }
             self.dispatch_action(CoreAction::DragEnd {
                 pointer_id: Some(pointer_id),
@@ -1744,10 +1757,18 @@ impl SvgView {
             self.stop_auto_pan();
             return;
         };
-        let (dir_x, t_x) =
-            edge_intensity(screen_x, zones.inner.left, zones.inner.right, zones.inner_inset);
-        let (dir_y, t_y) =
-            edge_intensity(screen_y, zones.inner.top, zones.inner.bottom, zones.inner_inset);
+        let (dir_x, t_x) = edge_intensity(
+            screen_x,
+            zones.inner.left,
+            zones.inner.right,
+            zones.inner_inset,
+        );
+        let (dir_y, t_y) = edge_intensity(
+            screen_y,
+            zones.inner.top,
+            zones.inner.bottom,
+            zones.inner_inset,
+        );
         let ease_x = smoothstep(t_x);
         let ease_y = smoothstep(t_y);
         let mut speed_ratio = snapshot.view_settings.auto_pan_speed_ratio.max(0.0);
@@ -1784,8 +1805,7 @@ impl SvgView {
         }
         self.multiplayer_active
             .set(matches!(sync_view.mode(), InitMode::Online));
-        let disconnected =
-            matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
+        let disconnected = matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
         if disconnected {
             self.root.set_class_name("app svg sync-disconnected");
         } else {
@@ -1848,7 +1868,11 @@ impl SvgView {
         }
         *last = Some(hash.to_string());
         if !self.multiplayer_active.get() {
-            boot::fail("image-missing", message, "Re-upload the image to this browser.");
+            boot::fail(
+                "image-missing",
+                message,
+                "Re-upload the image to this browser.",
+            );
         }
         self.private_image_loading.set(false);
     }
@@ -1936,11 +1960,17 @@ impl SvgView {
         } else {
             class.push_str(" preview-hidden");
         }
-        let drag_target = self.preview_drag.borrow().as_ref().and_then(|drag| match drag {
-            PreviewDragState::Move { .. } => Some(PreviewHoverTarget::Body),
-            PreviewDragState::Resize { handle, .. } => Some(PreviewHoverTarget::Resize(*handle)),
-            PreviewDragState::Pinch { .. } => None,
-        });
+        let drag_target = self
+            .preview_drag
+            .borrow()
+            .as_ref()
+            .and_then(|drag| match drag {
+                PreviewDragState::Move { .. } => Some(PreviewHoverTarget::Body),
+                PreviewDragState::Resize { handle, .. } => {
+                    Some(PreviewHoverTarget::Resize(*handle))
+                }
+                PreviewDragState::Pinch { .. } => None,
+            });
         let cursor_target = drag_target.unwrap_or(self.preview_hover.get());
         if let Some(cursor_class) = preview_cursor_class(cursor_target) {
             class.push_str(" ");
@@ -1971,7 +2001,10 @@ impl SvgView {
     fn arm_preview_click(&self, pointer_id: Option<i32>, local_x: f32, local_y: f32) {
         let mut gesture = ClickGesture::new_default();
         gesture.arm(local_x, local_y, now_ms());
-        *self.preview_click.borrow_mut() = Some(PreviewClickState { pointer_id, gesture });
+        *self.preview_click.borrow_mut() = Some(PreviewClickState {
+            pointer_id,
+            gesture,
+        });
     }
 
     fn clear_preview_click(&self) {
@@ -2144,12 +2177,7 @@ impl SvgView {
         ([x, y], [hit_x, hit_y])
     }
 
-    fn ensure_preview_seeded(
-        &self,
-        snapshot: &AppSnapshot,
-        rect: &web_sys::DomRect,
-        aspect: f32,
-    ) {
+    fn ensure_preview_seeded(&self, snapshot: &AppSnapshot, rect: &web_sys::DomRect, aspect: f32) {
         if self.preview_seeded.get() {
             return;
         }
@@ -2166,7 +2194,10 @@ impl SvgView {
         let (min_w, max_w) = self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
         let base_dim = viewport_w.min(viewport_h).max(1.0);
         let mut box_w = (base_dim * PREVIEW_BOX_INIT_FRAC).max(PREVIEW_BOX_MIN_WIDTH);
-        box_w = box_w.min(viewport_w * PREVIEW_BOX_MAX_FRAC).max(min_w).min(max_w);
+        box_w = box_w
+            .min(viewport_w * PREVIEW_BOX_MAX_FRAC)
+            .max(min_w)
+            .min(max_w);
         let (_, box_h, _, _) = Self::preview_box_metrics(box_w, aspect);
         let base_x = PREVIEW_BOX_MARGIN;
         let base_y = viewport_h - PREVIEW_BOX_MARGIN - box_h;
@@ -2281,8 +2312,7 @@ impl SvgView {
         let aspect = Self::preview_aspect(info);
         let frame_max_w =
             Self::preview_frame_max_width(info, snapshot.layout, viewport_w, viewport_h);
-        let (min_w, max_w) =
-            self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
+        let (min_w, max_w) = self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
         let dx = screen_b[0] - screen_a[0];
         let dy = screen_b[1] - screen_a[1];
         let distance = (dx * dx + dy * dy).sqrt();
@@ -2306,8 +2336,7 @@ impl SvgView {
         let center_x = mid_x - rvx;
         let center_y = mid_y - rvy;
         let mut pos = [center_x - half_w, center_y - half_h];
-        let (clamped, _) =
-            self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
+        let (clamped, _) = self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
         pos = clamped;
         self.preview_width.set(width);
         self.preview_pos.set(pos);
@@ -2337,8 +2366,7 @@ impl SvgView {
         self.ensure_preview_seeded(snapshot, rect, aspect);
         let frame_max_w =
             Self::preview_frame_max_width(info, snapshot.layout, viewport_w, viewport_h);
-        let (min_w, max_w) =
-            self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
+        let (min_w, max_w) = self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
         let mut width = self.preview_width.get().clamp(min_w, max_w);
         self.preview_width.set(width);
         let (box_w, box_h, _, _) = Self::preview_box_metrics(width, aspect);
@@ -2541,8 +2569,7 @@ impl SvgView {
         let decay = (-PREVIEW_MOMENTUM_DECAY * dt).exp();
         velocity[0] *= decay;
         velocity[1] *= decay;
-        let (clamped, hit) =
-            self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
+        let (clamped, hit) = self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
         if hit[0] {
             velocity[0] *= 0.2;
         }
@@ -2573,8 +2600,7 @@ impl SvgView {
         let width = self.clamp_preview_width(aspect, viewport_w, viewport_h, frame_max_w);
         let (box_w, box_h, image_w, image_h) = Self::preview_box_metrics(width, aspect);
         let mut pos = self.preview_pos.get();
-        let (clamped, _) =
-            self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
+        let (clamped, _) = self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
         if clamped != pos {
             self.preview_pos.set(clamped);
             pos = clamped;
@@ -2859,14 +2885,10 @@ impl SvgView {
         let _ = internal_group.set_attribute("transform", "");
         let _ = surface_group.set_attribute("class", "piece-surface");
         let _ = hitbox.set_attribute("class", "piece-hitbox");
-        let _ = outline_external.set_attribute(
-            "class",
-            "piece-outline piece-outline-group edge-external",
-        );
-        let _ = outline_internal.set_attribute(
-            "class",
-            "piece-outline piece-outline-group edge-internal",
-        );
+        let _ = outline_external
+            .set_attribute("class", "piece-outline piece-outline-group edge-external");
+        let _ = outline_internal
+            .set_attribute("class", "piece-outline piece-outline-group edge-internal");
         let _ = outline_simple.set_attribute("class", "piece-outline piece-outline-simple");
         let _ = back_rect.set_attribute("class", "piece-back");
         let _ = image.set_attribute("class", "piece-image");
@@ -2895,7 +2917,11 @@ impl SvgView {
         let _ = image.set_attribute("preserveAspectRatio", "xMidYMid meet");
         let _ = image.set_attribute("mask", &mask_ref);
 
-        let path = assets.paths.get(piece_id).map(|p| p.outline.clone()).unwrap_or_default();
+        let path = assets
+            .paths
+            .get(piece_id)
+            .map(|p| p.outline.clone())
+            .unwrap_or_default();
         let _ = hitbox.set_attribute("d", path.as_str());
 
         let _ = outline_group.append_child(&outline_external);
@@ -2959,9 +2985,10 @@ impl SvgView {
         let _ = self
             .workspace_rect
             .set_attribute("height", &fmt_f32(layout.view_height));
-        let _ = self
-            .puzzle_group
-            .set_attribute("transform", &format!("scale({})", fmt_f32(layout.puzzle_scale)));
+        let _ = self.puzzle_group.set_attribute(
+            "transform",
+            &format!("scale({})", fmt_f32(layout.puzzle_scale)),
+        );
         let bounds_inset = 1.0;
         let _ = self
             .puzzle_bounds
@@ -2977,10 +3004,8 @@ impl SvgView {
             "height",
             &fmt_f32(assets.info.image_height as f32 - 2.0 * bounds_inset),
         );
-        let mut frame_corner_radius = assets
-            .piece_width
-            .min(assets.piece_height)
-            * CORNER_RADIUS_RATIO;
+        let mut frame_corner_radius =
+            assets.piece_width.min(assets.piece_height) * CORNER_RADIUS_RATIO;
         let max_corner_radius = assets.piece_width.min(assets.piece_height) * 0.45;
         if frame_corner_radius > max_corner_radius {
             frame_corner_radius = max_corner_radius;
@@ -3003,25 +3028,25 @@ impl SvgView {
             .as_ref()
             .map(|info| info.image_height as f32)
             .unwrap_or(1.0);
-        let (connections_label, border_connections_label) = if let Some(info) =
-            snapshot.puzzle_info.as_ref()
-        {
-            let cols = info.cols as usize;
-            let rows = info.rows as usize;
-            let total = cols * rows;
-            if snapshot.core.connections.len() == total {
-                let (connected, border_connected, total_expected, border_expected) =
-                    count_connections(&snapshot.core.connections, cols, rows);
-                (
-                    format_progress(connected, total_expected),
-                    format_progress(border_connected, border_expected),
-                )
+        let (connections_label, border_connections_label) =
+            if let Some(info) = snapshot.puzzle_info.as_ref() {
+                let cols = info.cols as usize;
+                let rows = info.rows as usize;
+                let total = cols * rows;
+                let connections = snapshot.piece_connections();
+                if connections.len() == total {
+                    let (connected, border_connected, total_expected, border_expected) =
+                        count_connections(&connections, cols, rows);
+                    (
+                        format_progress(connected, total_expected),
+                        format_progress(border_connected, border_expected),
+                    )
+                } else {
+                    ("--".to_string(), "--".to_string())
+                }
             } else {
                 ("--".to_string(), "--".to_string())
-            }
-        } else {
-            ("--".to_string(), "--".to_string())
-        };
+            };
         let prefers_dark = prefers_dark_mode();
         let is_dark = match snapshot.app_settings.theme_mode {
             ThemeMode::Dark => true,
@@ -3109,9 +3134,10 @@ impl SvgView {
                 }
             }
         } else if let Some(id) = snapshot.hovered_id {
-            if snapshot.core.connections.len() == total {
+            let hover_connections = snapshot.piece_connections();
+            if hover_connections.len() == total {
                 for member in collect_group(
-                    &snapshot.core.connections,
+                    &hover_connections,
                     id,
                     assets.grid.cols as usize,
                     assets.grid.rows as usize,
@@ -3142,24 +3168,36 @@ impl SvgView {
         } else {
             0.0
         };
-        let drag_scale = if drag_dir.abs() > f32::EPSILON { DRAG_SCALE } else { 1.0 };
+        let drag_scale = if drag_dir.abs() > f32::EPSILON {
+            DRAG_SCALE
+        } else {
+            1.0
+        };
+        let positions = snapshot.piece_positions_px();
+        let rotations = snapshot.piece_rotations_deg();
         let drag_center = if drag_dir.abs() > f32::EPSILON {
-            snapshot
-                .drag_cursor
-                .or_else(|| drag_group_center(&snapshot.core.positions, &snapshot.dragging_members, assets.piece_width, assets.piece_height))
+            snapshot.drag_cursor.or_else(|| {
+                drag_group_center(
+                    &positions,
+                    &snapshot.dragging_members,
+                    assets.piece_width,
+                    assets.piece_height,
+                )
+            })
         } else {
             None
         };
+        let render_connections = snapshot.piece_connections();
         for (idx, node) in self.pieces.borrow().iter().enumerate() {
             if idx >= total {
                 break;
             }
-            let current = snapshot.core.positions.get(idx).copied().unwrap_or((
+            let current = positions.get(idx).copied().unwrap_or((
                 (idx as u32 % assets.grid.cols) as f32 * assets.piece_width,
                 (idx as u32 / assets.grid.cols) as f32 * assets.piece_height,
             ));
-            let rotation = snapshot.core.rotations.get(idx).copied().unwrap_or(0.0);
-            let flipped = snapshot.core.flips.get(idx).copied().unwrap_or(false);
+            let rotation = rotations.get(idx).copied().unwrap_or(0.0);
+            let flipped = snapshot.piece_flipped.get(idx).copied().unwrap_or(false);
             let is_dragging = dragging_mask.get(idx).copied().unwrap_or(false);
             let render_pos = if is_dragging {
                 if let Some(center) = drag_center {
@@ -3219,9 +3257,15 @@ impl SvgView {
                 drag_transform
             );
             let _ = node.root.set_attribute("transform", &outer_transform);
-            let _ = node.outline_group.set_attribute("transform", &inner_transform);
-            let _ = node.surface_group.set_attribute("transform", &inner_transform);
-            let _ = node.internal_group.set_attribute("transform", &inner_transform);
+            let _ = node
+                .outline_group
+                .set_attribute("transform", &inner_transform);
+            let _ = node
+                .surface_group
+                .set_attribute("transform", &inner_transform);
+            let _ = node
+                .internal_group
+                .set_attribute("transform", &inner_transform);
 
             let mut class = if is_dragging {
                 if flipped {
@@ -3261,12 +3305,18 @@ impl SvgView {
                     fmt_f32(current.1),
                     fmt_f32(rotation)
                 );
-                update_debug_label(&self.document, &node.debug_label, center_x, center_y, &label);
+                update_debug_label(
+                    &self.document,
+                    &node.debug_label,
+                    center_x,
+                    center_y,
+                    &label,
+                );
             } else {
                 let _ = node.debug_group.set_attribute("display", "none");
             }
-            if snapshot.core.connections.len() == total {
-                let connection = snapshot.core.connections.get(idx).copied().unwrap_or([false; 4]);
+            if render_connections.len() == total {
+                let connection = render_connections.get(idx).copied().unwrap_or([false; 4]);
                 let mut external_path = String::new();
                 if let Some(paths) = assets.paths.get(idx) {
                     for (dir, edge_path) in [
@@ -3332,12 +3382,14 @@ impl SvgView {
         let assets = self.core.assets()?;
         let mask_atlas = self.mask_atlas.borrow();
         let mask_atlas = mask_atlas.as_ref()?;
+        let positions = snapshot.piece_positions_px();
+        let rotations = snapshot.piece_rotations_deg();
         pick_piece_at(
             x,
             y,
-            &snapshot.core.positions,
-            &snapshot.core.rotations,
-            &snapshot.core.flips,
+            &positions,
+            &rotations,
+            &snapshot.piece_flipped,
             &snapshot.z_order,
             mask_atlas,
             assets.grid.cols as usize,
@@ -3374,10 +3426,11 @@ fn piece_owned_by_other(
         return false;
     }
     let total = cols * rows;
-    if piece_id >= total || snapshot.core.connections.len() < total {
+    let connections = snapshot.piece_connections();
+    if piece_id >= total || connections.len() < total {
         return false;
     }
-    let mut members = collect_group(&snapshot.core.connections, piece_id, cols, rows);
+    let mut members = collect_group(&connections, piece_id, cols, rows);
     if members.is_empty() {
         members.push(piece_id);
     }
@@ -3407,8 +3460,7 @@ impl GameView for SvgViewAdapter {
 
     fn render(&mut self, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
         let sync_view = snapshot_sync_view(sync_view);
-        self.view
-            .queue_render_snapshot(snapshot.clone(), sync_view);
+        self.view.queue_render_snapshot(snapshot.clone(), sync_view);
     }
 }
 
@@ -3596,7 +3648,11 @@ fn apply_taffy_layout(
             length(puzzle_width),
             length(right_gutter),
         ],
-        grid_template_rows: vec![length(top_gutter), length(puzzle_height), length(bottom_gutter)],
+        grid_template_rows: vec![
+            length(top_gutter),
+            length(puzzle_height),
+            length(bottom_gutter),
+        ],
         justify_items: Some(JustifyItems::Center),
         align_items: Some(AlignItems::Center),
         ..Default::default()
@@ -3951,21 +4007,115 @@ fn build_emboss_filter(
     }
     let emboss_opacity = fmt_f32(EMBOSS_OPACITY);
     let steps = vec![
-        ("feComponentTransfer", vec![("in", "SourceAlpha"), ("result", "a")]),
+        (
+            "feComponentTransfer",
+            vec![("in", "SourceAlpha"), ("result", "a")],
+        ),
         ("feFuncA", vec![("type", "linear"), ("slope", "1")]),
-        ("feOffset", vec![("in", "a"), ("dx", emboss_offset_neg.as_str()), ("dy", emboss_offset_neg.as_str()), ("result", "aOff")]),
-        ("feFlood", vec![("flood-color", "#000"), ("result", "black")]),
-        ("feComposite", vec![("in", "black"), ("in2", "a"), ("operator", "in"), ("result", "blackShape")]),
-        ("feFlood", vec![("flood-color", "#fff"), ("flood-opacity", "0.6"), ("result", "white")]),
-        ("feComposite", vec![("in", "white"), ("in2", "aOff"), ("operator", "in"), ("result", "whiteShape")]),
-        ("feMorphology", vec![("in", "whiteShape"), ("operator", "erode"), ("radius", "0.6"), ("result", "whiteThin")]),
-        ("feGaussianBlur", vec![("in", "whiteThin"), ("stdDeviation", "0.5"), ("result", "whiteShapeBlur")]),
-        ("feComposite", vec![("in", "whiteShapeBlur"), ("in2", "blackShape"), ("operator", "over"), ("result", "overlayFull")]),
-        ("feMorphology", vec![("in", "a"), ("operator", "erode"), ("radius", emboss_rim_radius.as_str()), ("result", "aInner")]),
-        ("feComposite", vec![("in", "a"), ("in2", "aInner"), ("operator", "arithmetic"), ("k1", "0"), ("k2", "1"), ("k3", "-1"), ("k4", "0"), ("result", "rim")]),
-        ("feComposite", vec![("in", "overlayFull"), ("in2", "rim"), ("operator", "in"), ("result", "overlayRim")]),
-        ("feComponentTransfer", vec![("in", "overlayRim"), ("result", "overlayRimOpacity")]),
-        ("feFuncA", vec![("type", "linear"), ("slope", emboss_opacity.as_str())]),
+        (
+            "feOffset",
+            vec![
+                ("in", "a"),
+                ("dx", emboss_offset_neg.as_str()),
+                ("dy", emboss_offset_neg.as_str()),
+                ("result", "aOff"),
+            ],
+        ),
+        (
+            "feFlood",
+            vec![("flood-color", "#000"), ("result", "black")],
+        ),
+        (
+            "feComposite",
+            vec![
+                ("in", "black"),
+                ("in2", "a"),
+                ("operator", "in"),
+                ("result", "blackShape"),
+            ],
+        ),
+        (
+            "feFlood",
+            vec![
+                ("flood-color", "#fff"),
+                ("flood-opacity", "0.6"),
+                ("result", "white"),
+            ],
+        ),
+        (
+            "feComposite",
+            vec![
+                ("in", "white"),
+                ("in2", "aOff"),
+                ("operator", "in"),
+                ("result", "whiteShape"),
+            ],
+        ),
+        (
+            "feMorphology",
+            vec![
+                ("in", "whiteShape"),
+                ("operator", "erode"),
+                ("radius", "0.6"),
+                ("result", "whiteThin"),
+            ],
+        ),
+        (
+            "feGaussianBlur",
+            vec![
+                ("in", "whiteThin"),
+                ("stdDeviation", "0.5"),
+                ("result", "whiteShapeBlur"),
+            ],
+        ),
+        (
+            "feComposite",
+            vec![
+                ("in", "whiteShapeBlur"),
+                ("in2", "blackShape"),
+                ("operator", "over"),
+                ("result", "overlayFull"),
+            ],
+        ),
+        (
+            "feMorphology",
+            vec![
+                ("in", "a"),
+                ("operator", "erode"),
+                ("radius", emboss_rim_radius.as_str()),
+                ("result", "aInner"),
+            ],
+        ),
+        (
+            "feComposite",
+            vec![
+                ("in", "a"),
+                ("in2", "aInner"),
+                ("operator", "arithmetic"),
+                ("k1", "0"),
+                ("k2", "1"),
+                ("k3", "-1"),
+                ("k4", "0"),
+                ("result", "rim"),
+            ],
+        ),
+        (
+            "feComposite",
+            vec![
+                ("in", "overlayFull"),
+                ("in2", "rim"),
+                ("operator", "in"),
+                ("result", "overlayRim"),
+            ],
+        ),
+        (
+            "feComponentTransfer",
+            vec![("in", "overlayRim"), ("result", "overlayRimOpacity")],
+        ),
+        (
+            "feFuncA",
+            vec![("type", "linear"), ("slope", emboss_opacity.as_str())],
+        ),
     ];
     let mut iter = steps.into_iter();
     while let Some((name, attrs)) = iter.next() {
@@ -4137,12 +4287,10 @@ fn pick_piece_at(
         let row = piece_id / cols;
         let base_x = col as f32 * piece_width;
         let base_y = row as f32 * piece_height;
-        let pos = positions.get(piece_id).copied().unwrap_or_else(|| {
-            (
-                base_x,
-                base_y,
-            )
-        });
+        let pos = positions
+            .get(piece_id)
+            .copied()
+            .unwrap_or_else(|| (base_x, base_y));
         let rotation = rotations.get(piece_id).copied().unwrap_or(0.0);
         let flipped = flips.get(piece_id).copied().unwrap_or(false);
         let mut local_x = x - pos.0;
@@ -4194,8 +4342,12 @@ fn preview_cursor_class(target: PreviewHoverTarget) -> Option<&'static str> {
         PreviewHoverTarget::Resize(handle) => Some(match handle {
             PreviewResizeHandle::Left | PreviewResizeHandle::Right => "preview-resize-ew",
             PreviewResizeHandle::Top | PreviewResizeHandle::Bottom => "preview-resize-ns",
-            PreviewResizeHandle::TopLeft | PreviewResizeHandle::BottomRight => "preview-resize-nwse",
-            PreviewResizeHandle::TopRight | PreviewResizeHandle::BottomLeft => "preview-resize-nesw",
+            PreviewResizeHandle::TopLeft | PreviewResizeHandle::BottomRight => {
+                "preview-resize-nwse"
+            }
+            PreviewResizeHandle::TopRight | PreviewResizeHandle::BottomLeft => {
+                "preview-resize-nesw"
+            }
         }),
     }
 }

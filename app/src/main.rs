@@ -4,27 +4,28 @@ mod app_router;
 mod app_runtime;
 mod boot;
 mod boot_runtime;
-mod view_runtime;
 mod core;
-mod input;
+mod game_state;
 mod idb;
+mod input;
 mod local_snapshot;
 mod model;
-mod persisted;
-mod persisted_store;
-mod puzzle_image;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod multiplayer_bridge;
 mod multiplayer_game_sync;
 mod multiplayer_identity;
-mod sync_runtime;
 mod multiplayer_sync;
-mod runtime;
+mod persisted;
+mod persisted_store;
+mod puzzle_image;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "renderer_stub.rs"]
 mod renderer;
+mod runtime;
+mod sync_runtime;
+mod view_runtime;
 
 #[cfg(target_arch = "wasm32")]
 mod wgpu_app;

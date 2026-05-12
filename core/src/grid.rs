@@ -6,9 +6,8 @@ pub struct GridChoice {
     pub actual_count: u32,
 }
 
-pub const TARGET_PIECE_COUNTS: [u32; 11] = [
-    50, 100, 150, 300, 500, 750, 1000, 1500, 2000, 3000, 5000,
-];
+pub const TARGET_PIECE_COUNTS: [u32; 11] =
+    [50, 100, 150, 300, 500, 750, 1000, 1500, 2000, 3000, 5000];
 pub const DEFAULT_TARGET_COUNT: u32 = 100;
 pub const GRID_REL_COUNT_TOL: f32 = 0.05;
 pub const GRID_PIECE_RATIO_MAX: f32 = 1.42;

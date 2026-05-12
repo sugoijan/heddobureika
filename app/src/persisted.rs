@@ -5,7 +5,7 @@ pub(crate) const SETTINGS_VERSION: u32 = 1;
 
 pub(crate) const BOOT_RECORD_KEY: &str = "boot.v2";
 pub(crate) const SETTINGS_KEY: &str = "settings.v1";
-pub(crate) const SNAPSHOT_KEY: &str = "snapshot.v1";
+pub(crate) const SNAPSHOT_KEY: &str = "playable-snapshot.v4";
 
 pub(crate) const LOCAL_PRIVATE_SCOPE: &str = "local";
 

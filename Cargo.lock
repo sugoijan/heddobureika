@@ -1548,6 +1548,7 @@ name = "heddobureika-core"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
+ "heddobureika-game",
  "imagesize",
  "rkyv",
  "serde",
@@ -1580,6 +1581,7 @@ dependencies = [
  "base64",
  "getrandom 0.2.17",
  "heddobureika-core",
+ "heddobureika-game",
  "heddobureika-image-pipeline",
  "imagesize",
  "js-sys",

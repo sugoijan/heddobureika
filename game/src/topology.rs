@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
 use crate::ids::{EdgeId, PieceId};
-pub use crate::traits::topology::PuzzleTopology;
+pub use crate::traits::topology::{FrameSnapKind, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
 
 /// Relative transform expectation for topology-defined neighbor relationships.
@@ -13,6 +13,68 @@ pub struct RelativePose {
     pub dx: LengthMm,
     pub dy: LengthMm,
     pub drot: AngleDeg,
+}
+
+/// Transport-friendly topology identity for canonical snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologySpec {
+    Unknown { piece_count: u32, edge_count: u32 },
+    Grid { cols: u32, rows: u32 },
+    TriangularTessellation { cols: u32, rows: u32 },
+}
+
+impl TopologySpec {
+    pub fn piece_count(self) -> u32 {
+        match self {
+            Self::Unknown { piece_count, .. } => piece_count,
+            Self::Grid { cols, rows } => cols * rows,
+            Self::TriangularTessellation { cols, rows } => cols * (rows * 2 + 1),
+        }
+    }
+
+    pub fn edge_count(self) -> u32 {
+        match self {
+            Self::Unknown { edge_count, .. } => edge_count,
+            Self::Grid { cols, rows } => {
+                rows * cols.saturating_sub(1) + cols * rows.saturating_sub(1)
+            }
+            Self::TriangularTessellation { cols, rows } => {
+                let piece_rows = rows * 2 + 1;
+                let vertical = piece_rows.saturating_sub(1) * cols;
+                let horizontal = (0..piece_rows)
+                    .map(|piece_row| {
+                        let start = if piece_row % 2 == 0 { 0 } else { 1 };
+                        if start >= cols {
+                            0
+                        } else {
+                            (cols - start) / 2
+                        }
+                    })
+                    .sum::<u32>();
+                vertical + horizontal
+            }
+        }
+    }
+
+    pub fn matches_counts(self, piece_count: u32, edge_count: u32) -> bool {
+        self.piece_count() == piece_count && self.edge_count() == edge_count
+    }
+
+    pub fn grid_topology(self) -> Option<GridTopology> {
+        match self {
+            Self::Grid { cols, rows } => GridTopology::try_new(cols, rows),
+            _ => None,
+        }
+    }
+
+    pub fn triangular_tessellation_topology(self) -> Option<TriangularTessellationTopology> {
+        match self {
+            Self::TriangularTessellation { cols, rows } => {
+                TriangularTessellationTopology::try_new(cols, rows)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Rectangular grid puzzle topology.
@@ -67,11 +129,14 @@ impl GridTopology {
 
     /// Canonical piece position in millimeters for testing/projection baselines.
     ///
-    /// Current scale is 1 mm per grid cell.
+    /// Returns the piece-CENTER pose in piece-count units: piece `(col, row)`
+    /// sits at `(col + 0.5, row + 0.5)`. This places piece 0's top-left
+    /// pixel at the workspace top-left under the standard
+    /// `piece_positions_px` conversion (`pose.x * piece_width - piece_width / 2`).
     pub fn canonical_position_mm(&self, piece: PieceId) -> Option<(LengthMm, LengthMm)> {
         let (row, col) = self.piece_row_col(piece)?;
-        let x = LengthMm::try_new(col as f32)?;
-        let y = LengthMm::try_new(row as f32)?;
+        let x = LengthMm::try_new(col as f32 + 0.5)?;
+        let y = LengthMm::try_new(row as f32 + 0.5)?;
         Some((x, y))
     }
 
@@ -112,6 +177,13 @@ impl GridTopology {
 }
 
 impl PuzzleTopology for GridTopology {
+    fn topology_spec(&self) -> TopologySpec {
+        TopologySpec::Grid {
+            cols: self.cols.get(),
+            rows: self.rows.get(),
+        }
+    }
+
     fn piece_count(&self) -> u32 {
         self.cols.get() * self.rows.get()
     }
@@ -164,6 +236,10 @@ impl PuzzleTopology for GridTopology {
 
     fn symmetry_angles(&self, _piece: PieceId) -> &[AngleDeg] {
         grid_symmetry_angles()
+    }
+
+    fn frame_snap_kind(&self) -> FrameSnapKind {
+        FrameSnapKind::Grid
     }
 }
 
@@ -376,6 +452,13 @@ impl TriangularTessellationTopology {
 }
 
 impl PuzzleTopology for TriangularTessellationTopology {
+    fn topology_spec(&self) -> TopologySpec {
+        TopologySpec::TriangularTessellation {
+            cols: self.cols.get(),
+            rows: self.rows.get(),
+        }
+    }
+
     fn piece_count(&self) -> u32 {
         self.piece_kinds.len() as u32
     }

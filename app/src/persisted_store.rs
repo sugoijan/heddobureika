@@ -7,12 +7,12 @@ use crate::persisted::{
     BootRecord, PrivateImageEntry, PrivateImageRefs, SettingsBlob, BOOT_RECORD_KEY,
     BOOT_RECORD_VERSION, SETTINGS_KEY, SETTINGS_VERSION, SNAPSHOT_KEY,
 };
-use heddobureika_core::{decode, encode, GameSnapshot, GAME_SNAPSHOT_VERSION};
+use heddobureika_core::{decode, encode, PlayableGameSnapshot, PLAYABLE_GAME_SNAPSHOT_VERSION};
 
 thread_local! {
     static BOOT_RECORD_CACHE: RefCell<Option<BootRecord>> = RefCell::new(None);
     static SETTINGS_CACHE: RefCell<Option<SettingsBlob>> = RefCell::new(None);
-    static SNAPSHOT_CACHE: RefCell<Option<GameSnapshot>> = RefCell::new(None);
+    static SNAPSHOT_CACHE: RefCell<Option<PlayableGameSnapshot>> = RefCell::new(None);
 }
 
 pub(crate) async fn bootstrap() -> Result<(), String> {
@@ -44,7 +44,7 @@ pub(crate) fn settings_blob() -> SettingsBlob {
         .unwrap_or_default()
 }
 
-pub(crate) fn snapshot() -> Option<GameSnapshot> {
+pub(crate) fn snapshot() -> Option<PlayableGameSnapshot> {
     SNAPSHOT_CACHE.with(|slot| slot.borrow().clone())
 }
 
@@ -78,7 +78,7 @@ where
     });
 }
 
-pub(crate) fn set_snapshot(next: Option<GameSnapshot>) {
+pub(crate) fn set_snapshot(next: Option<PlayableGameSnapshot>) {
     SNAPSHOT_CACHE.with(|slot| {
         *slot.borrow_mut() = next.clone();
     });
@@ -98,10 +98,7 @@ pub(crate) async fn load_private_image(hash: &str) -> Result<Option<PrivateImage
     Ok(decode::<PrivateImageEntry>(&bytes))
 }
 
-pub(crate) async fn save_private_image(
-    hash: &str,
-    entry: PrivateImageEntry,
-) -> Result<(), String> {
+pub(crate) async fn save_private_image(hash: &str, entry: PrivateImageEntry) -> Result<(), String> {
     let Some(bytes) = encode(&entry) else {
         return Ok(());
     };
@@ -163,13 +160,13 @@ async fn load_settings_blob(db: &web_sys::IdbDatabase) -> Option<SettingsBlob> {
     Some(settings)
 }
 
-async fn load_snapshot(db: &web_sys::IdbDatabase) -> Option<GameSnapshot> {
+async fn load_snapshot(db: &web_sys::IdbDatabase) -> Option<PlayableGameSnapshot> {
     let bytes = idb::idb_get_bytes(db, idb::IDB_STORE_SNAPSHOT, SNAPSHOT_KEY)
         .await
         .ok()
         .flatten()?;
-    let snapshot = decode::<GameSnapshot>(&bytes)?;
-    if snapshot.version != GAME_SNAPSHOT_VERSION {
+    let snapshot = decode::<PlayableGameSnapshot>(&bytes)?;
+    if snapshot.version != PLAYABLE_GAME_SNAPSHOT_VERSION {
         return None;
     }
     Some(snapshot)
@@ -197,7 +194,7 @@ async fn save_settings_blob(settings: SettingsBlob) -> Result<(), String> {
     Ok(())
 }
 
-async fn save_snapshot(snapshot: Option<GameSnapshot>) -> Result<(), String> {
+async fn save_snapshot(snapshot: Option<PlayableGameSnapshot>) -> Result<(), String> {
     let db = idb::open_db().await.map_err(idb::js_err)?;
     match snapshot {
         Some(snapshot) => {

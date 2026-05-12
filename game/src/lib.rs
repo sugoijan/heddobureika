@@ -22,10 +22,12 @@ pub mod rotation_step;
 pub mod rules;
 pub mod shape;
 pub mod shape_svg;
+pub mod snap;
 pub mod snapshot;
 pub mod topology;
 pub mod traits;
 pub mod units;
+pub mod update;
 
 pub use delta::{IdList, PlayableDelta};
 pub use edge_compose::ConnectorSeg;
@@ -40,12 +42,16 @@ pub use grid_shape::{
     GridShapeBuildError, GridShapeCache, GridShapeSettings,
 };
 pub use ids::{BorderEdgeId, EdgeId, FrameEdgeId, GroupId, PieceId};
-pub use logical::{GroupSlot, LogicalState, LogicalStateSummary, PieceSlot};
-pub use playable::{
-    FlipState, PlayableAction, PlayableState, PlayableStateSummary, Pose2, Position2,
-    RestrictedPlayableAction, SolveStage,
+pub use logical::{
+    GroupSlot, LogicalInvariantError, LogicalMerge, LogicalState, LogicalStateSummary, PieceSlot,
 };
-pub use projection::{InteractableState, ProjectionScratch};
+pub use playable::{
+    FlipState, PlayableAction, PlayableInvariantError, PlayableState, PlayableStateSummary, Pose2,
+    Position2, RestrictedPlayableAction, SolveStage,
+};
+pub use projection::{
+    IdentityPhysicalState, InteractableState, PhysicalProjection, ProjectionScratch, VisualState,
+};
 pub use rotation_step::{
     canonicalize_symmetry_angles, intersect_symmetry_angles, next_step_canonical, next_step_target,
     StepDirection, StepRotationTarget,
@@ -59,12 +65,22 @@ pub use shape::{
 pub use shape_svg::{
     cache_to_svg_paths, frame_to_svg_paths, path_to_svg_d, piece_to_svg_paths, SvgPiecePaths,
 };
-pub use snapshot::{PlayableSnapshot, SnapshotEnvelope, PLAYABLE_SNAPSHOT_VERSION};
-pub use topology::{GridTopology, RelativePose, TrianglePieceKind, TriangularTessellationTopology};
+pub use snap::{ActionId, JoinSite, MergePolicy, SnapCandidate, SnapProposal, SnapRejectionReason};
+pub use snapshot::{
+    PlayableSnapshot, PlayableSnapshotError, RestoredPlayableState, SnapshotEnvelope,
+    PLAYABLE_SNAPSHOT_VERSION,
+};
+pub use topology::{
+    GridTopology, RelativePose, TopologySpec, TrianglePieceKind, TriangularTessellationTopology,
+};
 pub use traits::edge_profile::EdgeProfileStrategy;
 pub use traits::shaping::{PieceGeometryProvider, TopologyShaper};
 pub use traits::topology::PuzzleTopology;
 pub use units::{AngleDeg, Dpi, LengthMm};
+pub use update::{
+    AppliedProposal, GroupMergeUpdate, GroupPoseUpdate, PlayableUpdateBatch,
+    ProposalApplyRejection, ProposalApplyStatus,
+};
 
 #[cfg(test)]
 mod tests {

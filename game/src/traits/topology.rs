@@ -2,12 +2,33 @@
 
 use crate::ids::{EdgeId, PieceId};
 use crate::rotation_step::{next_step_canonical, StepDirection};
-use crate::topology::RelativePose;
+use crate::topology::{RelativePose, TopologySpec};
 use crate::units::AngleDeg;
+
+/// Kinds of frame-snap policy supported by a topology.
+///
+/// Frame snap is the feature that pulls a group toward the puzzle's outer
+/// frame (corners/edges) when it lands close enough. Each topology decides
+/// whether the concept applies and which corners/edges count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSnapKind {
+    /// This topology does not participate in frame snap.
+    None,
+    /// Rectangular grid frame snap (corners + edges + complete-group identity).
+    Grid,
+}
 
 /// Describes puzzle piece/edge relationships without requiring a specific
 /// geometry implementation inside core state containers.
 pub trait PuzzleTopology {
+    /// Transport-friendly topology identity for snapshots.
+    fn topology_spec(&self) -> TopologySpec {
+        TopologySpec::Unknown {
+            piece_count: self.piece_count(),
+            edge_count: self.edge_count(),
+        }
+    }
+
     /// Total number of pieces in this puzzle.
     fn piece_count(&self) -> u32;
 
@@ -62,5 +83,15 @@ pub trait PuzzleTopology {
             rotation_snap_tolerance,
             StepDirection::Ccw,
         )
+    }
+
+    /// Identifies the kind of frame-snap policy this topology participates
+    /// in. Defaults to `None`; topologies that want frame-snap behavior
+    /// (currently only `GridTopology`) override.
+    ///
+    /// `PlayableState::apply_topology_frame_snap` reads this to dispatch to
+    /// the right snap-target computation.
+    fn frame_snap_kind(&self) -> FrameSnapKind {
+        FrameSnapKind::None
     }
 }

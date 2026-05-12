@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
-use std::fmt::Write;
 pub use heddobureika_core::game::*;
 pub(crate) use heddobureika_core::{
     best_grid_for_count, build_grid_choices, grid_choice_index, grid_choice_label, GridChoice,
     DEFAULT_TARGET_COUNT, FALLBACK_GRID, SOLVE_TIME_EXPONENT, SOLVE_TIME_FACTOR,
 };
+use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 pub(crate) const ROTATION_LOCK_THRESHOLD_DEFAULT: usize = 4;
 pub(crate) const ROTATION_LOCK_THRESHOLD_MIN: usize = 1;
 pub(crate) const ROTATION_NOISE_MIN: f32 = 0.0;
@@ -187,13 +187,7 @@ impl Default for RendererKind {
 }
 
 #[derive(
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct SvgRenderSettings {
     pub(crate) animations: bool,
@@ -214,13 +208,7 @@ impl Default for SvgRenderSettings {
 }
 
 #[derive(
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct WgpuRenderSettings {
     #[serde(default)]
@@ -250,13 +238,7 @@ fn default_wgpu_render_scale() -> f32 {
 }
 
 #[derive(
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct RenderSettings {
     #[serde(default = "default_image_max_dim")]
@@ -468,62 +450,6 @@ pub(crate) fn jitter_value(
     value.clamp(min, max)
 }
 
-pub(crate) fn is_solved(
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-    flips: &[bool],
-    connections: &[[bool; 4]],
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
-    rotation_enabled: bool,
-) -> bool {
-    let total = cols * rows;
-    if positions.len() != total {
-        return false;
-    }
-    if flips.len() != total {
-        return false;
-    }
-    if flips.iter().any(|flip| *flip) {
-        return false;
-    }
-    if is_fully_connected(connections, cols, rows) {
-        return true;
-    }
-    if rotation_enabled {
-        if rotations.len() != total {
-            return false;
-        }
-        for rotation in rotations {
-            if angle_delta(0.0, *rotation).abs() > ROTATION_SOLVE_TOLERANCE_DEG {
-                return false;
-            }
-        }
-    }
-    let tolerance = piece_width.min(piece_height) * SOLVE_TOLERANCE_RATIO;
-    let tolerance_sq = tolerance * tolerance;
-    for row in 0..rows {
-        for col in 0..cols {
-            let id = row * cols + col;
-            if let Some(pos) = positions.get(id) {
-                let target_x = col as f32 * piece_width;
-                let target_y = row as f32 * piece_height;
-                let dx = pos.0 - target_x;
-                let dy = pos.1 - target_y;
-                if dx * dx + dy * dy > tolerance_sq {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-
 pub(crate) fn rubber_band_distance(delta: f32, limit: f32) -> f32 {
     if limit <= 0.0 {
         return 0.0;
@@ -542,7 +468,6 @@ pub(crate) fn rubber_band_clamp(value: f32, min: f32, max: f32, limit: f32) -> f
         value
     }
 }
-
 
 pub(crate) fn next_snap_rotation(angle: f32) -> f32 {
     let next = (angle / ROTATION_STEP_DEG).floor() + 1.0;
@@ -568,8 +493,13 @@ pub(crate) fn click_rotation_delta(
     angle_delta(target, current_angle)
 }
 
-
-pub(crate) fn rotate_point(x: f32, y: f32, origin_x: f32, origin_y: f32, angle_deg: f32) -> (f32, f32) {
+pub(crate) fn rotate_point(
+    x: f32,
+    y: f32,
+    origin_x: f32,
+    origin_y: f32,
+    angle_deg: f32,
+) -> (f32, f32) {
     let (dx, dy) = (x - origin_x, y - origin_y);
     let (rx, ry) = rotate_vec(dx, dy, angle_deg);
     (origin_x + rx, origin_y + ry)
@@ -582,9 +512,7 @@ pub(crate) fn edge_seed(base: u32, orientation: u32, row: u32, col: u32) -> u32 
 }
 
 pub(crate) fn edge_from_seed(seed: u32, settings: &ShapeSettings) -> Edge {
-    let variation = settings
-        .variation
-        .clamp(VARIATION_MIN, VARIATION_MAX);
+    let variation = settings.variation.clamp(VARIATION_MIN, VARIATION_MAX);
     let tab_size_raw = jitter_value(
         seed,
         0,

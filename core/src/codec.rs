@@ -9,7 +9,9 @@ pub fn encode<T>(value: &T) -> Option<Vec<u8>>
 where
     T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, Error>>,
 {
-    rkyv::to_bytes::<Error>(value).ok().map(|bytes| bytes.into_vec())
+    rkyv::to_bytes::<Error>(value)
+        .ok()
+        .map(|bytes| bytes.into_vec())
 }
 
 pub fn decode<T>(bytes: &[u8]) -> Option<T>

@@ -138,9 +138,7 @@ impl PuzzleState {
         let mut positions = vec![(0.0, 0.0); total];
         let mut rotations = vec![0.0; total];
         for piece in 0..total {
-            if let Some(transform) =
-                self.piece_transform(piece, cols, piece_width, piece_height)
-            {
+            if let Some(transform) = self.piece_transform(piece, cols, piece_width, piece_height) {
                 positions[piece] = (transform.pos[0], transform.pos[1]);
                 rotations[piece] = transform.rot_deg;
             }

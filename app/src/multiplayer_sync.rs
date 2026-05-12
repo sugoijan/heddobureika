@@ -2,15 +2,15 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gloo::timers::future::TimeoutFuture;
-use js_sys::{Array, Math, Uint8Array};
-use wasm_bindgen::JsValue;
+use js_sys::{Array, Date, Math, Uint8Array};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
-use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
 use crate::persisted_store;
+use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
 
 pub(crate) struct WsHandlers {
     onopen: Closure<dyn FnMut(Event)>,
@@ -21,12 +21,7 @@ pub(crate) struct WsHandlers {
 
 impl WsHandlers {
     fn keep_alive(&self) {
-        let _ = (
-            &self.onopen,
-            &self.onmessage,
-            &self.onerror,
-            &self.onclose,
-        );
+        let _ = (&self.onopen, &self.onmessage, &self.onerror, &self.onclose);
     }
 }
 
@@ -75,15 +70,36 @@ fn outbound_delay_ms() -> u32 {
     compute_delay_ms(config.outbound_ms, config.jitter_ms)
 }
 
+thread_local! {
+    static INBOUND_LAST_FIRE_MS: Cell<f64> = Cell::new(0.0);
+    static OUTBOUND_LAST_FIRE_MS: Cell<f64> = Cell::new(0.0);
+}
+
+/// Clamps the per-message random delay so that consecutive messages cannot
+/// be reordered by jitter. Returns the wait-in-ms for *this* message, given
+/// its computed delay; updates the side-local monotonic fire-time cursor.
+fn schedule_monotonic(cursor: &'static std::thread::LocalKey<Cell<f64>>, delay_ms: u32) -> u32 {
+    let now = Date::now();
+    let computed_fire = now + delay_ms as f64;
+    let monotonic_fire = cursor.with(|cell| {
+        let prev = cell.get();
+        let target = computed_fire.max(prev + 1.0);
+        cell.set(target);
+        target
+    });
+    (monotonic_fire - now).max(0.0).ceil() as u32
+}
+
 fn send_bytes_with_delay(ws: &WebSocket, bytes: Vec<u8>) {
     let delay = outbound_delay_ms();
     if delay == 0 {
         let _ = ws.send_with_u8_array(&bytes);
         return;
     }
+    let wait = schedule_monotonic(&OUTBOUND_LAST_FIRE_MS, delay);
     let ws = ws.clone();
     spawn_local(async move {
-        TimeoutFuture::new(delay).await;
+        TimeoutFuture::new(wait).await;
         if ws.ready_state() == WebSocket::OPEN {
             let _ = ws.send_with_u8_array(&bytes);
         }
@@ -166,8 +182,9 @@ impl MultiplayerSyncAdapter {
                     }
                     return;
                 }
+                let wait = schedule_monotonic(&INBOUND_LAST_FIRE_MS, delay);
                 spawn_local(async move {
-                    TimeoutFuture::new(delay).await;
+                    TimeoutFuture::new(wait).await;
                     if let Some(msg) = decode::<ServerMsg>(&bytes) {
                         on_server_msg(msg);
                     }
@@ -206,12 +223,7 @@ impl MultiplayerSyncAdapter {
                     if reason.is_empty() {
                         gloo::console::log!("websocket closed", url.clone(), close.code());
                     } else {
-                        gloo::console::log!(
-                            "websocket closed",
-                            url.clone(),
-                            close.code(),
-                            reason
-                        );
+                        gloo::console::log!("websocket closed", url.clone(), close.code(), reason);
                     }
                 } else {
                     gloo::console::log!("websocket closed", url.clone());

@@ -2,9 +2,7 @@ use heddobureika_core::{catalog::puzzle_by_slug, PuzzleImageRef};
 
 pub(crate) fn resolve_puzzle_image_src(image_ref: &PuzzleImageRef) -> Option<String> {
     match image_ref {
-        PuzzleImageRef::BuiltIn { slug } => {
-            puzzle_by_slug(slug).map(|entry| entry.src.to_string())
-        }
+        PuzzleImageRef::BuiltIn { slug } => puzzle_by_slug(slug).map(|entry| entry.src.to_string()),
         PuzzleImageRef::Private { .. } => None,
     }
 }

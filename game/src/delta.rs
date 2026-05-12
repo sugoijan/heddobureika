@@ -17,6 +17,12 @@ pub struct PlayableDelta {
     pub dirty_groups: IdList<GroupId, 8>,
     pub dirty_pieces: IdList<PieceId, 16>,
     pub dirty_edges: IdList<EdgeId, 16>,
+    /// Edges whose `edge_active` flipped from true to false during this
+    /// batch. Subset of `dirty_edges`; used by the wire encoder to ship
+    /// explicit deactivations so clients can keep `edge_active` consistent
+    /// with the piece→group map (otherwise a future `detach_piece` rebuild
+    /// would resurrect stale active edges).
+    pub deactivated_edges: IdList<EdgeId, 8>,
     pub z_order_changed: bool,
     pub membership_changed: bool,
     pub solved_changed: bool,
@@ -35,6 +41,7 @@ impl PlayableDelta {
         self.dirty_groups.clear();
         self.dirty_pieces.clear();
         self.dirty_edges.clear();
+        self.deactivated_edges.clear();
         self.z_order_changed = false;
         self.membership_changed = false;
         self.solved_changed = false;

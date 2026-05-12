@@ -1,12 +1,12 @@
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::rc::Rc;
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use gloo::render::{request_animation_frame, AnimationFrame};
 use gloo::timers::callback::Timeout;
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use glyphon::cosmic_text::Align;
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use js_sys::{Date, Function, Reflect};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use taffy::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -16,25 +16,25 @@ use web_sys::{
     PointerEvent, WheelEvent,
 };
 
-use crate::boot;
 use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
+use crate::boot;
+use crate::core::*;
 use crate::input::{
     screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
     workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
     WheelIntentTracker,
 };
-use crate::sync_runtime;
-use crate::core::*;
+use crate::persisted_store;
+use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
     UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
+use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::{ClientId, PuzzleImageRef, PuzzleInfo};
-use crate::persisted_store;
-use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
@@ -384,9 +384,7 @@ pub(crate) fn run(core: Rc<AppCore>) {
             .expect("canvas element");
         canvas.set_class_name("puzzle-canvas");
         root.append_child(&canvas).expect("append canvas");
-        let sync_status = document
-            .create_element("div")
-            .expect("create sync status");
+        let sync_status = document.create_element("div").expect("create sync status");
         sync_status.set_class_name("sync-status");
         sync_status
             .set_attribute("title", "Server disconnected")
@@ -404,11 +402,10 @@ pub(crate) fn run(core: Rc<AppCore>) {
         let debug_overlay = DebugOverlay::new(&document);
         root.append_child(&debug_overlay.root).ok();
         *view.debug_overlay.borrow_mut() = Some(debug_overlay);
-        *view.sync_hook.borrow_mut() = Some(sync_runtime::register_sync_view_hook(Rc::new(
-            move || {
+        *view.sync_hook.borrow_mut() =
+            Some(sync_runtime::register_sync_view_hook(Rc::new(move || {
                 request_render();
-            },
-        )));
+            })));
         view_runtime::set_wgpu_settings_hook(Some(Rc::new({
             let view = view.clone();
             move |settings| {
@@ -429,7 +426,9 @@ pub(crate) fn run(core: Rc<AppCore>) {
         let subscription = core.subscribe(Rc::new(move || {
             let snapshot = core_for_render.snapshot();
             let sync_view = sync_runtime::sync_view();
-            adapter_for_render.borrow_mut().render(&snapshot, &sync_view);
+            adapter_for_render
+                .borrow_mut()
+                .render(&snapshot, &sync_view);
         }));
         *view.subscription.borrow_mut() = Some(subscription);
         WGPU_VIEW.with(|slot| {
@@ -626,7 +625,11 @@ impl WgpuView {
         }
         *last = Some(hash.to_string());
         if !self.multiplayer_active.get() {
-            boot::fail("image-missing", message, "Re-upload the image to this browser.");
+            boot::fail(
+                "image-missing",
+                message,
+                "Re-upload the image to this browser.",
+            );
         }
         self.private_image_loading.set(false);
     }
@@ -897,7 +900,10 @@ impl WgpuView {
         {
             let (point_a, point_b) = {
                 let policy = self.pointer_policy.borrow();
-                (policy.pointer_sample(touch_a), policy.pointer_sample(touch_b))
+                (
+                    policy.pointer_sample(touch_a),
+                    policy.pointer_sample(touch_b),
+                )
             };
             if let (Some(a), Some(b)) = (point_a, point_b) {
                 if self.update_preview_pinch(
@@ -1006,8 +1012,7 @@ impl WgpuView {
             else {
                 return;
             };
-            let (px, py) =
-                workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
+            let (px, py) = workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
             if let Some(gate) = self.touch_drag_gate.borrow_mut().as_mut() {
                 if let Some(drag_id) = snapshot.drag_pointer_id {
                     if gate.pointer_id != drag_id {
@@ -1119,9 +1124,9 @@ impl WgpuView {
         let pinch_ids = {
             let drag_ref = self.preview_drag.borrow();
             match drag_ref.as_ref() {
-                Some(PreviewDragState::Pinch { touch_a, touch_b, .. }) => {
-                    Some((*touch_a, *touch_b))
-                }
+                Some(PreviewDragState::Pinch {
+                    touch_a, touch_b, ..
+                }) => Some((*touch_a, *touch_b)),
                 _ => None,
             }
         };
@@ -1176,7 +1181,19 @@ impl WgpuView {
             {
                 let (px, py) =
                     workspace_to_puzzle_coords(snapshot.layout.puzzle_scale, view_x, view_y);
-                self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+                let should_send_move = snapshot
+                    .drag_cursor
+                    .map(|(last_x, last_y)| {
+                        let dx = px - last_x;
+                        let dy = py - last_y;
+                        let slop =
+                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        dx * dx + dy * dy > slop * slop
+                    })
+                    .unwrap_or(true);
+                if should_send_move {
+                    self.dispatch_action(CoreAction::DragMove { x: px, y: py });
+                }
             }
             self.dispatch_action(CoreAction::DragEnd {
                 pointer_id: Some(pointer_id),
@@ -1264,8 +1281,7 @@ impl WgpuView {
         let source_cap = (IMAGE_MAX_DIMENSION_MAX as f32 * WGPU_RENDER_SCALE_MAX)
             .round()
             .max(1.0) as u32;
-        let mut source_max_dim =
-            ((image_max_dim as f32) * render_scale).round().max(1.0) as u32;
+        let mut source_max_dim = ((image_max_dim as f32) * render_scale).round().max(1.0) as u32;
         if source_max_dim > source_cap {
             source_max_dim = source_cap;
         }
@@ -1663,13 +1679,12 @@ impl WgpuView {
         }
     }
 
-
     fn update_canvas_class(&self, snapshot: &AppSnapshot) {
         let mut canvas_class = "puzzle-canvas".to_string();
         let is_panning = self.pan_state.borrow().is_some();
         let preview_target = self.preview_hover.get();
-        let preview_hovered = preview_target != PreviewHoverTarget::None
-            || self.preview_drag.borrow().is_some();
+        let preview_hovered =
+            preview_target != PreviewHoverTarget::None || self.preview_drag.borrow().is_some();
         if is_panning {
             canvas_class.push_str(" panning");
         }
@@ -1694,14 +1709,19 @@ impl WgpuView {
         let drag_target = self.preview_drag.borrow().as_ref().map(|drag| match drag {
             PreviewDragState::Move { .. } => PreviewHoverTarget::Body,
             PreviewDragState::Resize { handle, .. } => PreviewHoverTarget::Resize(*handle),
-            PreviewDragState::Pinch { .. } => PreviewHoverTarget::Resize(PreviewResizeHandle::BottomRight),
+            PreviewDragState::Pinch { .. } => {
+                PreviewHoverTarget::Resize(PreviewResizeHandle::BottomRight)
+            }
         });
         let cursor_target = drag_target.unwrap_or(preview_target);
         if let Some(cursor_class) = preview_cursor_class(cursor_target) {
             canvas_class.push_str(" ");
             canvas_class.push_str(cursor_class);
         }
-        if matches!(self.preview_drag.borrow().as_ref().map(|drag| drag.kind()), Some(PreviewDragKind::Move)) {
+        if matches!(
+            self.preview_drag.borrow().as_ref().map(|drag| drag.kind()),
+            Some(PreviewDragKind::Move)
+        ) {
             canvas_class.push_str(" preview-dragging");
         }
         self.canvas.set_class_name(&canvas_class);
@@ -1744,7 +1764,11 @@ impl WgpuView {
     fn toggle_preview_revealed(self: &Rc<Self>) {
         let revealed = !self.preview_revealed.get();
         self.preview_revealed.set(revealed);
-        let target_blur = if revealed { 0.0 } else { PREVIEW_HIDDEN_BLUR_PX };
+        let target_blur = if revealed {
+            0.0
+        } else {
+            PREVIEW_HIDDEN_BLUR_PX
+        };
         self.preview_target_blur.set(target_blur);
         self.preview_anim_last_ms.set(0.0);
         self.request_render();
@@ -1753,7 +1777,10 @@ impl WgpuView {
     fn arm_preview_click(&self, pointer_id: Option<i32>, local_x: f32, local_y: f32) {
         let mut gesture = ClickGesture::new_default();
         gesture.arm(local_x, local_y, now_ms());
-        *self.preview_click.borrow_mut() = Some(PreviewClickState { pointer_id, gesture });
+        *self.preview_click.borrow_mut() = Some(PreviewClickState {
+            pointer_id,
+            gesture,
+        });
     }
 
     fn clear_preview_click(&self) {
@@ -1948,7 +1975,10 @@ impl WgpuView {
         let (min_w, max_w) = self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
         let base_dim = viewport_w.min(viewport_h).max(1.0);
         let mut box_w = (base_dim * PREVIEW_BOX_INIT_FRAC).max(PREVIEW_BOX_MIN_WIDTH);
-        box_w = box_w.min(viewport_w * PREVIEW_BOX_MAX_FRAC).max(min_w).min(max_w);
+        box_w = box_w
+            .min(viewport_w * PREVIEW_BOX_MAX_FRAC)
+            .max(min_w)
+            .min(max_w);
         let (_, box_h, _, _) = Self::preview_box_metrics(box_w, aspect);
         let base_x = PREVIEW_BOX_MARGIN;
         let base_y = viewport_h - PREVIEW_BOX_MARGIN - box_h;
@@ -2063,8 +2093,7 @@ impl WgpuView {
         let aspect = Self::preview_aspect(info);
         let frame_max_w =
             Self::preview_frame_max_width(info, snapshot.layout, viewport_w, viewport_h);
-        let (min_w, max_w) =
-            self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
+        let (min_w, max_w) = self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
         let dx = screen_b[0] - screen_a[0];
         let dy = screen_b[1] - screen_a[1];
         let distance = (dx * dx + dy * dy).sqrt();
@@ -2088,8 +2117,7 @@ impl WgpuView {
         let center_x = mid_x - rvx;
         let center_y = mid_y - rvy;
         let mut pos = [center_x - half_w, center_y - half_h];
-        let (clamped, _) =
-            self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
+        let (clamped, _) = self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
         pos = clamped;
         self.preview_width.set(width);
         self.preview_pos.set(pos);
@@ -2119,8 +2147,7 @@ impl WgpuView {
         self.ensure_preview_seeded(snapshot, canvas_rect, aspect);
         let frame_max_w =
             Self::preview_frame_max_width(info, snapshot.layout, viewport_w, viewport_h);
-        let (min_w, max_w) =
-            self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
+        let (min_w, max_w) = self.preview_width_bounds(aspect, viewport_w, viewport_h, frame_max_w);
         let mut width = self.preview_width.get().clamp(min_w, max_w);
         self.preview_width.set(width);
         let (box_w, box_h, _, _) = Self::preview_box_metrics(width, aspect);
@@ -2145,13 +2172,8 @@ impl WgpuView {
                 let vy = grab_offset[1] - half_h;
                 let (rvx, rvy) = rotate_vec(vx, vy, PREVIEW_TILT_DEG);
                 let target_pos = [local_x - half_w - rvx, local_y - half_h - rvy];
-                let (clamped, _) = self.clamp_preview_position(
-                    target_pos,
-                    box_w,
-                    box_h,
-                    viewport_w,
-                    viewport_h,
-                );
+                let (clamped, _) =
+                    self.clamp_preview_position(target_pos, box_w, box_h, viewport_w, viewport_h);
                 let dt = ((now_ms - *last_ms).max(0.0).min(50.0)) / 1000.0;
                 if dt > 0.0 {
                     let inst_vx = (clamped[0] - pos[0]) / dt;
@@ -2237,30 +2259,17 @@ impl WgpuView {
                 self.preview_width.set(width);
                 let (box_w, box_h, _, _) = Self::preview_box_metrics(width, aspect);
                 pos = match handle {
-                    PreviewResizeHandle::Left => {
-                        [right - box_w, center_y - box_h * 0.5]
-                    }
-                    PreviewResizeHandle::Right => {
-                        [left, center_y - box_h * 0.5]
-                    }
-                    PreviewResizeHandle::Top => {
-                        [center_x - box_w * 0.5, bottom - box_h]
-                    }
-                    PreviewResizeHandle::Bottom => {
-                        [center_x - box_w * 0.5, top]
-                    }
+                    PreviewResizeHandle::Left => [right - box_w, center_y - box_h * 0.5],
+                    PreviewResizeHandle::Right => [left, center_y - box_h * 0.5],
+                    PreviewResizeHandle::Top => [center_x - box_w * 0.5, bottom - box_h],
+                    PreviewResizeHandle::Bottom => [center_x - box_w * 0.5, top],
                     PreviewResizeHandle::TopLeft => [right - box_w, bottom - box_h],
                     PreviewResizeHandle::TopRight => [left, bottom - box_h],
                     PreviewResizeHandle::BottomLeft => [right - box_w, top],
                     PreviewResizeHandle::BottomRight => [left, top],
                 };
-                let (clamped, _) = self.clamp_preview_position(
-                    pos,
-                    box_w,
-                    box_h,
-                    viewport_w,
-                    viewport_h,
-                );
+                let (clamped, _) =
+                    self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
                 pos = clamped;
                 velocity = [0.0, 0.0];
                 *last_ms = now_ms;
@@ -2341,8 +2350,7 @@ impl WgpuView {
         let decay = (-PREVIEW_MOMENTUM_DECAY * dt).exp();
         velocity[0] *= decay;
         velocity[1] *= decay;
-        let (clamped, hit) =
-            self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
+        let (clamped, hit) = self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
         if hit[0] {
             velocity[0] *= 0.2;
         }
@@ -2373,8 +2381,7 @@ impl WgpuView {
         let width = self.clamp_preview_width(aspect, viewport_w, viewport_h, frame_max_w);
         let (box_w, box_h, image_w, image_h) = Self::preview_box_metrics(width, aspect);
         let mut pos = self.preview_pos.get();
-        let (clamped, _) =
-            self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
+        let (clamped, _) = self.clamp_preview_position(pos, box_w, box_h, viewport_w, viewport_h);
         if clamped != pos {
             self.preview_pos.set(clamped);
             pos = clamped;
@@ -2534,7 +2541,11 @@ impl WgpuView {
         let image_radius_px = puzzle_corner * image_scale;
         let image_rect_view = rect_to_view(layout.image_rect, view_rect, canvas_rect);
         let revealed = self.preview_revealed.get();
-        let base_opacity = if revealed { 1.0 } else { PREVIEW_HIDDEN_OPACITY };
+        let base_opacity = if revealed {
+            1.0
+        } else {
+            PREVIEW_HIDDEN_OPACITY
+        };
         let blur_norm = if PREVIEW_HIDDEN_BLUR_PX > 0.0 {
             (self.preview_blur.get() / PREVIEW_HIDDEN_BLUR_PX).clamp(0.0, 1.0)
         } else {
@@ -2720,10 +2731,18 @@ impl WgpuView {
             self.stop_auto_pan();
             return;
         };
-        let (dir_x, t_x) =
-            edge_intensity(screen_x, zones.inner.left, zones.inner.right, zones.inner_inset);
-        let (dir_y, t_y) =
-            edge_intensity(screen_y, zones.inner.top, zones.inner.bottom, zones.inner_inset);
+        let (dir_x, t_x) = edge_intensity(
+            screen_x,
+            zones.inner.left,
+            zones.inner.right,
+            zones.inner_inset,
+        );
+        let (dir_y, t_y) = edge_intensity(
+            screen_y,
+            zones.inner.top,
+            zones.inner.bottom,
+            zones.inner_inset,
+        );
         let ease_x = smoothstep(t_x);
         let ease_y = smoothstep(t_y);
         let mut speed_ratio = snapshot.view_settings.auto_pan_speed_ratio.max(0.0);
@@ -2758,12 +2777,14 @@ impl WgpuView {
         let assets = self.core.assets()?;
         let mask_atlas = self.mask_atlas.borrow();
         let mask_atlas = mask_atlas.as_ref()?;
+        let positions = snapshot.piece_positions_px();
+        let rotations = snapshot.piece_rotations_deg();
         pick_piece_at(
             x,
             y,
-            &snapshot.core.positions,
-            &snapshot.core.rotations,
-            &snapshot.core.flips,
+            &positions,
+            &rotations,
+            &snapshot.piece_flipped,
             &snapshot.z_order,
             mask_atlas,
             assets.grid.cols as usize,
@@ -2856,8 +2877,7 @@ impl WgpuView {
         self.multiplayer_active
             .set(matches!(sync_view.mode(), InitMode::Online));
         self.ensure_puzzle_image(snapshot);
-        let disconnected =
-            matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
+        let disconnected = matches!(sync_view.mode(), InitMode::Online) && !sync_view.connected();
         if disconnected {
             self.root.set_class_name("app wgpu sync-disconnected");
         } else {
@@ -2931,23 +2951,25 @@ impl WgpuView {
             }
         }
         let is_dark = is_dark_theme(snapshot.app_settings.theme_mode);
-        let (connections_label, border_connections_label) = if let Some(info) = snapshot.puzzle_info.as_ref() {
-            let cols = info.cols as usize;
-            let rows = info.rows as usize;
-            let total = cols * rows;
-            if snapshot.core.connections.len() == total {
-                let (connected, border_connected, total_expected, border_expected) =
-                    count_connections(&snapshot.core.connections, cols, rows);
-                (
-                    format_progress(connected, total_expected),
-                    format_progress(border_connected, border_expected),
-                )
+        let (connections_label, border_connections_label) =
+            if let Some(info) = snapshot.puzzle_info.as_ref() {
+                let cols = info.cols as usize;
+                let rows = info.rows as usize;
+                let total = cols * rows;
+                let connections = snapshot.piece_connections();
+                if connections.len() == total {
+                    let (connected, border_connected, total_expected, border_expected) =
+                        count_connections(&connections, cols, rows);
+                    (
+                        format_progress(connected, total_expected),
+                        format_progress(border_connected, border_expected),
+                    )
+                } else {
+                    ("--".to_string(), "--".to_string())
+                }
             } else {
                 ("--".to_string(), "--".to_string())
-            }
-        } else {
-            ("--".to_string(), "--".to_string())
-        };
+            };
         let backend_label = if snapshot.app_settings.show_debug {
             let existing = self.backend_label.borrow().clone();
             if existing.is_some() {
@@ -3010,17 +3032,24 @@ impl WgpuView {
         };
         let drag_origin = snapshot.drag_cursor;
         let drag_dir = if highlight_members.is_some() {
-            if snapshot.drag_right_click { -1.0 } else { 1.0 }
+            if snapshot.drag_right_click {
+                -1.0
+            } else {
+                1.0
+            }
         } else {
             0.0
         };
         let ownership_by_anchor = sync_view.ownership_by_anchor();
+        let positions = snapshot.piece_positions_px();
+        let rotations = snapshot.piece_rotations_deg();
+        let connections = snapshot.piece_connections();
         let instances = build_wgpu_instances(
-            &snapshot.core.positions,
-            &snapshot.core.rotations,
-            &snapshot.core.flips,
+            &positions,
+            &rotations,
+            &snapshot.piece_flipped,
             &snapshot.z_order,
-            &snapshot.core.connections,
+            &connections,
             snapshot.hovered_id,
             snapshot.app_settings.show_debug,
             assets.grid.cols as usize,
@@ -3378,7 +3407,9 @@ fn build_wgpu_instances(
         }
     }
     let drag_active = drag_dir.abs() > f32::EPSILON && drag_mask.iter().any(|val| *val);
-    let drag_count = highlighted_members.map(|members| members.len()).unwrap_or(0);
+    let drag_count = highlighted_members
+        .map(|members| members.len())
+        .unwrap_or(0);
     let drag_rotation = if drag_active {
         drag_angle_for_group(drag_count) * drag_dir.signum()
     } else {
@@ -3387,8 +3418,9 @@ fn build_wgpu_instances(
     let drag_scale = if drag_active { DRAG_SCALE } else { 1.0 };
     let drag_center = if drag_active {
         drag_origin.or_else(|| {
-            highlighted_members
-                .and_then(|members| drag_group_center(positions, members, piece_width, piece_height))
+            highlighted_members.and_then(|members| {
+                drag_group_center(positions, members, piece_width, piece_height)
+            })
         })
     } else {
         None
@@ -3409,11 +3441,7 @@ fn build_wgpu_instances(
         while let Some(id) = queue.pop() {
             members.push(id);
             for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-                if connections
-                    .get(id)
-                    .map(|edges| edges[dir])
-                    .unwrap_or(false)
-                {
+                if connections.get(id).map(|edges| edges[dir]).unwrap_or(false) {
                     if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
                         if group_id[neighbor] == usize::MAX {
                             group_id[neighbor] = gid;
@@ -3469,7 +3497,14 @@ fn build_wgpu_instances(
             let pos = positions.get(id).copied().unwrap_or((base_x, base_y));
             let render_pos = if drag_mask.get(id).copied().unwrap_or(false) {
                 if let Some(center) = drag_center {
-                    drag_group_position(pos, center, drag_scale, drag_rotation, piece_width, piece_height)
+                    drag_group_position(
+                        pos,
+                        center,
+                        drag_scale,
+                        drag_rotation,
+                        piece_width,
+                        piece_height,
+                    )
                 } else {
                     pos
                 }
@@ -3544,10 +3579,11 @@ fn piece_owned_by_other(
         return false;
     }
     let total = cols * rows;
-    if piece_id >= total || snapshot.core.connections.len() < total {
+    let connections = snapshot.piece_connections();
+    if piece_id >= total || connections.len() < total {
         return false;
     }
-    let mut members = collect_group(&snapshot.core.connections, piece_id, cols, rows);
+    let mut members = collect_group(&connections, piece_id, cols, rows);
     if members.is_empty() {
         members.push(piece_id);
     }
@@ -3665,10 +3701,7 @@ fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
     (max_width, max_height)
 }
 
-fn measure_text_block(
-    measure: &mut GlyphonMeasureState,
-    spec: &UiTextSpec,
-) -> (f32, f32) {
+fn measure_text_block(measure: &mut GlyphonMeasureState, spec: &UiTextSpec) -> (f32, f32) {
     let metrics = Metrics::new(spec.font_size, spec.line_height);
     let mut buffer = Buffer::new(&mut measure.font_system, metrics);
     buffer.set_size(&mut measure.font_system, None, None);
@@ -3737,7 +3770,11 @@ fn apply_taffy_layout(
             length(puzzle_width),
             length(right_gutter),
         ],
-        grid_template_rows: vec![length(top_gutter), length(puzzle_height), length(bottom_gutter)],
+        grid_template_rows: vec![
+            length(top_gutter),
+            length(puzzle_height),
+            length(bottom_gutter),
+        ],
         justify_items: Some(JustifyItems::Center),
         align_items: Some(AlignItems::Center),
         ..Default::default()
@@ -4092,19 +4129,18 @@ fn preview_cursor_class(target: PreviewHoverTarget) -> Option<&'static str> {
         PreviewHoverTarget::Resize(handle) => Some(match handle {
             PreviewResizeHandle::Left | PreviewResizeHandle::Right => "preview-resize-ew",
             PreviewResizeHandle::Top | PreviewResizeHandle::Bottom => "preview-resize-ns",
-            PreviewResizeHandle::TopLeft | PreviewResizeHandle::BottomRight => "preview-resize-nwse",
-            PreviewResizeHandle::TopRight | PreviewResizeHandle::BottomLeft => "preview-resize-nesw",
+            PreviewResizeHandle::TopLeft | PreviewResizeHandle::BottomRight => {
+                "preview-resize-nwse"
+            }
+            PreviewResizeHandle::TopRight | PreviewResizeHandle::BottomLeft => {
+                "preview-resize-nesw"
+            }
         }),
     }
 }
 
 fn rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
-    [
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        b as f32 / 255.0,
-        a,
-    ]
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a]
 }
 
 fn preview_colors(is_dark: bool) -> PreviewColors {

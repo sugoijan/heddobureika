@@ -237,11 +237,7 @@ impl ClickGesture {
         self.is_click_with_external_moved(now_ms, false)
     }
 
-    pub(crate) fn is_click_with_external_moved(
-        &self,
-        now_ms: f32,
-        external_moved: bool,
-    ) -> bool {
+    pub(crate) fn is_click_with_external_moved(&self, now_ms: f32, external_moved: bool) -> bool {
         if !self.active || external_moved {
             return false;
         }

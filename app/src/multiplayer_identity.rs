@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use heddobureika_core::ClientId;
 use js_sys::Date;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
@@ -9,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
 use web_sys::IdbDatabase;
-use heddobureika_core::ClientId;
 
 use crate::idb;
 
@@ -118,7 +118,9 @@ async fn generate_identity() -> Result<ClientIdentity, String> {
     };
 
     let db = idb::open_db().await.map_err(idb::js_err)?;
-    store_identity_record(&db, &record).await.map_err(idb::js_err)?;
+    store_identity_record(&db, &record)
+        .await
+        .map_err(idb::js_err)?;
 
     Ok(ClientIdentity {
         client_id,
@@ -146,8 +148,8 @@ fn import_identity(record: &StoredIdentity) -> Result<ClientIdentity, String> {
 }
 
 fn signing_key_from_bytes(private_key_bytes: &[u8]) -> Result<SigningKey, String> {
-    let secret = SecretKey::from_slice(private_key_bytes)
-        .map_err(|_| "invalid private key".to_string())?;
+    let secret =
+        SecretKey::from_slice(private_key_bytes).map_err(|_| "invalid private key".to_string())?;
     Ok(SigningKey::from(secret))
 }
 
@@ -186,7 +188,6 @@ async fn load_identity_record(db: &IdbDatabase) -> Result<Option<StoredIdentity>
 }
 
 async fn store_identity_record(db: &IdbDatabase, record: &StoredIdentity) -> Result<(), JsValue> {
-    let raw = serde_json::to_string(record)
-        .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let raw = serde_json::to_string(record).map_err(|err| JsValue::from_str(&err.to_string()))?;
     idb::idb_put_string(db, idb::IDB_STORE_IDENTITY, IDB_KEY, &raw).await
 }

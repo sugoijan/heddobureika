@@ -241,11 +241,6 @@ create-room *args:
       cargo run -p heddobureika-cli -- rooms create --admin-token "$token" --base-url "$base_url" "$@"; \
     fi
 
-# Run a single heuristic bot client against an existing room
-bot-run room_id *args:
-    @base_url="${ROOM_WS_BASE_URL:-ws://127.0.0.1:{{WRANGLER_PORT}}/ws}"; \
-    cargo run -p heddobureika-cli -- rooms bot run --room-id "{{room_id}}" --base-url "$base_url" "$@"
-
 # Show per-room durable recording status
 recording-status room_id *args:
     @if [ -f .dev.vars ]; then \
@@ -269,3 +264,6 @@ deploy:
     fi; \
     trunk build --release --public-url "$DEPLOY_PUBLIC_URL"; \
     rsync --progress -av --delete dist/ "$DEPLOY_RSYNC_DEST"
+
+fmt:
+    cargo fmt --all

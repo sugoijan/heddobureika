@@ -153,7 +153,10 @@ fn request_to_promise(request: IdbRequest) -> js_sys::Promise {
             let _ = resolve.call1(&JsValue::NULL, &result);
         });
         let on_error = wasm_bindgen::closure::Closure::once(move |_event: Event| {
-            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("indexeddb request failed"));
+            let _ = reject.call1(
+                &JsValue::NULL,
+                &JsValue::from_str("indexeddb request failed"),
+            );
         });
         request.set_onsuccess(Some(on_success.as_ref().unchecked_ref()));
         request.set_onerror(Some(on_error.as_ref().unchecked_ref()));

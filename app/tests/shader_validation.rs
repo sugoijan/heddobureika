@@ -120,21 +120,20 @@ fn entry_point<'a>(
         .unwrap_or_else(|| panic!("{label} missing entry point {stage:?}:{name}"))
 }
 
-fn entry_point_input_locations(
-    entry: &naga::EntryPoint,
-    module: &naga::Module,
-) -> BTreeSet<u32> {
+fn entry_point_input_locations(entry: &naga::EntryPoint, module: &naga::Module) -> BTreeSet<u32> {
     let mut locations = BTreeSet::new();
     for argument in &entry.function.arguments {
-        collect_binding_locations(module, argument.ty, argument.binding.as_ref(), &mut locations);
+        collect_binding_locations(
+            module,
+            argument.ty,
+            argument.binding.as_ref(),
+            &mut locations,
+        );
     }
     locations
 }
 
-fn entry_point_output_locations(
-    entry: &naga::EntryPoint,
-    module: &naga::Module,
-) -> BTreeSet<u32> {
+fn entry_point_output_locations(entry: &naga::EntryPoint, module: &naga::Module) -> BTreeSet<u32> {
     let mut locations = BTreeSet::new();
     if let Some(result) = &entry.function.result {
         collect_binding_locations(module, result.ty, result.binding.as_ref(), &mut locations);
@@ -185,8 +184,14 @@ fn resource_bindings(module: &naga::Module) -> BTreeMap<(u32, u32), ResourceKind
             },
             other => panic!("unexpected address space for binding {binding:?}: {other:?}"),
         };
-        if bindings.insert((binding.group, binding.binding), kind).is_some() {
-            panic!("duplicate binding for group {} binding {}", binding.group, binding.binding);
+        if bindings
+            .insert((binding.group, binding.binding), kind)
+            .is_some()
+        {
+            panic!(
+                "duplicate binding for group {} binding {}",
+                binding.group, binding.binding
+            );
         }
     }
     bindings

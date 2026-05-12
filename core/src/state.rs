@@ -1,15 +1,20 @@
-use crate::{compute_workspace_layout, GameRules, GridChoice, PuzzleInfo, WorkspaceLayout, FALLBACK_GRID};
+use crate::{
+    compute_workspace_layout, GameRules, GridChoice, PuzzleInfo, WorkspaceLayout, FALLBACK_GRID,
+};
 
+/// In-memory puzzle metadata.
+///
+/// Live piece data (positions, rotations, flips, connections) is not stored
+/// here. The app holds it in `AppGameState` (authoritative
+/// `PlayableState<GridTopology>` plus its `VisualState` projection), with
+/// transitional legacy scratch arrays kept app-private while the drag/snap
+/// math is incrementally rewritten to operate on `Pose2`/`PlayableState`.
 #[derive(Clone, Debug)]
 pub struct CoreState {
     pub puzzle_info: Option<PuzzleInfo>,
     pub grid: GridChoice,
     pub piece_width: f32,
     pub piece_height: f32,
-    pub positions: Vec<(f32, f32)>,
-    pub rotations: Vec<f32>,
-    pub flips: Vec<bool>,
-    pub connections: Vec<[bool; 4]>,
     pub solved: bool,
     pub layout: WorkspaceLayout,
     pub scramble_nonce: u32,
@@ -25,10 +30,6 @@ impl CoreState {
             grid: FALLBACK_GRID,
             piece_width: 0.0,
             piece_height: 0.0,
-            positions: Vec::new(),
-            rotations: Vec::new(),
-            flips: Vec::new(),
-            connections: Vec::new(),
             solved: false,
             layout,
             scramble_nonce: 0,

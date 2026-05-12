@@ -7,9 +7,14 @@ use js_sys::{Date, Function, Reflect};
 use wasm_bindgen::JsCast;
 
 use crate::core::*;
+use crate::game_state::AppGameState;
 use crate::input::ClickGesture;
 use crate::runtime::CoreAction;
-use heddobureika_core::{validate_image_ref, CoreSnapshot, CoreState, GameRules, PuzzleImageRef, PuzzleInfo};
+use heddobureika_core::{
+    safety_corrections_after_detach, validate_image_ref, AngleDeg, CoreState, EdgeId, FlipState,
+    GameRules, MergePolicy, PieceId, PlayableAction, Pose2, Position2, PuzzleImageRef, PuzzleInfo,
+    PuzzleTopology, RestrictedPlayableAction,
+};
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
 
@@ -80,7 +85,19 @@ struct ViewState {
 pub(crate) struct AppSnapshot {
     pub(crate) puzzle_info: Option<PuzzleInfo>,
     pub(crate) rules: GameRules,
-    pub(crate) core: CoreSnapshot,
+    /// Full authoritative game state. Cloned from `AppState.game` into each
+    /// snapshot so renderers and bridges can read from a `PlayableState` /
+    /// `VisualState` directly.
+    pub(crate) game: Option<AppGameState>,
+    /// Piece world poses in mm (center-of-piece coords), derived from
+    /// `state.game.visual.piece_visual_pose`.
+    pub(crate) piece_world_poses: Vec<Pose2>,
+    /// Per-piece flip state, derived from the piece's group's flip in
+    /// `state.game.playable.group_flip`.
+    pub(crate) piece_flipped: Vec<bool>,
+    /// Per-piece group anchor (the canonical group id = min piece in group).
+    pub(crate) piece_group_anchor: Vec<u32>,
+    pub(crate) scramble_nonce: u32,
     pub(crate) grid: GridChoice,
     pub(crate) piece_width: f32,
     pub(crate) piece_height: f32,
@@ -98,6 +115,71 @@ pub(crate) struct AppSnapshot {
     pub(crate) view: ViewRect,
     pub(crate) app_settings: AppSettings,
     pub(crate) view_settings: ViewSettings,
+}
+
+impl AppSnapshot {
+    /// Materializes piece pixel-coord top-left positions as a Vec.
+    pub(crate) fn piece_positions_px(&self) -> Vec<(f32, f32)> {
+        self.piece_world_poses
+            .iter()
+            .map(|pose| {
+                (
+                    pose.x_mm() * self.piece_width - self.piece_width * 0.5,
+                    pose.y_mm() * self.piece_height - self.piece_height * 0.5,
+                )
+            })
+            .collect()
+    }
+
+    /// Materializes piece rotations in degrees as a Vec.
+    pub(crate) fn piece_rotations_deg(&self) -> Vec<f32> {
+        self.piece_world_poses
+            .iter()
+            .map(|pose| pose.rotation_degrees())
+            .collect()
+    }
+
+    /// Materializes the per-piece connection table derived from
+    /// `state.game.playable.logical`. Returns an empty Vec when no game is
+    /// loaded.
+    pub(crate) fn piece_connections(&self) -> Vec<[bool; 4]> {
+        let Some(game) = self.game.as_ref() else {
+            return Vec::new();
+        };
+        let cols = self.grid.cols as usize;
+        let rows = self.grid.rows as usize;
+        let total = cols.saturating_mul(rows);
+        if total == 0 || game.playable.piece_count() != total {
+            return Vec::new();
+        }
+        let mut out = vec![[false; 4]; total];
+        for edge_idx in 0..game.playable.logical.edge_count() {
+            let edge = EdgeId(edge_idx as u32);
+            if game.playable.logical.is_edge_active(edge) != Some(true) {
+                continue;
+            }
+            let (a, b) = game.playable.logical.topology.edge_endpoints(edge);
+            let a_idx = a.as_usize();
+            let b_idx = b.as_usize();
+            if a_idx >= total || b_idx >= total {
+                continue;
+            }
+            if b_idx == a_idx + 1 && a_idx / cols == b_idx / cols {
+                out[a_idx][DIR_RIGHT] = true;
+                out[b_idx][DIR_LEFT] = true;
+            } else if a_idx == b_idx + 1 && a_idx / cols == b_idx / cols {
+                out[a_idx][DIR_LEFT] = true;
+                out[b_idx][DIR_RIGHT] = true;
+            } else if b_idx == a_idx + cols {
+                out[a_idx][DIR_DOWN] = true;
+                out[b_idx][DIR_UP] = true;
+            } else if a_idx == b_idx + cols {
+                out[a_idx][DIR_UP] = true;
+                out[b_idx][DIR_DOWN] = true;
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -134,7 +216,6 @@ impl Default for ViewSettings {
     }
 }
 
-
 struct SnapshotBuffer {
     front: AppSnapshot,
     back: AppSnapshot,
@@ -151,15 +232,6 @@ impl SnapshotBuffer {
 
     fn refresh_from_state(&mut self, state: &AppState) {
         fill_snapshot_from_state(state, &mut self.back);
-        std::mem::swap(&mut self.front, &mut self.back);
-    }
-
-    fn mutate_from_front<F>(&mut self, mutator: F)
-    where
-        F: FnOnce(&mut AppSnapshot),
-    {
-        self.back.clone_from(&self.front);
-        mutator(&mut self.back);
         std::mem::swap(&mut self.front, &mut self.back);
     }
 }
@@ -197,8 +269,10 @@ struct DragState {
 
 struct AppState {
     core: CoreState,
+    /// Authoritative game state. Populated whenever a puzzle is loaded;
+    /// `None` only on the empty default state.
+    game: Option<AppGameState>,
     assets: Option<Rc<PuzzleAssets>>,
-    z_order: Vec<usize>,
     hovered_id: Option<usize>,
     active_id: Option<usize>,
     dragging_members: Vec<usize>,
@@ -240,8 +314,53 @@ impl AppCore {
         }
     }
 
-    fn notify_snapshot_only(&self) {
-        self.notify_subscribers();
+    /// Reads a piece's pose from `state.game.visual` and converts it to the
+    /// legacy `((x_px, y_px), rot_deg)` format used by drag/snap math.
+    fn piece_pixel_pose(state: &AppState, piece_id: usize) -> ((f32, f32), f32) {
+        let Some(game) = state.game.as_ref() else {
+            return ((0.0, 0.0), 0.0);
+        };
+        let pose = game
+            .visual
+            .piece_visual_pose()
+            .get(piece_id)
+            .copied()
+            .unwrap_or_default();
+        let px = pose.x_mm() * state.core.piece_width - state.core.piece_width * 0.5;
+        let py = pose.y_mm() * state.core.piece_height - state.core.piece_height * 0.5;
+        ((px, py), pose.rotation_degrees())
+    }
+
+    /// Reads a piece's flip state from `state.game.playable.group_flip`.
+    fn piece_is_flipped(state: &AppState, piece_id: usize) -> bool {
+        let Some(game) = state.game.as_ref() else {
+            return false;
+        };
+        let piece = PieceId(piece_id as u32);
+        match game.playable.logical.group_of(piece) {
+            Some(group) => game.playable.flip_of(group) == Some(FlipState::Flipped),
+            None => false,
+        }
+    }
+
+    /// Writes a piece's pose into `state.game.visual.piece_visual_pose`,
+    /// converting the legacy `((x_px, y_px), rot_deg)` format to mm/degree
+    /// `Pose2`.
+    fn set_piece_pixel_pose(state: &mut AppState, piece_id: usize, px: (f32, f32), rot_deg: f32) {
+        let piece_width = state.core.piece_width;
+        let piece_height = state.core.piece_height;
+        let Some(game) = state.game.as_mut() else {
+            return;
+        };
+        if piece_width <= 0.0 || piece_height <= 0.0 {
+            return;
+        }
+        let mm_x = (px.0 + piece_width * 0.5) / piece_width;
+        let mm_y = (px.1 + piece_height * 0.5) / piece_height;
+        if let Some(pose) = Pose2::try_from_mm_degrees(mm_x, mm_y, rot_deg) {
+            game.visual
+                .set_piece_visual_pose(PieceId(piece_id as u32), pose);
+        }
     }
 
     fn refresh_snapshot_from_state(&self) {
@@ -252,17 +371,6 @@ impl AppCore {
 
     pub(crate) fn snapshot(&self) -> AppSnapshot {
         self.snapshots.borrow().front.clone()
-    }
-
-    pub(crate) fn mutate_snapshot<F>(&self, mutator: F)
-    where
-        F: FnOnce(&mut AppSnapshot),
-    {
-        {
-            let mut snapshots = self.snapshots.borrow_mut();
-            snapshots.mutate_from_front(mutator);
-        }
-        self.notify_snapshot_only();
     }
 
     pub(crate) fn assets(&self) -> Option<Rc<PuzzleAssets>> {
@@ -312,10 +420,23 @@ impl AppCore {
         };
         let piece_width = width as f32 / grid.cols as f32;
         let piece_height = height as f32 / grid.rows as f32;
-        let depth_cap = state.view_settings.shape.tab_depth_cap.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-        let curve_detail = state.view_settings.shape.curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
+        let depth_cap = state
+            .view_settings
+            .shape
+            .tab_depth_cap
+            .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+        let curve_detail = state
+            .view_settings
+            .shape
+            .curve_detail
+            .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
         let pieces = build_pieces(grid.rows, grid.cols);
-        let (horizontal, vertical) = build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &state.view_settings.shape);
+        let (horizontal, vertical) = build_edge_maps(
+            grid.rows,
+            grid.cols,
+            PUZZLE_SEED,
+            &state.view_settings.shape,
+        );
         let (horizontal_waves, vertical_waves) = build_line_waves(
             grid.rows,
             grid.cols,
@@ -401,31 +522,23 @@ impl AppCore {
         );
         let rotations = scramble_rotations(rotation_seed, total, state.core.rules.rotation_enabled);
         let flips = scramble_flips(flip_seed, total, 0.0);
-        let connections = vec![[false; 4]; total];
-        let (
-            _anchor_of,
-            _group_positions,
-            _group_rotations,
-            _group_order,
-            derived_positions,
-            derived_rotations,
-            piece_order,
-        ) = rebuild_group_state(
-            &positions,
-            &rotations,
-            &connections,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
-            Some(&order),
-        );
         state.core.scramble_nonce = nonce;
-        state.core.positions = derived_positions;
-        state.core.rotations = derived_rotations;
-        state.core.flips = flips;
-        state.core.connections = connections;
-        state.z_order = piece_order;
+        if let Some(info) = state.core.puzzle_info.clone() {
+            state.game = AppGameState::scrambled(
+                info,
+                state.core.rules,
+                nonce,
+                &positions,
+                &rotations,
+                &flips,
+                &order,
+                piece_width,
+                piece_height,
+            )
+            .ok();
+        } else {
+            state.game = None;
+        }
         state.hovered_id = None;
         state.active_id = None;
         state.dragging_members.clear();
@@ -451,17 +564,77 @@ impl AppCore {
         if total == 0 || piece_id >= total {
             return;
         }
-        let cols = state.core.grid.cols as usize;
-        let rows = state.core.grid.rows as usize;
+        // Apply shift-key split as a `DetachPieceAsGroup` mutation on
+        // state.game so the split persists through drag_move/drag_end.
+        // Multi-piece groups can sit outside the tight "safe area" because
+        // drag_move uses the same loose bound for groups as for singles; when
+        // a Shift-detach breaks such a group up, force-move each resulting
+        // group back to its applicable safety bound (loose for singletons,
+        // tight for multi-piece). This is the optimistic local apply — the
+        // server runs the exact same `safety_corrections_after_detach` logic
+        // server-side as part of its Detach handler, so the wire echo will
+        // confirm the same corrected poses.
         if shift_key {
-            clear_piece_connections(&mut state.core.connections, piece_id, cols, rows);
+            let rules = state.core.rules;
+            if let Some(game) = state.game.as_mut() {
+                let piece = PieceId(piece_id as u32);
+                let pose = game
+                    .visual
+                    .piece_visual_pose()
+                    .get(piece_id)
+                    .copied()
+                    .unwrap_or_default();
+                let flip = game
+                    .playable
+                    .logical
+                    .group_of(piece)
+                    .and_then(|g| game.playable.flip_of(g))
+                    .unwrap_or(FlipState::Normal);
+                let original_members: Vec<PieceId> = game
+                    .playable
+                    .logical
+                    .group_of(piece)
+                    .map(|g| game.playable.logical.members_of(g).collect())
+                    .unwrap_or_else(|| vec![piece]);
+                let _ = game.playable.apply_restricted_action_batch(
+                    RestrictedPlayableAction::DetachPieceAsGroup {
+                        piece,
+                        target_pose: pose,
+                        target_flip: flip,
+                    },
+                    None,
+                );
+                let puzzle_info = game.puzzle.clone();
+                let corrections = safety_corrections_after_detach(
+                    &game.playable,
+                    &original_members,
+                    &puzzle_info,
+                    &rules,
+                );
+                for (group, drop_pos) in corrections {
+                    let _ = game.playable.apply_action_only(
+                        PlayableAction::TranslateGroup { group, drop_pos },
+                        None,
+                    );
+                }
+                game.rebuild_visual();
+            }
         }
-        let mut members = collect_group(
-            &state.core.connections,
-            piece_id,
-            cols,
-            rows,
-        );
+        // Walk the group containing piece_id directly on state.game.
+        let mut members: Vec<usize> = if let Some(game) = state.game.as_ref() {
+            let piece = PieceId(piece_id as u32);
+            match game.playable.logical.group_of(piece) {
+                Some(group) => game
+                    .playable
+                    .logical
+                    .members_of(group)
+                    .map(|p| p.as_usize())
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         if members.is_empty() {
             members.push(piece_id);
         }
@@ -469,12 +642,8 @@ impl AppCore {
         let mut start_positions = Vec::with_capacity(members.len());
         let mut start_rotations = Vec::with_capacity(members.len());
         for id in &members {
-            if let Some(pos) = state.core.positions.get(*id).copied() {
-                start_positions.push(pos);
-            } else {
-                start_positions.push((0.0, 0.0));
-            }
-            let rot = state.core.rotations.get(*id).copied().unwrap_or(0.0);
+            let ((px, py), rot) = Self::piece_pixel_pose(&state, *id);
+            start_positions.push((px, py));
             start_rotations.push(rot);
         }
         let piece_width = state.core.piece_width;
@@ -484,15 +653,7 @@ impl AppCore {
         let now_ms = now_ms_f32();
         let mut click_gesture = ClickGesture::new_with_slop(click_slop);
         click_gesture.arm(x, y, now_ms);
-        let base_pos = state
-            .core
-            .positions
-            .get(piece_id)
-            .copied()
-            .unwrap_or((
-                (piece_id % state.core.grid.cols as usize) as f32 * piece_width,
-                (piece_id / state.core.grid.cols as usize) as f32 * piece_height,
-            ));
+        let base_pos = Self::piece_pixel_pose(&state, piece_id).0;
         let pivot_x = base_pos.0 + piece_width * 0.5;
         let pivot_y = base_pos.1 + piece_height * 0.5;
         let start_angle = (y - pivot_y).atan2(x - pivot_x);
@@ -517,7 +678,16 @@ impl AppCore {
         state.dragging_members = members.clone();
         state.active_id = Some(piece_id);
         state.hovered_id = None;
-        bring_members_to_front(&mut state.z_order, &members);
+        // Bring the dragged group to the top of the z-stack. The anchor
+        // piece id is `members[0]` (members is sorted ascending). On
+        // PlayableState that's a `SetGroupOrder` restricted action which
+        // promotes the named anchors to the back of `z_order` (= top of
+        // the render stack).
+        if let Some(game) = state.game.as_mut() {
+            let anchors = vec![members[0] as u32];
+            game.playable.set_z_order_by_anchors(&anchors);
+            game.rebuild_visual();
+        }
         drop(state);
         self.notify();
     }
@@ -538,20 +708,17 @@ impl AppCore {
             let current_angle = (y - pivot_y).atan2(x - pivot_x);
             let delta_deg = (current_angle - drag.start_angle).to_degrees();
             let anchor_id = drag.members.first().copied().unwrap_or(0);
-            let flipped = state.core.flips.get(anchor_id).copied().unwrap_or(false);
+            let flipped = Self::piece_is_flipped(&state, anchor_id);
             let rotation_delta = if flipped { -delta_deg } else { delta_deg };
             for (idx, id) in drag.members.iter().enumerate() {
                 let start_pos = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
                 let center_x = start_pos.0 + piece_width * 0.5;
                 let center_y = start_pos.1 + piece_height * 0.5;
                 let (rx, ry) = rotate_point(center_x, center_y, pivot_x, pivot_y, delta_deg);
-                if let Some(pos) = state.core.positions.get_mut(*id) {
-                    *pos = (rx - piece_width * 0.5, ry - piece_height * 0.5);
-                }
-                if let Some(rot) = state.core.rotations.get_mut(*id) {
-                    let start_rot = drag.start_rotations.get(idx).copied().unwrap_or(*rot);
-                    *rot = normalize_angle(start_rot + rotation_delta);
-                }
+                let new_px = (rx - piece_width * 0.5, ry - piece_height * 0.5);
+                let start_rot = drag.start_rotations.get(idx).copied().unwrap_or(0.0);
+                let new_rot = normalize_angle(start_rot + rotation_delta);
+                Self::set_piece_pixel_pose(&mut state, *id, new_px, new_rot);
             }
         } else {
             let dx = x - drag.start_x;
@@ -578,31 +745,14 @@ impl AppCore {
                     center_max_y = center_min_y;
                 }
                 let rubber_limit = piece_width.min(piece_height) * RUBBER_BAND_RATIO;
+                // Single bound for both single pieces and multi-piece groups —
+                // the tighter group-only inset was removed because it was
+                // disproportionately restrictive for puzzles with few/large
+                // pieces. Groups that get broken up by Shift-drag now have
+                // their resulting sub-groups force-moved back into the safe
+                // area at detach time (see `enforce_workspace_safety_after_detach`).
                 let (bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y) =
-                    if drag.members.len() > 1 {
-                        let mut min_x = center_min_x + piece_width;
-                        let mut max_x = center_max_x - piece_width;
-                        let mut min_y = center_min_y + piece_height;
-                        let mut max_y = center_max_y - piece_height;
-                        if max_x < min_x {
-                            let mid = (center_min_x + center_max_x) * 0.5;
-                            min_x = mid;
-                            max_x = mid;
-                        }
-                        if max_y < min_y {
-                            let mid = (center_min_y + center_max_y) * 0.5;
-                            min_y = mid;
-                            max_y = mid;
-                        }
-                        (min_x, max_x, min_y, max_y)
-                    } else {
-                        (
-                            center_min_x,
-                            center_max_x,
-                            center_min_y,
-                            center_max_y,
-                        )
-                    };
+                    (center_min_x, center_max_x, center_min_y, center_max_y);
                 let mut in_bounds = false;
                 let mut best_dx = dx;
                 let mut best_dy = dy;
@@ -635,10 +785,10 @@ impl AppCore {
                 }
             }
             for (idx, id) in drag.members.iter().enumerate() {
-                if let Some(pos) = state.core.positions.get_mut(*id) {
-                    let start = drag.start_positions.get(idx).copied().unwrap_or(*pos);
-                    *pos = (start.0 + dx, start.1 + dy);
-                }
+                let start = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
+                let new_px = (start.0 + dx, start.1 + dy);
+                let rot = drag.start_rotations.get(idx).copied().unwrap_or(0.0);
+                Self::set_piece_pixel_pose(&mut state, *id, new_px, rot);
             }
         }
         state.drag_state = Some(drag);
@@ -662,167 +812,96 @@ impl AppCore {
         let cols = state.core.grid.cols as usize;
         let rows = state.core.grid.rows as usize;
         let total = cols * rows;
-        if total == 0 {
-            state.drag_state = None;
-            state.dragging_members.clear();
-            state.active_id = None;
-            drop(state);
-            self.notify();
-            return;
-        }
         let piece_width = state.core.piece_width;
         let piece_height = state.core.piece_height;
-        let layout = state.core.layout;
-        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
-        let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
-        let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
-        let puzzle_view_width = layout.view_width / puzzle_scale;
-        let puzzle_view_height = layout.view_height / puzzle_scale;
-        let center_min_x = puzzle_view_min_x + piece_width * 0.5;
-        let center_min_y = puzzle_view_min_y + piece_height * 0.5;
-        let mut center_max_x = puzzle_view_min_x + puzzle_view_width - piece_width * 0.5;
-        let mut center_max_y = puzzle_view_min_y + puzzle_view_height - piece_height * 0.5;
-        if center_max_x < center_min_x {
-            center_max_x = center_min_x;
-        }
-        if center_max_y < center_min_y {
-            center_max_y = center_min_y;
-        }
-        let snap_distance = piece_width.min(piece_height) * state.core.rules.snap_distance_ratio;
-        let complete_snap = !state.core.solved;
-        let flips = state.core.flips.clone();
-        let frame_snap_ratio = state.core.rules.frame_snap_ratio;
         let rotation_snap_tolerance = state.core.rules.rotation_snap_tolerance_deg;
         let rotation_enabled = state.core.rules.rotation_enabled;
         let click_tolerance = drag.click_slop;
         let click_tolerance_sq = click_tolerance * click_tolerance;
-        let moved = drag
-            .members
-            .iter()
-            .enumerate()
-            .any(|(idx, id)| {
-                let start = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
-                let current = state.core.positions.get(*id).copied().unwrap_or(start);
-                let dx = current.0 - start.0;
-                let dy = current.1 - start.1;
-                dx * dx + dy * dy > click_tolerance_sq
-            });
+        let click_id = drag.primary_id;
+        let primary_piece = PieceId(click_id as u32);
+        let Some(game) = state.game.as_mut() else {
+            state.drag_state = None;
+            state.dragging_members.clear();
+            state.active_id = None;
+            drop(state);
+            self.notify();
+            return;
+        };
+        if total == 0 || game.playable.piece_count() != total {
+            state.drag_state = None;
+            state.dragging_members.clear();
+            state.active_id = None;
+            drop(state);
+            self.notify();
+            return;
+        }
+        let Some(primary_group) = game.playable.logical.group_of(primary_piece) else {
+            state.drag_state = None;
+            state.dragging_members.clear();
+            state.active_id = None;
+            drop(state);
+            self.notify();
+            return;
+        };
+        // Check whether the drag moved beyond the click threshold by sampling
+        // the current visual pose of each member against its start position.
+        let visual_poses = game.visual.piece_visual_pose();
+        let moved = drag.members.iter().enumerate().any(|(idx, id)| {
+            let start = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
+            let pose = visual_poses.get(*id).copied().unwrap_or_default();
+            let cx = pose.x_mm() * piece_width - piece_width * 0.5;
+            let cy = pose.y_mm() * piece_height - piece_height * 0.5;
+            let dx = cx - start.0;
+            let dy = cy - start.1;
+            dx * dx + dy * dy > click_tolerance_sq
+        });
         let is_click = drag
             .click_gesture
             .is_click_with_external_moved(now_ms_f32(), moved);
-        let click_id = drag.primary_id;
-        let was_flipped = state.core.flips.get(click_id).copied().unwrap_or(false);
+        let was_flipped = game.playable.flip_of(primary_group) == Some(FlipState::Flipped);
+        // Click while in rotate-mode toggles flip.
         if is_click && drag.rotate_mode {
-            if let Some(flip) = state.core.flips.get_mut(click_id) {
-                *flip = !*flip;
-            }
-            clear_piece_connections(&mut state.core.connections, click_id, cols, rows);
-            let order_snapshot = if state.z_order.len() == total {
-                Some(state.z_order.as_slice())
-            } else {
-                None
-            };
-            let (
-                _anchor_of,
-                _group_positions,
-                _group_rotations,
-                _group_order,
-                derived_positions,
-                derived_rotations,
-                piece_order,
-            ) = rebuild_group_state(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                order_snapshot,
+            game.playable.apply_restricted_action_batch(
+                RestrictedPlayableAction::FlipGroup {
+                    group: primary_group,
+                },
+                None,
             );
-            state.core.positions = derived_positions;
-            state.core.rotations = derived_rotations;
-            state.z_order = piece_order;
-            state.core.solved = is_solved(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.flips,
-                &state.core.connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                state.core.rules.rotation_enabled,
-            );
-            state.drag_state = None;
-            state.dragging_members.clear();
-            state.active_id = None;
+            game.rebuild_visual();
+            self.finalize_drag(&mut state);
             drop(state);
             self.notify();
             return;
         }
+        // Click on a flipped piece un-flips it.
         if is_click && was_flipped {
-            if let Some(flip) = state.core.flips.get_mut(click_id) {
-                *flip = false;
-            }
-            clear_piece_connections(&mut state.core.connections, click_id, cols, rows);
-            let order_snapshot = if state.z_order.len() == total {
-                Some(state.z_order.as_slice())
-            } else {
-                None
-            };
-            let (
-                _anchor_of,
-                _group_positions,
-                _group_rotations,
-                _group_order,
-                derived_positions,
-                derived_rotations,
-                piece_order,
-            ) = rebuild_group_state(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                order_snapshot,
+            game.playable.apply_action_with_snap(
+                PlayableAction::UnflipGroup {
+                    group: primary_group,
+                },
+                None,
+                MergePolicy::KeepFixedGroup,
             );
-            state.core.positions = derived_positions;
-            state.core.rotations = derived_rotations;
-            state.z_order = piece_order;
-            state.core.solved = is_solved(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.flips,
-                &state.core.connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                state.core.rules.rotation_enabled,
-            );
-            state.drag_state = None;
-            state.dragging_members.clear();
-            state.active_id = None;
+            game.rebuild_visual();
+            self.finalize_drag(&mut state);
             drop(state);
             self.notify();
             return;
         }
+        // Click with rotation enabled (and not rotate-mode): snap the group's
+        // current rotation toward the nearest cardinal angle.
         if is_click && rotation_enabled && !drag.rotate_mode && !drag.members.is_empty() {
-            let members = drag.members.clone();
-            let group_size = members.len();
-            let rotation_locked = group_size == total || group_size > ROTATION_LOCK_THRESHOLD_DEFAULT;
-            let anchor_id = members[0];
-            let current_angle = state.core.rotations.get(anchor_id).copied().unwrap_or(0.0);
+            let group_size = drag.members.len();
+            let rotation_locked =
+                group_size == total || group_size > ROTATION_LOCK_THRESHOLD_DEFAULT;
+            let current_pose = game.playable.pose_of(primary_group).unwrap_or_default();
+            let current_angle = current_pose.rotation_degrees();
             if group_size > 1
                 && rotation_locked
                 && angle_matches(current_angle, 0.0, rotation_snap_tolerance)
             {
-                state.drag_state = None;
-                state.dragging_members.clear();
-                state.active_id = None;
+                self.finalize_drag(&mut state);
                 drop(state);
                 self.notify();
                 return;
@@ -831,165 +910,109 @@ impl AppCore {
             if drag.right_click {
                 delta = -delta;
             }
-            for (idx, id) in members.iter().enumerate() {
-                let start_pos = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
-                let center_x = start_pos.0 + piece_width * 0.5;
-                let center_y = start_pos.1 + piece_height * 0.5;
-                let (rx, ry) = rotate_point(center_x, center_y, drag.start_x, drag.start_y, delta);
-                if let Some(pos) = state.core.positions.get_mut(*id) {
-                    *pos = (rx - piece_width * 0.5, ry - piece_height * 0.5);
-                }
-                if let Some(rot) = state.core.rotations.get_mut(*id) {
-                    let base = drag.start_rotations.get(idx).copied().unwrap_or(*rot);
-                    *rot = normalize_angle(base + delta);
-                }
-            }
-            {
-                let (positions, rotations, connections) = {
-                    let state = &mut *state;
-                    (&mut state.core.positions, &mut state.core.rotations, &mut state.core.connections)
-                };
-                apply_snaps_for_group(
-                    &members,
-                    positions,
-                    rotations,
-                    &flips,
-                    connections,
-                    cols,
-                    rows,
-                    piece_width,
-                    piece_height,
-                    snap_distance,
-                    frame_snap_ratio,
-                    complete_snap,
-                    center_min_x,
-                    center_max_x,
-                    center_min_y,
-                    center_max_y,
-                    layout.view_min_x,
-                    layout.view_min_y,
-                    layout.view_width,
-                    layout.view_height,
-                    rotation_snap_tolerance,
-                    rotation_enabled,
-                );
-            }
-            let order_snapshot = if state.z_order.len() == total {
-                Some(state.z_order.as_slice())
-            } else {
-                None
+            // Compute the new anchor pose: rotate the anchor's current world
+            // position around the click point by delta, and add delta to its
+            // rotation.
+            let click_x_mm = drag.start_x / piece_width;
+            let click_y_mm = drag.start_y / piece_height;
+            let anchor_x_mm = current_pose.x_mm();
+            let anchor_y_mm = current_pose.y_mm();
+            let (rx_px, ry_px) = rotate_point(
+                anchor_x_mm * piece_width,
+                anchor_y_mm * piece_height,
+                click_x_mm * piece_width,
+                click_y_mm * piece_height,
+                delta,
+            );
+            let new_x_mm = rx_px / piece_width;
+            let new_y_mm = ry_px / piece_height;
+            let new_rot = normalize_angle(current_angle + delta);
+            let Some(drop_pos) = Position2::try_from_mm(new_x_mm, new_y_mm) else {
+                self.finalize_drag(&mut state);
+                drop(state);
+                self.notify();
+                return;
             };
-            let (
-                _anchor_of,
-                _group_positions,
-                _group_rotations,
-                _group_order,
-                derived_positions,
-                derived_rotations,
-                piece_order,
-            ) = rebuild_group_state(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                order_snapshot,
+            let Some(drop_rotation) = AngleDeg::try_new(new_rot) else {
+                self.finalize_drag(&mut state);
+                drop(state);
+                self.notify();
+                return;
+            };
+            game.playable.apply_action_with_snap(
+                PlayableAction::TransformGroupTo {
+                    group: primary_group,
+                    drop_pos,
+                    drop_rotation,
+                },
+                None,
+                MergePolicy::KeepFixedGroup,
             );
-            state.core.positions = derived_positions;
-            state.core.rotations = derived_rotations;
-            state.z_order = piece_order;
-            state.core.solved = is_solved(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.flips,
-                &state.core.connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                state.core.rules.rotation_enabled,
-            );
-            state.drag_state = None;
-            state.dragging_members.clear();
-            state.active_id = None;
+            game.rebuild_visual();
+            self.finalize_drag(&mut state);
             drop(state);
             self.notify();
             return;
         }
-        {
-            let (positions, rotations, connections) = {
-                let state = &mut *state;
-                (&mut state.core.positions, &mut state.core.rotations, &mut state.core.connections)
+        // Regular drag end: commit the current visual pose of the dragged
+        // group, then let `apply_action_with_snap` run the snap algorithm.
+        let anchor_piece = game
+            .playable
+            .anchor_piece_of_group(primary_group)
+            .unwrap_or(primary_piece);
+        let visual_pose = game
+            .visual
+            .piece_visual_pose()
+            .get(anchor_piece.as_usize())
+            .copied()
+            .unwrap_or_default();
+        let Some(drop_pos) = Position2::try_from_mm(visual_pose.x_mm(), visual_pose.y_mm()) else {
+            self.finalize_drag(&mut state);
+            drop(state);
+            self.notify();
+            return;
+        };
+        if rotation_enabled {
+            let Some(drop_rotation) = AngleDeg::try_new(visual_pose.rotation_degrees()) else {
+                self.finalize_drag(&mut state);
+                drop(state);
+                self.notify();
+                return;
             };
-            apply_snaps_for_group(
-                &drag.members,
-                positions,
-                rotations,
-                &flips,
-                connections,
-                cols,
-                rows,
-                piece_width,
-                piece_height,
-                snap_distance,
-                frame_snap_ratio,
-                complete_snap,
-                center_min_x,
-                center_max_x,
-                center_min_y,
-                center_max_y,
-                layout.view_min_x,
-                layout.view_min_y,
-                layout.view_width,
-                layout.view_height,
-                rotation_snap_tolerance,
-                rotation_enabled,
+            game.playable.apply_action_with_snap(
+                PlayableAction::TransformGroupTo {
+                    group: primary_group,
+                    drop_pos,
+                    drop_rotation,
+                },
+                None,
+                MergePolicy::KeepFixedGroup,
+            );
+        } else {
+            game.playable.apply_action_with_snap(
+                PlayableAction::TranslateGroup {
+                    group: primary_group,
+                    drop_pos,
+                },
+                None,
+                MergePolicy::KeepFixedGroup,
             );
         }
-        let order_snapshot = if state.z_order.len() == total {
-            Some(state.z_order.as_slice())
-        } else {
-            None
-        };
-        let (
-            _anchor_of,
-            _group_positions,
-            _group_rotations,
-            _group_order,
-            derived_positions,
-            derived_rotations,
-            piece_order,
-        ) = rebuild_group_state(
-            &state.core.positions,
-            &state.core.rotations,
-            &state.core.connections,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
-            order_snapshot,
-        );
-        state.core.positions = derived_positions;
-        state.core.rotations = derived_rotations;
-        state.z_order = piece_order;
-        state.core.solved = is_solved(
-            &state.core.positions,
-            &state.core.rotations,
-            &state.core.flips,
-            &state.core.connections,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
-            state.core.rules.rotation_enabled,
-        );
+        game.rebuild_visual();
+        self.finalize_drag(&mut state);
+        drop(state);
+        self.notify();
+    }
+
+    /// Updates derived bookkeeping after a drag finalizes (whether snap
+    /// happened or not). Reads back from the now-authoritative `state.game`.
+    fn finalize_drag(&self, state: &mut AppState) {
+        if let Some(game) = state.game.as_ref() {
+            state.core.solved = game.playable.is_solved();
+        }
         state.drag_state = None;
         state.dragging_members.clear();
         state.active_id = None;
-        drop(state);
-        self.notify();
     }
 
     pub(crate) fn cancel_drag(&self) {
@@ -1047,7 +1070,8 @@ impl AppCore {
             .as_ref()
             .map(|info| (info.image_width as f32, info.image_height as f32))
             .unwrap_or((1.0, 1.0));
-        state.core.layout = compute_workspace_layout(width, height, state.core.rules.workspace_padding_ratio);
+        state.core.layout =
+            compute_workspace_layout(width, height, state.core.rules.workspace_padding_ratio);
         let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         drop(state);
@@ -1107,10 +1131,8 @@ impl AppCore {
             return;
         }
         let ratio = old_zoom / new_zoom;
-        state.view.center_x =
-            anchor_world_x - (anchor_world_x - state.view.center_x) * ratio;
-        state.view.center_y =
-            anchor_world_y - (anchor_world_y - state.view.center_y) * ratio;
+        state.view.center_x = anchor_world_x - (anchor_world_x - state.view.center_x) * ratio;
+        state.view.center_y = anchor_world_y - (anchor_world_y - state.view.center_y) * ratio;
         state.view.zoom = new_zoom;
         state.view.mode = ViewMode::Manual;
         state.view.clamp_to_layout(layout);
@@ -1235,13 +1257,137 @@ impl AppCore {
         self.notify();
     }
 
-    pub(crate) fn rotation_enabled(&self) -> bool {
-        self.state.borrow().core.rules.rotation_enabled
+    /// Zeros the rotation of every group's pose. Used by the dev panel's
+    /// "solve rotation" button and as a side effect when rotation is
+    /// disabled.
+    pub(crate) fn clear_all_group_rotations(&self) {
+        let mut state = self.state.borrow_mut();
+        let Some(game) = state.game.as_mut() else {
+            return;
+        };
+        for pose in game.playable.group_pose.iter_mut() {
+            if let Some(zeroed) = Pose2::try_from_mm_degrees(pose.x_mm(), pose.y_mm(), 0.0) {
+                *pose = zeroed;
+            }
+        }
+        game.rebuild_visual();
+        drop(state);
+        self.notify();
+    }
+
+    /// Sets every group's flip state to `Normal`. Used by the dev panel's
+    /// "unflip" button.
+    pub(crate) fn clear_all_group_flips(&self) {
+        let mut state = self.state.borrow_mut();
+        let Some(game) = state.game.as_mut() else {
+            return;
+        };
+        for flip in game.playable.group_flip.iter_mut() {
+            *flip = FlipState::Normal;
+        }
+        game.rebuild_visual();
+        drop(state);
+        self.notify();
+    }
+
+    /// Rescrambles the current puzzle in place: regenerates per-piece
+    /// positions/rotations/flips with a new nonce and installs the result.
+    /// Dev-panel "scramble" button.
+    pub(crate) fn rescramble(&self) {
+        let (info, rules, layout, current_nonce, piece_width, piece_height, depth_cap) = {
+            let state = self.state.borrow();
+            let Some(info) = state.core.puzzle_info.clone() else {
+                return;
+            };
+            let piece_width = state.core.piece_width;
+            let piece_height = state.core.piece_height;
+            if piece_width <= 0.0 || piece_height <= 0.0 {
+                return;
+            }
+            let depth_cap = state
+                .view_settings
+                .shape
+                .tab_depth_cap
+                .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+            (
+                info,
+                state.core.rules,
+                state.core.layout,
+                state.core.scramble_nonce,
+                piece_width,
+                piece_height,
+                depth_cap,
+            )
+        };
+        let cols = info.cols as usize;
+        let rows = info.rows as usize;
+        let total = cols * rows;
+        if total == 0 {
+            return;
+        }
+        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
+        let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
+        let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
+        let puzzle_view_width = layout.view_width / puzzle_scale;
+        let puzzle_view_height = layout.view_height / puzzle_scale;
+        let margin = piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
+        let nonce = time_nonce(current_nonce);
+        let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
+        let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
+        let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
+        let (positions, order) = scramble_layout(
+            seed,
+            cols,
+            rows,
+            piece_width,
+            piece_height,
+            puzzle_view_min_x,
+            puzzle_view_min_y,
+            puzzle_view_width,
+            puzzle_view_height,
+            margin,
+        );
+        let rotations = scramble_rotations(rotation_seed, total, rules.rotation_enabled);
+        let flips = scramble_flips(flip_seed, total, 0.0);
+        let Ok(game) = AppGameState::scrambled(
+            info,
+            rules,
+            nonce,
+            &positions,
+            &rotations,
+            &flips,
+            &order,
+            piece_width,
+            piece_height,
+        ) else {
+            return;
+        };
+        self.install_game(game, false);
+    }
+
+    /// Replaces the live state with a fully-solved puzzle: every edge
+    /// active, the single resulting group anchored at the origin with no
+    /// rotation or flip. Dev-panel "solve" button.
+    pub(crate) fn solve_puzzle(&self) {
+        let (info, rules) = {
+            let state = self.state.borrow();
+            (state.core.puzzle_info.clone(), state.core.rules)
+        };
+        let Some(info) = info else {
+            return;
+        };
+        let Ok(game) = AppGameState::solved(info, rules) else {
+            return;
+        };
+        self.install_game(game, false);
     }
 
     pub(crate) fn set_rotation_snap_tolerance(&self, value: f32) {
         let mut state = self.state.borrow_mut();
-        let value = value.clamp(ROTATION_SNAP_TOLERANCE_MIN_DEG, ROTATION_SNAP_TOLERANCE_MAX_DEG);
+        let value = value.clamp(
+            ROTATION_SNAP_TOLERANCE_MIN_DEG,
+            ROTATION_SNAP_TOLERANCE_MAX_DEG,
+        );
         if (state.core.rules.rotation_snap_tolerance_deg - value).abs() <= f32::EPSILON {
             return;
         }
@@ -1286,10 +1432,23 @@ impl AppCore {
         let grid = state.core.grid;
         let piece_width = info.image_width as f32 / grid.cols as f32;
         let piece_height = info.image_height as f32 / grid.rows as f32;
-        let depth_cap = state.view_settings.shape.tab_depth_cap.clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-        let curve_detail = state.view_settings.shape.curve_detail.clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
+        let depth_cap = state
+            .view_settings
+            .shape
+            .tab_depth_cap
+            .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
+        let curve_detail = state
+            .view_settings
+            .shape
+            .curve_detail
+            .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
         let pieces = build_pieces(grid.rows, grid.cols);
-        let (horizontal, vertical) = build_edge_maps(grid.rows, grid.cols, PUZZLE_SEED, &state.view_settings.shape);
+        let (horizontal, vertical) = build_edge_maps(
+            grid.rows,
+            grid.cols,
+            PUZZLE_SEED,
+            &state.view_settings.shape,
+        );
         let (horizontal_waves, vertical_waves) = build_line_waves(
             grid.rows,
             grid.cols,
@@ -1338,59 +1497,46 @@ impl AppCore {
         self.notify();
     }
 
-    pub(crate) fn apply_snapshot(
-        &self,
-        positions: Vec<(f32, f32)>,
-        rotations: Vec<f32>,
-        flips: Vec<bool>,
-        connections: Vec<[bool; 4]>,
-        z_order: Vec<usize>,
-        scramble_nonce: u32,
-    ) {
-        self.apply_snapshot_with_drag(
-            positions,
-            rotations,
-            flips,
-            connections,
-            z_order,
-            scramble_nonce,
-            false,
-        );
-    }
-
-    pub(crate) fn apply_snapshot_with_drag(
-        &self,
-        positions: Vec<(f32, f32)>,
-        rotations: Vec<f32>,
-        flips: Vec<bool>,
-        connections: Vec<[bool; 4]>,
-        z_order: Vec<usize>,
-        scramble_nonce: u32,
-        preserve_drag: bool,
-    ) {
+    /// Installs a fully-built `AppGameState` as the authoritative app state.
+    /// Used by callers that already have an `AppGameState` (multiplayer
+    /// bridge, local snapshot restore) so we don't round-trip through the
+    /// rectangular array projection.
+    pub(crate) fn install_game(&self, game: AppGameState, preserve_drag: bool) {
         let mut state = self.state.borrow_mut();
-        state.core.positions = positions;
-        state.core.rotations = rotations;
-        state.core.flips = flips;
-        state.core.connections = connections;
-        state.z_order = z_order;
-        state.core.scramble_nonce = scramble_nonce;
-        let cols = state.core.grid.cols as usize;
-        let rows = state.core.grid.rows as usize;
-        if cols > 0 && rows > 0 {
-            state.core.solved = is_solved(
-                &state.core.positions,
-                &state.core.rotations,
-                &state.core.flips,
-                &state.core.connections,
-                cols,
-                rows,
-                state.core.piece_width,
-                state.core.piece_height,
-                state.core.rules.rotation_enabled,
-            );
+        state.core.scramble_nonce = game.scramble_nonce;
+        state.core.solved = game.playable.is_solved();
+        // When preserving an active drag, `drag_move` owns the dragged
+        // pieces' visual poses. Capture them off the outgoing `state.game`
+        // before replacing it so the incoming authoritative-or-predicted
+        // visual doesn't briefly clobber the in-flight cursor pose (which
+        // would otherwise show as a one-frame flicker every server echo).
+        let preserved_visual: Vec<(PieceId, Pose2)> = if preserve_drag {
+            match state.game.as_ref() {
+                Some(old_game) => {
+                    let old_visual = old_game.visual.piece_visual_pose();
+                    state
+                        .dragging_members
+                        .iter()
+                        .filter_map(|&id| {
+                            old_visual
+                                .get(id)
+                                .copied()
+                                .map(|pose| (PieceId(id as u32), pose))
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            }
         } else {
-            state.core.solved = false;
+            Vec::new()
+        };
+        state.game = Some(game);
+        if !preserved_visual.is_empty() {
+            if let Some(new_game) = state.game.as_mut() {
+                for (piece, pose) in preserved_visual {
+                    new_game.visual.set_piece_visual_pose(piece, pose);
+                }
+            }
         }
         if !preserve_drag {
             state.drag_state = None;
@@ -1428,21 +1574,17 @@ impl AppCore {
             CoreAction::Sync(_) => {}
         }
     }
-
 }
 
 fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
     let mut snapshot = AppSnapshot {
         puzzle_info: None,
         rules: state.core.rules,
-        core: CoreSnapshot {
-            positions: Vec::new(),
-            rotations: Vec::new(),
-            flips: Vec::new(),
-            connections: Vec::new(),
-            group_order: Vec::new(),
-            scramble_nonce: 0,
-        },
+        game: None,
+        piece_world_poses: Vec::new(),
+        piece_flipped: Vec::new(),
+        piece_group_anchor: Vec::new(),
+        scramble_nonce: 0,
         grid: state.core.grid,
         piece_width: state.core.piece_width,
         piece_height: state.core.piece_height,
@@ -1468,11 +1610,25 @@ fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
 fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
     snapshot.puzzle_info = state.core.puzzle_info.clone();
     snapshot.rules = state.core.rules;
-    fill_core_snapshot(state, &mut snapshot.core);
+    snapshot.scramble_nonce = state.core.scramble_nonce;
+    fill_game_state_view(state, snapshot);
     snapshot.grid = state.core.grid;
     snapshot.piece_width = state.core.piece_width;
     snapshot.piece_height = state.core.piece_height;
-    snapshot.z_order.clone_from(&state.z_order);
+    // Derive the per-piece render order from `state.game.playable.z_order`
+    // (groups, back-to-front), expanded with each group's member piece
+    // ids. Renderers iterate this to draw back-to-front.
+    snapshot.z_order.clear();
+    if let Some(game) = state.game.as_ref() {
+        snapshot.z_order.reserve(game.playable.piece_count());
+        for group in game.playable.iter_z_asc() {
+            let mut members: Vec<PieceId> = game.playable.logical.members_of(group).collect();
+            members.sort_unstable_by_key(|p| p.as_usize());
+            for piece in members {
+                snapshot.z_order.push(piece.as_usize());
+            }
+        }
+    }
     snapshot.hovered_id = state.hovered_id;
     snapshot.active_id = state.active_id;
     snapshot
@@ -1501,54 +1657,41 @@ fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
     snapshot.view_settings = state.view_settings.clone();
 }
 
-fn fill_core_snapshot(state: &AppState, snapshot: &mut CoreSnapshot) {
-    snapshot.positions.clone_from(&state.core.positions);
-    snapshot.rotations.clone_from(&state.core.rotations);
-    snapshot.flips.clone_from(&state.core.flips);
-    snapshot.connections.clone_from(&state.core.connections);
-    snapshot.scramble_nonce = state.core.scramble_nonce;
-    snapshot.group_order.clear();
-    if let Some(info) = state.core.puzzle_info.as_ref() {
-        let cols = info.cols as usize;
-        let rows = info.rows as usize;
-        let total = cols.saturating_mul(rows);
-        if total > 0
-            && state.core.positions.len() == total
-            && state.core.rotations.len() == total
-            && state.core.flips.len() == total
-            && state.core.connections.len() == total
-        {
-            let piece_order = if state.z_order.len() == total {
-                state.z_order.clone()
-            } else {
-                (0..total).collect()
-            };
-            let anchor_of = anchor_of_from_connections(&state.core.connections, cols, rows);
-            snapshot.group_order.extend(
-                build_group_order_from_piece_order(&piece_order, &anchor_of)
-                    .into_iter()
-                    .filter_map(|id| u32::try_from(id).ok()),
-            );
-        }
-    }
-}
+/// Populates the renderer-facing accessors on `AppSnapshot` from
+/// `state.game`. When no game state is loaded, leaves the fields empty
+/// (legacy `core` fields take over for the no-puzzle case).
+fn fill_game_state_view(state: &AppState, snapshot: &mut AppSnapshot) {
+    let Some(game) = state.game.as_ref() else {
+        snapshot.game = None;
+        snapshot.piece_world_poses.clear();
+        snapshot.piece_flipped.clear();
+        snapshot.piece_group_anchor.clear();
+        return;
+    };
+    snapshot.game = Some(game.clone());
+    let total = game.playable.piece_count();
+    snapshot.piece_world_poses.clear();
+    snapshot.piece_world_poses.reserve(total);
+    snapshot.piece_flipped.clear();
+    snapshot.piece_flipped.reserve(total);
+    snapshot.piece_group_anchor.clear();
+    snapshot.piece_group_anchor.reserve(total);
 
-fn anchor_of_from_connections(connections: &[[bool; 4]], cols: usize, rows: usize) -> Vec<usize> {
-    let total = cols.saturating_mul(rows);
-    let mut anchor_of = vec![0usize; total];
-    let groups = groups_from_connections(connections, cols, rows);
-    for group in groups {
-        if group.is_empty() {
-            continue;
-        }
-        let anchor = group[0];
-        for id in group {
-            if id < total {
-                anchor_of[id] = anchor;
-            }
-        }
+    let visual_poses = game.visual.piece_visual_pose();
+    for idx in 0..total {
+        let piece = heddobureika_core::PieceId(idx as u32);
+        let pose = visual_poses.get(idx).copied().unwrap_or_default();
+        snapshot.piece_world_poses.push(pose);
+        let group = game.playable.logical.group_of(piece);
+        let flipped = group
+            .and_then(|g| game.playable.flip_of(g))
+            .map(|f| f == heddobureika_core::FlipState::Flipped)
+            .unwrap_or(false);
+        snapshot.piece_flipped.push(flipped);
+        snapshot
+            .piece_group_anchor
+            .push(group.map(|g| g.as_u32()).unwrap_or(idx as u32));
     }
-    anchor_of
 }
 
 impl ViewState {
@@ -1663,8 +1806,8 @@ impl AppState {
         let view = ViewState::new(core.layout);
         Self {
             core,
+            game: None,
             assets: None,
-            z_order: Vec::new(),
             hovered_id: None,
             active_id: None,
             dragging_members: Vec::new(),
@@ -1677,20 +1820,8 @@ impl AppState {
     }
 }
 
-fn bring_members_to_front(order: &mut Vec<usize>, members: &[usize]) {
-    if order.is_empty() || members.is_empty() {
-        return;
-    }
-    let mut keep = Vec::with_capacity(order.len());
-    for id in order.iter().copied() {
-        if !members.contains(&id) {
-            keep.push(id);
-        }
-    }
-    keep.extend_from_slice(members);
-    *order = keep;
-}
-
+/// After a Shift-detach has been applied to `game.playable`, walks every
+/// alive group containing a piece from `original_members` and force-moves
 fn select_grid(width: u32, height: u32) -> GridChoice {
     let choices = build_grid_choices(width, height);
     if choices.is_empty() {
@@ -1724,8 +1855,8 @@ fn now_ms_f32() -> f32 {
     {
         if let Some(window) = web_sys::window() {
             if let Ok(perf) = Reflect::get(&window, &"performance".into()) {
-                if let Ok(now_fn) =
-                    Reflect::get(&perf, &"now".into()).and_then(|value| value.dyn_into::<Function>())
+                if let Ok(now_fn) = Reflect::get(&perf, &"now".into())
+                    .and_then(|value| value.dyn_into::<Function>())
                 {
                     if let Ok(value) = now_fn.call0(&perf) {
                         if let Some(ms) = value.as_f64() {

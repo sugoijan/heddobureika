@@ -189,17 +189,13 @@ pub fn transcode_to_avif(
     let mut out = Vec::new();
     let quality = config.quality.min(100);
     let speed = config.speed.min(10);
-    let encoder = AvifEncoder::new_with_speed_quality(&mut out, speed, quality)
-        .with_num_threads(Some(1));
+    let encoder =
+        AvifEncoder::new_with_speed_quality(&mut out, speed, quality).with_num_threads(Some(1));
 
     match config.alpha_mode {
         AlphaMode::Discard => {
-            let rgb = map_rgba16_to_srgb_rgb8(
-                &rgba,
-                &metadata,
-                config.assume_opaque,
-                config.dither,
-            )?;
+            let rgb =
+                map_rgba16_to_srgb_rgb8(&rgba, &metadata, config.assume_opaque, config.dither)?;
             encoder
                 .write_image(&rgb, width, height, ExtendedColorType::Rgb8)
                 .map_err(|err| PipelineError::Encode(err.to_string()))?;
@@ -224,7 +220,8 @@ pub fn decode_rgba16(
     bytes: &[u8],
 ) -> Result<(ImageBuffer<Rgba<u16>, Vec<u16>>, ImageMetadata), PipelineError> {
     let metadata = read_image_metadata(bytes)?;
-    let image = image::load_from_memory(bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
+    let image =
+        image::load_from_memory(bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
     let rgba = image.to_rgba16();
     let rgba = apply_exif_orientation(rgba, metadata.orientation);
     Ok((rgba, metadata))
@@ -234,7 +231,8 @@ pub fn decode_rgba32f(
     bytes: &[u8],
 ) -> Result<(ImageBuffer<Rgba<f32>, Vec<f32>>, ImageMetadata), PipelineError> {
     let metadata = read_image_metadata(bytes)?;
-    let image = image::load_from_memory(bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
+    let image =
+        image::load_from_memory(bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
     let rgba = image.to_rgba32f();
     let rgba = apply_exif_orientation(rgba, metadata.orientation);
     Ok((rgba, metadata))
@@ -434,12 +432,7 @@ fn linear_to_u16_srgb(linear: f32) -> u16 {
     (value * 65535.0 + 0.5).floor() as u16
 }
 
-const BAYER_4X4: [u8; 16] = [
-    0, 8, 2, 10,
-    12, 4, 14, 6,
-    3, 11, 1, 9,
-    15, 7, 13, 5,
-];
+const BAYER_4X4: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
 
 fn dither_offset_4x4(x: u32, y: u32) -> f32 {
     let idx = ((y & 3) << 2 | (x & 3)) as usize;
@@ -728,9 +721,7 @@ fn read_png_metadata(bytes: &[u8]) -> Result<ImageMetadata, PipelineError> {
         metadata.icc_profile = Some(icc.as_ref().to_vec());
     }
     metadata.srgb = info.srgb.is_some();
-    metadata.gamma = info
-        .gama_chunk
-        .map(|value| f64::from(value.into_value()));
+    metadata.gamma = info.gama_chunk.map(|value| f64::from(value.into_value()));
 
     if let Some(cicp) = info.coding_independent_code_points.as_ref() {
         metadata.cicp = Some(PngCicp {

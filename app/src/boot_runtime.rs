@@ -27,8 +27,13 @@ pub(crate) fn set_boot_state(next: BootState) {
             return Vec::new();
         }
         *state = next;
-        BOOT_HOOKS
-            .with(|hooks| hooks.borrow().iter().map(|(_, hook)| hook.clone()).collect())
+        BOOT_HOOKS.with(|hooks| {
+            hooks
+                .borrow()
+                .iter()
+                .map(|(_, hook)| hook.clone())
+                .collect()
+        })
     });
     for hook in hooks {
         hook();

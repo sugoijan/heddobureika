@@ -3,11 +3,11 @@ use crate::core::{
     WGPU_EDGE_AA_DEFAULT, WGPU_RENDER_SCALE_MIN,
 };
 use bytemuck::{Pod, Zeroable};
+use glyphon::cosmic_text::Align;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use glyphon::cosmic_text::Align;
 use js_sys::Date;
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, JsValue};
@@ -368,10 +368,7 @@ fn build_frame_dashes(
     if frame_w <= 0.0 || frame_h <= 0.0 {
         return Vec::new();
     }
-    let r = corner_radius
-        .max(0.0)
-        .min(frame_w * 0.5)
-        .min(frame_h * 0.5);
+    let r = corner_radius.max(0.0).min(frame_w * 0.5).min(frame_h * 0.5);
     let right = frame_x + frame_w;
     let bottom = frame_y + frame_h;
     let mut points = Vec::new();
@@ -716,12 +713,10 @@ impl WgpuRenderer {
         canvas.set_width(canvas_width);
         canvas.set_height(canvas_height);
 
-        let instance = wgpu::util::new_instance_with_webgpu_detection(
-            wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            },
-        )
+        let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        })
         .await;
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
@@ -739,17 +734,14 @@ impl WgpuRenderer {
                 wasm_bindgen::JsValue::from_str(&format!("request_adapter failed: {err:?}"))
             })?;
         let backend = adapter.get_info().backend;
-        let limits =
-            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+        let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("heddobureika-device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: limits,
-                    ..Default::default()
-                },
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("heddobureika-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                ..Default::default()
+            })
             .await
             .map_err(|err| {
                 wasm_bindgen::JsValue::from_str(&format!("request_device failed: {err:?}"))
@@ -775,25 +767,19 @@ impl WgpuRenderer {
         let output_gamma = if is_srgb_output { 1.0 } else { 1.0 / 2.2 };
         let (body_color, workspace_fill, workspace_stroke, dash_color) = if is_dark_theme {
             (
-                [0x14 as f32 / 255.0, 0x13 as f32 / 255.0, 0x12 as f32 / 255.0],
                 [
-                    32.0 / 255.0,
-                    30.0 / 255.0,
-                    28.0 / 255.0,
-                    0.92,
+                    0x14 as f32 / 255.0,
+                    0x13 as f32 / 255.0,
+                    0x12 as f32 / 255.0,
                 ],
+                [32.0 / 255.0, 30.0 / 255.0, 28.0 / 255.0, 0.92],
                 [1.0, 1.0, 1.0, 0.08],
                 [1.0, 1.0, 1.0, 0.28],
             )
         } else {
             (
                 [1.0, 1.0, 1.0],
-                [
-                    250.0 / 255.0,
-                    247.0 / 255.0,
-                    241.0 / 255.0,
-                    0.9,
-                ],
+                [250.0 / 255.0, 247.0 / 255.0, 241.0 / 255.0, 0.9],
                 [0.0, 0.0, 0.0, 0.08],
                 [0.0, 0.0, 0.0, 0.25],
             )
@@ -890,75 +876,74 @@ impl WgpuRenderer {
             "mask-texture",
         )?;
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("piece-bind-group-layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("piece-bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let make_bind_group =
+            |label: &'static str, globals_buffer: &wgpu::Buffer| -> wgpu::BindGroup {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: globals_buffer.as_entire_binding(),
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&art_view),
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&mask_view),
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-        let make_bind_group = |label: &'static str,
-                               globals_buffer: &wgpu::Buffer|
-         -> wgpu::BindGroup {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: globals_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&art_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&mask_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            })
-        };
-        let bind_group_outline = make_bind_group("piece-bind-group-outline", &globals_buffer_outline);
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                })
+            };
+        let bind_group_outline =
+            make_bind_group("piece-bind-group-outline", &globals_buffer_outline);
         let bind_group_fill = make_bind_group("piece-bind-group-fill", &globals_buffer_fill);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1003,8 +988,7 @@ impl WgpuRenderer {
             };
         let pipeline_outline =
             make_pipeline("piece-outline-pipeline", wgpu::BlendState::ALPHA_BLENDING);
-        let pipeline_fill =
-            make_pipeline("piece-fill-pipeline", wgpu::BlendState::ALPHA_BLENDING);
+        let pipeline_fill = make_pipeline("piece-fill-pipeline", wgpu::BlendState::ALPHA_BLENDING);
 
         let frame_dash_globals = FrameGlobals {
             view_min: [view_min_x, view_min_y],
@@ -1216,8 +1200,13 @@ impl WgpuRenderer {
                 },
             ],
         }));
-        let ui_icon_atlas =
-            build_icon_atlas(&device, &queue, config.format, &ui_texture_bind_group_layout, &ui_sampler)?;
+        let ui_icon_atlas = build_icon_atlas(
+            &device,
+            &queue,
+            config.format,
+            &ui_texture_bind_group_layout,
+            &ui_sampler,
+        )?;
         let ui_preview_bind_group = Rc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui-preview-bind-group"),
             layout: &ui_texture_bind_group_layout,
@@ -1334,11 +1323,12 @@ impl WgpuRenderer {
             rotation: 0.0,
             _pad: 0.0,
         }];
-        let frame_bg_instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("frame-bg-instance-buffer"),
-            contents: bytemuck::cast_slice(&frame_bg_instances),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
+        let frame_bg_instance_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("frame-bg-instance-buffer"),
+                contents: bytemuck::cast_slice(&frame_bg_instances),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
         let half_stroke = workspace_stroke_width * 0.5;
         let left_x = workspace_min_x + half_stroke;
         let right_x = workspace_min_x + workspace_width - half_stroke;
@@ -1482,10 +1472,14 @@ impl WgpuRenderer {
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("piece-render-encoder"),
-        });
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("piece-render-encoder"),
+            });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1506,8 +1500,7 @@ impl WgpuRenderer {
             });
             render_pass.set_pipeline(&self.frame_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             if self.frame_bg_instance_count > 0 {
                 render_pass.set_bind_group(0, &self.frame_bg_bind_group, &[]);
                 render_pass.set_vertex_buffer(1, self.frame_bg_instance_buffer.slice(..));
@@ -1549,8 +1542,7 @@ impl WgpuRenderer {
             render_pass.set_pipeline(&self.ui_pipeline);
             render_pass.set_bind_group(0, &self.ui_globals_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             for sprite in &self.ui_sprites {
                 if sprite.instance.opacity <= f32::EPSILON {
                     continue;
@@ -1580,14 +1572,15 @@ impl WgpuRenderer {
             });
             render_pass.set_pipeline(&self.frame_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             if self.frame_stroke_instance_count > 0 {
                 render_pass.set_bind_group(0, &self.frame_stroke_bind_group, &[]);
-                render_pass
-                    .set_vertex_buffer(1, self.frame_stroke_instance_buffer.slice(..));
-                render_pass
-                    .draw_indexed(0..self.index_count, 0, 0..self.frame_stroke_instance_count);
+                render_pass.set_vertex_buffer(1, self.frame_stroke_instance_buffer.slice(..));
+                render_pass.draw_indexed(
+                    0..self.index_count,
+                    0,
+                    0..self.frame_stroke_instance_count,
+                );
             }
             if self.show_frame && self.frame_instance_count > 0 {
                 render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
@@ -1614,8 +1607,7 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             let stride = std::mem::size_of::<Instance>() as wgpu::BufferAddress;
             for batch in &self.instance_batches {
                 if batch.count == 0 {
@@ -1657,8 +1649,7 @@ impl WgpuRenderer {
             render_pass.set_pipeline(&self.ui_pipeline);
             render_pass.set_bind_group(0, &self.ui_globals_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             for sprite in &self.ui_overlay_sprites {
                 if sprite.instance.opacity <= f32::EPSILON {
                     continue;
@@ -1773,9 +1764,11 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
             if let Some(text_state) = self.text_state.as_ref() {
-                let _ = text_state
-                    .renderer
-                    .render(&text_state.atlas, &text_state.viewport, &mut render_pass);
+                let _ = text_state.renderer.render(
+                    &text_state.atlas,
+                    &text_state.viewport,
+                    &mut render_pass,
+                );
             }
         }
 
@@ -1794,8 +1787,12 @@ impl WgpuRenderer {
         let cache = Cache::new(&self.device);
         let mut atlas = TextAtlas::new(&self.device, &self.queue, &cache, self._config.format);
         let viewport = Viewport::new(&self.device, &cache);
-        let renderer =
-            TextRenderer::new(&mut atlas, &self.device, wgpu::MultisampleState::default(), None);
+        let renderer = TextRenderer::new(
+            &mut atlas,
+            &self.device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
         let scale = self.render_scale;
         let font_size = FPS_FONT_SIZE * scale;
         let line_height = FPS_LINE_HEIGHT * scale;
@@ -1846,8 +1843,12 @@ impl WgpuRenderer {
         let cache = Cache::new(&self.device);
         let mut atlas = TextAtlas::new(&self.device, &self.queue, &cache, self._config.format);
         let viewport = Viewport::new(&self.device, &cache);
-        let renderer =
-            TextRenderer::new(&mut atlas, &self.device, wgpu::MultisampleState::default(), None);
+        let renderer = TextRenderer::new(
+            &mut atlas,
+            &self.device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
         self.ui_text_state = Some(UiTextState {
             font_system,
             swash_cache,
@@ -1865,7 +1866,8 @@ impl WgpuRenderer {
         for spec in specs {
             keep_ids.push(spec.id);
         }
-        self.ui_sprites.retain(|sprite| keep_ids.contains(&sprite.id));
+        self.ui_sprites
+            .retain(|sprite| keep_ids.contains(&sprite.id));
         for spec in specs {
             let needs_new = self.ui_sprites.iter().all(|sprite| sprite.id != spec.id);
             if needs_new {
@@ -1913,11 +1915,13 @@ impl WgpuRenderer {
                     color: [1.0, 1.0, 1.0, 1.0],
                     radius_blur: [0.0, 0.0, 0.0, 0.0],
                 };
-                let instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ui-instance-buffer"),
-                    contents: bytemuck::cast_slice(&[instance]),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
+                let instance_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("ui-instance-buffer"),
+                            contents: bytemuck::cast_slice(&[instance]),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        });
                 self.ui_sprites.push(UiSprite {
                     id: spec.id,
                     text: String::new(),
@@ -1997,7 +2001,9 @@ impl WgpuRenderer {
                             | wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
                     });
-                    sprite.view = sprite.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    sprite.view = sprite
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
                     sprite.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("ui-texture-bind-group"),
                         layout: &self.ui_texture_bind_group_layout,
@@ -2054,11 +2060,11 @@ impl WgpuRenderer {
                     )
                     .is_ok()
                 {
-                    let mut encoder = self
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("ui-text-encoder"),
-                        });
+                    let mut encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("ui-text-encoder"),
+                            });
                     {
                         let mut render_pass =
                             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2082,9 +2088,11 @@ impl WgpuRenderer {
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
-                        let _ = ui_state
-                            .renderer
-                            .render(&ui_state.atlas, &ui_state.viewport, &mut render_pass);
+                        let _ = ui_state.renderer.render(
+                            &ui_state.atlas,
+                            &ui_state.viewport,
+                            &mut render_pass,
+                        );
                     }
                     self.queue.submit(Some(encoder.finish()));
                     sprite.text = spec.text.clone();
@@ -2152,13 +2160,13 @@ impl WgpuRenderer {
                         spec.desaturate,
                     ],
                 };
-                let instance_buffer = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("ui-overlay-instance-buffer"),
-                        contents: bytemuck::cast_slice(&[instance]),
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    });
+                let instance_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("ui-overlay-instance-buffer"),
+                            contents: bytemuck::cast_slice(&[instance]),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        });
                 self.ui_overlay_sprites.push(UiOverlaySprite {
                     texture: spec.texture,
                     bind_group: bind_group.clone(),
@@ -2167,8 +2175,7 @@ impl WgpuRenderer {
                 });
             }
         }
-        for (sprite, (spec, bind_group)) in
-            self.ui_overlay_sprites.iter_mut().zip(filtered.iter())
+        for (sprite, (spec, bind_group)) in self.ui_overlay_sprites.iter_mut().zip(filtered.iter())
         {
             if sprite.texture != spec.texture {
                 sprite.texture = spec.texture;
@@ -2300,13 +2307,7 @@ impl WgpuRenderer {
             .write_buffer(&self._ui_globals_buffer, 0, bytemuck::bytes_of(&ui_globals));
     }
 
-    pub(crate) fn set_workspace_rect(
-        &mut self,
-        min_x: f32,
-        min_y: f32,
-        width: f32,
-        height: f32,
-    ) {
+    pub(crate) fn set_workspace_rect(&mut self, min_x: f32, min_y: f32, width: f32, height: f32) {
         let puzzle_scale = self.globals.puzzle_scale.max(1.0e-4);
         let inv_puzzle_scale = 1.0 / puzzle_scale;
         let min_x = min_x * inv_puzzle_scale;
@@ -2427,11 +2428,13 @@ impl WgpuRenderer {
         let needed = set.instances.len() as u32;
         self.instance_count = needed;
         if needed > self.instance_capacity {
-            self.instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("piece-instance-buffer"),
-                contents: bytemuck::cast_slice(&set.instances),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
+            self.instance_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("piece-instance-buffer"),
+                        contents: bytemuck::cast_slice(&set.instances),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
             self.instance_capacity = needed;
         } else {
             self.queue.write_buffer(
@@ -2463,9 +2466,7 @@ fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
     (max_width, max_height)
 }
 
-fn image_to_rgba(
-    image: &HtmlImageElement,
-) -> Result<(Vec<u8>, u32, u32), wasm_bindgen::JsValue> {
+fn image_to_rgba(image: &HtmlImageElement) -> Result<(Vec<u8>, u32, u32), wasm_bindgen::JsValue> {
     let width = image.natural_width();
     let height = image.natural_height();
     let document = web_sys::window()
@@ -2798,9 +2799,7 @@ fn create_texture_view_from_pixels(
         .ok_or_else(|| wasm_bindgen::JsValue::from_str("texture size overflow"))?
         as usize;
     if pixels.len() != expected_len {
-        return Err(wasm_bindgen::JsValue::from_str(
-            "pixel data size mismatch",
-        ));
+        return Err(wasm_bindgen::JsValue::from_str("pixel data size mismatch"));
     }
     let texture = device.create_texture_with_data(
         queue,

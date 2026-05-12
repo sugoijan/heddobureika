@@ -6,9 +6,14 @@ use std::collections::hash_map::DefaultHasher;
 
 use crate::app_core::AppSnapshot;
 use crate::core::InitMode;
-use crate::local_snapshot::{build_game_snapshot_from_app, clear_local_snapshot, load_local_snapshot, save_local_snapshot};
+use crate::local_snapshot::{
+    build_playable_snapshot_from_app, clear_local_snapshot, load_local_snapshot,
+    save_local_snapshot,
+};
+use heddobureika_core::{
+    ClientId, PlayableGameSnapshot, PlayableRoomUpdate, RoomControlUpdate, RoomPersistence,
+};
 pub use heddobureika_core::{CoreAction, SyncAction};
-use heddobureika_core::{ClientId, GameSnapshot, RoomPersistence, RoomUpdate};
 
 #[derive(Clone)]
 pub struct ViewHooks {
@@ -19,8 +24,10 @@ pub struct ViewHooks {
 pub struct SyncHooks {
     pub on_remote_action: Rc<dyn Fn(CoreAction)>,
     pub on_snapshot: Rc<dyn Fn(AppSnapshot)>,
-    pub on_remote_snapshot: Rc<dyn Fn(GameSnapshot, u64)>,
-    pub on_remote_update: Rc<dyn Fn(RoomUpdate, u64, Option<ClientId>, Option<u64>)>,
+    pub on_remote_snapshot: Rc<dyn Fn(PlayableGameSnapshot, u64)>,
+    pub on_remote_update: Rc<dyn Fn(RoomControlUpdate, u64, Option<ClientId>, Option<u64>)>,
+    pub on_remote_playable_update:
+        Rc<dyn Fn(PlayableRoomUpdate, u64, Option<ClientId>, Option<u64>)>,
     pub on_event: Rc<dyn Fn(SyncEvent)>,
     pub on_asset: Rc<dyn Fn(AssetEvent)>,
 }
@@ -32,6 +39,7 @@ impl SyncHooks {
             on_snapshot: Rc::new(|_| {}),
             on_remote_snapshot: Rc::new(|_, _| {}),
             on_remote_update: Rc::new(|_, _, _, _| {}),
+            on_remote_playable_update: Rc::new(|_, _, _, _| {}),
             on_event: Rc::new(|_| {}),
             on_asset: Rc::new(|_| {}),
         }
@@ -47,10 +55,18 @@ pub enum SyncEvent {
         client_id: Option<ClientId>,
     },
     NeedInit,
-    Warning { minutes_idle: u32 },
-    Ownership { anchor_id: u32, owner: Option<ClientId> },
+    Warning {
+        minutes_idle: u32,
+    },
+    Ownership {
+        anchor_id: u32,
+        owner: Option<ClientId>,
+    },
     DropNotReady,
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -205,7 +221,7 @@ pub trait GameSync {
 pub struct LocalSyncAdapter {
     hooks: Option<SyncHooks>,
     observer: Option<Rc<dyn Fn(&CoreAction)>>,
-    pending_snapshot: Option<heddobureika_core::GameSnapshot>,
+    pending_snapshot: Option<PlayableGameSnapshot>,
     pending_loaded: bool,
     last_saved_fingerprint: Option<u64>,
 }
@@ -225,12 +241,12 @@ impl LocalSyncAdapter {
         self.observer = observer;
     }
 
-    pub fn take_pending_snapshot(&mut self) -> Option<heddobureika_core::GameSnapshot> {
+    pub fn take_pending_snapshot(&mut self) -> Option<PlayableGameSnapshot> {
         self.ensure_pending_loaded();
         self.pending_snapshot.take()
     }
 
-    pub fn requeue_pending_snapshot(&mut self, snapshot: heddobureika_core::GameSnapshot) {
+    pub fn requeue_pending_snapshot(&mut self, snapshot: PlayableGameSnapshot) {
         self.pending_snapshot = Some(snapshot);
     }
 
@@ -265,7 +281,7 @@ impl LocalSyncAdapter {
         if self.last_saved_fingerprint == fingerprint {
             return;
         }
-        let Some(game_snapshot) = build_game_snapshot_from_app(snapshot) else {
+        let Some(game_snapshot) = build_playable_snapshot_from_app(snapshot) else {
             return;
         };
         save_local_snapshot(&game_snapshot);
@@ -281,19 +297,7 @@ impl Default for LocalSyncAdapter {
 
 fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
     let info = snapshot.puzzle_info.as_ref()?;
-    let cols = info.cols as usize;
-    let rows = info.rows as usize;
-    let total = cols * rows;
-    if total == 0 {
-        return None;
-    }
-    if snapshot.core.positions.len() != total
-        || snapshot.core.rotations.len() != total
-        || snapshot.core.flips.len() != total
-        || snapshot.core.connections.len() != total
-    {
-        return None;
-    }
+    let game = snapshot.game.as_ref()?;
     let mut hasher = DefaultHasher::new();
     info.label.hash(&mut hasher);
     info.image_ref.hash(&mut hasher);
@@ -302,19 +306,12 @@ fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
     info.shape_seed.hash(&mut hasher);
     info.image_width.hash(&mut hasher);
     info.image_height.hash(&mut hasher);
-    snapshot.core.scramble_nonce.hash(&mut hasher);
-    for (x, y) in &snapshot.core.positions {
-        x.to_bits().hash(&mut hasher);
-        y.to_bits().hash(&mut hasher);
-    }
-    for rot in &snapshot.core.rotations {
-        rot.to_bits().hash(&mut hasher);
-    }
-    for flip in &snapshot.core.flips {
-        flip.hash(&mut hasher);
-    }
-    for conn in &snapshot.core.connections {
-        conn.hash(&mut hasher);
+    game.scramble_nonce.hash(&mut hasher);
+    game.playable.revision.hash(&mut hasher);
+    for pose in game.visual.piece_visual_pose() {
+        pose.x_mm().to_bits().hash(&mut hasher);
+        pose.y_mm().to_bits().hash(&mut hasher);
+        pose.rotation_degrees().to_bits().hash(&mut hasher);
     }
     for id in &snapshot.z_order {
         id.hash(&mut hasher);

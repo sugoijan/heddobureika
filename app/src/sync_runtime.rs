@@ -8,7 +8,7 @@ use crate::app_core::{AppCore, AppSnapshot, AppSubscription};
 use crate::app_router::{self, MultiplayerConfig};
 use crate::boot_runtime::{self, BootState};
 use crate::core::{collect_group, InitMode};
-use crate::local_snapshot::{apply_game_snapshot_to_core, ApplySnapshotResult};
+use crate::local_snapshot::{apply_playable_snapshot_to_core, ApplySnapshotResult};
 use crate::multiplayer_game_sync::MultiplayerGameSync;
 use crate::runtime::{CoreAction, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView};
 
@@ -35,9 +35,9 @@ struct SyncRuntimeState {
     retry_timer: Option<Timeout>,
     sync_view_hooks: Vec<(u64, Rc<dyn Fn()>)>,
     next_sync_view_hook_id: u64,
-    mp_local_transform_observer:
-        Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>,
+    mp_local_transform_observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
     mp_local_flip_observer: Option<Rc<dyn Fn(u32, bool)>>,
+    mp_local_detach_observer: Option<Rc<dyn Fn(u32)>>,
 }
 
 impl SyncRuntimeState {
@@ -61,6 +61,7 @@ impl SyncRuntimeState {
             next_sync_view_hook_id: 0,
             mp_local_transform_observer: None,
             mp_local_flip_observer: None,
+            mp_local_detach_observer: None,
         }
     }
 
@@ -74,17 +75,26 @@ impl SyncRuntimeState {
             if let Some(sync) = self.multiplayer.as_ref() {
                 sync.borrow_mut().init(self.combined_hooks());
             }
-            if let (Some(sync), Some(observer)) =
-                (self.multiplayer.as_ref(), self.mp_local_transform_observer.as_ref())
-            {
+            if let (Some(sync), Some(observer)) = (
+                self.multiplayer.as_ref(),
+                self.mp_local_transform_observer.as_ref(),
+            ) {
                 sync.borrow()
                     .set_local_transform_observer(Some(observer.clone()));
             }
-            if let (Some(sync), Some(observer)) =
-                (self.multiplayer.as_ref(), self.mp_local_flip_observer.as_ref())
-            {
+            if let (Some(sync), Some(observer)) = (
+                self.multiplayer.as_ref(),
+                self.mp_local_flip_observer.as_ref(),
+            ) {
                 sync.borrow()
                     .set_local_flip_observer(Some(observer.clone()));
+            }
+            if let (Some(sync), Some(observer)) = (
+                self.multiplayer.as_ref(),
+                self.mp_local_detach_observer.as_ref(),
+            ) {
+                sync.borrow()
+                    .set_local_detach_observer(Some(observer.clone()));
             }
             if let Some(mut local_sync) = self.local_sync.take() {
                 local_sync.shutdown();
@@ -115,6 +125,8 @@ fn merge_hooks(primary: &SyncHooks, secondary: &SyncHooks) -> SyncHooks {
     let on_remote_snapshot_b = secondary.on_remote_snapshot.clone();
     let on_remote_update_a = primary.on_remote_update.clone();
     let on_remote_update_b = secondary.on_remote_update.clone();
+    let on_remote_playable_update_a = primary.on_remote_playable_update.clone();
+    let on_remote_playable_update_b = secondary.on_remote_playable_update.clone();
     let on_event_a = primary.on_event.clone();
     let on_event_b = secondary.on_event.clone();
     let on_asset_a = primary.on_asset.clone();
@@ -135,6 +147,10 @@ fn merge_hooks(primary: &SyncHooks, secondary: &SyncHooks) -> SyncHooks {
         on_remote_update: Rc::new(move |update, seq, source, client_seq| {
             on_remote_update_a(update.clone(), seq, source, client_seq);
             on_remote_update_b(update, seq, source, client_seq);
+        }),
+        on_remote_playable_update: Rc::new(move |update, seq, source, client_seq| {
+            on_remote_playable_update_a(update.clone(), seq, source, client_seq);
+            on_remote_playable_update_b(update, seq, source, client_seq);
         }),
         on_event: Rc::new(move |event| {
             on_event_a(event.clone());
@@ -234,7 +250,7 @@ fn handle_local_snapshot(snapshot: AppSnapshot, core: Rc<AppCore>) {
     if allow_persist {
         let mut skip_save = false;
         if let Some(pending_snapshot) = pending {
-            match apply_game_snapshot_to_core(&pending_snapshot, &core, &snapshot) {
+            match apply_playable_snapshot_to_core(&pending_snapshot, &core, &snapshot) {
                 ApplySnapshotResult::Applied => {
                     return;
                 }
@@ -369,6 +385,10 @@ pub(crate) fn multiplayer_handle() -> Option<Rc<RefCell<MultiplayerGameSync>>> {
     STATE.with(|slot| slot.borrow().multiplayer.clone())
 }
 
+pub(crate) fn current_app_snapshot() -> Option<AppSnapshot> {
+    STATE.with(|slot| slot.borrow().last_snapshot.clone())
+}
+
 pub(crate) fn set_state_applied(value: bool) {
     STATE.with(|slot| {
         if let Some(sync) = slot.borrow().multiplayer.as_ref() {
@@ -404,7 +424,7 @@ pub(crate) fn set_local_observer(observer: Option<Rc<dyn Fn(&CoreAction)>>) {
 }
 
 pub(crate) fn set_multiplayer_local_transform_observer(
-    observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>,
+    observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
 ) {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
@@ -421,6 +441,16 @@ pub(crate) fn set_multiplayer_local_flip_observer(observer: Option<Rc<dyn Fn(u32
         state.mp_local_flip_observer = observer.clone();
         if let Some(sync) = state.multiplayer.as_ref() {
             sync.borrow().set_local_flip_observer(observer);
+        }
+    });
+}
+
+pub(crate) fn set_multiplayer_local_detach_observer(observer: Option<Rc<dyn Fn(u32)>>) {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.mp_local_detach_observer = observer.clone();
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow().set_local_detach_observer(observer);
         }
     });
 }
@@ -505,14 +535,24 @@ fn anchor_for_piece(snapshot: &AppSnapshot, piece_id: usize) -> Option<usize> {
     if piece_id >= total {
         return None;
     }
-    if snapshot.core.connections.len() < total {
-        return None;
+    if snapshot.piece_group_anchor.len() != total {
+        // No live game state yet; derive the group from the on-demand
+        // connections projection.
+        let connections = snapshot.piece_connections();
+        if connections.len() < total {
+            return None;
+        }
+        let mut members = collect_group(&connections, piece_id, cols, rows);
+        if members.is_empty() {
+            members.push(piece_id);
+        }
+        return members.into_iter().min();
     }
-    let mut members = collect_group(&snapshot.core.connections, piece_id, cols, rows);
-    if members.is_empty() {
-        members.push(piece_id);
-    }
-    members.into_iter().min()
+    snapshot
+        .piece_group_anchor
+        .get(piece_id)
+        .copied()
+        .map(|anchor| anchor as usize)
 }
 
 fn should_block_owned_action(core: &AppCore, action: &CoreAction) -> bool {
@@ -560,7 +600,7 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
             drag_anchor_before = snapshot.dragging_members.first().copied();
             drag_primary_before = snapshot.drag_primary_id;
             if let Some(id) = drag_primary_before {
-                flip_before = snapshot.core.flips.get(id).copied();
+                flip_before = snapshot.piece_flipped.get(id).copied();
             }
         }
         core.apply_action(action.clone());
@@ -575,22 +615,16 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
             let Some(anchor_id) = snapshot.dragging_members.first().copied() else {
                 return;
             };
-            if anchor_id >= snapshot.core.positions.len() {
+            let Some((pos, rot_deg)) = piece_grid_pose(&snapshot, anchor_id) else {
                 return;
-            }
+            };
             if snapshot.drag_rotate_mode {
-                if anchor_id >= snapshot.core.rotations.len() {
-                    return;
-                }
-                let pos = snapshot.core.positions[anchor_id];
-                let rot_deg = snapshot.core.rotations[anchor_id];
                 handle_local_action(&CoreAction::Sync(SyncAction::Transform {
                     anchor_id,
                     pos,
                     rot_deg,
                 }));
             } else {
-                let pos = snapshot.core.positions[anchor_id];
                 handle_local_action(&CoreAction::Sync(SyncAction::Move { anchor_id, pos }));
             }
         }
@@ -603,7 +637,7 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
                 return;
             }
             if let (Some(primary_id), Some(before_flip)) = (drag_primary_before, flip_before) {
-                if let Some(after_flip) = snapshot.core.flips.get(primary_id).copied() {
+                if let Some(after_flip) = snapshot.piece_flipped.get(primary_id).copied() {
                     if after_flip != before_flip {
                         handle_local_action(&CoreAction::Sync(SyncAction::Flip {
                             piece_id: primary_id,
@@ -613,11 +647,9 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
                     }
                 }
             }
-            if anchor_id >= snapshot.core.positions.len() || anchor_id >= snapshot.core.rotations.len() {
+            let Some((pos, rot_deg)) = piece_grid_pose(&snapshot, anchor_id) else {
                 return;
-            }
-            let pos = snapshot.core.positions[anchor_id];
-            let rot_deg = snapshot.core.rotations[anchor_id];
+            };
             handle_local_action(&CoreAction::Sync(SyncAction::Place {
                 anchor_id,
                 pos,
@@ -626,6 +658,19 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
         }
         _ => {}
     }
+}
+
+/// Reads a piece's legacy pixel-coord pose `((x_px, y_px), rot_deg)` from the
+/// new `piece_world_poses` accessor. Used by sync paths that still feed the
+/// legacy `SyncAction` wire format (px coords).
+fn piece_grid_pose(
+    snapshot: &crate::app_core::AppSnapshot,
+    piece_id: usize,
+) -> Option<((f32, f32), f32)> {
+    let pose = snapshot.piece_world_poses.get(piece_id).copied()?;
+    let px = pose.x_mm() * snapshot.piece_width - snapshot.piece_width * 0.5;
+    let py = pose.y_mm() * snapshot.piece_height - snapshot.piece_height * 0.5;
+    Some(((px, py), pose.rotation_degrees()))
 }
 
 pub(crate) fn clear_local_snapshot() {
@@ -703,9 +748,7 @@ pub(crate) fn register_sync_view_hook(hook: Rc<dyn Fn()>) -> SyncViewHookHandle 
 }
 
 #[cfg(test)]
-pub(crate) fn install_test_handler(
-    hooks: SyncHooks,
-) -> Rc<dyn Fn(heddobureika_core::ServerMsg)> {
+pub(crate) fn install_test_handler(hooks: SyncHooks) -> Rc<dyn Fn(heddobureika_core::ServerMsg)> {
     STATE.with(|slot| {
         if let Some(sync) = slot.borrow().multiplayer.as_ref() {
             sync.borrow_mut().install_handler(hooks)

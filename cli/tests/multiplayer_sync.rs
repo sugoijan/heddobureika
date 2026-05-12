@@ -4,9 +4,19 @@ use heddobureika_core::catalog::DEFAULT_PUZZLE_SLUG;
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
-    AdminMsg, ClientMsg, PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleStateSnapshot,
-    RoomPersistence, ServerMsg, ASSET_CHUNK_BYTES,
+    AdminMsg, ClientMsg, GameRules, GridTopology, LogicalState, PieceId, PlayRules,
+    PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableState, Pose2,
+    PuzzleImageRef, PuzzleInfo, PuzzleSpec, RestoredPlayableState, RoomPersistence, ServerMsg,
+    ASSET_CHUNK_BYTES,
 };
+
+/// Test fixture: each piece is its own singleton group with the given pose.
+/// No edges are active.
+struct SingletonFixture {
+    positions: Vec<(f32, f32)>,
+    rotations: Vec<f32>,
+    scramble_nonce: u32,
+}
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rand::RngExt;
@@ -185,7 +195,7 @@ async fn send_admin_msg(
     Ok(())
 }
 
-fn build_init_payload() -> (PuzzleInfo, PuzzleStateSnapshot) {
+fn build_init_payload() -> (PuzzleInfo, SingletonFixture) {
     let cols = 2u32;
     let rows = 2u32;
     let image_width = 400u32;
@@ -199,9 +209,6 @@ fn build_init_payload() -> (PuzzleInfo, PuzzleStateSnapshot) {
         }
     }
     let rotations = vec![0.0; (cols * rows) as usize];
-    let flips = vec![false; (cols * rows) as usize];
-    let connections = vec![[false; 4]; (cols * rows) as usize];
-    let group_order = (0..(cols * rows)).map(|id| id as u32).collect();
     let puzzle = PuzzleInfo {
         label: "Test".to_string(),
         image_ref: PuzzleImageRef::BuiltIn {
@@ -213,15 +220,74 @@ fn build_init_payload() -> (PuzzleInfo, PuzzleStateSnapshot) {
         image_width,
         image_height,
     };
-    let state = PuzzleStateSnapshot {
+    let state = SingletonFixture {
         positions,
         rotations,
-        flips,
-        connections,
-        group_order,
         scramble_nonce: 0,
     };
     (puzzle, state)
+}
+
+fn singleton_playable(
+    puzzle: &PuzzleInfo,
+    state: &SingletonFixture,
+) -> PlayableState<GridTopology> {
+    let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
+    let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+    let topology = GridTopology::try_new(puzzle.cols, puzzle.rows).expect("valid grid");
+    let logical = LogicalState::new(topology);
+    let mut playable = PlayableState::new(logical, PlayRules::default());
+    for (idx, &(x, y)) in state.positions.iter().enumerate() {
+        let mm_x = (x + piece_width * 0.5) / piece_width;
+        let mm_y = (y + piece_height * 0.5) / piece_height;
+        let pose = Pose2::try_from_mm_degrees(mm_x, mm_y, state.rotations[idx]).expect("finite");
+        playable.group_pose[idx] = pose;
+    }
+    playable
+}
+
+fn build_init_msg(puzzle: &PuzzleInfo, state: &SingletonFixture) -> ClientMsg {
+    let playable = singleton_playable(puzzle, state);
+    ClientMsg::Init {
+        snapshot: PlayableGameSnapshot::from_playable(
+            puzzle.clone(),
+            GameRules::default(),
+            state.scramble_nonce,
+            &playable,
+            None,
+        ),
+    }
+}
+
+fn playable_position(
+    puzzle: &PuzzleInfo,
+    anchor_id: u32,
+    pos: (f32, f32),
+) -> PlayablePositionSnapshot {
+    let cols = puzzle.cols as usize;
+    let rows = puzzle.rows as usize;
+    assert!(cols > 0 && rows > 0);
+    assert!((anchor_id as usize) < cols * rows);
+    let piece_width = puzzle.image_width as f32 / cols as f32;
+    let piece_height = puzzle.image_height as f32 / rows as f32;
+    PlayablePositionSnapshot {
+        x_mm: (pos.0 + piece_width * 0.5) / piece_width,
+        y_mm: (pos.1 + piece_height * 0.5) / piece_height,
+    }
+}
+
+fn playable_pose(
+    puzzle: &PuzzleInfo,
+    anchor_id: u32,
+    pos: (f32, f32),
+    rot_deg: f32,
+) -> PlayablePoseSnapshot {
+    let drop_pos = playable_position(puzzle, anchor_id, pos);
+    PlayablePoseSnapshot {
+        x_mm: drop_pos.x_mm,
+        y_mm: drop_pos.y_mm,
+        rotation_deg: rot_deg,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -258,11 +324,7 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
     let init_deadline = Duration::from_secs(5);
     let (puzzle, state) = build_init_payload();
     let mut initialized = false;
-    let init = ClientMsg::Init {
-        puzzle: puzzle.clone(),
-        rules: None,
-        state: Some(state.clone()),
-    };
+    let init = build_init_msg(&puzzle, &state);
 
     let a_welcome = recv_with_timeout(&mut a_read, init_deadline).await;
     if let Some(ServerMsg::Welcome {
@@ -313,18 +375,20 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
     send_client_msg(
         &mut a_write,
         ClientMsg::Move {
-            anchor_id,
-            pos: new_pos,
+            piece_id: anchor_id,
+            drop_pos: playable_position(&puzzle, anchor_id, new_pos),
             client_seq: 1,
+            base_revision: 0,
         },
     )
     .await?;
     send_client_msg(
         &mut a_write,
         ClientMsg::Place {
-            anchor_id,
-            pos: new_pos,
-            rot_deg: 0.0,
+            piece_id: anchor_id,
+            drop_pose: playable_pose(&puzzle, anchor_id, new_pos, 0.0),
+            client_seq: 2,
+            base_revision: 0,
         },
     )
     .await?;
@@ -333,28 +397,45 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
     let deadline = Duration::from_secs(5);
     while let Some(msg) = recv_with_timeout(&mut b_read, deadline).await {
         match msg {
-            ServerMsg::Update { update, .. } => {
-                if let heddobureika_core::protocol::RoomUpdate::GroupTransform {
-                    anchor_id: a,
-                    pos,
-                    ..
-                } = update
-                {
-                    if a == anchor_id
-                        && (pos.0 - new_pos.0).abs() < 0.01
-                        && (pos.1 - new_pos.1).abs() < 0.01
-                    {
-                        observed = true;
-                        break;
+            ServerMsg::State { snapshot, .. } => {
+                let restored = match snapshot.restore_playable_from_spec() {
+                    Ok(RestoredPlayableState::Grid(p)) => p,
+                    Ok(_) => {
+                        return Err("unsupported topology in state message".into());
                     }
+                    Err(err) => {
+                        return Err(format!("restore state snapshot failed: {err:?}").into());
+                    }
+                };
+                let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
+                let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+                let pos = restored
+                    .piece_world_pose(PieceId(anchor_id))
+                    .map(|pose| {
+                        (
+                            pose.x_mm() * piece_width - piece_width * 0.5,
+                            pose.y_mm() * piece_height - piece_height * 0.5,
+                        )
+                    })
+                    .unwrap_or(start_pos);
+                if (pos.0 - new_pos.0).abs() < 0.01 && (pos.1 - new_pos.1).abs() < 0.01 {
+                    observed = true;
+                    break;
                 }
             }
-            ServerMsg::State { snapshot, .. } => {
-                let pos = snapshot
-                    .state
-                    .positions
-                    .get(anchor_id as usize)
-                    .copied()
+            ServerMsg::PlayableUpdate { update, .. } => {
+                let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
+                let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+                let pos = update
+                    .group_changes
+                    .iter()
+                    .find(|change| change.group == anchor_id)
+                    .map(|change| {
+                        (
+                            change.pose.x_mm * piece_width - piece_width * 0.5,
+                            change.pose.y_mm * piece_height - piece_height * 0.5,
+                        )
+                    })
                     .unwrap_or(start_pos);
                 if (pos.0 - new_pos.0).abs() < 0.01 && (pos.1 - new_pos.1).abs() < 0.01 {
                     observed = true;
@@ -576,11 +657,7 @@ async fn recording_caps_and_exports_rows() -> Result<(), Box<dyn std::error::Err
     let (mut a_write, mut a_read) = ws_a.split();
 
     let (puzzle, state) = build_init_payload();
-    let init = ClientMsg::Init {
-        puzzle,
-        rules: None,
-        state: Some(state.clone()),
-    };
+    let init = build_init_msg(&puzzle, &state);
 
     let mut initialized = false;
     while let Some(msg) = recv_with_timeout(&mut a_read, Duration::from_secs(5)).await {
@@ -631,18 +708,20 @@ async fn recording_caps_and_exports_rows() -> Result<(), Box<dyn std::error::Err
     send_client_msg(
         &mut a_write,
         ClientMsg::Move {
-            anchor_id: 0,
-            pos: (30.0, 30.0),
+            piece_id: 0,
+            drop_pos: playable_position(&puzzle, 0, (30.0, 30.0)),
             client_seq: 1,
+            base_revision: 0,
         },
     )
     .await?;
     send_client_msg(
         &mut a_write,
         ClientMsg::Place {
-            anchor_id: 0,
-            pos: (30.0, 30.0),
-            rot_deg: 0.0,
+            piece_id: 0,
+            drop_pose: playable_pose(&puzzle, 0, (30.0, 30.0), 0.0),
+            client_seq: 2,
+            base_revision: 0,
         },
     )
     .await?;

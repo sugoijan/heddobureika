@@ -6,11 +6,17 @@ use gloo::console;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app_router;
-use crate::runtime::{AssetEvent, CoreAction, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView};
 use crate::core::InitMode;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
-use heddobureika_core::{ClientId, ClientMsg, RoomPersistence, RoomUpdate, ServerMsg};
+use crate::runtime::{
+    AssetEvent, CoreAction, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView,
+};
+use crate::sync_runtime;
+use heddobureika_core::{
+    ClientId, ClientMsg, PlayablePoseSnapshot, PlayablePositionSnapshot, RoomControlUpdate,
+    RoomPersistence, ServerMsg,
+};
 
 pub(crate) struct MultiplayerGameSync {
     adapter: MultiplayerSyncAdapter,
@@ -29,8 +35,9 @@ pub(crate) struct MultiplayerGameSync {
     ownership_seq_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
     hooks: RefCell<SyncHooks>,
     local_transform_observer:
-        Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>>>,
+        Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>>>,
     local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool)>>>>,
+    local_detach_observer: Rc<RefCell<Option<Rc<dyn Fn(u32)>>>>,
 }
 
 impl MultiplayerGameSync {
@@ -53,14 +60,11 @@ impl MultiplayerGameSync {
             hooks: RefCell::new(SyncHooks::empty()),
             local_transform_observer: Rc::new(RefCell::new(None)),
             local_flip_observer: Rc::new(RefCell::new(None)),
+            local_detach_observer: Rc::new(RefCell::new(None)),
         }
     }
 
-    pub(crate) fn connect(
-        &mut self,
-        room_id: &str,
-        on_fail: Rc<dyn Fn()>,
-    ) {
+    pub(crate) fn connect(&mut self, room_id: &str, on_fail: Rc<dyn Fn()>) {
         self.reset_state();
         let room_id = room_id.trim();
         if room_id.is_empty() {
@@ -114,13 +118,17 @@ impl MultiplayerGameSync {
 
     pub(crate) fn set_local_transform_observer(
         &self,
-        observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64)>>,
+        observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
     ) {
         *self.local_transform_observer.borrow_mut() = observer;
     }
 
     pub(crate) fn set_local_flip_observer(&self, observer: Option<Rc<dyn Fn(u32, bool)>>) {
         *self.local_flip_observer.borrow_mut() = observer;
+    }
+
+    pub(crate) fn set_local_detach_observer(&self, observer: Option<Rc<dyn Fn(u32)>>) {
+        *self.local_detach_observer.borrow_mut() = observer;
     }
 
     fn next_client_seq_for(&self, anchor_id: u32) -> u64 {
@@ -136,10 +144,7 @@ impl MultiplayerGameSync {
         self.state_applied.set(value);
     }
 
-    pub(crate) fn install_handler(
-        &mut self,
-        hooks: SyncHooks,
-    ) -> Rc<dyn Fn(ServerMsg)> {
+    pub(crate) fn install_handler(&mut self, hooks: SyncHooks) -> Rc<dyn Fn(ServerMsg)> {
         let handler = self.build_handler(hooks);
         *self.handler.borrow_mut() = Some(handler.clone());
         handler
@@ -173,6 +178,7 @@ impl MultiplayerGameSync {
         let on_asset = hooks.on_asset.clone();
         let on_remote_snapshot = hooks.on_remote_snapshot.clone();
         let on_remote_update = hooks.on_remote_update.clone();
+        let on_remote_playable_update = hooks.on_remote_playable_update.clone();
         Rc::new(move |msg: ServerMsg| match msg {
             ServerMsg::Welcome {
                 room_id,
@@ -203,7 +209,10 @@ impl MultiplayerGameSync {
                     (on_event)(SyncEvent::NeedInit);
                 }
             }
-            ServerMsg::AdminAck { room_id, persistence } => {
+            ServerMsg::AdminAck {
+                room_id,
+                persistence,
+            } => {
                 *room_id_cell.borrow_mut() = Some(room_id);
                 persistence_cell.set(Some(persistence));
             }
@@ -240,33 +249,38 @@ impl MultiplayerGameSync {
                 console::log!(
                     "multiplayer state received",
                     seq,
-                    snapshot.state.positions.len(),
+                    snapshot.state.topology_piece_count,
                     format!("{}x{}", snapshot.puzzle.cols, snapshot.puzzle.rows)
                 );
                 last_seq.set(seq);
                 init_required_cell.set(false);
                 (on_remote_snapshot)(snapshot, seq);
             }
-            ServerMsg::Update {
+            ServerMsg::ControlUpdate {
                 seq,
                 update,
                 source,
                 client_seq,
             } => {
-                let kind = update_kind(&update);
+                let kind = control_update_kind(&update);
                 console::log!(
-                    "multiplayer update received",
+                    "multiplayer control update received",
                     seq,
                     kind,
                     format!("source={:?}", source)
                 );
-                if let RoomUpdate::Ownership { anchor_id, owner, .. } = &update {
+                if let RoomControlUpdate::Ownership {
+                    group_anchor,
+                    owner,
+                    ..
+                } = &update
+                {
                     let should_apply = {
                         let mut seq_map = ownership_seq_by_anchor.borrow_mut();
-                        match seq_map.get(anchor_id) {
+                        match seq_map.get(group_anchor) {
                             Some(last_seq) if *last_seq >= seq => false,
                             _ => {
-                                seq_map.insert(*anchor_id, seq);
+                                seq_map.insert(*group_anchor, seq);
                                 true
                             }
                         }
@@ -275,7 +289,7 @@ impl MultiplayerGameSync {
                         console::warn!(
                             "multiplayer ownership update dropped (stale)",
                             seq,
-                            format!("anchor={anchor_id}")
+                            format!("anchor={group_anchor}")
                         );
                         return;
                     }
@@ -283,9 +297,9 @@ impl MultiplayerGameSync {
                         let current = ownership_by_anchor.borrow();
                         let mut next = (**current).clone();
                         if let Some(owner_id) = owner {
-                            next.insert(*anchor_id, *owner_id);
+                            next.insert(*group_anchor, *owner_id);
                         } else {
-                            next.remove(anchor_id);
+                            next.remove(group_anchor);
                         }
                         next
                     };
@@ -295,23 +309,55 @@ impl MultiplayerGameSync {
                         crate::wgpu_app::request_render();
                     }
                     (on_event)(SyncEvent::Ownership {
-                        anchor_id: *anchor_id,
+                        anchor_id: *group_anchor,
                         owner: *owner,
                     });
                     return;
                 }
                 let last = last_seq.get();
                 if seq <= last {
-                    console::warn!("multiplayer update dropped (stale)", seq, last, kind);
+                    console::warn!(
+                        "multiplayer control update dropped (stale)",
+                        seq,
+                        last,
+                        kind
+                    );
                     return;
                 }
                 last_seq.set(seq);
                 if !state_applied.get() {
-                    console::warn!("multiplayer update dropped (not ready)", seq, kind);
+                    console::warn!("multiplayer control update dropped (not ready)", seq, kind);
                     (on_event)(SyncEvent::DropNotReady);
                     return;
                 }
                 (on_remote_update)(update, seq, source, client_seq);
+            }
+            ServerMsg::PlayableUpdate {
+                seq,
+                update,
+                source,
+                client_seq,
+            } => {
+                console::log!(
+                    "multiplayer playable update received",
+                    seq,
+                    format!("{:?}", update.kind),
+                    format!("source={:?}", source),
+                    format!("client_seq={:?}", client_seq),
+                    format!("revision={}", update.revision_after)
+                );
+                let last = last_seq.get();
+                if seq <= last {
+                    console::warn!("multiplayer playable update dropped (stale)", seq, last);
+                    return;
+                }
+                last_seq.set(seq);
+                if !state_applied.get() {
+                    console::warn!("multiplayer playable update dropped (not ready)", seq);
+                    (on_event)(SyncEvent::DropNotReady);
+                    return;
+                }
+                (on_remote_playable_update)(update, seq, source, client_seq);
             }
             ServerMsg::Pong { .. } => {}
             ServerMsg::UploadAck { hash } => {
@@ -328,6 +374,42 @@ impl MultiplayerGameSync {
     }
 }
 
+fn playable_position_from_core_pos(
+    anchor_id: usize,
+    pos: (f32, f32),
+) -> Option<PlayablePositionSnapshot> {
+    let snapshot = sync_runtime::current_app_snapshot()?;
+    let info = snapshot.puzzle_info?;
+    let cols = info.cols as usize;
+    let rows = info.rows as usize;
+    let total = cols.checked_mul(rows)?;
+    if cols == 0 || rows == 0 || anchor_id >= total {
+        return None;
+    }
+    let piece_width = info.image_width as f32 / cols as f32;
+    let piece_height = info.image_height as f32 / rows as f32;
+    if piece_width <= 0.0 || piece_height <= 0.0 {
+        return None;
+    }
+    Some(PlayablePositionSnapshot {
+        x_mm: (pos.0 + piece_width * 0.5) / piece_width,
+        y_mm: (pos.1 + piece_height * 0.5) / piece_height,
+    })
+}
+
+fn playable_pose_from_core_pose(
+    anchor_id: usize,
+    pos: (f32, f32),
+    rot_deg: f32,
+) -> Option<PlayablePoseSnapshot> {
+    let drop_pos = playable_position_from_core_pos(anchor_id, pos)?;
+    Some(PlayablePoseSnapshot {
+        x_mm: drop_pos.x_mm,
+        y_mm: drop_pos.y_mm,
+        rotation_deg: rot_deg,
+    })
+}
+
 impl GameSync for MultiplayerGameSync {
     fn init(&mut self, hooks: SyncHooks) {
         *self.hooks.borrow_mut() = hooks;
@@ -335,21 +417,39 @@ impl GameSync for MultiplayerGameSync {
 
     fn handle_local_action(&mut self, action: &CoreAction) {
         match action {
-            CoreAction::BeginDrag { piece_id, .. } => {
+            CoreAction::BeginDrag {
+                piece_id,
+                shift_key,
+                ..
+            } => {
                 self.send(ClientMsg::Select {
                     piece_id: *piece_id as u32,
                 });
+                if *shift_key {
+                    self.send(ClientMsg::Detach {
+                        piece_id: *piece_id as u32,
+                        base_revision: 0,
+                    });
+                    if let Some(observer) = self.local_detach_observer.borrow().as_ref() {
+                        observer(*piece_id as u32);
+                    }
+                }
             }
             CoreAction::Sync(sync_action) => match sync_action {
                 SyncAction::Move { anchor_id, pos } => {
                     let client_seq = self.next_client_seq_for(*anchor_id as u32);
+                    let Some(drop_pos) = playable_position_from_core_pos(*anchor_id, *pos) else {
+                        console::warn!("multiplayer move skipped (invalid playable position)");
+                        return;
+                    };
                     self.send(ClientMsg::Move {
-                        anchor_id: *anchor_id as u32,
-                        pos: *pos,
+                        piece_id: *anchor_id as u32,
+                        drop_pos,
                         client_seq,
+                        base_revision: 0,
                     });
                     if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
-                        observer(*anchor_id as u32, *pos, None, client_seq);
+                        observer(*anchor_id as u32, *pos, None, client_seq, false);
                     }
                 }
                 SyncAction::Transform {
@@ -358,14 +458,19 @@ impl GameSync for MultiplayerGameSync {
                     rot_deg,
                 } => {
                     let client_seq = self.next_client_seq_for(*anchor_id as u32);
+                    let Some(drop_pose) = playable_pose_from_core_pose(*anchor_id, *pos, *rot_deg)
+                    else {
+                        console::warn!("multiplayer transform skipped (invalid playable pose)");
+                        return;
+                    };
                     self.send(ClientMsg::Transform {
-                        anchor_id: *anchor_id as u32,
-                        pos: *pos,
-                        rot_deg: *rot_deg,
+                        piece_id: *anchor_id as u32,
+                        drop_pose,
                         client_seq,
+                        base_revision: 0,
                     });
                     if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
-                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq);
+                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq, false);
                     }
                 }
                 SyncAction::Place {
@@ -373,20 +478,27 @@ impl GameSync for MultiplayerGameSync {
                     pos,
                     rot_deg,
                 } => {
+                    let client_seq = self.next_client_seq_for(*anchor_id as u32);
+                    let Some(drop_pose) = playable_pose_from_core_pose(*anchor_id, *pos, *rot_deg)
+                    else {
+                        console::warn!("multiplayer place skipped (invalid playable pose)");
+                        return;
+                    };
                     self.send(ClientMsg::Place {
-                        anchor_id: *anchor_id as u32,
-                        pos: *pos,
-                        rot_deg: *rot_deg,
+                        piece_id: *anchor_id as u32,
+                        drop_pose,
+                        client_seq,
+                        base_revision: 0,
                     });
                     if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
-                        let client_seq = self.next_client_seq_for(*anchor_id as u32);
-                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq);
+                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq, true);
                     }
                 }
                 SyncAction::Flip { piece_id, flipped } => {
                     self.send(ClientMsg::Flip {
                         piece_id: *piece_id as u32,
                         flipped: *flipped,
+                        base_revision: 0,
                     });
                     if let Some(observer) = self.local_flip_observer.borrow().as_ref() {
                         observer(*piece_id as u32, *flipped);
@@ -394,7 +506,7 @@ impl GameSync for MultiplayerGameSync {
                 }
                 SyncAction::Release { anchor_id } => {
                     self.send(ClientMsg::Release {
-                        anchor_id: *anchor_id as u32,
+                        piece_id: *anchor_id as u32,
                     });
                 }
             },
@@ -419,12 +531,9 @@ impl GameSync for MultiplayerGameSync {
     }
 }
 
-pub(crate) fn update_kind(update: &RoomUpdate) -> &'static str {
+pub(crate) fn control_update_kind(update: &RoomControlUpdate) -> &'static str {
     match update {
-        RoomUpdate::Ownership { .. } => "ownership",
-        RoomUpdate::GroupTransform { .. } => "group_transform",
-        RoomUpdate::Flip { .. } => "flip",
-        RoomUpdate::GroupOrder { .. } => "group_order",
-        RoomUpdate::Connections { .. } => "connections",
+        RoomControlUpdate::Ownership { .. } => "ownership",
+        RoomControlUpdate::GroupOrder { .. } => "group_order",
     }
 }

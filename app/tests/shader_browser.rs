@@ -32,7 +32,10 @@ fn ui_shader_compiles_in_webgl2() {
 #[wasm_bindgen_test(async)]
 async fn shaders_compile_in_webgpu() {
     let instance = wgpu::Instance::default();
-    let Some(adapter) = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await else {
+    let Some(adapter) = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await
+    else {
         return;
     };
     let (device, _queue) = adapter

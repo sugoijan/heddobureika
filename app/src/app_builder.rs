@@ -1,26 +1,26 @@
 use crate::app_core::AppCore;
 use crate::app_router;
 use crate::app_runtime;
-use crate::boot_runtime::{self, BootState};
 use crate::boot;
-use crate::sync_runtime;
-use crate::core::{RendererKind, RenderSettings, GridChoice, InitMode};
+use crate::boot_runtime::{self, BootState};
+use crate::core::{
+    best_grid_for_count, build_grid_choices, grid_choice_index, scramble_nonce_from_seed,
+    DEFAULT_TARGET_COUNT, FALLBACK_GRID, IMAGE_MAX_DIMENSION_MAX, IMAGE_MAX_DIMENSION_MIN,
+    PUZZLE_SEED,
+};
+use crate::core::{GridChoice, InitMode, RenderSettings, RendererKind};
 use crate::local_snapshot::load_local_snapshot;
 use crate::persisted::BootPuzzleSelection;
 use crate::persisted_store;
-use web_sys::window;
-use js_sys::decode_uri_component;
+use crate::sync_runtime;
 use heddobureika_core::catalog::{
     logical_image_size, puzzle_by_slug, PuzzleCatalogEntry, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG,
 };
 use heddobureika_core::PuzzleImageRef;
-use crate::core::{
-    best_grid_for_count, build_grid_choices, grid_choice_index, DEFAULT_TARGET_COUNT,
-    FALLBACK_GRID, IMAGE_MAX_DIMENSION_MAX, IMAGE_MAX_DIMENSION_MIN, PUZZLE_SEED,
-    scramble_nonce_from_seed,
-};
+use js_sys::decode_uri_component;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::window;
 
 #[cfg(target_arch = "wasm32")]
 use crate::multiplayer_bridge;
@@ -77,7 +77,10 @@ fn parse_seed_value(value: &str) -> Option<u32> {
     }
     let normalized = raw.replace('_', "");
     let trimmed = normalized.trim();
-    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u32::from_str_radix(hex, 16).ok()
     } else {
         trimmed.parse::<u32>().ok()
@@ -132,7 +135,11 @@ fn parse_hash_route() -> Option<HashRoute> {
     }
     if let Some(entry) = puzzle_entry {
         return Some(HashRoute {
-            mode: HashRouteMode::Puzzle { entry, pieces, seed },
+            mode: HashRouteMode::Puzzle {
+                entry,
+                pieces,
+                seed,
+            },
             clear_hash: true,
         });
     }
@@ -185,12 +192,7 @@ fn default_grid_choice(width: u32, height: u32) -> GridChoice {
         .unwrap_or_else(|| choices[0])
 }
 
-fn resolve_grid_override(
-    width: u32,
-    height: u32,
-    cols: u32,
-    rows: u32,
-) -> Option<GridChoice> {
+fn resolve_grid_override(width: u32, height: u32, cols: u32, rows: u32) -> Option<GridChoice> {
     let choices = build_grid_choices(width, height);
     let index = grid_choice_index(&choices, cols, rows)?;
     choices.get(index).copied()
@@ -199,8 +201,13 @@ fn resolve_grid_override(
 fn resolve_boot_selection() -> Option<BootSelection> {
     if let Some(route) = parse_hash_route() {
         match route.mode {
-            HashRouteMode::Puzzle { entry, pieces, seed } => {
-                let grid_override = pieces.and_then(|target| best_grid_for_count(entry.width, entry.height, target));
+            HashRouteMode::Puzzle {
+                entry,
+                pieces,
+                seed,
+            } => {
+                let grid_override = pieces
+                    .and_then(|target| best_grid_for_count(entry.width, entry.height, target));
                 return Some(BootSelection {
                     entry,
                     grid_override,
@@ -239,12 +246,8 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
     }
     if let Some(selection) = load_saved_puzzle_selection() {
         if let Some(entry) = puzzle_by_slug(&selection.puzzle_slug).copied() {
-            let grid_override = resolve_grid_override(
-                entry.width,
-                entry.height,
-                selection.cols,
-                selection.rows,
-            );
+            let grid_override =
+                resolve_grid_override(entry.width, entry.height, selection.cols, selection.rows);
             return Some(BootSelection {
                 entry,
                 grid_override,
@@ -273,9 +276,9 @@ fn apply_selection(core: Rc<AppCore>, image_max_dim: u32, selection: BootSelecti
     let grid = selection
         .grid_override
         .unwrap_or_else(|| default_grid_choice(logical_w, logical_h));
-    let scramble_nonce = selection
-        .seed
-        .map(|seed| scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize));
+    let scramble_nonce = selection.seed.map(|seed| {
+        scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
+    });
     core.set_puzzle_with_grid_with_nonce(
         selection.entry.label.to_string(),
         PuzzleImageRef::BuiltIn {
@@ -336,7 +339,7 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
                     snapshot.puzzle.image_ref.clone(),
                     (snapshot.puzzle.image_width, snapshot.puzzle.image_height),
                     Some(grid_override),
-                    Some(snapshot.state.scramble_nonce),
+                    Some(snapshot.scramble_nonce),
                 );
                 return;
             }

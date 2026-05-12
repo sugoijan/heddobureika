@@ -43,6 +43,7 @@ toml = "1"
 imagesize = "0.14"
 
 # game
+heddobureika-game = { path = "game" }
 smallvec = "1.15"
 typed_floats = "1.0"
 

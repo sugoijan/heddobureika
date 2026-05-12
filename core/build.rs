@@ -23,7 +23,8 @@ struct PuzzleEntry {
 }
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().unwrap_or(&manifest_dir);
     let env_path = workspace_root.join(".env");
     let env_local_path = workspace_root.join(".env.local");
@@ -129,9 +130,8 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
     let out_path = out_dir.join("puzzle_catalog.rs");
-    fs::write(&out_path, output).unwrap_or_else(|err| {
-        panic!("failed to write {}: {err}", out_path.display())
-    });
+    fs::write(&out_path, output)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", out_path.display()));
 }
 
 fn resolve_catalog_path(workspace_root: &Path) -> PathBuf {
