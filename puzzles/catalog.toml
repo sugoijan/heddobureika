@@ -1,5 +1,10 @@
-default_slug = "zoe-samurai"
-default_src = "puzzles/zoe-samurai.jpg"
+default_slug = "zoe-assassin"
+default_src = "puzzles/zoe-assassin.jpg"
+
+[[puzzles]]
+label = "Zoe Assassin"
+slug = "zoe-assassin"
+src = "puzzles/zoe-assassin.jpg"
 
 [[puzzles]]
 label = "Zoe Samurai"
