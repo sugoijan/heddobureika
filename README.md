@@ -20,6 +20,7 @@ Catalog lives in `puzzles/catalog.toml`. Override it by setting `PUZZLE_CATALOG_
 Requirements:
 
 - Rust toolchain (cargo)
+- Node.js 22 or newer
 - `just`
 - `trunk` (for frontend dev)
 - `pnpm` (for JS tooling, including `pnpm exec wrangler` for worker dev)
