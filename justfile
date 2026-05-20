@@ -254,7 +254,7 @@ recording-status room_id *args:
     base_url="${ROOM_WS_BASE_URL:-ws://127.0.0.1:{{WRANGLER_PORT}}/ws}"; \
     cargo run -p heddobureika-cli -- rooms recording status --room-id "{{room_id}}" --admin-token "$token" --base-url "$base_url" "$@"
 
-deploy:
+deploy-app:
     @if [ -f .env.local ]; then \
       set -a; source .env.local; set +a; \
     fi; \
@@ -264,6 +264,87 @@ deploy:
     fi; \
     trunk build --release --public-url "$DEPLOY_PUBLIC_URL"; \
     rsync --progress -av --delete dist/ "$DEPLOY_RSYNC_DEST"
+
+deploy-worker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ -f .env.local ]]; then
+      set -a
+      source .env.local
+      set +a
+    fi
+
+    missing=()
+    for name in \
+      DEPLOY_WORKER_NAME \
+      DEPLOY_WORKER_ROUTE \
+      DEPLOY_WORKER_ROOM_PATH_PREFIX \
+      DEPLOY_WORKER_ADMIN_TOKEN
+    do
+      if [[ -z "${!name:-}" ]]; then
+        missing+=("$name")
+      fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+      printf 'Missing worker deploy config in .env.local: %s\n' "${missing[*]}" >&2
+      exit 1
+    fi
+
+    mkdir -p "${WRANGLER_LOG_PATH:-.wrangler/logs}"
+    secret_file="$(mktemp "${TMPDIR:-/tmp}/heddobureika-worker-secrets.XXXXXX")"
+    cleanup() {
+      rm -f "$secret_file"
+    }
+    trap cleanup EXIT
+    chmod 600 "$secret_file"
+    printf 'ADMIN_TOKEN=%s\n' "$DEPLOY_WORKER_ADMIN_TOKEN" > "$secret_file"
+
+    WRANGLER_LOG_PATH="${WRANGLER_LOG_PATH:-.wrangler/logs}" \
+      pnpm exec wrangler deploy \
+        --env production \
+        --name "$DEPLOY_WORKER_NAME" \
+        --route "$DEPLOY_WORKER_ROUTE" \
+        --var "ROOM_PATH_PREFIX:$DEPLOY_WORKER_ROOM_PATH_PREFIX" \
+        --secrets-file "$secret_file" \
+        --keep-vars
+
+deploy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ -f .env.local ]]; then
+      set -a
+      source .env.local
+      set +a
+    fi
+
+    worker_vars=(
+      DEPLOY_WORKER_NAME
+      DEPLOY_WORKER_ROUTE
+      DEPLOY_WORKER_ROOM_PATH_PREFIX
+      DEPLOY_WORKER_ADMIN_TOKEN
+    )
+    configured=0
+    missing=()
+    for name in "${worker_vars[@]}"; do
+      if [[ -n "${!name:-}" ]]; then
+        configured=1
+      else
+        missing+=("$name")
+      fi
+    done
+
+    if (( configured )); then
+      if (( ${#missing[@]} > 0 )); then
+        printf 'Partial worker deploy config in .env.local; missing: %s\n' "${missing[*]}" >&2
+        exit 1
+      fi
+      just deploy-worker
+    fi
+
+    just deploy-app
 
 fmt:
     cargo fmt --all

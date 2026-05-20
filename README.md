@@ -98,6 +98,22 @@ cargo run -p heddobureika-cli -- rooms recording compare --baseline human-run.nd
 Local deploy config (optional):
 
 - Add `.env.local` with `DEPLOY_PUBLIC_URL` and `DEPLOY_RSYNC_DEST` to enable `just deploy`.
+- Custom puzzle catalogs can stay local and uncommitted. Put the catalog at `puzzles/catalog.local.toml`, put custom art under `puzzles/local/`, and set `PUZZLE_CATALOG_PATH=puzzles/catalog.local.toml`.
+- `just deploy` deploys only the app unless worker deploy config is present. If any worker deploy variable is set, all of these are required:
+
+```sh
+DEPLOY_PUBLIC_URL=/heddobureika/
+DEPLOY_RSYNC_DEST=user@host:/var/www/heddobureika/
+PUZZLE_CATALOG_PATH=puzzles/catalog.local.toml
+
+DEPLOY_WORKER_NAME=heddobureika-custom
+DEPLOY_WORKER_ROUTE=example.com/heddobureika/ws/*
+DEPLOY_WORKER_ROOM_PATH_PREFIX=/heddobureika/ws/
+TRUNK_PUBLIC_HEDDOBUREIKA_WS_BASE=wss://example.com/heddobureika/ws
+DEPLOY_WORKER_ADMIN_TOKEN=replace-me
+```
+
+`DEPLOY_WORKER_ADMIN_TOKEN` is uploaded to Cloudflare as the worker secret `ADMIN_TOKEN`. Use a distinct `DEPLOY_WORKER_NAME` for each custom catalog if you want separate durable object state.
 
 ## Disclaimer
 
