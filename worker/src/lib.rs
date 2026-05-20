@@ -7,7 +7,7 @@ use heddobureika_core::game::{
 };
 use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
 use heddobureika_core::{
-    best_grid_for_count, logical_image_size, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
+    logical_image_size, nearest_valid_grid, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
 };
 use heddobureika_core::{
     validate_image_ref, ActionId, AdminMsg, ClientId, ClientMsg, GameBridgeError, GameRules,
@@ -1839,7 +1839,7 @@ impl Room {
             }
         };
         let target = spec.pieces.unwrap_or(DEFAULT_TARGET_COUNT);
-        let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
+        let grid = nearest_valid_grid(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
         let scramble_override = spec.seed.map(|seed| {
             scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
         });
@@ -2204,7 +2204,7 @@ impl Room {
             return Ok(());
         }
         let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
-        let grid = best_grid_for_count(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
+        let grid = nearest_valid_grid(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
         let scramble_override = seed.map(|seed| {
             scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
         });

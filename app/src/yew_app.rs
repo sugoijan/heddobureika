@@ -809,11 +809,24 @@ fn app(props: &AppProps) -> Html {
         .unwrap_or(0);
     let grid_index = use_state(|| grid_default_index);
     let grid_index_value = *grid_index;
-    let grid = grid_choices
+    let grid_custom_count = use_state(|| None::<u32>);
+    let grid_custom_count_value = *grid_custom_count;
+    let grid_custom_active = grid_custom_count_value.is_some();
+    let preset_grid = grid_choices
         .get(grid_index_value)
         .copied()
         .or_else(|| grid_choices.first().copied())
         .unwrap_or(FALLBACK_GRID);
+    let grid = if let (Some(count), Some((width, height))) =
+        (grid_custom_count_value, puzzle_dims_value)
+    {
+        nearest_valid_grid(width, height, count).unwrap_or(preset_grid)
+    } else {
+        preset_grid
+    };
+    let grid_custom_input_value = grid_custom_count_value
+        .map(|count| count.to_string())
+        .unwrap_or_default();
     let total = (grid.cols * grid.rows) as usize;
     let grid_label = if puzzle_info_value.is_some() && !grid_choices.is_empty() {
         grid_choice_label(&grid)
@@ -832,11 +845,19 @@ fn app(props: &AppProps) -> Html {
         .map(|(index, choice)| {
             let label = grid_choice_label(choice);
             html! {
-                <option value={index.to_string()} selected={index == grid_index_value}>
+                <option
+                    value={index.to_string()}
+                    selected={!grid_custom_active && index == grid_index_value}
+                >
                     {label}
                 </option>
             }
         })
+        .chain(std::iter::once(html! {
+            <option value="custom" selected={grid_custom_active}>
+                { "Custom\u{2026}" }
+            </option>
+        }))
         .collect();
     let initial_puzzle_art_index = app_core
         .snapshot()
@@ -916,6 +937,9 @@ fn app(props: &AppProps) -> Html {
     let admin_seed_value = (*admin_seed).clone();
     let admin_pieces_index = use_state(|| 0usize);
     let admin_pieces_index_value = *admin_pieces_index;
+    let admin_pieces_custom_count = use_state(|| None::<u32>);
+    let admin_pieces_custom_count_value = *admin_pieces_custom_count;
+    let admin_pieces_custom_active = admin_pieces_custom_count_value.is_some();
     let admin_socket = use_mut_ref(AdminSocket::new);
     let room_transition_seq = use_mut_ref(|| 0u64);
     let pending_created_room = use_mut_ref(|| None::<String>);
@@ -1065,7 +1089,7 @@ fn app(props: &AppProps) -> Html {
         admin_grid_choices.push(FALLBACK_GRID);
     }
     let admin_pieces_options: Html = std::iter::once(html! {
-        <option value="default" selected={admin_pieces_index_value == 0}>
+        <option value="default" selected={!admin_pieces_custom_active && admin_pieces_index_value == 0}>
             { "Default pieces" }
         </option>
     })
@@ -1076,17 +1100,39 @@ fn app(props: &AppProps) -> Html {
             .map(|(index, choice)| {
                 let value = (index + 1).to_string();
                 html! {
-                    <option value={value} selected={admin_pieces_index_value == index + 1}>
+                    <option
+                        value={value}
+                        selected={!admin_pieces_custom_active && admin_pieces_index_value == index + 1}
+                    >
                         { grid_choice_label(choice) }
                     </option>
                 }
             }),
     )
+    .chain(std::iter::once(html! {
+        <option value="custom" selected={admin_pieces_custom_active}>
+            { "Custom\u{2026}" }
+        </option>
+    }))
     .collect();
+    let admin_pieces_custom_input_value = admin_pieces_custom_count_value
+        .map(|count| count.to_string())
+        .unwrap_or_default();
+    let admin_selected_pieces_value = if let Some(count) = admin_pieces_custom_count_value {
+        Some(clamp_custom_piece_count(count))
+    } else if admin_pieces_index_value == 0 {
+        None
+    } else {
+        admin_grid_choices
+            .get(admin_pieces_index_value.saturating_sub(1))
+            .map(|choice| choice.target_count)
+    };
     {
         let admin_pieces_index = admin_pieces_index.clone();
+        let admin_pieces_custom_count = admin_pieces_custom_count.clone();
         use_effect_with((admin_puzzle_index_value, image_max_dim), move |_| {
             admin_pieces_index.set(0);
+            admin_pieces_custom_count.set(None);
             || ()
         });
     }
@@ -1473,8 +1519,7 @@ fn app(props: &AppProps) -> Html {
         let admin_room_id = admin_room_id.clone();
         let admin_token_value = admin_token_active_value.clone();
         let admin_seed_value = admin_seed_value.clone();
-        let admin_grid_choices = admin_grid_choices.clone();
-        let admin_pieces_index_value = admin_pieces_index_value;
+        let admin_selected_pieces_value = admin_selected_pieces_value;
         Callback::from(move |_: MouseEvent| {
             let Some(room_id) = admin_room_id.as_ref() else {
                 return;
@@ -1491,13 +1536,7 @@ fn app(props: &AppProps) -> Html {
                 .get(admin_puzzle_index_value)
                 .copied()
                 .unwrap_or(PUZZLE_ARTS[0]);
-            let pieces = if admin_pieces_index_value == 0 {
-                None
-            } else {
-                admin_grid_choices
-                    .get(admin_pieces_index_value.saturating_sub(1))
-                    .map(|choice| choice.target_count)
-            };
+            let pieces = admin_selected_pieces_value;
             let seed = parse_optional_seed(&admin_seed_value);
             admin_socket.borrow_mut().send(
                 ws_base,
@@ -1520,8 +1559,7 @@ fn app(props: &AppProps) -> Html {
         let admin_room_id = admin_room_id.clone();
         let admin_token_value = admin_token_active_value.clone();
         let admin_seed_value = admin_seed_value.clone();
-        let admin_grid_choices = admin_grid_choices.clone();
-        let admin_pieces_index_value = admin_pieces_index_value;
+        let admin_selected_pieces_value = admin_selected_pieces_value;
         let admin_private_error = admin_private_error.clone();
         let admin_private_status = admin_private_status.clone();
         let admin_private_status_note = admin_private_status_note.clone();
@@ -1568,13 +1606,7 @@ fn app(props: &AppProps) -> Html {
                 admin_private_status.set(AdminUploadStatus::Failed);
                 return;
             }
-            let pieces = if admin_pieces_index_value == 0 {
-                None
-            } else {
-                admin_grid_choices
-                    .get(admin_pieces_index_value.saturating_sub(1))
-                    .map(|choice| choice.target_count)
-            };
+            let pieces = admin_selected_pieces_value;
             let seed = parse_optional_seed(&admin_seed_value);
             let admin_socket = admin_socket.clone();
             let admin_private_error = admin_private_error.clone();
@@ -1727,6 +1759,7 @@ fn app(props: &AppProps) -> Html {
         let puzzle_info = puzzle_info_store.clone();
         let puzzle_art_index = puzzle_art_index.clone();
         let grid_index = grid_index.clone();
+        let grid_custom_count = grid_custom_count.clone();
         let save_revision = save_revision.clone();
         let positions_live = positions_live.clone();
         let rotations_live = rotations_live.clone();
@@ -1756,6 +1789,14 @@ fn app(props: &AppProps) -> Html {
                         if let Some(index) = grid_choice_index(&choices, info.cols, info.rows) {
                             if *grid_index != index {
                                 grid_index.set(index);
+                            }
+                            if (*grid_custom_count).is_some() {
+                                grid_custom_count.set(None);
+                            }
+                        } else {
+                            let actual_count = info.cols.saturating_mul(info.rows);
+                            if actual_count > 0 && *grid_custom_count != Some(actual_count) {
+                                grid_custom_count.set(Some(actual_count));
                             }
                         }
                     }
@@ -1942,19 +1983,39 @@ fn app(props: &AppProps) -> Html {
     };
     let on_grid_change = {
         let grid_index = grid_index.clone();
+        let grid_custom_count = grid_custom_count.clone();
         let grid_choices = grid_choices.clone();
         let grid_choices_len = grid_choices.len();
         let lock_puzzle_controls = lock_puzzle_controls;
         let app_core = app_core.clone();
         let image_max_dim = image_max_dim;
         let puzzle_art = puzzle_art;
+        let preset_grid = preset_grid;
+        let puzzle_dims_value = puzzle_dims_value;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
             }
             let select: HtmlSelectElement = event.target_unchecked_into();
-            if let Ok(value) = select.value().parse::<usize>() {
+            let raw = select.value();
+            if raw == "custom" {
+                let initial = clamp_custom_piece_count(preset_grid.target_count.max(1));
+                grid_custom_count.set(Some(initial));
+                clear_saved_game();
+                if let Some((width, height)) = puzzle_dims_value {
+                    let grid = nearest_valid_grid(width, height, initial).unwrap_or(preset_grid);
+                    app_builder::request_puzzle_change(
+                        app_core.clone(),
+                        image_max_dim,
+                        puzzle_art,
+                        Some(grid),
+                    );
+                }
+                return;
+            }
+            if let Ok(value) = raw.parse::<usize>() {
                 if value < grid_choices_len {
+                    grid_custom_count.set(None);
                     grid_index.set(value);
                     clear_saved_game();
                     if let Some(grid) = grid_choices.get(value).copied() {
@@ -1966,6 +2027,60 @@ fn app(props: &AppProps) -> Html {
                         );
                     }
                 }
+            }
+        })
+    };
+    let on_grid_custom_commit = {
+        let grid_custom_count = grid_custom_count.clone();
+        let lock_puzzle_controls = lock_puzzle_controls;
+        let app_core = app_core.clone();
+        let image_max_dim = image_max_dim;
+        let puzzle_art = puzzle_art;
+        let preset_grid = preset_grid;
+        let puzzle_dims_value = puzzle_dims_value;
+        let current_custom = grid_custom_count_value;
+        Callback::from(move |input: HtmlInputElement| {
+            if lock_puzzle_controls {
+                return;
+            }
+            let raw = input.value();
+            let parsed = raw.trim().parse::<u32>().ok();
+            let next = parsed
+                .map(clamp_custom_piece_count)
+                .or(current_custom)
+                .unwrap_or(clamp_custom_piece_count(preset_grid.target_count.max(1)));
+            input.set_value(&next.to_string());
+            if current_custom == Some(next) {
+                return;
+            }
+            grid_custom_count.set(Some(next));
+            clear_saved_game();
+            if let Some((width, height)) = puzzle_dims_value {
+                let grid = nearest_valid_grid(width, height, next).unwrap_or(preset_grid);
+                app_builder::request_puzzle_change(
+                    app_core.clone(),
+                    image_max_dim,
+                    puzzle_art,
+                    Some(grid),
+                );
+            }
+        })
+    };
+    let on_grid_custom_blur = {
+        let on_grid_custom_commit = on_grid_custom_commit.clone();
+        Callback::from(move |event: FocusEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            on_grid_custom_commit.emit(input);
+        })
+    };
+    let on_grid_custom_keydown = {
+        let on_grid_custom_commit = on_grid_custom_commit.clone();
+        Callback::from(move |event: KeyboardEvent| {
+            if event.key() == "Enter" {
+                event.prevent_default();
+                let input: HtmlInputElement = event.target_unchecked_into();
+                on_grid_custom_commit.emit(input.clone());
+                let _ = input.blur();
             }
         })
     };
@@ -2178,15 +2293,66 @@ fn app(props: &AppProps) -> Html {
     };
     let on_admin_pieces_change = {
         let admin_pieces_index = admin_pieces_index.clone();
+        let admin_pieces_custom_count = admin_pieces_custom_count.clone();
+        let admin_grid_choices = admin_grid_choices.clone();
+        let admin_pieces_index_value = admin_pieces_index_value;
         Callback::from(move |event: Event| {
             let select: HtmlSelectElement = event.target_unchecked_into();
             let value = select.value();
             if value == "default" {
+                admin_pieces_custom_count.set(None);
                 admin_pieces_index.set(0);
                 return;
             }
+            if value == "custom" {
+                let initial = if admin_pieces_index_value == 0 {
+                    DEFAULT_TARGET_COUNT
+                } else {
+                    admin_grid_choices
+                        .get(admin_pieces_index_value.saturating_sub(1))
+                        .map(|choice| choice.target_count)
+                        .unwrap_or(DEFAULT_TARGET_COUNT)
+                };
+                admin_pieces_custom_count.set(Some(clamp_custom_piece_count(initial)));
+                return;
+            }
             if let Ok(index) = value.parse::<usize>() {
+                admin_pieces_custom_count.set(None);
                 admin_pieces_index.set(index);
+            }
+        })
+    };
+    let on_admin_pieces_custom_commit = {
+        let admin_pieces_custom_count = admin_pieces_custom_count.clone();
+        let current_custom = admin_pieces_custom_count_value;
+        Callback::from(move |input: HtmlInputElement| {
+            let raw = input.value();
+            let parsed = raw.trim().parse::<u32>().ok();
+            let next = parsed
+                .map(clamp_custom_piece_count)
+                .or(current_custom)
+                .unwrap_or(DEFAULT_TARGET_COUNT);
+            input.set_value(&next.to_string());
+            if current_custom != Some(next) {
+                admin_pieces_custom_count.set(Some(next));
+            }
+        })
+    };
+    let on_admin_pieces_custom_blur = {
+        let on_admin_pieces_custom_commit = on_admin_pieces_custom_commit.clone();
+        Callback::from(move |event: FocusEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            on_admin_pieces_custom_commit.emit(input);
+        })
+    };
+    let on_admin_pieces_custom_keydown = {
+        let on_admin_pieces_custom_commit = on_admin_pieces_custom_commit.clone();
+        Callback::from(move |event: KeyboardEvent| {
+            if event.key() == "Enter" {
+                event.prevent_default();
+                let input: HtmlInputElement = event.target_unchecked_into();
+                on_admin_pieces_custom_commit.emit(input.clone());
+                let _ = input.blur();
             }
         })
     };
@@ -2361,8 +2527,7 @@ fn app(props: &AppProps) -> Html {
         let room_id_draft_trimmed = room_id_draft_trimmed.clone();
         let room_id_draft_valid = room_id_draft_valid;
         let admin_seed_value = admin_seed_value.clone();
-        let admin_grid_choices = admin_grid_choices.clone();
-        let admin_pieces_index_value = admin_pieces_index_value;
+        let admin_selected_pieces_value = admin_selected_pieces_value;
         Callback::from(move |_: MouseEvent| {
             let room_id = room_id_draft_trimmed.trim().to_string();
             if !room_id_draft_valid {
@@ -2395,13 +2560,7 @@ fn app(props: &AppProps) -> Html {
                 .get(admin_puzzle_index_value)
                 .copied()
                 .unwrap_or(PUZZLE_ARTS[0]);
-            let pieces = if admin_pieces_index_value == 0 {
-                None
-            } else {
-                admin_grid_choices
-                    .get(admin_pieces_index_value.saturating_sub(1))
-                    .map(|choice| choice.target_count)
-            };
+            let pieces = admin_selected_pieces_value;
             let seed = parse_optional_seed(&admin_seed_value);
             admin_socket.borrow_mut().send(
                 ws_base,
@@ -2898,12 +3057,30 @@ fn app(props: &AppProps) -> Html {
                 </label>
                 { if !multiplayer_active {
                     html! {
-                        <select
-                            id="grid-select"
-                            onchange={on_grid_change}
-                        >
-                            {grid_options}
-                        </select>
+                        <>
+                            <select
+                                id="grid-select"
+                                onchange={on_grid_change}
+                            >
+                                {grid_options}
+                            </select>
+                            { if grid_custom_active {
+                                html! {
+                                    <input
+                                        id="grid-custom-count"
+                                        type="number"
+                                        min={CUSTOM_PIECE_COUNT_MIN.to_string()}
+                                        max={CUSTOM_PIECE_COUNT_MAX.to_string()}
+                                        step="1"
+                                        value={grid_custom_input_value.clone()}
+                                        onblur={on_grid_custom_blur}
+                                        onkeydown={on_grid_custom_keydown}
+                                    />
+                                }
+                            } else {
+                                html! {}
+                            }}
+                        </>
                     }
                 } else {
                     html! {}
@@ -3089,6 +3266,23 @@ fn app(props: &AppProps) -> Html {
                             >
                                 {admin_pieces_options.clone()}
                             </select>
+                            { if admin_pieces_custom_active {
+                                html! {
+                                    <input
+                                        id="admin-pieces-custom-count"
+                                        type="number"
+                                        min={CUSTOM_PIECE_COUNT_MIN.to_string()}
+                                        max={CUSTOM_PIECE_COUNT_MAX.to_string()}
+                                        step="1"
+                                        value={admin_pieces_custom_input_value.clone()}
+                                        onblur={on_admin_pieces_custom_blur.clone()}
+                                        onkeydown={on_admin_pieces_custom_keydown.clone()}
+                                        disabled={room_setup_busy}
+                                    />
+                                }
+                            } else {
+                                html! {}
+                            }}
                         </div>
                         <div class="control">
                             <label for="admin-seed">
@@ -3200,6 +3394,22 @@ fn app(props: &AppProps) -> Html {
                                         >
                                             {admin_pieces_options}
                                         </select>
+                                        { if admin_pieces_custom_active {
+                                            html! {
+                                                <input
+                                                    id="admin-pieces-custom-count"
+                                                    type="number"
+                                                    min={CUSTOM_PIECE_COUNT_MIN.to_string()}
+                                                    max={CUSTOM_PIECE_COUNT_MAX.to_string()}
+                                                    step="1"
+                                                    value={admin_pieces_custom_input_value}
+                                                    onblur={on_admin_pieces_custom_blur}
+                                                    onkeydown={on_admin_pieces_custom_keydown}
+                                                />
+                                            }
+                                        } else {
+                                            html! {}
+                                        }}
                                     </div>
                                     <div class="control">
                                         <label for="admin-seed">

@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_variables))]
+
 mod app_builder;
 mod app_core;
 mod app_router;

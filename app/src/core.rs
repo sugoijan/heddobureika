@@ -1,6 +1,7 @@
 pub use heddobureika_core::game::*;
 pub(crate) use heddobureika_core::{
-    best_grid_for_count, build_grid_choices, grid_choice_index, grid_choice_label, GridChoice,
+    build_grid_choices, clamp_custom_piece_count, grid_choice_index, grid_choice_label,
+    nearest_valid_grid, GridChoice, CUSTOM_PIECE_COUNT_MAX, CUSTOM_PIECE_COUNT_MIN,
     DEFAULT_TARGET_COUNT, FALLBACK_GRID, SOLVE_TIME_EXPONENT, SOLVE_TIME_FACTOR,
 };
 use serde::{Deserialize, Serialize};

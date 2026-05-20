@@ -4,7 +4,7 @@ use crate::app_runtime;
 use crate::boot;
 use crate::boot_runtime::{self, BootState};
 use crate::core::{
-    best_grid_for_count, build_grid_choices, grid_choice_index, scramble_nonce_from_seed,
+    build_grid_choices, grid_choice_index, nearest_valid_grid, scramble_nonce_from_seed,
     DEFAULT_TARGET_COUNT, FALLBACK_GRID, IMAGE_MAX_DIMENSION_MAX, IMAGE_MAX_DIMENSION_MIN,
     PUZZLE_SEED,
 };
@@ -206,8 +206,8 @@ fn resolve_boot_selection() -> Option<BootSelection> {
                 pieces,
                 seed,
             } => {
-                let grid_override = pieces
-                    .and_then(|target| best_grid_for_count(entry.width, entry.height, target));
+                let grid_override =
+                    pieces.and_then(|target| nearest_valid_grid(entry.width, entry.height, target));
                 return Some(BootSelection {
                     entry,
                     grid_override,

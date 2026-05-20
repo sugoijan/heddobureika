@@ -107,3 +107,38 @@ pub fn build_grid_choices(width: u32, height: u32) -> Vec<GridChoice> {
         .filter_map(|target| best_grid_for_count(width, height, *target))
         .collect()
 }
+
+pub const CUSTOM_PIECE_COUNT_MIN: u32 = TARGET_PIECE_COUNTS[0];
+pub const CUSTOM_PIECE_COUNT_MAX: u32 = TARGET_PIECE_COUNTS[TARGET_PIECE_COUNTS.len() - 1];
+
+pub fn clamp_custom_piece_count(count: u32) -> u32 {
+    count.clamp(CUSTOM_PIECE_COUNT_MIN, CUSTOM_PIECE_COUNT_MAX)
+}
+
+/// Finds a valid `GridChoice` for an arbitrary target count, searching nearby
+/// counts when the exact target doesn't fit any allowed grid.
+pub fn nearest_valid_grid(width: u32, height: u32, target: u32) -> Option<GridChoice> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let target = clamp_custom_piece_count(target.max(1));
+    if let Some(choice) = best_grid_for_count(width, height, target) {
+        return Some(choice);
+    }
+    let lo = CUSTOM_PIECE_COUNT_MIN;
+    let hi = CUSTOM_PIECE_COUNT_MAX;
+    let max_delta = (target - lo).max(hi - target);
+    for delta in 1..=max_delta {
+        if target >= lo + delta {
+            if let Some(choice) = best_grid_for_count(width, height, target - delta) {
+                return Some(choice);
+            }
+        }
+        if target + delta <= hi {
+            if let Some(choice) = best_grid_for_count(width, height, target + delta) {
+                return Some(choice);
+            }
+        }
+    }
+    None
+}
