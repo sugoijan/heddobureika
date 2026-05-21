@@ -1,6 +1,6 @@
 use crate::core::{
-    GridChoice, Piece, PiecePaths, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM,
-    WGPU_EDGE_AA_DEFAULT, WGPU_RENDER_SCALE_MIN,
+    PuzzleRenderGeometry, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM, WGPU_EDGE_AA_DEFAULT,
+    WGPU_RENDER_SCALE_MIN,
 };
 use bytemuck::{Pod, Zeroable};
 use glyphon::cosmic_text::Align;
@@ -56,6 +56,13 @@ pub(crate) struct Instance {
     pub(crate) drag: f32,
     pub(crate) piece_origin: [f32; 2],
     pub(crate) mask_origin: [f32; 2],
+    /// Per-piece rotation pivot in piece-local pixel coordinates, relative
+    /// to the piece's bounds top-left. For grid pieces this matches
+    /// `size * 0.5`; for triangular pieces it is the canonical (centroid)
+    /// position which can sit off-center inside the bounding box. The
+    /// vertex shader rotates the quad around this point so the visual
+    /// rotation matches the hit-test rotation.
+    pub(crate) pose_anchor: [f32; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +187,11 @@ impl Instance {
                     format: wgpu::VertexFormat::Float32x2,
                     offset: 40,
                     shader_location: 8,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 48,
+                    shader_location: 9,
                 },
             ],
         }
@@ -671,11 +683,8 @@ impl WgpuRenderer {
     pub(crate) async fn new(
         canvas: HtmlCanvasElement,
         image: HtmlImageElement,
-        _pieces: Vec<Piece>,
-        _paths: Vec<PiecePaths>,
-        grid: GridChoice,
-        piece_width: f32,
-        piece_height: f32,
+        puzzle_bounds_px: [f32; 2],
+        typical_piece_extent_px: [f32; 2],
         view_min_x: f32,
         view_min_y: f32,
         view_width: f32,
@@ -693,8 +702,10 @@ impl WgpuRenderer {
         is_dark_theme: bool,
     ) -> Result<Self, wasm_bindgen::JsValue> {
         let (art_pixels, art_width, art_height) = image_to_rgba(&image)?;
-        let logical_width = piece_width * grid.cols as f32;
-        let logical_height = piece_height * grid.rows as f32;
+        let logical_width = puzzle_bounds_px[0];
+        let logical_height = puzzle_bounds_px[1];
+        let piece_width = typical_piece_extent_px[0];
+        let piece_height = typical_piece_extent_px[1];
         let puzzle_scale = puzzle_scale.max(1.0e-4);
         let inv_puzzle_scale = 1.0 / puzzle_scale;
         let workspace_min_x = workspace_min_x * inv_puzzle_scale;
@@ -1300,6 +1311,7 @@ impl WgpuRenderer {
             drag: 0.0,
             piece_origin: [0.0, 0.0],
             mask_origin: [0.0, 0.0],
+            pose_anchor: [0.0, 0.0],
         }];
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("piece-instance-buffer"),
@@ -2728,18 +2740,26 @@ fn draw_icon_chevron(
 }
 
 pub(crate) fn build_mask_atlas(
-    pieces: &[Piece],
-    paths: &[PiecePaths],
-    piece_width: f32,
-    piece_height: f32,
-    grid: GridChoice,
-    padding: f32,
+    geometry: &PuzzleRenderGeometry,
 ) -> Result<MaskAtlasData, wasm_bindgen::JsValue> {
-    let pad = padding.max(0.0).ceil();
-    let slot_w = (piece_width + pad * 2.0).ceil() as u32;
-    let slot_h = (piece_height + pad * 2.0).ceil() as u32;
-    let atlas_width = slot_w * grid.cols;
-    let atlas_height = slot_h * grid.rows;
+    let pad = geometry.mask_pad_px.max(0.0).ceil();
+    let max_piece_w = geometry
+        .pieces
+        .iter()
+        .map(|piece| piece.bounds_px.width)
+        .fold(0.0_f32, f32::max);
+    let max_piece_h = geometry
+        .pieces
+        .iter()
+        .map(|piece| piece.bounds_px.height)
+        .fold(0.0_f32, f32::max);
+    let slot_w = (max_piece_w + pad * 2.0).ceil().max(1.0) as u32;
+    let slot_h = (max_piece_h + pad * 2.0).ceil().max(1.0) as u32;
+    let count = geometry.pieces.len() as u32;
+    let atlas_cols = (count as f32).sqrt().ceil().max(1.0) as u32;
+    let atlas_rows = count.div_ceil(atlas_cols).max(1);
+    let atlas_width = slot_w * atlas_cols;
+    let atlas_height = slot_h * atlas_rows;
 
     let document = web_sys::window()
         .and_then(|window| window.document())
@@ -2756,14 +2776,11 @@ pub(crate) fn build_mask_atlas(
     ctx.set_fill_style_str("black");
     ctx.fill_rect(0.0, 0.0, atlas_width as f64, atlas_height as f64);
 
-    let mut origins = vec![[0.0, 0.0]; pieces.len()];
-    for (index, piece) in pieces.iter().enumerate() {
-        let path = paths
-            .get(index)
-            .ok_or_else(|| wasm_bindgen::JsValue::from_str("missing piece path"))?;
-        let path2d = Path2d::new_with_path_string(&path.outline)?;
-        let atlas_x = piece.col * slot_w;
-        let atlas_y = piece.row * slot_h;
+    let mut origins = vec![[0.0, 0.0]; geometry.pieces.len()];
+    for (index, piece) in geometry.pieces.iter().enumerate() {
+        let path2d = Path2d::new_with_path_string(&piece.outline_svg)?;
+        let atlas_x = (index as u32 % atlas_cols) * slot_w;
+        let atlas_y = (index as u32 / atlas_cols) * slot_h;
         let offset_x = atlas_x as f64 + pad as f64;
         let offset_y = atlas_y as f64 + pad as f64;
         ctx.save();

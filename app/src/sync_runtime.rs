@@ -7,7 +7,7 @@ use gloo::timers::future::TimeoutFuture;
 use crate::app_core::{AppCore, AppSnapshot, AppSubscription};
 use crate::app_router::{self, MultiplayerConfig};
 use crate::boot_runtime::{self, BootState};
-use crate::core::{collect_group, InitMode};
+use crate::core::InitMode;
 use crate::local_snapshot::{apply_playable_snapshot_to_core, ApplySnapshotResult};
 use crate::multiplayer_game_sync::MultiplayerGameSync;
 use crate::runtime::{CoreAction, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView};
@@ -526,27 +526,12 @@ fn should_block_actions() -> bool {
 }
 
 fn anchor_for_piece(snapshot: &AppSnapshot, piece_id: usize) -> Option<usize> {
-    let cols = snapshot.grid.cols as usize;
-    let rows = snapshot.grid.rows as usize;
-    if cols == 0 || rows == 0 {
+    // Topology-agnostic lookup: the snapshot already tracks per-piece group
+    // anchors derived from the authoritative `PlayableState`. If the game
+    // hasn't been initialised yet (no piece_group_anchor populated), the
+    // caller treats this piece as having no owner.
+    if piece_id >= snapshot.piece_group_anchor.len() {
         return None;
-    }
-    let total = cols * rows;
-    if piece_id >= total {
-        return None;
-    }
-    if snapshot.piece_group_anchor.len() != total {
-        // No live game state yet; derive the group from the on-demand
-        // connections projection.
-        let connections = snapshot.piece_connections();
-        if connections.len() < total {
-            return None;
-        }
-        let mut members = collect_group(&connections, piece_id, cols, rows);
-        if members.is_empty() {
-            members.push(piece_id);
-        }
-        return members.into_iter().min();
     }
     snapshot
         .piece_group_anchor
@@ -668,8 +653,16 @@ fn piece_grid_pose(
     piece_id: usize,
 ) -> Option<((f32, f32), f32)> {
     let pose = snapshot.piece_world_poses.get(piece_id).copied()?;
-    let px = pose.x_mm() * snapshot.piece_width - snapshot.piece_width * 0.5;
-    let py = pose.y_mm() * snapshot.piece_height - snapshot.piece_height * 0.5;
+    // Convert mm → px using the topology's pose unit scale (which matches
+    // `piece_width`/`piece_height` for grid puzzles but not for triangular
+    // or irregular topologies). The "-0.5 * pose_unit" centers the legacy
+    // wire format's top-left convention on the canonical piece position.
+    let unit_x = snapshot.pose_unit_px[0];
+    let unit_y = snapshot.pose_unit_px[1];
+    let origin_x = snapshot.pose_origin_px[0];
+    let origin_y = snapshot.pose_origin_px[1];
+    let px = origin_x + pose.x_mm() * unit_x - unit_x * 0.5;
+    let py = origin_y + pose.y_mm() * unit_y - unit_y * 0.5;
     Some(((px, py), pose.rotation_degrees()))
 }
 

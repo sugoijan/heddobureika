@@ -250,7 +250,7 @@ impl MultiplayerGameSync {
                     "multiplayer state received",
                     seq,
                     snapshot.state.topology_piece_count,
-                    format!("{}x{}", snapshot.puzzle.cols, snapshot.puzzle.rows)
+                    format!("topology={}", snapshot.puzzle.topology.tag)
                 );
                 last_seq.set(seq);
                 init_required_cell.set(false);
@@ -379,21 +379,27 @@ fn playable_position_from_core_pos(
     pos: (f32, f32),
 ) -> Option<PlayablePositionSnapshot> {
     let snapshot = sync_runtime::current_app_snapshot()?;
-    let info = snapshot.puzzle_info?;
-    let cols = info.cols as usize;
-    let rows = info.rows as usize;
-    let total = cols.checked_mul(rows)?;
-    if cols == 0 || rows == 0 || anchor_id >= total {
+    let total = snapshot
+        .puzzle_info
+        .as_ref()
+        .map(|info| info.piece_count() as usize)
+        .unwrap_or(0);
+    if total == 0 || anchor_id >= total {
         return None;
     }
-    let piece_width = info.image_width as f32 / cols as f32;
-    let piece_height = info.image_height as f32 / rows as f32;
-    if piece_width <= 0.0 || piece_height <= 0.0 {
+    // Convert pixel top-left → pose-mm using the topology's actual pose
+    // unit. This is the same conversion the renderer uses, and works for
+    // grid + triangular + any future irregular topology.
+    let unit_x = snapshot.pose_unit_px[0];
+    let unit_y = snapshot.pose_unit_px[1];
+    let origin_x = snapshot.pose_origin_px[0];
+    let origin_y = snapshot.pose_origin_px[1];
+    if unit_x <= 0.0 || unit_y <= 0.0 {
         return None;
     }
     Some(PlayablePositionSnapshot {
-        x_mm: (pos.0 + piece_width * 0.5) / piece_width,
-        y_mm: (pos.1 + piece_height * 0.5) / piece_height,
+        x_mm: (pos.0 + unit_x * 0.5 - origin_x) / unit_x,
+        y_mm: (pos.1 + unit_y * 0.5 - origin_y) / unit_y,
     })
 }
 

@@ -415,6 +415,8 @@ async fn create_room(
                 },
                 pieces: None,
                 seed: None,
+                topology: None,
+                shape_seed: None,
             },
             Some(UploadPlan { path, pieces, seed }),
         )
@@ -434,6 +436,8 @@ async fn create_room(
                 },
                 pieces,
                 seed,
+                topology: None,
+                shape_seed: None,
             },
             None,
         )
@@ -537,6 +541,8 @@ async fn upload_private_file(
         AdminMsg::UploadPrivateEnd {
             pieces: plan.pieces,
             seed: plan.seed,
+            topology: None,
+            shape_seed: None,
         },
     )
     .await?;

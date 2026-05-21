@@ -1,7 +1,8 @@
 use heddobureika_game::{
-    ActionId, EdgeId, FlipState, GridTopology, InteractableState, LogicalState, MergePolicy,
-    PlayRules, PlayableAction, PlayableState, Pose2, Position2, ProjectionScratch,
-    ProposalApplyRejection, ProposalApplyStatus, RestrictedPlayableAction, SnapRejectionReason,
+    ActionId, EdgeId, FlipState, GridTopology, HexagonalTopology, InteractableState, LogicalState,
+    MergePolicy, PieceOuterFeature, PlayRules, PlayableAction, PlayableState, Pose2, Position2,
+    ProjectionScratch, ProposalApplyRejection, ProposalApplyStatus, PuzzleTopology,
+    RestrictedPlayableAction, SnapRejectionReason, TriangularTessellationTopology, VoronoiTopology,
 };
 
 #[test]
@@ -1016,4 +1017,584 @@ fn corner_frame_snap_target_is_inside_workspace_frame_bottom_right() {
         .expect("group pose");
     assert_approx(pose.x_mm(), 4.5);
     assert_approx(pose.y_mm(), 4.5);
+}
+
+/// Regression: 90°-rotated top-edge piece on a non-square grid must snap so
+/// its (rotated) outer edge aligns with the right frame edge in pixel space.
+///
+/// In a 5x3 grid with `aspect = piece_height / piece_width = 0.5`, the
+/// top-edge piece `(col=2, row=0)` has its outer edge midpoint at local
+/// offset `(0, -0.5)` in pose units. Rotating that by 90° via the
+/// aspect-aware rotation yields `(0.25, 0)` in pose units (the rotated
+/// piece is `aspect` pose-units tall = 0.5 in pose units, so its half-extent
+/// is 0.25). Snapping to the right edge therefore places the piece center at
+/// `x = cols - 0.25 = 4.75`, with the rotated piece-edge landing on
+/// `x = 5.0` (the frame edge). The Y axis is free.
+#[test]
+fn transform_action_frame_snap_aligns_rotated_edge_on_non_square_grid() {
+    let topology = GridTopology::try_new(5, 3).expect("valid grid");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+    // piece_width_px = 300, piece_height_px = 150 → aspect = 0.5.
+    playable.set_piece_aspect_ratio(0.5);
+
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(2),
+            drop_pos: Position2::try_from_mm(4.70, 1.00).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::try_new(90.0).expect("finite"),
+        },
+        Some(ActionId(301)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(2))
+        .expect("group pose");
+    assert_approx(pose.x_mm(), 4.75);
+    assert_approx(pose.y_mm(), 1.00);
+    assert_approx(pose.rotation_degrees(), 90.0);
+}
+
+/// Regression: triangular-tessellation half-row edge pieces must snap to the
+/// top frame edge. Prior to the topology-frame-snap implementation,
+/// `is_frame_border_piece` was the default `false` for triangular pieces and
+/// no frame snap targets were emitted at all.
+///
+/// 3x2 triangular tessellation: piece_row 0 is a half-row at canonical
+/// `y = 0`. PieceId(1) is at `(1.0, 0.0)`. Dropping it just below the top
+/// edge — but far enough from neighbor canonical positions to avoid a
+/// join-snap — should pull only the Y axis to 0; X is preserved.
+#[test]
+fn transform_action_frame_snaps_triangular_top_edge_half_piece() {
+    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(1),
+            drop_pos: Position2::try_from_mm(1.25, 0.05).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(302)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(1))
+        .expect("group pose");
+    assert_approx(pose.x_mm(), 1.25);
+    assert_approx(pose.y_mm(), 0.0);
+}
+
+/// Regression: triangular corner half-triangle (PieceId(0): piece_row=0,
+/// col=0) must snap as a *corner* (both axes constrained), not just an edge.
+/// The rounded notch in the frame's TL corner makes only this piece fit, so
+/// it should snap to `(0, 0)` from any drag inside the snap zone.
+#[test]
+fn transform_action_frame_snaps_triangular_corner_half_triangle() {
+    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(0),
+            drop_pos: Position2::try_from_mm(0.07, 0.06).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(303)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(0))
+        .expect("group pose");
+    assert_approx(pose.x_mm(), 0.0);
+    assert_approx(pose.y_mm(), 0.0);
+}
+
+/// Regression: triangular bottom-right corner half-triangle must also corner-
+/// snap. The bottom-right canonical position for 3x2 is `(cols-1, 2*rows)`
+/// = `(2, 4)`. PieceId(14) sits there (last piece in piece_row 4, col=2).
+#[test]
+fn transform_action_frame_snaps_triangular_corner_bottom_right_half_triangle() {
+    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(14),
+            drop_pos: Position2::try_from_mm(1.95, 3.96).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(304)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(14))
+        .expect("group pose");
+    assert_approx(pose.x_mm(), 2.0);
+    assert_approx(pose.y_mm(), 4.0);
+}
+
+/// Regression: triangular regular-row piece in the first column should snap
+/// to the *left* frame edge (single-axis X). PieceId(3) is at piece_row=1,
+/// col=0 → canonical `(0.5, 1.0)`. Dropping it just inside the left edge —
+/// far enough from canonical to avoid a vertical-edge join with the
+/// half-corner above — pulls X to `0.5`, Y is preserved.
+#[test]
+fn transform_action_frame_snaps_triangular_left_edge_regular_piece() {
+    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(3),
+            drop_pos: Position2::try_from_mm(0.55, 1.30).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(305)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(3))
+        .expect("group pose");
+    assert_approx(pose.x_mm(), 0.5);
+    assert_approx(pose.y_mm(), 1.30);
+}
+
+/// Regression: triangular top-edge half-piece rotated 180° must snap
+/// its flat side to the *visual* bottom frame. The visual frame for a
+/// 3x2 triangular tessellation runs from `y = 0` to `y = piece_rows
+/// = 5`, NOT to `y = 4` (the bottom half-row anchor). Top-half-row
+/// pieces have their anchor on the flat side, so the anchor itself
+/// must land on the visual bottom at `y = 5` for the rotated piece to
+/// fit there.
+#[test]
+fn transform_action_frame_snaps_triangular_top_edge_rotated_to_bottom() {
+    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(1),
+            drop_pos: Position2::try_from_mm(1.25, 4.95).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::try_new(180.0).expect("finite"),
+        },
+        Some(ActionId(310)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(1))
+        .expect("group pose");
+    assert_approx(pose.y_mm(), 5.0);
+}
+
+/// Symmetric regression: triangular bottom-edge half-piece rotated
+/// 180° must snap its flat side to the visual top frame at `y = 0`.
+/// Bottom-half-row pieces have their flat side one pose unit BELOW
+/// the anchor, so the rotated piece's anchor lands one unit BELOW the
+/// flat side (i.e., at `y = 1` for snap to top).
+#[test]
+fn transform_action_frame_snaps_triangular_bottom_edge_rotated_to_top() {
+    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+    // Piece 13: piece_row=4 (bottom half-row), col=1, canonical (1, 4).
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(13),
+            drop_pos: Position2::try_from_mm(1.25, 1.05).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::try_new(180.0).expect("finite"),
+        },
+        Some(ActionId(311)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(13))
+        .expect("group pose");
+    assert_approx(pose.y_mm(), 1.0);
+}
+
+/// Voronoi smoke test: the universal frame-snap solver pulls a corner
+/// cell to its canonical site from a small drop offset (both axes).
+/// Locates a corner cell by inspecting the topology's outer features —
+/// any cell with at least one `CornerAttachment` qualifies.
+#[test]
+fn transform_action_frame_snaps_voronoi_corner_cell() {
+    let topology = VoronoiTopology::try_new(12, 7, 1.0).expect("valid voronoi");
+    // Find a piece whose outer features include a CornerAttachment.
+    let corner_piece = (0..topology.piece_count())
+        .map(heddobureika_game::PieceId)
+        .find(|piece| {
+            let mut has_corner = false;
+            topology.visit_outer_features(*piece, &mut |f| {
+                if matches!(f, PieceOuterFeature::CornerAttachment { .. }) {
+                    has_corner = true;
+                }
+            });
+            has_corner
+        })
+        .expect("voronoi must have at least one corner cell");
+    let (site_x, site_y) = topology
+        .canonical_position_in_pose_units(corner_piece)
+        .expect("site");
+
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+    let group = heddobureika_game::GroupId(corner_piece.as_u32());
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group,
+            drop_pos: Position2::try_from_mm(site_x + 0.05, site_y + 0.06).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(401)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable.pose_of(group).expect("group pose");
+    assert_approx(pose.x_mm(), site_x);
+    assert_approx(pose.y_mm(), site_y);
+}
+
+/// Voronoi smoke test: an edge cell with only `BorderEdge` features
+/// (no CornerAttachment) snaps along ONE axis (perpendicular to the
+/// matching frame side) while the other axis is left at the drop
+/// position. Selects the first such cell from the topology.
+#[test]
+fn transform_action_frame_snaps_voronoi_edge_cell_single_axis() {
+    let topology = VoronoiTopology::try_new(16, 7, 1.0).expect("valid voronoi");
+    let edge_piece = (0..topology.piece_count())
+        .map(heddobureika_game::PieceId)
+        .find(|piece| {
+            let mut border = 0usize;
+            let mut corner = 0usize;
+            topology.visit_outer_features(*piece, &mut |f| match f {
+                PieceOuterFeature::BorderEdge { .. } => border += 1,
+                PieceOuterFeature::CornerAttachment { .. } => corner += 1,
+            });
+            corner == 0 && border >= 1
+        })
+        .expect("voronoi must have an edge-only border cell");
+    let (site_x, site_y) = topology
+        .canonical_position_in_pose_units(edge_piece)
+        .expect("site");
+
+    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+    let group = heddobureika_game::GroupId(edge_piece.as_u32());
+    // Tiny drift on both axes; only the axis the BorderEdge constrains
+    // (perpendicular to the frame side it sits on) snaps back.
+    let drop_x = site_x + 0.05;
+    let drop_y = site_y + 0.05;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group,
+            drop_pos: Position2::try_from_mm(drop_x, drop_y).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(402)),
+        MergePolicy::KeepFixedGroup,
+    );
+
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable.pose_of(group).expect("group pose");
+    // Exactly one of x/y must have snapped back to the site; the other
+    // axis remains at the drop position (within float tolerance).
+    let x_snapped = (pose.x_mm() - site_x).abs() < 1.0e-4;
+    let y_snapped = (pose.y_mm() - site_y).abs() < 1.0e-4;
+    let x_drift = (pose.x_mm() - drop_x).abs() < 1.0e-4;
+    let y_drift = (pose.y_mm() - drop_y).abs() < 1.0e-4;
+    assert!(
+        (x_snapped && y_drift) || (y_snapped && x_drift),
+        "expected exactly one axis to snap: pose=({}, {}), drop=({}, {}), site=({}, {})",
+        pose.x_mm(),
+        pose.y_mm(),
+        drop_x,
+        drop_y,
+        site_x,
+        site_y,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Hexagonal-tiling snap tests.
+//
+// Reference layout (5x3): 13 pieces, snap_frame_extent = (6, 2√3).
+//   piece 0  : TL corner       anchor (0, 0)
+//   piece 1  : left edge cut   anchor (0, √3)
+//   piece 2  : BL corner       anchor (0, 2√3)
+//   piece 3  : top tangent     anchor (1.5, √3/2)
+//   piece 4  : bottom tangent  anchor (1.5, 1.5·√3)
+//   piece 5  : top edge cut    anchor (3, 0)
+//   piece 6  : interior        anchor (3, √3)
+//   piece 7  : bottom edge cut anchor (3, 2√3)
+//   piece 8  : top tangent     anchor (4.5, √3/2)
+//   piece 9  : bottom tangent  anchor (4.5, 1.5·√3)
+//   piece 10 : TR corner       anchor (6, 0)
+//   piece 11 : right edge cut  anchor (6, √3)
+//   piece 12 : BR corner       anchor (6, 2√3)
+// ---------------------------------------------------------------------
+
+const HEX_SQRT_3: f32 = 1.732_050_8;
+
+fn hex_topology_5x3_playable() -> PlayableState<HexagonalTopology> {
+    let topology = HexagonalTopology::try_new_uniform(5, 3).expect("valid hex");
+    PlayableState::new(LogicalState::new(topology), PlayRules::default())
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_tl_corner() {
+    let mut playable = hex_topology_5x3_playable();
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(0),
+            drop_pos: Position2::try_from_mm(0.07, 0.05).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(601)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(0))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 0.0);
+    assert_approx(pose.y_mm(), 0.0);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_tr_corner() {
+    let mut playable = hex_topology_5x3_playable();
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(10),
+            drop_pos: Position2::try_from_mm(5.93, 0.05).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(602)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(10))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 6.0);
+    assert_approx(pose.y_mm(), 0.0);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_br_corner() {
+    let mut playable = hex_topology_5x3_playable();
+    let extent_y = 2.0 * HEX_SQRT_3;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(12),
+            drop_pos: Position2::try_from_mm(5.93, extent_y - 0.05).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(603)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(12))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 6.0);
+    assert_approx(pose.y_mm(), extent_y);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_bl_corner() {
+    let mut playable = hex_topology_5x3_playable();
+    let extent_y = 2.0 * HEX_SQRT_3;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(2),
+            drop_pos: Position2::try_from_mm(0.07, extent_y - 0.05).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(604)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(2))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 0.0);
+    assert_approx(pose.y_mm(), extent_y);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_top_edge_cut() {
+    let mut playable = hex_topology_5x3_playable();
+    // Piece 5: top edge cut piece, canonical (3, 0). Drop slightly off
+    // canonical to verify only the y axis snaps (the horizontal
+    // BorderEdge sits on the top frame, perpendicular = y).
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(5),
+            drop_pos: Position2::try_from_mm(3.0, 0.07).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(605)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(5))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 3.0);
+    assert_approx(pose.y_mm(), 0.0);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_bottom_edge_cut() {
+    let mut playable = hex_topology_5x3_playable();
+    // Piece 7: bottom edge cut piece, canonical (3, 2√3).
+    let extent_y = 2.0 * HEX_SQRT_3;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(7),
+            drop_pos: Position2::try_from_mm(3.0, extent_y - 0.07).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(606)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(7))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 3.0);
+    assert_approx(pose.y_mm(), extent_y);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_left_edge_cut() {
+    let mut playable = hex_topology_5x3_playable();
+    // Piece 1: left edge cut, canonical (0, √3). Drop with shifted y
+    // so the join distance to the N-neighbour (piece 0 at world (0,0),
+    // join target = canonical (0, √3)) exceeds the join tolerance
+    // (0.2 * √3 ≈ 0.346) while still inside the frame-snap zone (x
+    // within 0.2 of 0).
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(1),
+            drop_pos: Position2::try_from_mm(0.07, 0.5).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(607)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(1))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 0.0);
+    assert_approx(pose.y_mm(), 0.5);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_right_edge_cut() {
+    let mut playable = hex_topology_5x3_playable();
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(11),
+            drop_pos: Position2::try_from_mm(5.93, 0.5).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(608)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(11))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 6.0);
+    assert_approx(pose.y_mm(), 0.5);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_top_tangent() {
+    let mut playable = hex_topology_5x3_playable();
+    // Piece 3: top tangent, canonical (1.5, √3/2). BorderEdge piece-
+    // local y = -√3/2, so world midpoint y = anchor.y - √3/2 must hit
+    // y = 0 (top frame). Drop x shifted away from canonical to clear
+    // the NW-neighbour (piece 0) join zone.
+    let drop_y = HEX_SQRT_3 / 2.0 + 0.07;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(3),
+            drop_pos: Position2::try_from_mm(0.95, drop_y).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(609)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(3))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 0.95);
+    assert_approx(pose.y_mm(), HEX_SQRT_3 / 2.0);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_bottom_tangent() {
+    let mut playable = hex_topology_5x3_playable();
+    // Piece 4: bottom tangent, canonical (1.5, 1.5·√3). BorderEdge
+    // piece-local y = +√3/2 ⇒ world midpoint y = anchor.y + √3/2,
+    // snaps to y = 2√3 (bottom frame).
+    let anchor_y = 1.5 * HEX_SQRT_3;
+    let drop_y = anchor_y - 0.07;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(4),
+            drop_pos: Position2::try_from_mm(0.95, drop_y).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::zero(),
+        },
+        Some(ActionId(610)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(4))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 0.95);
+    assert_approx(pose.y_mm(), anchor_y);
+}
+
+#[test]
+fn transform_action_frame_snaps_hexagonal_top_edge_rotated_to_bottom() {
+    let mut playable = hex_topology_5x3_playable();
+    // Top edge cut piece 5 rotated 180°: BorderEdge stays at piece-
+    // local y = 0, world midpoint stays at anchor. Drop near bottom
+    // frame; snap pulls anchor y to extent_y.
+    let extent_y = 2.0 * HEX_SQRT_3;
+    let batch = playable.apply_action_with_snap(
+        PlayableAction::TransformGroupTo {
+            group: heddobureika_game::GroupId(5),
+            drop_pos: Position2::try_from_mm(3.0, extent_y - 0.07).expect("finite"),
+            drop_rotation: heddobureika_game::AngleDeg::try_new(180.0).expect("finite"),
+        },
+        Some(ActionId(611)),
+        MergePolicy::KeepFixedGroup,
+    );
+    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
+    let pose = playable
+        .pose_of(heddobureika_game::GroupId(5))
+        .expect("pose");
+    assert_approx(pose.x_mm(), 3.0);
+    assert_approx(pose.y_mm(), extent_y);
+    assert_approx(pose.rotation_degrees(), 180.0);
 }

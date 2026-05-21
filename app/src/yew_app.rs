@@ -29,8 +29,9 @@ use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
 use heddobureika_core::{
-    is_valid_room_id, logical_image_size, AdminMsg, ClientId, PlayableGameSnapshot, PuzzleImageRef,
-    PuzzleInfo, PuzzleSpec, RoomControlUpdate, ServerMsg, ASSET_CHUNK_BYTES,
+    available_topologies, is_valid_room_id, logical_image_size, topology_kind_for_tag, AdminMsg,
+    ClientId, PieceCountChoice, PlayableGameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec,
+    PuzzleTopology, RoomControlUpdate, ServerMsg, TopologySpec, ASSET_CHUNK_BYTES,
     PRIVATE_UPLOAD_MAX_BYTES, ROOM_ID_ALPHABET, ROOM_ID_LEN,
 };
 use image_pipeline::{AlphaMode, PipelineConfig};
@@ -779,6 +780,55 @@ fn parse_optional_seed(raw: &str) -> Option<u32> {
     u32::from_str_radix(value, radix).ok()
 }
 
+/// One puzzle-configuration change emitted by any of the shared puzzle
+/// controls (art, topology, piece count, regenerate). The dispatcher
+/// (`apply_puzzle_change` in the component) decides whether to apply it
+/// locally or send it to the room as an admin action.
+#[derive(Clone)]
+struct PuzzleChangeRequest {
+    entry: PuzzleCatalogEntry,
+    grid_override: Option<GridChoice>,
+    descriptor: TopologySpec,
+    shape_seed: u32,
+}
+
+fn request_local_puzzle_change(
+    app_core: Rc<AppCore>,
+    image_max_dim: u32,
+    entry: PuzzleCatalogEntry,
+    grid_override: Option<GridChoice>,
+    descriptor: TopologySpec,
+    shape_seed: u32,
+) {
+    // Grid catalog entries get a dedicated path that also saves the
+    // current grid pick for restore-on-reload. Every other topology goes
+    // through the generic `set_puzzle_with_topology`; the descriptor is
+    // already complete because each topology's `resolve_target` builds
+    // it against the active image dimensions before we get here.
+    if descriptor.tag == "grid" {
+        app_builder::request_puzzle_change(
+            app_core,
+            image_max_dim,
+            entry,
+            grid_override,
+            shape_seed,
+        );
+        return;
+    }
+    let (logical_width, logical_height) =
+        logical_image_size(entry.width, entry.height, image_max_dim);
+    app_core.set_puzzle_with_topology_seeded(
+        entry.label.to_string(),
+        PuzzleImageRef::BuiltIn {
+            slug: entry.slug.to_string(),
+        },
+        (logical_width, logical_height),
+        descriptor,
+        None,
+        shape_seed,
+    );
+}
+
 #[function_component(App)]
 fn app(props: &AppProps) -> Html {
     #[cfg(test)]
@@ -827,6 +877,26 @@ fn app(props: &AppProps) -> Html {
     let grid_custom_input_value = grid_custom_count_value
         .map(|count| count.to_string())
         .unwrap_or_default();
+    let local_topology = use_state(|| "grid".to_string());
+    let local_topology_value = (*local_topology).clone();
+    let active_topology_kind = topology_kind_for_tag(&local_topology_value)
+        .copied()
+        .unwrap_or(available_topologies()[0]);
+    let local_topology_is_grid = active_topology_kind.tag == "grid";
+    // Unified non-grid piece-count picker state. Grid keeps its own
+    // historical state (`grid_index` / `grid_custom_count`) since it
+    // also stores a *catalog selection* on disk; non-grid topologies
+    // just need a target count + a seed for re-roll.
+    let non_grid_target_count = use_state(|| active_topology_kind.default_target_count);
+    let non_grid_custom_count = use_state(|| None::<u32>);
+    // Initialised lazily from the live `info.shape_seed` once the
+    // snapshot lands. The `0` placeholder gets replaced by the snapshot
+    // observer below before any user can click Regenerate.
+    let regenerate_seed = use_state(|| 0u32);
+    let non_grid_target_count_value = *non_grid_target_count;
+    let non_grid_custom_count_value = *non_grid_custom_count;
+    let regenerate_seed_value = *regenerate_seed;
+    let non_grid_custom_active = non_grid_custom_count_value.is_some();
     let total = (grid.cols * grid.rows) as usize;
     let grid_label = if puzzle_info_value.is_some() && !grid_choices.is_empty() {
         grid_choice_label(&grid)
@@ -870,8 +940,6 @@ fn app(props: &AppProps) -> Html {
         .unwrap_or(0);
     let puzzle_art_index = use_state(|| initial_puzzle_art_index);
     let puzzle_art_index_value = *puzzle_art_index;
-    let admin_puzzle_index = use_state(|| initial_puzzle_art_index);
-    let admin_puzzle_index_value = *admin_puzzle_index;
     let puzzle_art = PUZZLE_ARTS
         .get(puzzle_art_index_value)
         .copied()
@@ -882,17 +950,6 @@ fn app(props: &AppProps) -> Html {
         .map(|(index, art)| {
             html! {
                 <option value={index.to_string()} selected={index == puzzle_art_index_value}>
-                    {art.label}
-                </option>
-            }
-        })
-        .collect();
-    let admin_puzzle_options: Html = PUZZLE_ARTS
-        .iter()
-        .enumerate()
-        .map(|(index, art)| {
-            html! {
-                <option value={index.to_string()} selected={index == admin_puzzle_index_value}>
                     {art.label}
                 </option>
             }
@@ -935,11 +992,6 @@ fn app(props: &AppProps) -> Html {
     let admin_status_value = *admin_status;
     let admin_seed = use_state(|| String::new());
     let admin_seed_value = (*admin_seed).clone();
-    let admin_pieces_index = use_state(|| 0usize);
-    let admin_pieces_index_value = *admin_pieces_index;
-    let admin_pieces_custom_count = use_state(|| None::<u32>);
-    let admin_pieces_custom_count_value = *admin_pieces_custom_count;
-    let admin_pieces_custom_active = admin_pieces_custom_count_value.is_some();
     let admin_socket = use_mut_ref(AdminSocket::new);
     let room_transition_seq = use_mut_ref(|| 0u64);
     let pending_created_room = use_mut_ref(|| None::<String>);
@@ -979,7 +1031,12 @@ fn app(props: &AppProps) -> Html {
     let multiplayer_controls_online = multiplayer_active || online_setup_value;
     let show_online_setup = online_setup_value && !multiplayer_active;
     let mp_init_required_value = sync_view.init_required();
-    let lock_puzzle_controls = !boot_ready_value || (multiplayer_active && !mp_init_required_value);
+    // Admins may reconfigure the room through the same puzzle controls, so
+    // they stay unlocked for them. Non-admin players in an initialized room
+    // see the controls disabled (reflecting the room's current puzzle).
+    let admin_enabled = multiplayer_active && matches!(admin_status_value, AdminStatus::Accepted);
+    let lock_puzzle_controls =
+        !boot_ready_value || (multiplayer_active && !mp_init_required_value && !admin_enabled);
     let _ = *sync_revision;
     let tab_width_input =
         on_setting_change(app_core.clone(), settings.clone(), |settings, value| {
@@ -1075,67 +1132,46 @@ fn app(props: &AppProps) -> Html {
     let image_max_dim = render_settings_value
         .image_max_dim
         .clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
-    let admin_puzzle_entry = PUZZLE_ARTS
-        .get(admin_puzzle_index_value)
-        .copied()
-        .unwrap_or(PUZZLE_ARTS[0]);
-    let (admin_logical_width, admin_logical_height) = logical_image_size(
-        admin_puzzle_entry.width,
-        admin_puzzle_entry.height,
-        image_max_dim,
-    );
-    let mut admin_grid_choices = build_grid_choices(admin_logical_width, admin_logical_height);
-    if admin_grid_choices.is_empty() {
-        admin_grid_choices.push(FALLBACK_GRID);
-    }
-    let admin_pieces_options: Html = std::iter::once(html! {
-        <option value="default" selected={!admin_pieces_custom_active && admin_pieces_index_value == 0}>
-            { "Default pieces" }
-        </option>
-    })
-    .chain(
-        admin_grid_choices
-            .iter()
-            .enumerate()
-            .map(|(index, choice)| {
-                let value = (index + 1).to_string();
-                html! {
-                    <option
-                        value={value}
-                        selected={!admin_pieces_custom_active && admin_pieces_index_value == index + 1}
-                    >
-                        { grid_choice_label(choice) }
-                    </option>
-                }
-            }),
-    )
-    .chain(std::iter::once(html! {
-        <option value="custom" selected={admin_pieces_custom_active}>
-            { "Custom\u{2026}" }
-        </option>
-    }))
-    .collect();
-    let admin_pieces_custom_input_value = admin_pieces_custom_count_value
-        .map(|count| count.to_string())
-        .unwrap_or_default();
-    let admin_selected_pieces_value = if let Some(count) = admin_pieces_custom_count_value {
-        Some(clamp_custom_piece_count(count))
-    } else if admin_pieces_index_value == 0 {
+    // Resolve the active topology spec from UI state. Grid follows its
+    // catalog-aware path (cols/rows from `grid`); every other topology
+    // delegates to its `TopologyKind::resolve_target`, which builds a
+    // spec from `(target_count, image_dims, seed)`.
+    let local_topology_descriptor = if local_topology_is_grid {
+        TopologySpec::grid(grid.cols, grid.rows)
+    } else {
+        let (w, h) = puzzle_dims_value.unwrap_or_else(|| {
+            logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim)
+        });
+        let target = non_grid_custom_count_value.unwrap_or(non_grid_target_count_value);
+        (active_topology_kind.resolve_target)(target, w, h, regenerate_seed_value)
+            .map(|choice| choice.spec)
+            .unwrap_or_else(|| TopologySpec::grid(grid.cols, grid.rows))
+    };
+    // Choices the non-grid picker offers (only iterated when non-grid is active).
+    let non_grid_dims = puzzle_dims_value
+        .unwrap_or_else(|| logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim));
+    let non_grid_choices: Vec<PieceCountChoice> = if local_topology_is_grid {
+        Vec::new()
+    } else {
+        (active_topology_kind.piece_count_choices)(non_grid_dims.0, non_grid_dims.1)
+    };
+    let non_grid_index = if non_grid_custom_active {
         None
     } else {
-        admin_grid_choices
-            .get(admin_pieces_index_value.saturating_sub(1))
-            .map(|choice| choice.target_count)
+        non_grid_choices
+            .iter()
+            .position(|choice| choice.target_count == non_grid_target_count_value)
     };
-    {
-        let admin_pieces_index = admin_pieces_index.clone();
-        let admin_pieces_custom_count = admin_pieces_custom_count.clone();
-        use_effect_with((admin_puzzle_index_value, image_max_dim), move |_| {
-            admin_pieces_index.set(0);
-            admin_pieces_custom_count.set(None);
-            || ()
-        });
-    }
+    let non_grid_custom_input_value = non_grid_custom_count_value
+        .map(|count| count.to_string())
+        .unwrap_or_default();
+    let non_grid_select_value = if non_grid_custom_active {
+        "custom".to_string()
+    } else {
+        non_grid_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "custom".to_string())
+    };
     let renderer_kind = render_settings_value.renderer;
     let svg_settings_value = render_settings_value.svg.clone();
     let wgpu_settings_value = render_settings_value.wgpu.clone();
@@ -1489,7 +1525,6 @@ fn app(props: &AppProps) -> Html {
             },
         );
     }
-    let admin_enabled = multiplayer_active && matches!(admin_status_value, AdminStatus::Accepted);
     let admin_status_label = match admin_status_value {
         AdminStatus::Idle => "Admin token not verified",
         AdminStatus::Connecting => "Admin token: connecting...",
@@ -1514,52 +1549,13 @@ fn app(props: &AppProps) -> Html {
         admin_private_status_value,
         AdminUploadStatus::Reading | AdminUploadStatus::Sending | AdminUploadStatus::AwaitingAck
     );
-    let on_admin_change_puzzle = {
-        let admin_socket = admin_socket.clone();
-        let admin_room_id = admin_room_id.clone();
-        let admin_token_value = admin_token_active_value.clone();
-        let admin_seed_value = admin_seed_value.clone();
-        let admin_selected_pieces_value = admin_selected_pieces_value;
-        Callback::from(move |_: MouseEvent| {
-            let Some(room_id) = admin_room_id.as_ref() else {
-                return;
-            };
-            let token = admin_token_value.trim();
-            if token.is_empty() {
-                return;
-            }
-            let Some(ws_base) = app_router::default_ws_base() else {
-                return;
-            };
-            let ws_base = ws_base;
-            let entry = PUZZLE_ARTS
-                .get(admin_puzzle_index_value)
-                .copied()
-                .unwrap_or(PUZZLE_ARTS[0]);
-            let pieces = admin_selected_pieces_value;
-            let seed = parse_optional_seed(&admin_seed_value);
-            admin_socket.borrow_mut().send(
-                ws_base,
-                room_id.clone(),
-                token.to_string(),
-                AdminMsg::ChangePuzzle {
-                    puzzle: PuzzleSpec {
-                        image_ref: PuzzleImageRef::BuiltIn {
-                            slug: entry.slug.to_string(),
-                        },
-                        pieces,
-                        seed,
-                    },
-                },
-            );
-        })
-    };
     let on_admin_private_file_input = {
         let admin_socket = admin_socket.clone();
         let admin_room_id = admin_room_id.clone();
         let admin_token_value = admin_token_active_value.clone();
         let admin_seed_value = admin_seed_value.clone();
-        let admin_selected_pieces_value = admin_selected_pieces_value;
+        let upload_descriptor = local_topology_descriptor.clone();
+        let upload_shape_seed = regenerate_seed_value;
         let admin_private_error = admin_private_error.clone();
         let admin_private_status = admin_private_status.clone();
         let admin_private_status_note = admin_private_status_note.clone();
@@ -1606,8 +1602,13 @@ fn app(props: &AppProps) -> Html {
                 admin_private_status.set(AdminUploadStatus::Failed);
                 return;
             }
-            let pieces = admin_selected_pieces_value;
+            // Topology is fully resolved client-side and re-fit to the
+            // uploaded image's real dimensions by the worker. `pieces` stays
+            // `None` because the topology spec is authoritative.
+            let pieces: Option<u32> = None;
             let seed = parse_optional_seed(&admin_seed_value);
+            let topology = Some(upload_descriptor.clone().into());
+            let shape_seed = Some(upload_shape_seed);
             let admin_socket = admin_socket.clone();
             let admin_private_error = admin_private_error.clone();
             let admin_private_status = admin_private_status.clone();
@@ -1647,7 +1648,12 @@ fn app(props: &AppProps) -> Html {
                         bytes: chunk.to_vec(),
                     });
                 }
-                messages.push(AdminMsg::UploadPrivateEnd { pieces, seed });
+                messages.push(AdminMsg::UploadPrivateEnd {
+                    pieces,
+                    seed,
+                    topology,
+                    shape_seed,
+                });
                 admin_socket
                     .borrow_mut()
                     .send_upload(ws_base, room_id, token, messages);
@@ -1678,6 +1684,29 @@ fn app(props: &AppProps) -> Html {
                 room_id.clone(),
                 token.to_string(),
                 AdminMsg::Scramble { seed },
+            );
+        })
+    };
+    let on_admin_solve = {
+        let admin_socket = admin_socket.clone();
+        let admin_room_id = admin_room_id.clone();
+        let admin_token_value = admin_token_active_value.clone();
+        Callback::from(move |_: MouseEvent| {
+            let Some(room_id) = admin_room_id.as_ref() else {
+                return;
+            };
+            let token = admin_token_value.trim();
+            if token.is_empty() {
+                return;
+            }
+            let Some(ws_base) = app_router::default_ws_base() else {
+                return;
+            };
+            admin_socket.borrow_mut().send(
+                ws_base,
+                room_id.clone(),
+                token.to_string(),
+                AdminMsg::Solve,
             );
         })
     };
@@ -1760,6 +1789,10 @@ fn app(props: &AppProps) -> Html {
         let puzzle_art_index = puzzle_art_index.clone();
         let grid_index = grid_index.clone();
         let grid_custom_count = grid_custom_count.clone();
+        let local_topology = local_topology.clone();
+        let non_grid_target_count = non_grid_target_count.clone();
+        let non_grid_custom_count = non_grid_custom_count.clone();
+        let regenerate_seed = regenerate_seed.clone();
         let save_revision = save_revision.clone();
         let positions_live = positions_live.clone();
         let rotations_live = rotations_live.clone();
@@ -1772,6 +1805,72 @@ fn app(props: &AppProps) -> Html {
                 app_snapshot.set(snapshot.clone());
                 puzzle_info.set(snapshot.puzzle_info.clone());
                 if let Some(info) = snapshot.puzzle_info.as_ref() {
+                    // Mirror the engine's shape_seed so the Regenerate
+                    // button bumps from the actual live value instead of
+                    // a stale UI placeholder.
+                    if *regenerate_seed != info.shape_seed {
+                        regenerate_seed.set(info.shape_seed);
+                    }
+                    if let Some(game) = snapshot.game.as_ref() {
+                        let topology = &game.playable.logical.topology;
+                        let descriptor = topology.to_spec();
+                        // Resolve the spec's tag through the registry so
+                        // legacy aliases (e.g. `voronoi_canary`) collapse
+                        // onto the current kind.
+                        let resolved_tag = topology_kind_for_tag(&descriptor.tag)
+                            .map(|kind| kind.tag.to_string())
+                            .unwrap_or_else(|| "grid".to_string());
+                        if *local_topology != resolved_tag {
+                            local_topology.set(resolved_tag.clone());
+                        }
+                        // For non-grid topologies, sync the unified picker
+                        // state from the live spec. Reverse-lookup the
+                        // user-facing *target* (the hint) from the preset
+                        // choices so the picker keeps showing the preset
+                        // the user actually selected — `topology.piece_count()`
+                        // returns the *actual* piece count, which often
+                        // differs from any preset target and would force the
+                        // picker to fall through to "Custom".
+                        if resolved_tag != "grid" {
+                            if let Some(kind) = topology_kind_for_tag(&resolved_tag).copied() {
+                                let choices =
+                                    (kind.piece_count_choices)(info.image_width, info.image_height);
+                                let actual_count = topology.piece_count();
+                                let current_target = *non_grid_target_count;
+                                // Compare by `actual_count` — `target_count` is
+                                // the user's hint and `spec` may include a seed
+                                // that doesn't match the picker's canonical
+                                // choice list (e.g. Voronoi). Prefer the
+                                // currently selected target if it still
+                                // resolves to this spec's piece count.
+                                let matched = choices
+                                    .iter()
+                                    .find(|c| {
+                                        c.target_count == current_target
+                                            && c.actual_count == actual_count
+                                    })
+                                    .or_else(|| {
+                                        choices.iter().find(|c| c.actual_count == actual_count)
+                                    });
+                                if let Some(matched) = matched {
+                                    if *non_grid_target_count != matched.target_count {
+                                        non_grid_target_count.set(matched.target_count);
+                                    }
+                                    if non_grid_custom_count.is_some() {
+                                        non_grid_custom_count.set(None);
+                                    }
+                                } else {
+                                    let custom = clamp_custom_piece_count(actual_count);
+                                    if *non_grid_custom_count != Some(custom) {
+                                        non_grid_custom_count.set(Some(custom));
+                                    }
+                                    if *non_grid_target_count != custom {
+                                        non_grid_target_count.set(custom);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let desired_index = match &info.image_ref {
                         PuzzleImageRef::BuiltIn { slug } => puzzle_art_index_by_slug(slug),
                         _ => None,
@@ -1782,32 +1881,64 @@ fn app(props: &AppProps) -> Html {
                         }
                     }
                     if info.image_width > 0 && info.image_height > 0 {
-                        let mut choices = build_grid_choices(info.image_width, info.image_height);
-                        if choices.is_empty() {
-                            choices.push(FALLBACK_GRID);
-                        }
-                        if let Some(index) = grid_choice_index(&choices, info.cols, info.rows) {
-                            if *grid_index != index {
-                                grid_index.set(index);
+                        // The puzzle picker UI is intrinsically grid-only;
+                        // the catalog only stores grid puzzles. We read the
+                        // grid dims via the topology descriptor accessor so
+                        // non-grid puzzles fall through gracefully.
+                        if let Some((cols, rows)) = info.grid_dims() {
+                            let mut choices =
+                                build_grid_choices(info.image_width, info.image_height);
+                            if choices.is_empty() {
+                                choices.push(FALLBACK_GRID);
                             }
-                            if (*grid_custom_count).is_some() {
-                                grid_custom_count.set(None);
-                            }
-                        } else {
-                            let actual_count = info.cols.saturating_mul(info.rows);
-                            if actual_count > 0 && *grid_custom_count != Some(actual_count) {
-                                grid_custom_count.set(Some(actual_count));
+                            if let Some(index) = grid_choice_index(&choices, cols, rows) {
+                                if *grid_index != index {
+                                    grid_index.set(index);
+                                }
+                                if (*grid_custom_count).is_some() {
+                                    grid_custom_count.set(None);
+                                }
+                            } else {
+                                let actual_count = cols.saturating_mul(rows);
+                                if actual_count > 0 && *grid_custom_count != Some(actual_count) {
+                                    grid_custom_count.set(Some(actual_count));
+                                }
                             }
                         }
                     }
                 }
-                let cols = snapshot.grid.cols as usize;
-                let rows = snapshot.grid.rows as usize;
+                // The legacy yew preview is grid-only: it expects a
+                // row/col indexable connection table. For non-grid
+                // topologies (triangular, future Voronoi) we just refresh
+                // the bare snapshot fields and leave the detailed
+                // `PuzzleState` empty.
+                let is_grid = snapshot
+                    .puzzle_info
+                    .as_ref()
+                    .map(|info| info.topology.tag.as_str())
+                    == Some("grid");
+                let (cols, rows) = snapshot
+                    .puzzle_info
+                    .as_ref()
+                    .and_then(|info| info.grid_dims())
+                    .map(|(c, r)| (c as usize, r as usize))
+                    .unwrap_or((0, 0));
                 let total = cols * rows;
                 let positions = snapshot.piece_positions_px();
                 let rotations = snapshot.piece_rotations_deg();
-                let connections = snapshot.piece_connections();
-                if total == 0
+                let connections: Vec<[bool; 4]> = if is_grid {
+                    snapshot
+                        .game
+                        .as_ref()
+                        .map(|game| {
+                            grid_piece_connections_from_playable(&game.playable, cols, rows)
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if !is_grid
+                    || total == 0
                     || positions.len() != total
                     || rotations.len() != total
                     || snapshot.piece_flipped.len() != total
@@ -1838,8 +1969,8 @@ fn app(props: &AppProps) -> Html {
                 let derived = derive_ui_state_from_puzzle(
                     &next_state,
                     cols,
-                    snapshot.piece_width,
-                    snapshot.piece_height,
+                    snapshot.pose_unit_px[0],
+                    snapshot.pose_unit_px[1],
                 );
                 group_anchor.set(derived.anchor_of.clone());
                 group_pos.set(derived.group_pos.clone());
@@ -1966,20 +2097,92 @@ fn app(props: &AppProps) -> Html {
     } else {
         "--".to_string()
     };
-    let (connections_label, border_connections_label) = if puzzle_info_value.is_some() {
-        let connections_value = app_snapshot_value.piece_connections();
-        if connections_value.len() == total {
-            let (connected, border_connected, total_expected, border_expected) =
-                count_connections(&connections_value, grid.cols as usize, grid.rows as usize);
-            (
-                format_progress(connected, total_expected),
-                format_progress(border_connected, border_expected),
-            )
+    let (connections_label, border_connections_label) = if let Some(game) =
+        app_snapshot_value.game.as_ref()
+    {
+        let connections_label = format_progress(
+            game.playable.logical.active_edge_count(),
+            game.playable.logical.edge_count(),
+        );
+        let border_connections_label = if game.playable.logical.topology.to_spec().tag == "grid" {
+            let connections_value = grid_piece_connections_from_playable(
+                &game.playable,
+                grid.cols as usize,
+                grid.rows as usize,
+            );
+            if connections_value.len() == total {
+                let (connected, border_connected, total_expected, border_expected) =
+                    count_connections(&connections_value, grid.cols as usize, grid.rows as usize);
+                let _ = (connected, total_expected);
+                format_progress(border_connected, border_expected)
+            } else {
+                "--".to_string()
+            }
         } else {
-            ("--".to_string(), "--".to_string())
-        }
+            "--".to_string()
+        };
+        (connections_label, border_connections_label)
     } else {
         ("--".to_string(), "--".to_string())
+    };
+    // Single entry point for every shared puzzle control. In an initialized
+    // online room an admin's change is sent as `ChangePuzzle` (carrying the
+    // resolved topology + shape seed); local play, online setup (room not yet
+    // created), and the NeedInit handshake all build the puzzle locally — the
+    // handshake then ships that local snapshot to the server, and it already
+    // carries the full topology.
+    let apply_puzzle_change: Callback<PuzzleChangeRequest> = {
+        let app_core = app_core.clone();
+        let admin_socket = admin_socket.clone();
+        let admin_room_id = admin_room_id.clone();
+        let admin_token_active_value = admin_token_active_value.clone();
+        let admin_seed_value = admin_seed_value.clone();
+        let multiplayer_active = multiplayer_active;
+        let admin_enabled = admin_enabled;
+        let mp_init_required_value = mp_init_required_value;
+        let image_max_dim = image_max_dim;
+        Callback::from(move |req: PuzzleChangeRequest| {
+            if multiplayer_active && !mp_init_required_value {
+                if !admin_enabled {
+                    return;
+                }
+                let Some(room_id) = admin_room_id.as_ref() else {
+                    return;
+                };
+                let token = admin_token_active_value.trim();
+                if token.is_empty() {
+                    return;
+                }
+                let Some(ws_base) = app_router::default_ws_base() else {
+                    return;
+                };
+                admin_socket.borrow_mut().send(
+                    ws_base,
+                    room_id.clone(),
+                    token.to_string(),
+                    AdminMsg::ChangePuzzle {
+                        puzzle: PuzzleSpec {
+                            image_ref: PuzzleImageRef::BuiltIn {
+                                slug: req.entry.slug.to_string(),
+                            },
+                            pieces: None,
+                            seed: parse_optional_seed(&admin_seed_value),
+                            topology: Some(req.descriptor.clone().into()),
+                            shape_seed: Some(req.shape_seed),
+                        },
+                    },
+                );
+                return;
+            }
+            request_local_puzzle_change(
+                app_core.clone(),
+                image_max_dim,
+                req.entry,
+                req.grid_override,
+                req.descriptor,
+                req.shape_seed,
+            );
+        })
     };
     let on_grid_change = {
         let grid_index = grid_index.clone();
@@ -1987,11 +2190,11 @@ fn app(props: &AppProps) -> Html {
         let grid_choices = grid_choices.clone();
         let grid_choices_len = grid_choices.len();
         let lock_puzzle_controls = lock_puzzle_controls;
-        let app_core = app_core.clone();
-        let image_max_dim = image_max_dim;
+        let apply_puzzle_change = apply_puzzle_change.clone();
         let puzzle_art = puzzle_art;
         let preset_grid = preset_grid;
         let puzzle_dims_value = puzzle_dims_value;
+        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
@@ -2004,12 +2207,12 @@ fn app(props: &AppProps) -> Html {
                 clear_saved_game();
                 if let Some((width, height)) = puzzle_dims_value {
                     let grid = nearest_valid_grid(width, height, initial).unwrap_or(preset_grid);
-                    app_builder::request_puzzle_change(
-                        app_core.clone(),
-                        image_max_dim,
-                        puzzle_art,
-                        Some(grid),
-                    );
+                    apply_puzzle_change.emit(PuzzleChangeRequest {
+                        entry: puzzle_art,
+                        grid_override: Some(grid),
+                        descriptor: TopologySpec::grid(grid.cols, grid.rows),
+                        shape_seed: regenerate_seed_value,
+                    });
                 }
                 return;
             }
@@ -2019,12 +2222,12 @@ fn app(props: &AppProps) -> Html {
                     grid_index.set(value);
                     clear_saved_game();
                     if let Some(grid) = grid_choices.get(value).copied() {
-                        app_builder::request_puzzle_change(
-                            app_core.clone(),
-                            image_max_dim,
-                            puzzle_art,
-                            Some(grid),
-                        );
+                        apply_puzzle_change.emit(PuzzleChangeRequest {
+                            entry: puzzle_art,
+                            grid_override: Some(grid),
+                            descriptor: TopologySpec::grid(grid.cols, grid.rows),
+                            shape_seed: regenerate_seed_value,
+                        });
                     }
                 }
             }
@@ -2033,12 +2236,12 @@ fn app(props: &AppProps) -> Html {
     let on_grid_custom_commit = {
         let grid_custom_count = grid_custom_count.clone();
         let lock_puzzle_controls = lock_puzzle_controls;
-        let app_core = app_core.clone();
-        let image_max_dim = image_max_dim;
+        let apply_puzzle_change = apply_puzzle_change.clone();
         let puzzle_art = puzzle_art;
         let preset_grid = preset_grid;
         let puzzle_dims_value = puzzle_dims_value;
         let current_custom = grid_custom_count_value;
+        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |input: HtmlInputElement| {
             if lock_puzzle_controls {
                 return;
@@ -2057,12 +2260,12 @@ fn app(props: &AppProps) -> Html {
             clear_saved_game();
             if let Some((width, height)) = puzzle_dims_value {
                 let grid = nearest_valid_grid(width, height, next).unwrap_or(preset_grid);
-                app_builder::request_puzzle_change(
-                    app_core.clone(),
-                    image_max_dim,
-                    puzzle_art,
-                    Some(grid),
-                );
+                apply_puzzle_change.emit(PuzzleChangeRequest {
+                    entry: puzzle_art,
+                    grid_override: Some(grid),
+                    descriptor: TopologySpec::grid(grid.cols, grid.rows),
+                    shape_seed: regenerate_seed_value,
+                });
             }
         })
     };
@@ -2084,12 +2287,222 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
+    let on_local_topology_change = {
+        let local_topology = local_topology.clone();
+        let non_grid_target_count = non_grid_target_count.clone();
+        let non_grid_custom_count = non_grid_custom_count.clone();
+        let apply_puzzle_change = apply_puzzle_change.clone();
+        let image_max_dim = image_max_dim;
+        let puzzle_art = puzzle_art;
+        let grid = grid;
+        let regenerate_seed_value = regenerate_seed_value;
+        let lock_puzzle_controls = lock_puzzle_controls;
+        Callback::from(move |event: Event| {
+            if lock_puzzle_controls {
+                return;
+            }
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            let value = select.value();
+            let kind = topology_kind_for_tag(&value)
+                .copied()
+                .unwrap_or(available_topologies()[0]);
+            let descriptor = if value == "grid" {
+                TopologySpec::grid(grid.cols, grid.rows)
+            } else {
+                let (w, h) = logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim);
+                // Default to the topology's default target if we're
+                // switching from grid; otherwise keep the current
+                // non-grid target so the picker doesn't reset.
+                let target = if *local_topology == "grid" {
+                    non_grid_custom_count
+                        .as_ref()
+                        .map(|x| *x)
+                        .unwrap_or(kind.default_target_count)
+                } else {
+                    non_grid_custom_count
+                        .as_ref()
+                        .map(|x| *x)
+                        .unwrap_or(*non_grid_target_count)
+                };
+                (kind.resolve_target)(target, w, h, regenerate_seed_value)
+                    .map(|choice| {
+                        // Persist the resolved target so subsequent
+                        // re-renders show the right `<option>` selected.
+                        non_grid_target_count.set(choice.target_count);
+                        choice.spec
+                    })
+                    .unwrap_or_else(|| TopologySpec::grid(grid.cols, grid.rows))
+            };
+            local_topology.set(value);
+            clear_saved_game();
+            let grid_override = if descriptor.tag == "grid" {
+                Some(grid)
+            } else {
+                None
+            };
+            apply_puzzle_change.emit(PuzzleChangeRequest {
+                entry: puzzle_art,
+                grid_override,
+                descriptor,
+                shape_seed: regenerate_seed_value,
+            });
+        })
+    };
+    // Unified non-grid piece-count handlers. The `<select>` (preset
+    // counts) and the custom `<input>` both feed `non_grid_target_count`
+    // / `non_grid_custom_count`; the active topology kind's
+    // `resolve_target` produces the actual spec.
+    let on_non_grid_count_change = {
+        let non_grid_target_count = non_grid_target_count.clone();
+        let non_grid_custom_count = non_grid_custom_count.clone();
+        let apply_puzzle_change = apply_puzzle_change.clone();
+        let image_max_dim = image_max_dim;
+        let puzzle_art = puzzle_art;
+        let active_kind = active_topology_kind;
+        let regenerate_seed_value = regenerate_seed_value;
+        let lock_puzzle_controls = lock_puzzle_controls;
+        Callback::from(move |event: Event| {
+            if lock_puzzle_controls {
+                return;
+            }
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            let value = select.value();
+            if value == "custom" {
+                let (w, h) = logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim);
+                let initial = clamp_custom_piece_count(*non_grid_target_count);
+                non_grid_custom_count.set(Some(initial));
+                if let Some(choice) =
+                    (active_kind.resolve_target)(initial, w, h, regenerate_seed_value)
+                {
+                    apply_puzzle_change.emit(PuzzleChangeRequest {
+                        entry: puzzle_art,
+                        grid_override: None,
+                        descriptor: choice.spec,
+                        shape_seed: regenerate_seed_value,
+                    });
+                }
+                return;
+            }
+            let Ok(index) = value.parse::<usize>() else {
+                return;
+            };
+            let (w, h) = logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim);
+            let choices = (active_kind.piece_count_choices)(w, h);
+            let Some(choice) = choices.get(index) else {
+                return;
+            };
+            non_grid_custom_count.set(None);
+            non_grid_target_count.set(choice.target_count);
+            clear_saved_game();
+            apply_puzzle_change.emit(PuzzleChangeRequest {
+                entry: puzzle_art,
+                grid_override: None,
+                descriptor: choice.spec.clone(),
+                shape_seed: regenerate_seed_value,
+            });
+        })
+    };
+    let on_non_grid_custom_commit = {
+        let non_grid_target_count = non_grid_target_count.clone();
+        let non_grid_custom_count = non_grid_custom_count.clone();
+        let apply_puzzle_change = apply_puzzle_change.clone();
+        let image_max_dim = image_max_dim;
+        let puzzle_art = puzzle_art;
+        let active_kind = active_topology_kind;
+        let regenerate_seed_value = regenerate_seed_value;
+        let lock_puzzle_controls = lock_puzzle_controls;
+        Callback::from(move |input: HtmlInputElement| {
+            if lock_puzzle_controls {
+                return;
+            }
+            let next = input
+                .value()
+                .trim()
+                .parse::<u32>()
+                .map(clamp_custom_piece_count)
+                .unwrap_or_else(|_| active_kind.default_target_count);
+            input.set_value(&next.to_string());
+            non_grid_custom_count.set(Some(next));
+            non_grid_target_count.set(next);
+            clear_saved_game();
+            let (w, h) = logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim);
+            if let Some(choice) = (active_kind.resolve_target)(next, w, h, regenerate_seed_value) {
+                apply_puzzle_change.emit(PuzzleChangeRequest {
+                    entry: puzzle_art,
+                    grid_override: None,
+                    descriptor: choice.spec,
+                    shape_seed: regenerate_seed_value,
+                });
+            }
+        })
+    };
+    let on_non_grid_custom_blur = {
+        let on_non_grid_custom_commit = on_non_grid_custom_commit.clone();
+        Callback::from(move |event: FocusEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            on_non_grid_custom_commit.emit(input);
+        })
+    };
+    let on_non_grid_custom_keydown = {
+        let on_non_grid_custom_commit = on_non_grid_custom_commit.clone();
+        Callback::from(move |event: KeyboardEvent| {
+            if event.key() == "Enter" {
+                event.prevent_default();
+                let input: HtmlInputElement = event.target_unchecked_into();
+                on_non_grid_custom_commit.emit(input.clone());
+                let _ = input.blur();
+            }
+        })
+    };
+    let on_regenerate_click = {
+        let regenerate_seed = regenerate_seed.clone();
+        let non_grid_target_count = non_grid_target_count.clone();
+        let non_grid_custom_count = non_grid_custom_count.clone();
+        let apply_puzzle_change = apply_puzzle_change.clone();
+        let image_max_dim = image_max_dim;
+        let puzzle_art = puzzle_art;
+        let active_kind = active_topology_kind;
+        let grid = grid;
+        let lock_puzzle_controls = lock_puzzle_controls;
+        Callback::from(move |_: MouseEvent| {
+            if lock_puzzle_controls {
+                return;
+            }
+            // Bump the seed. Every topology consumes it via
+            // `info.shape_seed` (tab/blank directions); Voronoi also
+            // bakes it into its spec so its layout regenerates too.
+            let next_seed = (*regenerate_seed).wrapping_add(1).max(1);
+            regenerate_seed.set(next_seed);
+            clear_saved_game();
+            if active_kind.tag == "grid" {
+                apply_puzzle_change.emit(PuzzleChangeRequest {
+                    entry: puzzle_art,
+                    grid_override: Some(grid),
+                    descriptor: TopologySpec::grid(grid.cols, grid.rows),
+                    shape_seed: next_seed,
+                });
+                return;
+            }
+            let target = (*non_grid_custom_count).unwrap_or(*non_grid_target_count);
+            let (w, h) = logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim);
+            if let Some(choice) = (active_kind.resolve_target)(target, w, h, next_seed) {
+                apply_puzzle_change.emit(PuzzleChangeRequest {
+                    entry: puzzle_art,
+                    grid_override: None,
+                    descriptor: choice.spec,
+                    shape_seed: next_seed,
+                });
+            }
+        })
+    };
     let on_puzzle_art_change = {
         let puzzle_art_index = puzzle_art_index.clone();
         let puzzle_art_len = PUZZLE_ARTS.len();
         let lock_puzzle_controls = lock_puzzle_controls;
-        let app_core = app_core.clone();
-        let image_max_dim = image_max_dim;
+        let apply_puzzle_change = apply_puzzle_change.clone();
+        let descriptor = local_topology_descriptor.clone();
+        let grid = grid;
+        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
@@ -2100,12 +2513,17 @@ fn app(props: &AppProps) -> Html {
                     puzzle_art_index.set(value);
                     clear_saved_game();
                     let entry = PUZZLE_ARTS.get(value).copied().unwrap_or(PUZZLE_ARTS[0]);
-                    app_builder::request_puzzle_change(
-                        app_core.clone(),
-                        image_max_dim,
+                    let grid_override = if descriptor.tag == "grid" {
+                        Some(grid)
+                    } else {
+                        None
+                    };
+                    apply_puzzle_change.emit(PuzzleChangeRequest {
                         entry,
-                        None,
-                    );
+                        grid_override,
+                        descriptor: descriptor.clone(),
+                        shape_seed: regenerate_seed_value,
+                    });
                 }
             }
         })
@@ -2126,6 +2544,7 @@ fn app(props: &AppProps) -> Html {
         let private_status = private_status.clone();
         let app_core = app_core.clone();
         let image_max_dim = image_max_dim;
+        let descriptor = local_topology_descriptor.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             let Some(files) = input.files() else {
@@ -2145,6 +2564,7 @@ fn app(props: &AppProps) -> Html {
             let app_core = app_core.clone();
             let private_error = private_error.clone();
             let private_status = private_status.clone();
+            let descriptor = descriptor.clone();
             spawn_local(async move {
                 private_status.set(Some("Reading file...".to_string()));
                 let bytes = match read_file_bytes(file.clone()).await {
@@ -2183,6 +2603,16 @@ fn app(props: &AppProps) -> Html {
                 };
                 let (logical_width, logical_height) =
                     logical_image_size(width, height, image_max_dim);
+                // The descriptor was built against the previously-active
+                // image's dimensions. Each topology decides whether its
+                // identity depends on image aspect (Voronoi rebuilds;
+                // grid + triangular are aspect-independent and pass
+                // through unchanged).
+                let descriptor = topology_kind_for_tag(&descriptor.tag)
+                    .map(|kind| {
+                        (kind.rebuild_for_image)(&descriptor, logical_width, logical_height)
+                    })
+                    .unwrap_or(descriptor.clone());
                 let hash = sha256_hex(&stored_bytes);
                 let now = now_ms_u64();
                 let size = (stored_bytes.len() as u64).min(u32::MAX as u64) as u32;
@@ -2228,10 +2658,11 @@ fn app(props: &AppProps) -> Html {
                 }
                 clear_saved_game();
                 let image_ref = PuzzleImageRef::Private { hash };
-                app_core.set_puzzle_with_grid(
+                app_core.set_puzzle_with_topology(
                     label,
                     image_ref,
                     (logical_width, logical_height),
+                    descriptor.clone(),
                     None,
                 );
                 private_status.set(None);
@@ -2272,88 +2703,11 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
-    let on_admin_puzzle_change = {
-        let admin_puzzle_index = admin_puzzle_index.clone();
-        let puzzle_art_len = PUZZLE_ARTS.len();
-        Callback::from(move |event: Event| {
-            let select: HtmlSelectElement = event.target_unchecked_into();
-            if let Ok(value) = select.value().parse::<usize>() {
-                if value < puzzle_art_len {
-                    admin_puzzle_index.set(value);
-                }
-            }
-        })
-    };
     let on_admin_seed_input = {
         let admin_seed = admin_seed.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             admin_seed.set(input.value());
-        })
-    };
-    let on_admin_pieces_change = {
-        let admin_pieces_index = admin_pieces_index.clone();
-        let admin_pieces_custom_count = admin_pieces_custom_count.clone();
-        let admin_grid_choices = admin_grid_choices.clone();
-        let admin_pieces_index_value = admin_pieces_index_value;
-        Callback::from(move |event: Event| {
-            let select: HtmlSelectElement = event.target_unchecked_into();
-            let value = select.value();
-            if value == "default" {
-                admin_pieces_custom_count.set(None);
-                admin_pieces_index.set(0);
-                return;
-            }
-            if value == "custom" {
-                let initial = if admin_pieces_index_value == 0 {
-                    DEFAULT_TARGET_COUNT
-                } else {
-                    admin_grid_choices
-                        .get(admin_pieces_index_value.saturating_sub(1))
-                        .map(|choice| choice.target_count)
-                        .unwrap_or(DEFAULT_TARGET_COUNT)
-                };
-                admin_pieces_custom_count.set(Some(clamp_custom_piece_count(initial)));
-                return;
-            }
-            if let Ok(index) = value.parse::<usize>() {
-                admin_pieces_custom_count.set(None);
-                admin_pieces_index.set(index);
-            }
-        })
-    };
-    let on_admin_pieces_custom_commit = {
-        let admin_pieces_custom_count = admin_pieces_custom_count.clone();
-        let current_custom = admin_pieces_custom_count_value;
-        Callback::from(move |input: HtmlInputElement| {
-            let raw = input.value();
-            let parsed = raw.trim().parse::<u32>().ok();
-            let next = parsed
-                .map(clamp_custom_piece_count)
-                .or(current_custom)
-                .unwrap_or(DEFAULT_TARGET_COUNT);
-            input.set_value(&next.to_string());
-            if current_custom != Some(next) {
-                admin_pieces_custom_count.set(Some(next));
-            }
-        })
-    };
-    let on_admin_pieces_custom_blur = {
-        let on_admin_pieces_custom_commit = on_admin_pieces_custom_commit.clone();
-        Callback::from(move |event: FocusEvent| {
-            let input: HtmlInputElement = event.target_unchecked_into();
-            on_admin_pieces_custom_commit.emit(input);
-        })
-    };
-    let on_admin_pieces_custom_keydown = {
-        let on_admin_pieces_custom_commit = on_admin_pieces_custom_commit.clone();
-        Callback::from(move |event: KeyboardEvent| {
-            if event.key() == "Enter" {
-                event.prevent_default();
-                let input: HtmlInputElement = event.target_unchecked_into();
-                on_admin_pieces_custom_commit.emit(input.clone());
-                let _ = input.blur();
-            }
         })
     };
     let on_ws_delay_in_input = {
@@ -2527,7 +2881,9 @@ fn app(props: &AppProps) -> Html {
         let room_id_draft_trimmed = room_id_draft_trimmed.clone();
         let room_id_draft_valid = room_id_draft_valid;
         let admin_seed_value = admin_seed_value.clone();
-        let admin_selected_pieces_value = admin_selected_pieces_value;
+        let puzzle_art = puzzle_art;
+        let create_descriptor = local_topology_descriptor.clone();
+        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |_: MouseEvent| {
             let room_id = room_id_draft_trimmed.trim().to_string();
             if !room_id_draft_valid {
@@ -2556,11 +2912,6 @@ fn app(props: &AppProps) -> Html {
             pending_created_room.borrow_mut().replace(room_id.clone());
             room_setup_status.set(RoomSetupStatus::Creating);
             room_setup_error.set(None);
-            let entry = PUZZLE_ARTS
-                .get(admin_puzzle_index_value)
-                .copied()
-                .unwrap_or(PUZZLE_ARTS[0]);
-            let pieces = admin_selected_pieces_value;
             let seed = parse_optional_seed(&admin_seed_value);
             admin_socket.borrow_mut().send(
                 ws_base,
@@ -2570,10 +2921,12 @@ fn app(props: &AppProps) -> Html {
                     persistence: heddobureika_core::RoomPersistence::Durable,
                     puzzle: PuzzleSpec {
                         image_ref: PuzzleImageRef::BuiltIn {
-                            slug: entry.slug.to_string(),
+                            slug: puzzle_art.slug.to_string(),
                         },
-                        pieces,
+                        pieces: None,
                         seed,
+                        topology: Some(create_descriptor.clone().into()),
+                        shape_seed: Some(regenerate_seed_value),
                     },
                 },
             );
@@ -3037,85 +3390,196 @@ fn app(props: &AppProps) -> Html {
                     { "Puzzle art" }
                     <span class="control-value">{ puzzle_art.label }</span>
                 </label>
-                { if !multiplayer_active {
-                    html! {
-                        <select
-                            id="puzzle-art-select"
-                            onchange={on_puzzle_art_change}
-                        >
-                            {puzzle_art_options}
-                        </select>
-                    }
-                } else {
-                    html! {}
-                }}
+                <select
+                    id="puzzle-art-select"
+                    onchange={on_puzzle_art_change}
+                    disabled={lock_puzzle_controls}
+                >
+                    {puzzle_art_options}
+                </select>
             </div>
+            { {
+                let topology_options: Html = available_topologies()
+                    .iter()
+                    .map(|kind| {
+                        let value = kind.tag.to_string();
+                        let selected = kind.tag == active_topology_kind.tag;
+                        let label = kind.display_name.to_string();
+                        html! { <option {value} {selected}>{ label }</option> }
+                    })
+                    .collect();
+                html! {
+                    <div class="control">
+                        <label>
+                            { "Topology" }
+                            <span class="control-value">{ active_topology_kind.display_name }</span>
+                        </label>
+                        <select
+                            id="local-topology-select"
+                            onchange={on_local_topology_change}
+                            disabled={lock_puzzle_controls}
+                        >
+                            { topology_options }
+                        </select>
+                    </div>
+                }
+            } }
+            { if local_topology_is_grid {
+                // Grid keeps its dedicated picker so the catalog-aware
+                // request_puzzle_change path can save the selection on
+                // disk. Other topologies use the unified non-grid picker
+                // below.
+                html! {
+                    <div class="control">
+                        <label>
+                            { "Grid" }
+                            <span class="control-value">{ grid_label }</span>
+                        </label>
+                        <select
+                            id="grid-select"
+                            onchange={on_grid_change}
+                            disabled={lock_puzzle_controls}
+                        >
+                            {grid_options}
+                        </select>
+                        { if grid_custom_active {
+                            html! {
+                                <input
+                                    id="grid-custom-count"
+                                    type="number"
+                                    min={CUSTOM_PIECE_COUNT_MIN.to_string()}
+                                    max={CUSTOM_PIECE_COUNT_MAX.to_string()}
+                                    step="1"
+                                    value={grid_custom_input_value.clone()}
+                                    onblur={on_grid_custom_blur}
+                                    onkeydown={on_grid_custom_keydown}
+                                    disabled={lock_puzzle_controls}
+                                />
+                            }
+                        } else {
+                            html! {}
+                        }}
+                        <button
+                            type="button"
+                            id="grid-regenerate"
+                            onclick={on_regenerate_click.clone()}
+                            disabled={lock_puzzle_controls}
+                        >
+                            { "Regenerate" }
+                        </button>
+                    </div>
+                }
+            } else {
+                // Unified non-grid piece-count picker driven by the
+                // active topology kind's `piece_count_choices` /
+                // `resolve_target`.
+                let non_grid_options: Html = non_grid_choices
+                    .iter()
+                    .enumerate()
+                    .map(|(index, choice)| {
+                        let value = index.to_string();
+                        let selected = !non_grid_custom_active
+                            && non_grid_index.map(|i| i == index).unwrap_or(false);
+                        let label = choice.label.clone();
+                        html! { <option {value} {selected}>{ label }</option> }
+                    })
+                    .chain(std::iter::once(html! {
+                        <option value="custom" selected={non_grid_custom_active}>
+                            { "Custom" }
+                        </option>
+                    }))
+                    .collect();
+                let regenerate_button = html! {
+                    <button
+                        type="button"
+                        id="non-grid-regenerate"
+                        onclick={on_regenerate_click.clone()}
+                    >
+                        { "Regenerate" }
+                    </button>
+                };
+                html! {
+                    <div class="control">
+                        <select
+                            id="non-grid-piece-count"
+                            value={non_grid_select_value.clone()}
+                            onchange={on_non_grid_count_change}
+                        >
+                            { non_grid_options }
+                        </select>
+                        { if non_grid_custom_active {
+                            html! {
+                                <input
+                                    id="non-grid-custom-count"
+                                    type="number"
+                                    min={CUSTOM_PIECE_COUNT_MIN.to_string()}
+                                    max={CUSTOM_PIECE_COUNT_MAX.to_string()}
+                                    step="1"
+                                    value={non_grid_custom_input_value.clone()}
+                                    onblur={on_non_grid_custom_blur}
+                                    onkeydown={on_non_grid_custom_keydown}
+                                />
+                            }
+                        } else {
+                            html! {}
+                        }}
+                        { regenerate_button }
+                    </div>
+                }
+            } }
+            <hr class="control-separator" />
             <div class="control">
-                <label>
-                    { "Grid" }
-                    <span class="control-value">{ grid_label }</span>
+                <label for="private-file">
+                    { "Private image file" }
                 </label>
-                { if !multiplayer_active {
-                    html! {
-                        <>
-                            <select
-                                id="grid-select"
-                                onchange={on_grid_change}
-                            >
-                                {grid_options}
-                            </select>
-                            { if grid_custom_active {
-                                html! {
-                                    <input
-                                        id="grid-custom-count"
-                                        type="number"
-                                        min={CUSTOM_PIECE_COUNT_MIN.to_string()}
-                                        max={CUSTOM_PIECE_COUNT_MAX.to_string()}
-                                        step="1"
-                                        value={grid_custom_input_value.clone()}
-                                        onblur={on_grid_custom_blur}
-                                        onkeydown={on_grid_custom_keydown}
-                                    />
-                                }
-                            } else {
-                                html! {}
-                            }}
-                        </>
-                    }
-                } else {
-                    html! {}
-                }}
+                <input
+                    id="private-file"
+                    type="file"
+                    accept="image/*"
+                    onchange={if admin_enabled { on_admin_private_file_input } else { on_private_file_input }}
+                    disabled={lock_puzzle_controls || private_upload_busy || admin_private_upload_busy}
+                />
             </div>
             { if !multiplayer_active {
                 html! {
+                    <div class="control">
+                        <label for="private-label">
+                            { "Private label" }
+                            <span class="control-value">{ "optional" }</span>
+                        </label>
+                        <input
+                            id="private-label"
+                            type="text"
+                            value={private_label_value.clone()}
+                            oninput={on_private_label_input}
+                            disabled={lock_puzzle_controls || private_upload_busy}
+                        />
+                    </div>
+                }
+            } else {
+                html! {}
+            }}
+            { {
+                // Show the upload status/error appropriate to the active path:
+                // the admin (websocket) upload for admins, the local upload
+                // otherwise.
+                let status = if admin_enabled {
+                    if matches!(admin_private_status_value, AdminUploadStatus::Idle) {
+                        None
+                    } else {
+                        Some(admin_private_status_display.clone())
+                    }
+                } else {
+                    private_status_value.clone()
+                };
+                let error = if admin_enabled {
+                    admin_private_error_value.clone()
+                } else {
+                    private_error_value.clone()
+                };
+                html! {
                     <>
-                        <hr class="control-separator" />
-                        <div class="control">
-                            <label for="private-file">
-                                { "Private image file" }
-                            </label>
-                            <input
-                                id="private-file"
-                                type="file"
-                                accept="image/*"
-                                onchange={on_private_file_input}
-                                disabled={lock_puzzle_controls || private_upload_busy}
-                            />
-                        </div>
-                        <div class="control">
-                            <label for="private-label">
-                                { "Private label" }
-                                <span class="control-value">{ "optional" }</span>
-                            </label>
-                            <input
-                                id="private-label"
-                                type="text"
-                                value={private_label_value.clone()}
-                                oninput={on_private_label_input}
-                                disabled={lock_puzzle_controls || private_upload_busy}
-                            />
-                        </div>
-                        { if let Some(message) = private_status_value.clone() {
+                        { if let Some(message) = status {
                             html! {
                                 <div class="control">
                                     <label>
@@ -3127,7 +3591,7 @@ fn app(props: &AppProps) -> Html {
                         } else {
                             html! {}
                         }}
-                        { if let Some(message) = private_error_value.clone() {
+                        { if let Some(message) = error {
                             html! {
                                 <div class="control">
                                     <label>
@@ -3141,18 +3605,16 @@ fn app(props: &AppProps) -> Html {
                         }}
                     </>
                 }
-            } else {
-                html! {}
-            }}
-            { if !multiplayer_active {
+            } }
+            { if !multiplayer_active || admin_enabled {
                 html! {
                     <>
                         <div class="control">
                             <button
                                 class="control-button"
                                 type="button"
-                                onclick={on_scramble}
-                                disabled={scramble_disabled}
+                                onclick={if admin_enabled { on_admin_scramble } else { on_scramble }}
+                                disabled={scramble_disabled && !admin_enabled}
                             >
                                 { "Scramble" }
                             </button>
@@ -3161,12 +3623,20 @@ fn app(props: &AppProps) -> Html {
                             <button
                                 class="control-button"
                                 type="button"
-                                onclick={on_solve}
-                                disabled={scramble_disabled}
+                                onclick={if admin_enabled { on_admin_solve } else { on_solve }}
+                                disabled={scramble_disabled && !admin_enabled}
                             >
                                 { "Solve" }
                             </button>
                         </div>
+                    </>
+                }
+            } else {
+                html! {}
+            }}
+            { if !multiplayer_active {
+                html! {
+                    <>
                         <div class="control">
                             <button
                                 class="control-button"
@@ -3244,49 +3714,8 @@ fn app(props: &AppProps) -> Html {
                             />
                         </div>
                         <div class="control">
-                            <label for="admin-puzzle">
-                                { "Admin puzzle" }
-                            </label>
-                            <select
-                                id="admin-puzzle"
-                                onchange={on_admin_puzzle_change.clone()}
-                                disabled={room_setup_busy}
-                            >
-                                {admin_puzzle_options.clone()}
-                            </select>
-                        </div>
-                        <div class="control">
-                            <label for="admin-pieces">
-                                { "Admin pieces" }
-                            </label>
-                            <select
-                                id="admin-pieces"
-                                onchange={on_admin_pieces_change.clone()}
-                                disabled={room_setup_busy}
-                            >
-                                {admin_pieces_options.clone()}
-                            </select>
-                            { if admin_pieces_custom_active {
-                                html! {
-                                    <input
-                                        id="admin-pieces-custom-count"
-                                        type="number"
-                                        min={CUSTOM_PIECE_COUNT_MIN.to_string()}
-                                        max={CUSTOM_PIECE_COUNT_MAX.to_string()}
-                                        step="1"
-                                        value={admin_pieces_custom_input_value.clone()}
-                                        onblur={on_admin_pieces_custom_blur.clone()}
-                                        onkeydown={on_admin_pieces_custom_keydown.clone()}
-                                        disabled={room_setup_busy}
-                                    />
-                                }
-                            } else {
-                                html! {}
-                            }}
-                        </div>
-                        <div class="control">
                             <label for="admin-seed">
-                                { "Admin seed (optional)" }
+                                { "Shuffle seed (optional)" }
                             </label>
                             <input
                                 id="admin-seed"
@@ -3371,107 +3800,24 @@ fn app(props: &AppProps) -> Html {
                             </label>
                         </div>
                         { if admin_enabled {
+                            // Puzzle configuration (art, topology, pieces,
+                            // regenerate, scramble, private upload) lives in
+                            // the Puzzle group and is shared with local play.
+                            // Only the shuffle seed — meaningful for
+                            // reproducible server-side scrambles — stays here.
                             html! {
-                                <>
-                                    <div class="control">
-                                        <label for="admin-puzzle">
-                                            { "Admin puzzle" }
-                                        </label>
-                                        <select
-                                            id="admin-puzzle"
-                                            onchange={on_admin_puzzle_change}
-                                        >
-                                            {admin_puzzle_options}
-                                        </select>
-                                    </div>
-                                    <div class="control">
-                                        <label for="admin-pieces">
-                                            { "Admin pieces" }
-                                        </label>
-                                        <select
-                                            id="admin-pieces"
-                                            onchange={on_admin_pieces_change}
-                                        >
-                                            {admin_pieces_options}
-                                        </select>
-                                        { if admin_pieces_custom_active {
-                                            html! {
-                                                <input
-                                                    id="admin-pieces-custom-count"
-                                                    type="number"
-                                                    min={CUSTOM_PIECE_COUNT_MIN.to_string()}
-                                                    max={CUSTOM_PIECE_COUNT_MAX.to_string()}
-                                                    step="1"
-                                                    value={admin_pieces_custom_input_value}
-                                                    onblur={on_admin_pieces_custom_blur}
-                                                    onkeydown={on_admin_pieces_custom_keydown}
-                                                />
-                                            }
-                                        } else {
-                                            html! {}
-                                        }}
-                                    </div>
-                                    <div class="control">
-                                        <label for="admin-seed">
-                                            { "Admin seed (optional)" }
-                                        </label>
-                                        <input
-                                            id="admin-seed"
-                                            type="text"
-                                            value={admin_seed_value.clone()}
-                                            placeholder="0x1234"
-                                            oninput={on_admin_seed_input}
-                                        />
-                                    </div>
-                                    <div class="control">
-                                        <button
-                                            class="control-button"
-                                            type="button"
-                                            onclick={on_admin_change_puzzle}
-                                        >
-                                            { "Admin: Change puzzle" }
-                                        </button>
-                                    </div>
-                                    <div class="control">
-                                        <label for="admin-private-file">
-                                            { "Admin private image file" }
-                                        </label>
-                                        <input
-                                            id="admin-private-file"
-                                            type="file"
-                                            accept="image/*"
-                                            onchange={on_admin_private_file_input}
-                                            disabled={admin_private_upload_busy}
-                                        />
-                                    </div>
-                                    <div class="control">
-                                        <label>
-                                            { "Admin upload status" }
-                                            <span class="control-value">{ admin_private_status_display.clone() }</span>
-                                        </label>
-                                    </div>
-                                    { if let Some(message) = admin_private_error_value.clone() {
-                                        html! {
-                                            <div class="control">
-                                                <label>
-                                                    { "Admin private image error" }
-                                                    <span class="control-value">{ message }</span>
-                                                </label>
-                                            </div>
-                                        }
-                                    } else {
-                                        html! {}
-                                    }}
-                                    <div class="control">
-                                        <button
-                                            class="control-button"
-                                            type="button"
-                                            onclick={on_admin_scramble}
-                                        >
-                                            { "Admin: Scramble" }
-                                        </button>
-                                    </div>
-                                </>
+                                <div class="control">
+                                    <label for="admin-seed">
+                                        { "Shuffle seed (optional)" }
+                                    </label>
+                                    <input
+                                        id="admin-seed"
+                                        type="text"
+                                        value={admin_seed_value.clone()}
+                                        placeholder="0x1234"
+                                        oninput={on_admin_seed_input}
+                                    />
+                                </div>
                             }
                         } else {
                             html! {}

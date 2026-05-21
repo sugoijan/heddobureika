@@ -2,12 +2,14 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
     compute_workspace_layout, rotate_vec, safety_corrections_after_detach, scramble_flips,
-    scramble_layout, scramble_nonce_from_seed, scramble_rotations, scramble_seed, splitmix32,
-    DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
+    scramble_layout_for_pieces, scramble_nonce_from_seed, scramble_rotations,
+    scramble_seed_from_topology, splitmix32, PieceBoundsPx, DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE,
+    MAX_LINE_BEND_RATIO, PUZZLE_SEED,
 };
 use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
 use heddobureika_core::{
-    logical_image_size, nearest_valid_grid, puzzle_by_slug, DEFAULT_TARGET_COUNT, FALLBACK_GRID,
+    logical_image_size, nearest_valid_grid, puzzle_by_slug, topology_kind_for_tag,
+    DEFAULT_TARGET_COUNT, FALLBACK_GRID,
 };
 use heddobureika_core::{
     validate_image_ref, ActionId, AdminMsg, ClientId, ClientMsg, GameBridgeError, GameRules,
@@ -18,7 +20,7 @@ use heddobureika_core::{
     ASSET_CHUNK_BYTES, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
 };
 use heddobureika_game::{
-    AngleDeg, FlipState, GridTopology, GroupId, LogicalState, PlayableAction, PlayableState, Pose2,
+    AngleDeg, FlipState, GroupId, LogicalState, PlayableAction, PlayableState, Pose2, TopologySpec,
 };
 use image_pipeline::{AlphaMode, PipelineConfig};
 use imagesize::{Compression, ImageType};
@@ -33,7 +35,7 @@ use worker::*;
 
 const DEFAULT_ROOM_PATH_PREFIX: &str = "/ws/";
 const META_KEY: &str = "room_meta";
-const SNAPSHOT_KEY: &str = "playable_room_snapshot_v4";
+const SNAPSHOT_KEY: &str = "playable_room_snapshot_v5";
 const ROOM_ID_KEY: &str = "room_id";
 const ASSET_STORAGE_CHUNK_BYTES: usize = 256 * 1024;
 const DEFAULT_RECORDING_MAX_EVENTS: u32 = 200_000;
@@ -88,6 +90,80 @@ fn normalize_room_path_prefix(raw: &str) -> String {
         value.push('/');
     }
     value
+}
+
+fn grid_dims_for_topology(topology: &PlayableTopologySnapshot) -> Option<(usize, usize)> {
+    if topology.tag != "grid" {
+        return None;
+    }
+    let spec: TopologySpec = topology.clone().into();
+    let (cols, rows) = heddobureika_core::build_topology_from_spec(&spec)?.dims_hint()?;
+    Some((cols as usize, rows as usize))
+}
+
+/// Resolve the `TopologySpec` to build for an admin puzzle request.
+///
+/// When the client supplies a fully resolved topology we use it, but first
+/// re-fit it to the room's *actual* image dimensions: aspect-dependent
+/// topologies (Voronoi, hexagonal) bake the image aspect into their payload,
+/// and the client may have resolved against a stale or approximate size
+/// (notably for private uploads, where the server is the first to know the
+/// final logical size). `rebuild_for_image` is infallible by contract, so
+/// this never loses a buildable spec. When no topology is supplied we keep
+/// the legacy behaviour: a grid derived from the requested piece count.
+fn resolve_topology_for_spec(
+    topology: &Option<PlayableTopologySnapshot>,
+    pieces: Option<u32>,
+    shape_seed: Option<u32>,
+    image_width: u32,
+    image_height: u32,
+) -> std::result::Result<TopologySpec, String> {
+    match topology {
+        Some(snapshot) => {
+            let requested: TopologySpec = snapshot.clone().into();
+            let kind = topology_kind_for_tag(&requested.tag)
+                .ok_or_else(|| format!("unknown topology: {}", requested.tag))?;
+            // Re-resolve the topology against the room's *actual* image
+            // dimensions rather than trusting the client's resolution. The
+            // client resolves against the selected catalog art's aspect, which
+            // is wrong for a custom uploaded image of a different shape — so we
+            // re-fit here using the requested spec's own piece count as the
+            // target. The seed keeps seeded layouts (Voronoi) reproducible.
+            let target = heddobureika_core::build_topology_from_spec(&requested)
+                .map(|topology| topology.piece_count())
+                .filter(|count| *count > 0)
+                .unwrap_or(DEFAULT_TARGET_COUNT);
+            let seed = shape_seed.unwrap_or(0);
+            let resolved = (kind.resolve_target)(target, image_width, image_height, seed)
+                .map(|choice| choice.spec)
+                .unwrap_or(requested);
+            // Reject specs we can't build, so the admin sees a clear error
+            // instead of a generic "failed to initialize room".
+            let built = heddobureika_core::build_topology_from_spec(&resolved)
+                .ok_or_else(|| format!("unknown or invalid topology: {}", resolved.tag))?;
+            if built.piece_count() == 0 {
+                return Err("topology produced no pieces".to_string());
+            }
+            Ok(resolved)
+        }
+        None => {
+            let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
+            let grid =
+                nearest_valid_grid(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
+            Ok(TopologySpec::grid(grid.cols, grid.rows))
+        }
+    }
+}
+
+/// Scramble nonce for a resolved topology. Mirrors the grid-only derivation
+/// for grids (so the same numeric seed reproduces the same scramble) and
+/// falls back to a topology-agnostic `(0, 0)` salt for everything else —
+/// `build_initial_snapshot` then re-salts the nonce with the full spec via
+/// `scramble_seed_from_topology`, so distinct topologies still diverge.
+fn scramble_override_for_topology(spec: &TopologySpec, seed: Option<u32>) -> Option<u32> {
+    let snapshot: PlayableTopologySnapshot = spec.clone().into();
+    let (cols, rows) = grid_dims_for_topology(&snapshot).unwrap_or((0, 0));
+    seed.map(|seed| scramble_nonce_from_seed(PUZZLE_SEED, seed, cols, rows))
 }
 
 fn extract_room_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
@@ -251,15 +327,12 @@ struct Ownership {
 /// or read in place.
 struct RoomLivePuzzle {
     snapshot: PlayableGameSnapshot,
-    playable: heddobureika_game::PlayableState<heddobureika_game::GridTopology>,
+    playable: heddobureika_game::GenericPlayableState,
 }
 
 impl RoomLivePuzzle {
     fn from_snapshot(snapshot: PlayableGameSnapshot) -> Option<Self> {
-        let playable = match snapshot.restore_playable_from_spec().ok()? {
-            heddobureika_core::RestoredPlayableState::Grid(p) => p,
-            _ => return None,
-        };
+        let playable = snapshot.restore_playable_from_spec().ok()?;
         Some(Self { snapshot, playable })
     }
 
@@ -431,7 +504,7 @@ fn apply_bridge_finalize(
 }
 
 fn playable_group_for_anchor(
-    playable: &heddobureika_game::PlayableState<heddobureika_game::GridTopology>,
+    playable: &heddobureika_game::GenericPlayableState,
     anchor_id: u32,
 ) -> Result<GroupId, GameBridgeError> {
     playable
@@ -513,8 +586,22 @@ fn apply_bridge_detach(
     // "unsafe" pose flash.
     let puzzle = live.snapshot.puzzle.clone();
     let rules = live.snapshot.rules;
-    let corrections =
-        safety_corrections_after_detach(&live.playable, &original_members, &puzzle, &rules);
+    let pose_unit_px = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
+        .map(|t| {
+            let (ex, ey) = t.image_extent_in_pose_units();
+            (
+                puzzle.image_width as f32 / ex.max(1.0),
+                puzzle.image_height as f32 / ey.max(1.0),
+            )
+        })
+        .unwrap_or((1.0, 1.0));
+    let corrections = safety_corrections_after_detach(
+        &live.playable,
+        &original_members,
+        &puzzle,
+        &rules,
+        pose_unit_px,
+    );
     for (corr_group, drop_pos) in corrections {
         let correction_batch = live.playable.apply_action_only(
             PlayableAction::TranslateGroup {
@@ -866,11 +953,21 @@ impl DurableObject for Room {
                     AdminMsg::UploadPrivateChunk { bytes } => {
                         return self.handle_admin_upload_chunk(ws, bytes).await;
                     }
-                    AdminMsg::UploadPrivateEnd { pieces, seed } => {
-                        return self.handle_admin_upload_end(ws, pieces, seed).await;
+                    AdminMsg::UploadPrivateEnd {
+                        pieces,
+                        seed,
+                        topology,
+                        shape_seed,
+                    } => {
+                        return self
+                            .handle_admin_upload_end(ws, pieces, seed, topology, shape_seed)
+                            .await;
                     }
                     AdminMsg::Scramble { seed } => {
                         return self.handle_admin_scramble(ws, seed).await;
+                    }
+                    AdminMsg::Solve => {
+                        return self.handle_admin_solve(ws).await;
                     }
                     AdminMsg::RecordingSet {
                         enabled,
@@ -1054,8 +1151,6 @@ impl DurableObject for Room {
 }
 
 struct RoomGeometry {
-    cols: usize,
-    rows: usize,
     piece_width: f32,
     piece_height: f32,
     center_min_x: f32,
@@ -1289,12 +1384,9 @@ impl Room {
             .min(u32::MAX as usize) as u32;
         let total_edges = snapshot.state.topology_edge_count;
 
-        let border_done = match snapshot.state.topology {
-            heddobureika_core::PlayableTopologySnapshot::Grid { cols, rows } => {
-                Self::grid_border_done_from_playable(snapshot, cols as usize, rows as usize)
-            }
-            _ => false,
-        };
+        let border_done = grid_dims_for_topology(&snapshot.state.topology)
+            .map(|(cols, rows)| Self::grid_border_done_from_playable(snapshot, cols, rows))
+            .unwrap_or(false);
 
         Some(SnapshotProgress {
             groups: group_count,
@@ -1760,17 +1852,12 @@ impl Room {
     }
 
     fn geometry_for_playable_snapshot(snapshot: &PlayableGameSnapshot) -> Option<RoomGeometry> {
-        let (cols, rows) = match snapshot.state.topology {
-            PlayableTopologySnapshot::Grid { cols, rows } => (cols as usize, rows as usize),
-            _ => return None,
-        };
+        // Grid-only geometry helper: returns None for non-grid topologies.
+        let (cols, rows) = grid_dims_for_topology(&snapshot.state.topology)?;
         if cols == 0 || rows == 0 {
             return None;
         }
-        if snapshot.puzzle.cols as usize != cols
-            || snapshot.puzzle.rows as usize != rows
-            || snapshot.state.topology_piece_count as usize != cols.saturating_mul(rows)
-        {
+        if snapshot.state.topology_piece_count as usize != cols.saturating_mul(rows) {
             return None;
         }
         let image_width = snapshot.puzzle.image_width as f32;
@@ -1801,8 +1888,6 @@ impl Room {
             center_max_y = center_min_y;
         }
         Some(RoomGeometry {
-            cols,
-            rows,
             piece_width,
             piece_height,
             center_min_x,
@@ -1838,17 +1923,19 @@ impl Room {
                 return Err("private puzzles must be uploaded".to_string());
             }
         };
-        let target = spec.pieces.unwrap_or(DEFAULT_TARGET_COUNT);
-        let grid = nearest_valid_grid(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
-        let scramble_override = spec.seed.map(|seed| {
-            scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
-        });
+        let topology_spec = resolve_topology_for_spec(
+            &spec.topology,
+            spec.pieces,
+            spec.shape_seed,
+            image_width,
+            image_height,
+        )?;
+        let scramble_override = scramble_override_for_topology(&topology_spec, spec.seed);
         let puzzle = PuzzleInfo {
             label,
             image_ref,
-            rows: grid.rows,
-            cols: grid.cols,
-            shape_seed: PUZZLE_SEED,
+            topology: topology_spec.into(),
+            shape_seed: spec.shape_seed.unwrap_or(PUZZLE_SEED),
             image_width,
             image_height,
         };
@@ -2075,6 +2162,8 @@ impl Room {
         ws: WebSocket,
         pieces: Option<u32>,
         seed: Option<u32>,
+        topology: Option<PlayableTopologySnapshot>,
+        shape_seed: Option<u32>,
     ) -> Result<()> {
         let now = now_ms();
         let tags = self.state.get_tags(&ws);
@@ -2203,17 +2292,31 @@ impl Room {
             );
             return Ok(());
         }
-        let target = pieces.unwrap_or(DEFAULT_TARGET_COUNT);
-        let grid = nearest_valid_grid(image_width, image_height, target).unwrap_or(FALLBACK_GRID);
-        let scramble_override = seed.map(|seed| {
-            scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
-        });
+        let topology_spec = match resolve_topology_for_spec(
+            &topology,
+            pieces,
+            shape_seed,
+            image_width,
+            image_height,
+        ) {
+            Ok(spec) => spec,
+            Err(message) => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_puzzle".to_string(),
+                        message,
+                    },
+                );
+                return Ok(());
+            }
+        };
+        let scramble_override = scramble_override_for_topology(&topology_spec, seed);
         let puzzle = PuzzleInfo {
             label: String::new(),
             image_ref: PuzzleImageRef::Private { hash: hash.clone() },
-            rows: grid.rows,
-            cols: grid.cols,
-            shape_seed: PUZZLE_SEED,
+            topology: topology_spec.into(),
+            shape_seed: shape_seed.unwrap_or(PUZZLE_SEED),
             image_width,
             image_height,
         };
@@ -2280,8 +2383,11 @@ impl Room {
                 snapshot.snapshot.rules.clone(),
             )
         };
-        let cols = puzzle.cols as usize;
-        let rows = puzzle.rows as usize;
+        // Scramble nonce is salted with the topology so the same numeric
+        // seed yields different scrambles for different topologies. Grid
+        // gives us `(cols, rows)`; other topologies fall back to a salt
+        // derived from piece count and topology tag bytes.
+        let (cols, rows) = grid_dims_for_topology(&puzzle.topology).unwrap_or((0, 0));
         let scramble_override =
             seed.map(|seed| scramble_nonce_from_seed(PUZZLE_SEED, seed, cols, rows));
         let mut snapshot = match self.build_initial_snapshot(puzzle, rules, scramble_override) {
@@ -2315,6 +2421,80 @@ impl Room {
         self.broadcast(&state_msg_from_snapshot(&snapshot))?;
         self.schedule_alarm().await?;
         Ok(())
+    }
+
+    async fn handle_admin_solve(&self, ws: WebSocket) -> Result<()> {
+        let now = now_ms();
+        let (puzzle, rules) = {
+            let inner = self.inner.borrow();
+            if !inner.meta.activated {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "inactive".to_string(),
+                        message: "room not activated".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+            let Some(snapshot) = inner.live.as_ref() else {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "uninitialized".to_string(),
+                        message: "room not initialized".to_string(),
+                    },
+                );
+                return Ok(());
+            };
+            (
+                snapshot.snapshot.puzzle.clone(),
+                snapshot.snapshot.rules.clone(),
+            )
+        };
+        let mut snapshot = match Self::build_solved_snapshot(puzzle, rules) {
+            Some(snapshot) => snapshot,
+            None => {
+                let _ = self.send_server_msg(
+                    &ws,
+                    &ServerMsg::Error {
+                        code: "invalid_init".to_string(),
+                        message: "failed to solve room".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        {
+            let mut inner = self.inner.borrow_mut();
+            let next_seq = inner
+                .live
+                .as_ref()
+                .map(|live| live.snapshot.seq.saturating_add(1))
+                .unwrap_or(0);
+            set_playable_snapshot_seq(&mut snapshot, next_seq);
+            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
+            inner.owners_by_anchor.clear();
+            inner.owner_by_client.clear();
+        }
+
+        self.touch_command(now, true).await?;
+        self.persist_snapshot_if_needed().await?;
+        self.broadcast(&state_msg_from_snapshot(&snapshot))?;
+        self.schedule_alarm().await?;
+        Ok(())
+    }
+
+    /// Builds a fully-solved snapshot (every piece in one connected group at
+    /// its canonical pose) for the given puzzle. Topology-agnostic.
+    fn build_solved_snapshot(puzzle: PuzzleInfo, rules: GameRules) -> Option<PlayableGameSnapshot> {
+        let topology = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())?;
+        let play_rules = rules.to_play_rules().ok()?;
+        let playable = PlayableState::solved(topology, play_rules);
+        playable.validate().ok()?;
+        Some(PlayableGameSnapshot::from_playable(
+            puzzle, rules, 0, &playable, None,
+        ))
     }
 
     async fn handle_asset_request(&self, ws: WebSocket, hash: String) -> Result<()> {
@@ -2559,10 +2739,9 @@ impl Room {
             return Ok(());
         }
 
-        if snapshot.puzzle.cols == 0
-            || snapshot.puzzle.rows == 0
-            || snapshot.puzzle.image_width == 0
+        if snapshot.puzzle.image_width == 0
             || snapshot.puzzle.image_height == 0
+            || snapshot.puzzle.piece_count() == 0
             || snapshot.restore_playable_from_spec().is_err()
         {
             let _ = self.send_server_msg(
@@ -2597,20 +2776,26 @@ impl Room {
         rules: GameRules,
         scramble_override: Option<u32>,
     ) -> Option<PlayableGameSnapshot> {
-        let cols = puzzle.cols as usize;
-        let rows = puzzle.rows as usize;
-        if cols == 0 || rows == 0 {
-            return None;
-        }
         let image_width = puzzle.image_width as f32;
         let image_height = puzzle.image_height as f32;
         if image_width <= 0.0 || image_height <= 0.0 {
             return None;
         }
-
-        let total = cols * rows;
-        let piece_width = image_width / cols as f32;
-        let piece_height = image_height / rows as f32;
+        // Topology-agnostic snapshot construction: the topology itself
+        // tells us how many pose-units span the image, which gives us
+        // per-axis pose units to convert pixel positions into pose-mm.
+        // Works for grid, triangular, and any future topology.
+        let topology = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())?;
+        let (extent_x, extent_y) = topology.image_extent_in_pose_units();
+        if extent_x <= 0.0 || extent_y <= 0.0 {
+            return None;
+        }
+        let pose_unit_x = image_width / extent_x;
+        let pose_unit_y = image_height / extent_y;
+        let total = topology.piece_count() as usize;
+        if total == 0 {
+            return None;
+        }
         let layout =
             compute_workspace_layout(image_width, image_height, rules.workspace_padding_ratio);
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
@@ -2618,7 +2803,7 @@ impl Room {
         let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
         let puzzle_view_width = layout.view_width / puzzle_scale;
         let puzzle_view_height = layout.view_height / puzzle_scale;
-        let margin = piece_width.max(piece_height) * (DEFAULT_TAB_DEPTH_CAP + MAX_LINE_BEND_RATIO);
+        let margin = pose_unit_x.max(pose_unit_y) * (DEFAULT_TAB_DEPTH_CAP + MAX_LINE_BEND_RATIO);
 
         let scramble_nonce = match scramble_override {
             Some(value) => value,
@@ -2627,15 +2812,22 @@ impl Room {
                 splitmix32(now_seed ^ 0xA5A5_55AA)
             }
         };
-        let seed = scramble_seed(PUZZLE_SEED, scramble_nonce, cols, rows);
+        let seed = scramble_seed_from_topology(PUZZLE_SEED, scramble_nonce, &puzzle.to_spec());
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-        let (positions, order) = scramble_layout(
+        // Per-piece bounding boxes: assume a uniform piece extent (one
+        // pose unit per axis) for now. The worker doesn't currently have
+        // render geometry, so this is approximate — fine for grid and
+        // triangular where pieces fit within a pose-unit-square cell.
+        let piece_bounds: Vec<PieceBoundsPx> = (0..total)
+            .map(|_| PieceBoundsPx {
+                width: pose_unit_x,
+                height: pose_unit_y,
+            })
+            .collect();
+        let (positions, order) = scramble_layout_for_pieces(
             seed,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
+            &piece_bounds,
             puzzle_view_min_x,
             puzzle_view_min_y,
             puzzle_view_width,
@@ -2644,15 +2836,14 @@ impl Room {
         );
         let rotations = scramble_rotations(rotation_seed, total, rules.rotation_enabled);
         let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
-        let topology = GridTopology::try_new(puzzle.cols, puzzle.rows)?;
         let play_rules = rules.to_play_rules().ok()?;
         let mut playable = PlayableState::new(LogicalState::new(topology), play_rules);
         for idx in 0..total {
             let (x, y) = *positions.get(idx)?;
             let rotation = *rotations.get(idx)?;
             let pose = Pose2::try_from_mm_degrees(
-                (x + piece_width * 0.5) / piece_width,
-                (y + piece_height * 0.5) / piece_height,
+                (x + pose_unit_x * 0.5) / pose_unit_x,
+                (y + pose_unit_y * 0.5) / pose_unit_y,
                 rotation,
             )?;
             if let Some(group_pose) = playable.group_pose.get_mut(idx) {
@@ -2700,14 +2891,7 @@ impl Room {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
-                Some(geometry) => geometry,
-                None => {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-            let total = geometry.cols * geometry.rows;
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if piece_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
@@ -2836,14 +3020,8 @@ impl Room {
             if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
                 owner.since_ms = now;
             }
-            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
-                Some(geometry) => geometry,
-                None => {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-            let total = geometry.cols * geometry.rows;
+            let geometry = Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot);
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if anchor_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
@@ -2869,33 +3047,39 @@ impl Room {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let Some((_anchor_pos, anchor_rot)) =
-                playable_piece_grid_pose(&runtime_snapshot.snapshot, anchor_id_usize, &geometry)
-            else {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            };
-            let pos = legacy_top_left_from_playable_position(drop_pos, &geometry);
-            let Some(next_positions) = playable_projected_group_positions(
-                &runtime_snapshot.snapshot,
-                &members,
-                anchor_id_usize,
-                pos,
-                anchor_rot,
-                &geometry,
-            ) else {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            };
+            // The server-side bounds clamp needs per-piece pixel rects, which
+            // only the grid topology exposes. For other topologies we skip it
+            // and trust the client's optimistic placement — the move still
+            // applies below.
+            if let Some(geometry) = &geometry {
+                let Some((_anchor_pos, anchor_rot)) =
+                    playable_piece_grid_pose(&runtime_snapshot.snapshot, anchor_id_usize, geometry)
+                else {
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                };
+                let pos = legacy_top_left_from_playable_position(drop_pos, geometry);
+                let Some(next_positions) = playable_projected_group_positions(
+                    &runtime_snapshot.snapshot,
+                    &members,
+                    anchor_id_usize,
+                    pos,
+                    anchor_rot,
+                    geometry,
+                ) else {
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                };
 
-            if !self.group_in_bounds(&members, &next_positions, &geometry) {
-                console_log!(
-                    "move ignored: out of bounds (client={} anchor={})",
-                    client_id,
-                    anchor_id
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
+                if !self.group_in_bounds(&members, &next_positions, geometry) {
+                    console_log!(
+                        "move ignored: out of bounds (client={} anchor={})",
+                        client_id,
+                        anchor_id
+                    );
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                }
             }
 
             let action_id =
@@ -2971,14 +3155,8 @@ impl Room {
             if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
                 owner.since_ms = now;
             }
-            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
-                Some(geometry) => geometry,
-                None => {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-            let total = geometry.cols * geometry.rows;
+            let geometry = Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot);
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if anchor_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
@@ -3005,33 +3183,36 @@ impl Room {
                 return Ok(());
             }
 
-            let pos = legacy_top_left_from_playable_position(
-                PlayablePositionSnapshot {
-                    x_mm: drop_pose.x_mm,
-                    y_mm: drop_pose.y_mm,
-                },
-                &geometry,
-            );
-            let Some(next_positions) = playable_projected_group_positions(
-                &runtime_snapshot.snapshot,
-                &members,
-                anchor_id_usize,
-                pos,
-                drop_pose.rotation_deg,
-                &geometry,
-            ) else {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            };
-
-            if !self.group_in_bounds(&members, &next_positions, &geometry) {
-                console_log!(
-                    "transform ignored: out of bounds (client={} anchor={})",
-                    client_id,
-                    anchor_id
+            // Grid-only server-side bounds clamp (see `handle_move`).
+            if let Some(geometry) = &geometry {
+                let pos = legacy_top_left_from_playable_position(
+                    PlayablePositionSnapshot {
+                        x_mm: drop_pose.x_mm,
+                        y_mm: drop_pose.y_mm,
+                    },
+                    geometry,
                 );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
+                let Some(next_positions) = playable_projected_group_positions(
+                    &runtime_snapshot.snapshot,
+                    &members,
+                    anchor_id_usize,
+                    pos,
+                    drop_pose.rotation_deg,
+                    geometry,
+                ) else {
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                };
+
+                if !self.group_in_bounds(&members, &next_positions, geometry) {
+                    console_log!(
+                        "transform ignored: out of bounds (client={} anchor={})",
+                        client_id,
+                        anchor_id
+                    );
+                    inner.live = Some(runtime_snapshot);
+                    return Ok(());
+                }
             }
 
             let action_id =
@@ -3092,14 +3273,7 @@ impl Room {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
-                Some(geometry) => geometry,
-                None => {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-            let total = geometry.cols * geometry.rows;
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if piece_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
@@ -3207,14 +3381,7 @@ impl Room {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
-                Some(geometry) => geometry,
-                None => {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-            let total = geometry.cols * geometry.rows;
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if piece_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
@@ -3381,14 +3548,7 @@ impl Room {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            let geometry = match Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot) {
-                Some(geometry) => geometry,
-                None => {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-            let total = geometry.cols * geometry.rows;
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if anchor_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
@@ -4731,8 +4891,8 @@ fn legacy_top_left_from_playable_position(
 mod tests {
     use super::*;
     use heddobureika_core::{
-        EdgeId, FlipState, GridTopology, LogicalState, PieceId, PlayRules, PlayableState, Pose2,
-        PuzzleTopology, RestoredPlayableState,
+        EdgeId, FlipState, GenericPlayableState, GridTopology, LogicalState, PieceId, PlayRules,
+        PlayableState, Pose2, PuzzleTopology,
     };
 
     /// Per-piece fixture data used by the 2x1 test builder.
@@ -4748,31 +4908,27 @@ mod tests {
     /// Restores the playable state from a `PlayableGameSnapshot` so tests
     /// can read per-piece world poses, flips, and connectivity directly
     /// without going through a legacy projection helper.
-    fn restore_grid(snapshot: &PlayableGameSnapshot) -> PlayableState<GridTopology> {
-        match snapshot
+    fn restore_grid(snapshot: &PlayableGameSnapshot) -> GenericPlayableState {
+        snapshot
             .restore_playable_from_spec()
             .expect("restore playable")
-        {
-            RestoredPlayableState::Grid(p) => p,
-            _ => panic!("expected grid topology"),
-        }
     }
 
-    fn piece_position_px(playable: &PlayableState<GridTopology>, piece: u32) -> (f32, f32) {
+    fn piece_position_px(playable: &GenericPlayableState, piece: u32) -> (f32, f32) {
         let pose = playable
             .piece_world_pose(PieceId(piece))
             .expect("piece world pose");
         (pose.x_mm() * 100.0 - 50.0, pose.y_mm() * 100.0 - 50.0)
     }
 
-    fn piece_rotation_deg(playable: &PlayableState<GridTopology>, piece: u32) -> f32 {
+    fn piece_rotation_deg(playable: &GenericPlayableState, piece: u32) -> f32 {
         playable
             .piece_world_pose(PieceId(piece))
             .expect("piece world pose")
             .rotation_degrees()
     }
 
-    fn piece_flipped(playable: &PlayableState<GridTopology>, piece: u32) -> bool {
+    fn piece_flipped(playable: &GenericPlayableState, piece: u32) -> bool {
         let group = playable
             .logical
             .group_of(PieceId(piece))
@@ -4780,7 +4936,7 @@ mod tests {
         playable.flip_of(group) == Some(FlipState::Flipped)
     }
 
-    fn group_order_anchors(playable: &PlayableState<GridTopology>) -> Vec<u32> {
+    fn group_order_anchors(playable: &GenericPlayableState) -> Vec<u32> {
         playable
             .iter_z_asc()
             .filter_map(|group| playable.anchor_piece_of_group(group))
@@ -4788,7 +4944,7 @@ mod tests {
             .collect()
     }
 
-    fn edge_active_between(playable: &PlayableState<GridTopology>, a: u32, b: u32) -> bool {
+    fn edge_active_between(playable: &GenericPlayableState, a: u32, b: u32) -> bool {
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
         for edge_idx in 0..playable.logical.edge_count() {
             let edge = EdgeId(edge_idx as u32);
@@ -5010,7 +5166,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_snapshot_codec_writes_v4_playable_snapshot() {
+    fn stored_snapshot_codec_writes_current_playable_snapshot() {
         let snapshot = snapshot_2x1(LegacyFixture {
             positions: vec![(-50.0, -50.0), (50.0, -50.0)],
             rotations: vec![0.0, 0.0],
@@ -5022,7 +5178,7 @@ mod tests {
 
         let bytes = encode_stored_snapshot(&snapshot).expect("snapshot should encode");
         let playable_snapshot =
-            decode::<PlayableGameSnapshot>(&bytes).expect("stored bytes should be V4 playable");
+            decode::<PlayableGameSnapshot>(&bytes).expect("stored bytes should be playable");
         assert_eq!(
             playable_snapshot.version,
             heddobureika_core::PLAYABLE_GAME_SNAPSHOT_VERSION
@@ -5046,13 +5202,13 @@ mod tests {
     #[test]
     fn stored_snapshot_codec_rejects_legacy_snapshot_bytes() {
         // Encode an arbitrary non-PlayableGameSnapshot value. The decoder
-        // should reject anything that isn't the V4 playable snapshot.
+        // should reject anything that isn't the current playable snapshot.
         let bogus_bytes = encode(&(22u32, 7u32, 99u32)).expect("encode bogus payload");
         assert!(decode_stored_snapshot(&bogus_bytes).is_none());
     }
 
     #[test]
-    fn state_message_uses_v4_playable_snapshot() {
+    fn state_message_uses_current_playable_snapshot() {
         let snapshot = snapshot_2x1(LegacyFixture {
             positions: vec![(-50.0, -50.0), (50.0, -50.0)],
             rotations: vec![0.0, 0.0],
@@ -5160,14 +5316,13 @@ mod tests {
             image_ref: PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
-            rows: 1,
-            cols: 2,
+            topology: TopologySpec::grid(2, 1).into(),
             shape_seed: 1,
             image_width: 200,
             image_height: 100,
         };
         let scramble_nonce = state.scramble_nonce;
-        let topology = GridTopology::try_new(puzzle.cols, puzzle.rows).expect("valid grid");
+        let topology = GridTopology::try_new(2, 1).expect("valid grid");
         let mut logical = LogicalState::new(topology);
         // 2x1 grid has exactly one horizontal edge (id 0) between piece 0 and 1.
         let edge_between_0_and_1 = state.connections[0][heddobureika_core::DIR_RIGHT]
@@ -5244,5 +5399,140 @@ mod tests {
             (actual - expected).abs() <= 1.0e-4,
             "expected {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn resolve_topology_for_spec_round_trips_every_registry_kind() {
+        // Each selectable topology, resolved client-side and shipped over the
+        // wire in `PuzzleSpec::topology`, must come back as a buildable,
+        // non-empty topology of the same family.
+        let (w, h) = (1600u32, 900u32);
+        for kind in heddobureika_core::available_topologies() {
+            let choice = (kind.resolve_target)(kind.default_target_count, w, h, 1)
+                .unwrap_or_else(|| panic!("{} resolve_target", kind.tag));
+            let snapshot: PlayableTopologySnapshot = choice.spec.into();
+            let resolved = resolve_topology_for_spec(&Some(snapshot), None, Some(1), w, h)
+                .unwrap_or_else(|err| panic!("{} resolve_topology_for_spec: {err}", kind.tag));
+            assert_eq!(resolved.tag, kind.tag, "topology family preserved");
+            let built = heddobureika_core::build_topology_from_spec(&resolved)
+                .unwrap_or_else(|| panic!("{} build", kind.tag));
+            assert!(built.piece_count() > 0, "{} produced pieces", kind.tag);
+        }
+    }
+
+    #[test]
+    fn resolve_topology_for_spec_falls_back_to_grid_without_topology() {
+        let resolved =
+            resolve_topology_for_spec(&None, Some(100), None, 1000, 1000).expect("grid fallback");
+        assert_eq!(resolved.tag, "grid");
+        let built =
+            heddobureika_core::build_topology_from_spec(&resolved).expect("build grid fallback");
+        assert!(built.piece_count() > 0);
+    }
+
+    #[test]
+    fn resolve_topology_for_spec_rejects_unknown_tag() {
+        let bogus = PlayableTopologySnapshot {
+            tag: "not_a_real_topology".to_string(),
+            payload: Vec::new(),
+        };
+        assert!(resolve_topology_for_spec(&Some(bogus), None, None, 800, 600).is_err());
+    }
+
+    #[test]
+    fn resolve_topology_for_spec_refits_aspect_dependent_topology() {
+        // The client resolves Voronoi against a square image; the room's real
+        // image is wide. `rebuild_for_image` should re-fit the spec to the
+        // room's aspect while preserving the requested piece count.
+        let kind = heddobureika_core::topology_kind_for_tag("voronoi").expect("voronoi kind");
+        let client_choice = (kind.resolve_target)(120, 1000, 1000, 7).expect("client resolve");
+        let client_count = heddobureika_core::build_topology_from_spec(&client_choice.spec)
+            .expect("client build")
+            .piece_count();
+        let snapshot: PlayableTopologySnapshot = client_choice.spec.into();
+        let resolved = resolve_topology_for_spec(&Some(snapshot), None, Some(7), 1920, 600)
+            .expect("server refit");
+        assert_eq!(resolved.tag, "voronoi");
+        let built = heddobureika_core::build_topology_from_spec(&resolved).expect("server build");
+        assert_eq!(
+            built.piece_count(),
+            client_count,
+            "piece count preserved across aspect refit"
+        );
+    }
+
+    #[test]
+    fn resolve_topology_refits_grid_to_real_image_aspect() {
+        // A grid resolved client-side against a square catalog image must not
+        // keep its square shape when applied to a wide custom upload — the
+        // worker re-fits the grid to the room's real aspect.
+        let kind = heddobureika_core::topology_kind_for_tag("grid").expect("grid kind");
+        let square = (kind.resolve_target)(100, 1000, 1000, 0).expect("client grid");
+        let snapshot: PlayableTopologySnapshot = square.spec.into();
+        let resolved =
+            resolve_topology_for_spec(&Some(snapshot), None, None, 1920, 600).expect("refit");
+        let (cols, rows) = heddobureika_core::build_topology_from_spec(&resolved)
+            .expect("build grid")
+            .dims_hint()
+            .expect("grid dims");
+        assert!(
+            cols > rows,
+            "grid should widen for a wide image, got {cols}x{rows}"
+        );
+    }
+
+    fn snapshot_for_topology(
+        spec: TopologySpec,
+        image_w: u32,
+        image_h: u32,
+    ) -> PlayableGameSnapshot {
+        let topology =
+            heddobureika_core::build_topology_from_spec(&spec).expect("buildable topology");
+        let logical = LogicalState::new(topology);
+        let playable = PlayableState::new(logical, PlayRules::default());
+        let puzzle = PuzzleInfo {
+            label: "test".to_string(),
+            image_ref: PuzzleImageRef::BuiltIn {
+                slug: "test".to_string(),
+            },
+            topology: spec.into(),
+            shape_seed: 1,
+            image_width: image_w,
+            image_height: image_h,
+        };
+        let mut snapshot =
+            PlayableGameSnapshot::from_playable(puzzle, GameRules::default(), 0, &playable, None);
+        set_playable_snapshot_seq(&mut snapshot, 5);
+        snapshot
+    }
+
+    #[test]
+    fn non_grid_actions_apply_even_though_geometry_is_grid_only() {
+        // Regression: every action handler bailed when
+        // `geometry_for_playable_snapshot` returned `None`, which it always
+        // does for non-grid topologies — so no move/flip/etc. processed on
+        // triangular/hexagonal/Voronoi rooms. The grid-only geometry now only
+        // gates an optional server-side bounds clamp; the action itself must
+        // still apply.
+        let grid = snapshot_for_topology(TopologySpec::grid(3, 2), 600, 400);
+        assert!(
+            Room::geometry_for_playable_snapshot(&grid).is_some(),
+            "grid keeps its bounds-clamp geometry"
+        );
+
+        let triangular =
+            snapshot_for_topology(TopologySpec::triangular_tessellation(3, 2), 600, 400);
+        assert!(
+            Room::geometry_for_playable_snapshot(&triangular).is_none(),
+            "non-grid yields no geometry, so the clamp is skipped (not the whole action)"
+        );
+
+        // The topology-agnostic apply path the handler now reaches must
+        // mutate the non-grid snapshot.
+        let mut live = RoomLivePuzzle::from_snapshot(triangular).expect("live puzzle");
+        let batch = apply_bridge_flip(&mut live, 0, true, ActionId(7)).expect("flip applies");
+        assert_eq!(batch.proposal.action_id, Some(ActionId(7)));
+        assert_eq!(batch.revision_after, batch.revision_before + 1);
+        assert_eq!(live.snapshot.seq, batch.revision_after);
     }
 }

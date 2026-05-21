@@ -283,20 +283,20 @@ impl DebugOverlay {
 #[derive(Clone, PartialEq)]
 struct PuzzleKey {
     image_ref: PuzzleImageRef,
-    cols: u32,
-    rows: u32,
+    topology: heddobureika_core::PlayableTopologySnapshot,
     width: u32,
     height: u32,
+    shape_seed: u32,
 }
 
 impl PuzzleKey {
     fn from_info(info: &PuzzleInfo) -> Self {
         Self {
             image_ref: info.image_ref.clone(),
-            cols: info.cols,
-            rows: info.rows,
+            topology: info.topology.clone(),
             width: info.image_width,
             height: info.image_height,
+            shape_seed: info.shape_seed,
         }
     }
 }
@@ -1097,8 +1097,9 @@ impl SvgView {
                     if gate.pointer_id != drag_id {
                         gate.moved = true;
                     } else if !gate.moved {
-                        let click_tolerance =
-                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        let click_tolerance = snapshot.min_piece_extent_px[0]
+                            .min(snapshot.min_piece_extent_px[1])
+                            * CLICK_MOVE_RATIO;
                         let slop = screen_slop_to_puzzle(
                             TOUCH_DRAG_SLOP_PX,
                             svg,
@@ -1217,8 +1218,9 @@ impl SvgView {
                     .map(|(last_x, last_y)| {
                         let dx = px - last_x;
                         let dy = py - last_y;
-                        let slop =
-                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        let slop = snapshot.min_piece_extent_px[0]
+                            .min(snapshot.min_piece_extent_px[1])
+                            * CLICK_MOVE_RATIO;
                         dx * dx + dy * dy > slop * slop
                     })
                     .unwrap_or(true);
@@ -2794,13 +2796,13 @@ impl SvgView {
         );
         let _ = self.defs.append_child(&emboss_filter);
 
-        let mask_x = fmt_f32(-assets.mask_pad);
-        let mask_y = fmt_f32(-assets.mask_pad);
-        let mask_width = fmt_f32(assets.piece_width + assets.mask_pad * 2.0);
-        let mask_height = fmt_f32(assets.piece_height + assets.mask_pad * 2.0);
-        for (piece, paths) in assets.pieces.iter().zip(assets.paths.iter()) {
+        for piece in assets.render_geometry.pieces.iter() {
+            let mask_x = fmt_f32(-assets.mask_pad);
+            let mask_y = fmt_f32(-assets.mask_pad);
+            let mask_width = fmt_f32(piece.bounds_px.width + assets.mask_pad * 2.0);
+            let mask_height = fmt_f32(piece.bounds_px.height + assets.mask_pad * 2.0);
             let mask = create_svg_element(&self.document, "mask");
-            let _ = mask.set_attribute("id", &format!("piece-mask-{}", piece.id));
+            let _ = mask.set_attribute("id", &format!("piece-mask-{}", piece.id.as_usize()));
             let _ = mask.set_attribute("maskUnits", "userSpaceOnUse");
             let _ = mask.set_attribute("maskContentUnits", "userSpaceOnUse");
             let _ = mask.set_attribute("x", &mask_x);
@@ -2815,7 +2817,7 @@ impl SvgView {
             let _ = rect.set_attribute("height", &mask_height);
             let _ = rect.set_attribute("fill", "black");
             let path = create_svg_element(&self.document, "path");
-            let _ = path.set_attribute("d", paths.outline.as_str());
+            let _ = path.set_attribute("d", piece.outline_svg.as_str());
             let _ = path.set_attribute("fill", "white");
             let _ = mask.append_child(&rect);
             let _ = mask.append_child(&path);
@@ -2824,14 +2826,7 @@ impl SvgView {
 
         if self.mask_atlas.borrow().is_none() {
             boot::set_phase("Preparing pieces", "Building mask atlas.");
-            match build_mask_atlas(
-                &assets.pieces,
-                &assets.paths,
-                assets.piece_width,
-                assets.piece_height,
-                assets.grid,
-                assets.mask_pad,
-            ) {
+            match build_mask_atlas(&assets.render_geometry) {
                 Ok(atlas) => {
                     *self.mask_atlas.borrow_mut() = Some(Rc::new(atlas));
                 }
@@ -2851,8 +2846,8 @@ impl SvgView {
         clear_children(&self.puzzle_group);
         let _ = self.puzzle_group.append_child(&self.puzzle_bounds);
         self.pieces.borrow_mut().clear();
-        for piece in &assets.pieces {
-            let node = self.build_piece_node(snapshot, assets, piece.id, image_src);
+        for piece in &assets.render_geometry.pieces {
+            let node = self.build_piece_node(snapshot, assets, piece.id.as_usize(), image_src);
             let _ = self.puzzle_group.append_child(&node.root);
             self.pieces.borrow_mut().push(node);
         }
@@ -2896,11 +2891,26 @@ impl SvgView {
         let _ = debug_label.set_attribute("class", "piece-debug-label");
         let _ = debug_center.set_attribute("class", "piece-debug-center");
 
+        let Some(piece_geometry) = assets.render_geometry.pieces.get(piece_id) else {
+            return SvgPieceNodes {
+                root,
+                outline_group,
+                surface_group,
+                internal_group,
+                outline_external,
+                outline_internal,
+                outline_simple,
+                debug_group,
+                debug_label,
+            };
+        };
         let mask_ref = format!("url(#piece-mask-{piece_id})");
-        let img_col = piece_id as u32 % assets.grid.cols;
-        let img_row = piece_id as u32 / assets.grid.cols;
-        let img_x = fmt_f32(-(img_col as f32 * assets.piece_width));
-        let img_y = fmt_f32(-(img_row as f32 * assets.piece_height));
+        let image_offset = assets
+            .render_geometry
+            .piece_image_offset(piece_geometry.id)
+            .unwrap_or([0.0, 0.0]);
+        let img_x = fmt_f32(image_offset[0]);
+        let img_y = fmt_f32(image_offset[1]);
         let width = fmt_f32(assets.info.image_width as f32);
         let height = fmt_f32(assets.info.image_height as f32);
         let _ = back_rect.set_attribute("x", &img_x);
@@ -2917,11 +2927,7 @@ impl SvgView {
         let _ = image.set_attribute("preserveAspectRatio", "xMidYMid meet");
         let _ = image.set_attribute("mask", &mask_ref);
 
-        let path = assets
-            .paths
-            .get(piece_id)
-            .map(|p| p.outline.clone())
-            .unwrap_or_default();
+        let path = piece_geometry.outline_svg.clone();
         let _ = hitbox.set_attribute("d", path.as_str());
 
         let _ = outline_group.append_child(&outline_external);
@@ -2938,8 +2944,8 @@ impl SvgView {
         let _ = root.append_child(&internal_group);
 
         let _ = debug_center.set_attribute("r", "3");
-        let center_x = fmt_f32(assets.piece_width * 0.5);
-        let center_y = fmt_f32(assets.piece_height * 0.5);
+        let center_x = fmt_f32(piece_geometry.pose_anchor_px[0]);
+        let center_y = fmt_f32(piece_geometry.pose_anchor_px[1]);
         let _ = debug_center.set_attribute("cx", &center_x);
         let _ = debug_center.set_attribute("cy", &center_y);
         let _ = debug_label.set_attribute("x", &center_x);
@@ -3004,13 +3010,10 @@ impl SvgView {
             "height",
             &fmt_f32(assets.info.image_height as f32 - 2.0 * bounds_inset),
         );
-        let mut frame_corner_radius =
-            assets.piece_width.min(assets.piece_height) * CORNER_RADIUS_RATIO;
-        let max_corner_radius = assets.piece_width.min(assets.piece_height) * 0.45;
-        if frame_corner_radius > max_corner_radius {
-            frame_corner_radius = max_corner_radius;
-        }
-        let radius = fmt_f32(frame_corner_radius);
+        // Dashed workspace outline shares the same `PuzzleFrameShape`
+        // every topology uses for its border pieces, so a given puzzle
+        // has a single corner radius regardless of topology kind.
+        let radius = fmt_f32(assets.render_geometry.frame_shape.corner_radius_px);
         let _ = self.puzzle_bounds.set_attribute("rx", &radius);
         let _ = self.puzzle_bounds.set_attribute("ry", &radius);
     }
@@ -3029,21 +3032,20 @@ impl SvgView {
             .map(|info| info.image_height as f32)
             .unwrap_or(1.0);
         let (connections_label, border_connections_label) =
-            if let Some(info) = snapshot.puzzle_info.as_ref() {
-                let cols = info.cols as usize;
-                let rows = info.rows as usize;
-                let total = cols * rows;
-                let connections = snapshot.piece_connections();
-                if connections.len() == total {
-                    let (connected, border_connected, total_expected, border_expected) =
-                        count_connections(&connections, cols, rows);
-                    (
-                        format_progress(connected, total_expected),
-                        format_progress(border_connected, border_expected),
-                    )
+            if let Some(game) = snapshot.game.as_ref() {
+                let connections_label = format_progress(
+                    game.playable.logical.active_edge_count(),
+                    game.playable.logical.edge_count(),
+                );
+                // Topology-agnostic border-connection count — see the
+                // matching block in wgpu_app for the rationale.
+                let (border_connected, border_expected) = count_border_connections(&game.playable);
+                let border_connections_label = if border_expected > 0 {
+                    format_progress(border_connected, border_expected)
                 } else {
-                    ("--".to_string(), "--".to_string())
-                }
+                    "--".to_string()
+                };
+                (connections_label, border_connections_label)
             } else {
                 ("--".to_string(), "--".to_string())
             };
@@ -3122,7 +3124,7 @@ impl SvgView {
         assets: &PuzzleAssets,
         sync_view: &dyn GameSyncView,
     ) {
-        let total = assets.grid.cols as usize * assets.grid.rows as usize;
+        let total = assets.render_geometry.pieces.len();
         if total == 0 {
             return;
         }
@@ -3134,20 +3136,15 @@ impl SvgView {
                 }
             }
         } else if let Some(id) = snapshot.hovered_id {
-            let hover_connections = snapshot.piece_connections();
-            if hover_connections.len() == total {
-                for member in collect_group(
-                    &hover_connections,
-                    id,
-                    assets.grid.cols as usize,
-                    assets.grid.rows as usize,
-                ) {
+            let members = snapshot.group_members_for_piece(id);
+            if members.is_empty() && id < hovered_mask.len() {
+                hovered_mask[id] = true;
+            } else {
+                for member in members {
                     if member < hovered_mask.len() {
                         hovered_mask[member] = true;
                     }
                 }
-            } else if id < hovered_mask.len() {
-                hovered_mask[id] = true;
             }
         }
         let mut dragging_mask = vec![false; total];
@@ -3180,22 +3177,23 @@ impl SvgView {
                 drag_group_center(
                     &positions,
                     &snapshot.dragging_members,
-                    assets.piece_width,
-                    assets.piece_height,
+                    &assets.render_geometry,
                 )
             })
         } else {
             None
         };
-        let render_connections = snapshot.piece_connections();
         for (idx, node) in self.pieces.borrow().iter().enumerate() {
             if idx >= total {
                 break;
             }
-            let current = positions.get(idx).copied().unwrap_or((
-                (idx as u32 % assets.grid.cols) as f32 * assets.piece_width,
-                (idx as u32 / assets.grid.cols) as f32 * assets.piece_height,
-            ));
+            let Some(piece_geometry) = assets.render_geometry.pieces.get(idx) else {
+                continue;
+            };
+            let current = positions
+                .get(idx)
+                .copied()
+                .unwrap_or((piece_geometry.bounds_px.x, piece_geometry.bounds_px.y));
             let rotation = rotations.get(idx).copied().unwrap_or(0.0);
             let flipped = snapshot.piece_flipped.get(idx).copied().unwrap_or(false);
             let is_dragging = dragging_mask.get(idx).copied().unwrap_or(false);
@@ -3206,8 +3204,7 @@ impl SvgView {
                         center,
                         drag_scale,
                         drag_rotation,
-                        assets.piece_width,
-                        assets.piece_height,
+                        piece_geometry.pose_anchor_px,
                     )
                 } else {
                     current
@@ -3215,8 +3212,8 @@ impl SvgView {
             } else {
                 current
             };
-            let center_x = assets.piece_width * 0.5;
-            let center_y = assets.piece_height * 0.5;
+            let center_x = piece_geometry.pose_anchor_px[0];
+            let center_y = piece_geometry.pose_anchor_px[1];
             let flip_transform = if flipped {
                 format!(
                     " translate({} {}) scale(-1 1) translate(-{} -{})",
@@ -3315,50 +3312,63 @@ impl SvgView {
             } else {
                 let _ = node.debug_group.set_attribute("display", "none");
             }
-            if render_connections.len() == total {
-                let connection = render_connections.get(idx).copied().unwrap_or([false; 4]);
-                let mut external_path = String::new();
-                if let Some(paths) = assets.paths.get(idx) {
-                    for (dir, edge_path) in [
-                        (DIR_UP, &paths.edges[DIR_UP]),
-                        (DIR_RIGHT, &paths.edges[DIR_RIGHT]),
-                        (DIR_DOWN, &paths.edges[DIR_DOWN]),
-                        (DIR_LEFT, &paths.edges[DIR_LEFT]),
-                    ] {
-                        let connected = connection.get(dir).copied().unwrap_or(false);
-                        if !connected {
+            // Topology-agnostic "external edges" outline. For each
+            // incident topology edge that is *not* currently active (i.e.
+            // the piece is not joined to its neighbour across that edge),
+            // include the corresponding `edge_svgs` path in the outline.
+            // Frame-border edges (no topology edge) are always external.
+            // This replaces the legacy grid `[bool; 4]` connection table —
+            // any topology that emits `topology_edges` alongside its
+            // `edge_svgs` gets the same hover/owned outline behaviour.
+            let mut external_path = String::new();
+            if let Some(game) = snapshot.game.as_ref() {
+                let logical = &game.playable.logical;
+                let svgs = &piece_geometry.edge_svgs;
+                for (edge_idx, topo_edge) in piece_geometry.topology_edges.iter().enumerate() {
+                    let active = topo_edge
+                        .and_then(|edge| logical.is_edge_active(edge))
+                        .unwrap_or(false);
+                    if !active {
+                        if let Some(svg) = svgs.get(edge_idx) {
                             if !external_path.is_empty() {
                                 external_path.push(' ');
                             }
-                            external_path.push_str(edge_path);
+                            external_path.push_str(svg);
                         }
                     }
                 }
-                if external_path.is_empty() {
-                    let _ = node.outline_external.set_attribute("d", "");
-                    let _ = node.outline_internal.set_attribute("d", "");
-                    let _ = node.outline_external.set_attribute("display", "none");
-                    let _ = node.outline_internal.set_attribute("display", "none");
-                } else if flipped {
-                    let _ = node.outline_internal.set_attribute("d", &external_path);
-                    let _ = node.outline_internal.set_attribute("display", "");
-                    let _ = node.outline_external.set_attribute("d", "");
-                    let _ = node.outline_external.set_attribute("display", "none");
-                } else {
-                    let _ = node.outline_external.set_attribute("d", &external_path);
-                    let _ = node.outline_external.set_attribute("display", "");
-                    let _ = node.outline_internal.set_attribute("d", "");
-                    let _ = node.outline_internal.set_attribute("display", "none");
-                }
             }
-            if let Some(paths) = assets.paths.get(idx) {
-                let _ = node.outline_simple.set_attribute("d", &paths.outline);
+            // If no per-edge data is available (e.g. game not yet loaded),
+            // fall back to the full piece outline so the hover indicator
+            // still has *something* to draw.
+            let outline_d = if external_path.is_empty() {
+                piece_geometry.outline_svg.clone()
+            } else {
+                external_path
+            };
+            if flipped {
+                let _ = node.outline_internal.set_attribute("d", &outline_d);
+                let _ = node.outline_internal.set_attribute("display", "");
+                let _ = node.outline_external.set_attribute("d", "");
+                let _ = node.outline_external.set_attribute("display", "none");
+            } else {
+                let _ = node.outline_external.set_attribute("d", &outline_d);
+                let _ = node.outline_external.set_attribute("display", "");
+                let _ = node.outline_internal.set_attribute("d", "");
+                let _ = node.outline_internal.set_attribute("display", "none");
             }
+            let _ = node
+                .outline_simple
+                .set_attribute("d", &piece_geometry.outline_svg);
         }
     }
 
     fn update_z_order(&self, snapshot: &AppSnapshot) {
-        let total = snapshot.grid.cols as usize * snapshot.grid.rows as usize;
+        let total = snapshot
+            .game
+            .as_ref()
+            .map(|game| game.playable.piece_count())
+            .unwrap_or(snapshot.z_order.len());
         if total == 0 {
             return;
         }
@@ -3392,10 +3402,7 @@ impl SvgView {
             &snapshot.piece_flipped,
             &snapshot.z_order,
             mask_atlas,
-            assets.grid.cols as usize,
-            assets.grid.rows as usize,
-            assets.piece_width,
-            assets.piece_height,
+            &assets.render_geometry,
             assets.mask_pad,
         )
     }
@@ -3420,17 +3427,10 @@ fn piece_owned_by_other(
     if ownership.is_empty() {
         return false;
     }
-    let cols = snapshot.grid.cols as usize;
-    let rows = snapshot.grid.rows as usize;
-    if cols == 0 || rows == 0 {
+    if piece_id >= snapshot.piece_group_anchor.len() {
         return false;
     }
-    let total = cols * rows;
-    let connections = snapshot.piece_connections();
-    if piece_id >= total || connections.len() < total {
-        return false;
-    }
-    let mut members = collect_group(&connections, piece_id, cols, rows);
+    let mut members = snapshot.group_members_for_piece(piece_id);
     if members.is_empty() {
         members.push(piece_id);
     }
@@ -4213,8 +4213,7 @@ fn workspace_fade_scale(x: f32, y: f32, layout: WorkspaceLayout, view: ViewRect)
 fn drag_group_center(
     positions: &[(f32, f32)],
     members: &[usize],
-    piece_width: f32,
-    piece_height: f32,
+    geometry: &PuzzleRenderGeometry,
 ) -> Option<(f32, f32)> {
     if members.is_empty() {
         return None;
@@ -4223,9 +4222,9 @@ fn drag_group_center(
     let mut sum_y = 0.0;
     let mut count = 0.0;
     for id in members {
-        if let Some(pos) = positions.get(*id) {
-            sum_x += pos.0 + piece_width * 0.5;
-            sum_y += pos.1 + piece_height * 0.5;
+        if let (Some(pos), Some(piece)) = (positions.get(*id), geometry.pieces.get(*id)) {
+            sum_x += pos.0 + piece.pose_anchor_px[0];
+            sum_y += pos.1 + piece.pose_anchor_px[1];
             count += 1.0;
         }
     }
@@ -4241,10 +4240,9 @@ fn drag_group_position(
     center: (f32, f32),
     scale: f32,
     rotation_deg: f32,
-    piece_width: f32,
-    piece_height: f32,
+    pose_anchor_px: [f32; 2],
 ) -> (f32, f32) {
-    let piece_center = (pos.0 + piece_width * 0.5, pos.1 + piece_height * 0.5);
+    let piece_center = (pos.0 + pose_anchor_px[0], pos.1 + pose_anchor_px[1]);
     let mut dx = piece_center.0 - center.0;
     let mut dy = piece_center.1 - center.1;
     dx *= scale;
@@ -4252,8 +4250,8 @@ fn drag_group_position(
     let (rx, ry) = rotate_vec(dx, dy, rotation_deg);
     let new_center = (center.0 + rx, center.1 + ry);
     (
-        new_center.0 - piece_width * 0.5,
-        new_center.1 - piece_height * 0.5,
+        new_center.0 - pose_anchor_px[0],
+        new_center.1 - pose_anchor_px[1],
     )
 }
 
@@ -4265,45 +4263,33 @@ fn pick_piece_at(
     flips: &[bool],
     z_order: &[usize],
     mask_atlas: &MaskAtlasData,
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
+    geometry: &PuzzleRenderGeometry,
     mask_pad: f32,
 ) -> Option<usize> {
-    if cols == 0 || rows == 0 || piece_width <= 0.0 || piece_height <= 0.0 {
+    if geometry.pieces.is_empty() {
         return None;
     }
-    let center_x = piece_width * 0.5;
-    let center_y = piece_height * 0.5;
-    let min_x = -mask_pad;
-    let min_y = -mask_pad;
-    let max_x = piece_width + mask_pad;
-    let max_y = piece_height + mask_pad;
     let atlas_width = mask_atlas.width as i32;
     let atlas_height = mask_atlas.height as i32;
     for &piece_id in z_order.iter().rev() {
-        let col = piece_id % cols;
-        let row = piece_id / cols;
-        let base_x = col as f32 * piece_width;
-        let base_y = row as f32 * piece_height;
+        let Some(piece) = geometry.pieces.get(piece_id) else {
+            continue;
+        };
         let pos = positions
             .get(piece_id)
             .copied()
-            .unwrap_or_else(|| (base_x, base_y));
+            .unwrap_or((piece.bounds_px.x, piece.bounds_px.y));
         let rotation = rotations.get(piece_id).copied().unwrap_or(0.0);
         let flipped = flips.get(piece_id).copied().unwrap_or(false);
-        let mut local_x = x - pos.0;
-        let mut local_y = y - pos.1;
-        if rotation.abs() > f32::EPSILON {
-            let rot = if flipped { rotation } else { -rotation };
-            let (rx, ry) = rotate_point(local_x, local_y, center_x, center_y, rot);
-            local_x = rx;
-            local_y = ry;
-        }
-        if flipped {
-            local_x = piece_width - local_x;
-        }
+        let Some((local_x, local_y)) =
+            geometry.hit_test_local_coords(piece.id, (x, y), pos, rotation, flipped)
+        else {
+            continue;
+        };
+        let min_x = -mask_pad;
+        let min_y = -mask_pad;
+        let max_x = piece.bounds_px.width + mask_pad;
+        let max_y = piece.bounds_px.height + mask_pad;
         if local_x < min_x || local_y < min_y || local_x > max_x || local_y > max_y {
             continue;
         }

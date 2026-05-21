@@ -1,4 +1,4 @@
-use crate::app_core::AppCore;
+use crate::app_core::{random_shape_seed, AppCore};
 use crate::app_router;
 use crate::app_runtime;
 use crate::boot;
@@ -16,7 +16,7 @@ use crate::sync_runtime;
 use heddobureika_core::catalog::{
     logical_image_size, puzzle_by_slug, PuzzleCatalogEntry, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG,
 };
-use heddobureika_core::PuzzleImageRef;
+use heddobureika_core::{PuzzleImageRef, TopologySpec};
 use js_sys::decode_uri_component;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
@@ -50,10 +50,11 @@ struct HashRoute {
     clear_hash: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BootSelection {
     entry: PuzzleCatalogEntry,
     grid_override: Option<GridChoice>,
+    topology: Option<TopologySpec>,
     seed: Option<u32>,
     clear_hash: bool,
     force_new: bool,
@@ -211,6 +212,7 @@ fn resolve_boot_selection() -> Option<BootSelection> {
                 return Some(BootSelection {
                     entry,
                     grid_override,
+                    topology: None,
                     seed,
                     clear_hash: route.clear_hash,
                     force_new: true,
@@ -226,17 +228,39 @@ fn resolve_boot_selection() -> Option<BootSelection> {
 
 fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
     if let Some(snapshot) = load_local_snapshot() {
-        if let PuzzleImageRef::BuiltIn { slug } = &snapshot.puzzle.image_ref {
-            if let Some(entry) = puzzle_by_slug(slug).copied() {
-                let grid_override = resolve_grid_override(
-                    snapshot.puzzle.image_width,
-                    snapshot.puzzle.image_height,
-                    snapshot.puzzle.cols,
-                    snapshot.puzzle.rows,
+        // Validate that the persisted topology spec can actually be
+        // rebuilt before treating it as a real boot selection. This
+        // guards against stale snapshots whose payload no longer matches
+        // any known topology (e.g. after a breaking change to the spec
+        // format) — without the check, the app would silently apply a
+        // garbage spec, leave `puzzle_info` unset, and stall on the
+        // "restore not ready (puzzle info)" log forever. If the topology
+        // is unresolvable we discard the persisted snapshot and fall
+        // through to the catalog default.
+        let topology_spec: heddobureika_core::TopologySpec = snapshot.state.topology.clone().into();
+        let topology_ok = heddobureika_core::build_topology_from_spec(&topology_spec).is_some();
+        if !topology_ok {
+            #[cfg(target_arch = "wasm32")]
+            {
+                gloo::console::log!(
+                    "boot: discarding incompatible saved snapshot (unknown topology spec)"
                 );
+            }
+            crate::local_snapshot::clear_local_snapshot();
+        } else if let PuzzleImageRef::BuiltIn { slug } = &snapshot.puzzle.image_ref {
+            if let Some(entry) = puzzle_by_slug(slug).copied() {
+                let grid_override = snapshot.puzzle.grid_dims().and_then(|(cols, rows)| {
+                    resolve_grid_override(
+                        snapshot.puzzle.image_width,
+                        snapshot.puzzle.image_height,
+                        cols,
+                        rows,
+                    )
+                });
                 return Some(BootSelection {
                     entry,
                     grid_override,
+                    topology: Some(topology_spec),
                     seed: None,
                     clear_hash,
                     force_new: false,
@@ -251,6 +275,7 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
             return Some(BootSelection {
                 entry,
                 grid_override,
+                topology: None,
                 seed: None,
                 clear_hash,
                 force_new: false,
@@ -263,32 +288,52 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
         .map(|entry| BootSelection {
             entry,
             grid_override: None,
+            topology: None,
             seed: None,
             clear_hash,
             force_new: false,
         })
 }
 
-fn apply_selection(core: Rc<AppCore>, image_max_dim: u32, selection: BootSelection) {
+fn apply_selection(
+    core: Rc<AppCore>,
+    image_max_dim: u32,
+    selection: BootSelection,
+    shape_seed: u32,
+) {
     let max_dim = image_max_dim.clamp(IMAGE_MAX_DIMENSION_MIN, IMAGE_MAX_DIMENSION_MAX);
     let (logical_w, logical_h) =
         logical_image_size(selection.entry.width, selection.entry.height, max_dim);
     let grid = selection
         .grid_override
         .unwrap_or_else(|| default_grid_choice(logical_w, logical_h));
+    let descriptor = selection
+        .topology
+        .clone()
+        .unwrap_or_else(|| TopologySpec::grid(grid.cols, grid.rows));
     let scramble_nonce = selection.seed.map(|seed| {
         scramble_nonce_from_seed(PUZZLE_SEED, seed, grid.cols as usize, grid.rows as usize)
     });
-    core.set_puzzle_with_grid_with_nonce(
+    let image_ref = PuzzleImageRef::BuiltIn {
+        slug: selection.entry.slug.to_string(),
+    };
+    // Single entry point on the engine — pass the descriptor straight
+    // through. The grid-specific catalog bookkeeping (`save_puzzle_selection`
+    // vs. `clear_saved_puzzle_selection`) lives here in the catalog
+    // layer, not on `AppCore`.
+    core.set_puzzle_with_topology_seeded(
         selection.entry.label.to_string(),
-        PuzzleImageRef::BuiltIn {
-            slug: selection.entry.slug.to_string(),
-        },
+        image_ref,
         (logical_w, logical_h),
-        Some(grid),
+        descriptor.clone(),
         scramble_nonce,
+        shape_seed,
     );
-    save_puzzle_selection(selection.entry, grid);
+    if descriptor.tag == "grid" {
+        save_puzzle_selection(selection.entry, grid);
+    } else {
+        clear_saved_puzzle_selection();
+    }
 }
 
 pub(crate) fn request_puzzle_change(
@@ -296,31 +341,23 @@ pub(crate) fn request_puzzle_change(
     image_max_dim: u32,
     entry: PuzzleCatalogEntry,
     grid_override: Option<GridChoice>,
+    shape_seed: u32,
 ) {
     let selection = BootSelection {
         entry,
         grid_override,
+        topology: None,
         seed: None,
         clear_hash: false,
         force_new: false,
     };
-    apply_selection(core, image_max_dim, selection);
-}
-
-fn grid_override_from_snapshot(info: &heddobureika_core::PuzzleInfo) -> GridChoice {
-    resolve_grid_override(info.image_width, info.image_height, info.cols, info.rows).unwrap_or(
-        GridChoice {
-            target_count: info.cols.saturating_mul(info.rows),
-            cols: info.cols,
-            rows: info.rows,
-            actual_count: info.cols.saturating_mul(info.rows),
-        },
-    )
+    apply_selection(core, image_max_dim, selection, shape_seed);
 }
 
 fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
     let hash_route = parse_hash_route();
-    if let Some(snapshot) = load_local_snapshot() {
+    let saved_snapshot = load_local_snapshot();
+    if let Some(snapshot) = saved_snapshot.as_ref() {
         if !matches!(snapshot.puzzle.image_ref, PuzzleImageRef::BuiltIn { .. }) {
             if !matches!(
                 hash_route.as_ref().map(|route| &route.mode),
@@ -333,13 +370,13 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
                 {
                     app_router::clear_location_hash();
                 }
-                let grid_override = grid_override_from_snapshot(&snapshot.puzzle);
-                core.set_puzzle_with_grid_with_nonce(
+                core.set_puzzle_with_topology_seeded(
                     snapshot.puzzle.label.clone(),
                     snapshot.puzzle.image_ref.clone(),
                     (snapshot.puzzle.image_width, snapshot.puzzle.image_height),
-                    Some(grid_override),
+                    snapshot.state.topology.clone().into(),
                     Some(snapshot.scramble_nonce),
+                    snapshot.puzzle.shape_seed,
                 );
                 return;
             }
@@ -355,7 +392,21 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
     if selection.clear_hash {
         app_router::clear_location_hash();
     }
-    apply_selection(core, settings.image_max_dim, selection);
+    // If a saved snapshot matches the catalog selection we're about to
+    // boot, preserve its shape_seed so the in-progress saved game can
+    // restore. Otherwise mint a fresh random seed — every new puzzle
+    // gets a unique tab/blank pattern.
+    let shape_seed = saved_snapshot
+        .as_ref()
+        .filter(
+            |snap| match (&snap.puzzle.image_ref, selection.entry.slug) {
+                (PuzzleImageRef::BuiltIn { slug }, target_slug) => slug == target_slug,
+                _ => false,
+            },
+        )
+        .map(|snap| snap.puzzle.shape_seed)
+        .unwrap_or_else(random_shape_seed);
+    apply_selection(core, settings.image_max_dim, selection, shape_seed);
 }
 
 struct BootCoordinator {

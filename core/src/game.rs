@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 
-use heddobureika_game::{
-    GroupId, PieceId, PlayableState, Position2, PuzzleTopology,
-};
+use heddobureika_game::{GroupId, PieceId, PlayableState, Position2, PuzzleTopology};
 
 use crate::snapshot::{GameRules, PuzzleInfo};
 
@@ -575,6 +573,102 @@ pub fn scramble_nonce_from_seed(base: u32, seed: u32, cols: usize, rows: usize) 
     mixed.wrapping_mul(0x144C_BC89)
 }
 
+/// Topology-agnostic scramble seed derivation. Hashes the topology kind +
+/// numeric params into a `u32` salt so different topologies (or the same
+/// topology with different params) yield distinct scrambles for the same
+/// nonce.
+pub fn scramble_seed_from_topology(
+    base: u32,
+    nonce: u32,
+    topology: &heddobureika_game::TopologySpec,
+) -> u32 {
+    let mut hash: u32 = 0x5CA7_7EED;
+    // Hash both the tag and the opaque payload — together they uniquely
+    // identify the topology instance. We don't care about the payload's
+    // internal structure; the FNV-style mix is enough to avoid trivial
+    // collisions between topologies.
+    for byte in topology.tag.as_bytes() {
+        hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
+    }
+    for byte in &topology.payload {
+        hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
+    }
+    base ^ nonce.wrapping_mul(0x9E37_79B9) ^ hash
+}
+
+/// Inverse of `scramble_seed_from_topology` — recover the nonce from a
+/// seed and topology. Used by code that wants to round-trip a "share-this-
+/// scramble" seed back into a `scramble_nonce`.
+pub fn scramble_nonce_from_topology_seed(
+    base: u32,
+    seed: u32,
+    topology: &heddobureika_game::TopologySpec,
+) -> u32 {
+    let mut hash: u32 = 0x5CA7_7EED;
+    // Hash both the tag and the opaque payload — together they uniquely
+    // identify the topology instance. We don't care about the payload's
+    // internal structure; the FNV-style mix is enough to avoid trivial
+    // collisions between topologies.
+    for byte in topology.tag.as_bytes() {
+        hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
+    }
+    for byte in &topology.payload {
+        hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
+    }
+    let mixed = seed ^ base ^ hash;
+    mixed.wrapping_mul(0x144C_BC89)
+}
+
+/// Per-piece bounding box used by the topology-agnostic scramble layout.
+#[derive(Clone, Copy, Debug)]
+pub struct PieceBoundsPx {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Topology-agnostic scramble layout. Each piece is placed at a random
+/// position inside the workspace, with a per-piece `margin` inset based
+/// on its own bounding box. The returned `(Vec<(f32, f32)>, Vec<usize>)`
+/// pair is `(positions, order)`, where positions are piece top-left
+/// pixels and order is a random z-order over the same piece ids.
+pub fn scramble_layout_for_pieces(
+    seed: u32,
+    piece_bounds: &[PieceBoundsPx],
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+    margin: f32,
+) -> (Vec<(f32, f32)>, Vec<usize>) {
+    let total = piece_bounds.len();
+    let mut positions = Vec::with_capacity(total);
+    for (idx, bounds) in piece_bounds.iter().enumerate() {
+        let min_x = view_min_x + margin;
+        let mut max_x = view_min_x + view_width - bounds.width - margin;
+        let min_y = view_min_y + margin;
+        let mut max_y = view_min_y + view_height - bounds.height - margin;
+        if max_x < min_x {
+            max_x = min_x;
+        }
+        if max_y < min_y {
+            max_y = min_y;
+        }
+        let salt = (idx as u32) << 1;
+        positions.push((
+            rand_range(seed, salt, min_x, max_x),
+            rand_range(seed, salt + 1, min_y, max_y),
+        ));
+    }
+
+    let mut order: Vec<usize> = (0..total).collect();
+    for i in (1..order.len()).rev() {
+        let salt = 0xC0DE_u32 + i as u32;
+        let j = (rand_unit(seed, salt) * (i as f32 + 1.0)) as usize;
+        order.swap(i, j);
+    }
+    (positions, order)
+}
+
 pub fn scramble_layout(
     seed: u32,
     cols: usize,
@@ -659,15 +753,32 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
     affected_pieces: &[PieceId],
     puzzle: &PuzzleInfo,
     rules: &GameRules,
+    pose_unit_px: (f32, f32),
 ) -> Vec<(GroupId, Position2)> {
-    if puzzle.cols == 0 || puzzle.rows == 0 {
+    if puzzle.image_width == 0 || puzzle.image_height == 0 {
         return Vec::new();
     }
-    let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
-    let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+    // Derive the piece's pixel extent for the workspace-clamp inset from
+    // the topology's pose-unit declaration. `pose_unit_px` is the per-axis
+    // scale for converting pose-mm → pixels; the caller is responsible for
+    // providing values that match the render geometry. For the inset we
+    // assume a typical piece spans one pose unit per axis, which matches
+    // grid pieces exactly and is a safe over-approximation for triangular.
+    let piece_width = pose_unit_px.0.max(0.0);
+    let piece_height = pose_unit_px.1.max(0.0);
     if piece_width <= 0.0 || piece_height <= 0.0 {
         return Vec::new();
     }
+    let pose_unit_x = if pose_unit_px.0 > 0.0 {
+        pose_unit_px.0
+    } else {
+        piece_width
+    };
+    let pose_unit_y = if pose_unit_px.1 > 0.0 {
+        pose_unit_px.1
+    } else {
+        piece_height
+    };
     let layout = compute_workspace_layout(
         puzzle.image_width as f32,
         puzzle.image_height as f32,
@@ -725,16 +836,16 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
             (tight_min_x, tight_max_x, tight_min_y, tight_max_y)
         };
 
-        let cx = pose.x_mm() * piece_width;
-        let cy = pose.y_mm() * piece_height;
+        let cx = pose.x_mm() * pose_unit_x;
+        let cy = pose.y_mm() * pose_unit_y;
         let new_cx = cx.clamp(min_x, max_x);
         let new_cy = cy.clamp(min_y, max_y);
         if (new_cx - cx).abs() < 1.0e-3 && (new_cy - cy).abs() < 1.0e-3 {
             continue;
         }
 
-        let new_x_mm = new_cx / piece_width;
-        let new_y_mm = new_cy / piece_height;
+        let new_x_mm = new_cx / pose_unit_x;
+        let new_y_mm = new_cy / pose_unit_y;
         let Some(new_pos) = Position2::try_from_mm(new_x_mm, new_y_mm) else {
             continue;
         };
@@ -757,8 +868,7 @@ mod safety_tests {
             image_ref: PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
-            rows: 1,
-            cols: 3,
+            topology: heddobureika_game::TopologySpec::grid(3, 1).into(),
             shape_seed: 0,
             image_width: 300,
             image_height: 100,
@@ -799,9 +909,7 @@ mod safety_tests {
         let _ = playable.apply_restricted_action_batch(
             RestrictedPlayableAction::DetachPieceAsGroup {
                 piece: PieceId(2),
-                target_pose: playable
-                    .piece_world_pose(PieceId(2))
-                    .expect("piece 2 pose"),
+                target_pose: playable.piece_world_pose(PieceId(2)).expect("piece 2 pose"),
                 target_flip: heddobureika_game::FlipState::Normal,
             },
             None,
@@ -809,8 +917,21 @@ mod safety_tests {
 
         let puzzle = puzzle_3x1();
         let rules = GameRules::default();
-        let corrections =
-            safety_corrections_after_detach(&playable, &original_members, &puzzle, &rules);
+        let corrections = safety_corrections_after_detach(
+            &playable,
+            &original_members,
+            &puzzle,
+            &rules,
+            heddobureika_game::build_topology_from_spec(&puzzle.to_spec())
+                .map(|t| {
+                    let (ex, ey) = t.image_extent_in_pose_units();
+                    (
+                        puzzle.image_width as f32 / ex.max(1.0),
+                        puzzle.image_height as f32 / ey.max(1.0),
+                    )
+                })
+                .unwrap_or((1.0, 1.0)),
+        );
 
         // The remaining {0, 1} group should be force-moved. The singleton {2}
         // sits at (250, 50) in pixel-center coords — inside the loose bound
@@ -852,8 +973,7 @@ mod safety_tests {
             image_ref: PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
-            rows: 1,
-            cols: 2,
+            topology: heddobureika_game::TopologySpec::grid(2, 1).into(),
             shape_seed: 0,
             image_width: 200,
             image_height: 100,
@@ -876,17 +996,28 @@ mod safety_tests {
         let _ = playable.apply_restricted_action_batch(
             RestrictedPlayableAction::DetachPieceAsGroup {
                 piece: PieceId(1),
-                target_pose: playable
-                    .piece_world_pose(PieceId(1))
-                    .expect("piece 1 pose"),
+                target_pose: playable.piece_world_pose(PieceId(1)).expect("piece 1 pose"),
                 target_flip: heddobureika_game::FlipState::Normal,
             },
             None,
         );
 
         let rules = GameRules::default();
-        let corrections =
-            safety_corrections_after_detach(&playable, &original_members, &puzzle, &rules);
+        let corrections = safety_corrections_after_detach(
+            &playable,
+            &original_members,
+            &puzzle,
+            &rules,
+            heddobureika_game::build_topology_from_spec(&puzzle.to_spec())
+                .map(|t| {
+                    let (ex, ey) = t.image_extent_in_pose_units();
+                    (
+                        puzzle.image_width as f32 / ex.max(1.0),
+                        puzzle.image_height as f32 / ey.max(1.0),
+                    )
+                })
+                .unwrap_or((1.0, 1.0)),
+        );
 
         assert!(
             corrections.is_empty(),

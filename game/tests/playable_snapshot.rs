@@ -20,7 +20,7 @@ fn playable_snapshot_round_trips_authoritative_state() {
     assert_eq!(batch.revision_after, 1);
 
     let snapshot = PlayableSnapshot::from_playable(&playable, Some(heddobureika_game::PieceId(1)));
-    assert_eq!(snapshot.topology, TopologySpec::Grid { cols: 2, rows: 1 });
+    assert_eq!(snapshot.topology, TopologySpec::grid(2, 1));
     snapshot
         .validate_for_topology(&topology)
         .expect("snapshot should validate against its topology");
@@ -53,34 +53,30 @@ fn playable_snapshot_restores_known_grid_topology_from_spec() {
     let playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
     let snapshot = PlayableSnapshot::from_playable(&playable, None);
 
-    let restored = match snapshot.restore_from_spec() {
-        Ok(heddobureika_game::RestoredPlayableState::Grid(state)) => state,
-        Ok(_) => panic!("grid snapshot should restore a grid state"),
-        Err(err) => panic!("grid snapshot should restore from spec: {err:?}"),
-    };
+    let restored = snapshot
+        .restore_from_spec()
+        .expect("grid snapshot should restore from spec");
 
     assert_eq!(restored.logical.piece_count(), 2);
     assert_eq!(restored.logical.edge_count(), 1);
 }
 
 #[test]
-fn playable_snapshot_records_triangular_topology_spec() {
+fn playable_snapshot_records_triangular_topology_descriptor() {
     let topology = TriangularTessellationTopology::example_3x2();
     let playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
     let snapshot = PlayableSnapshot::from_playable(&playable, None);
 
     assert_eq!(
         snapshot.topology,
-        TopologySpec::TriangularTessellation { cols: 3, rows: 2 }
+        TopologySpec::triangular_tessellation(3, 2)
     );
     assert_eq!(snapshot.topology_piece_count, 15);
     assert_eq!(snapshot.topology_edge_count, 17);
 
-    let restored = match snapshot.restore_from_spec() {
-        Ok(heddobureika_game::RestoredPlayableState::TriangularTessellation(state)) => state,
-        Ok(_) => panic!("triangular snapshot should restore a triangular state"),
-        Err(err) => panic!("triangular snapshot should restore from spec: {err:?}"),
-    };
+    let restored = snapshot
+        .restore_from_spec()
+        .expect("triangular snapshot should restore from spec");
     assert_eq!(restored.logical.piece_count(), 15);
     assert_eq!(restored.logical.edge_count(), 17);
 }
@@ -134,18 +130,19 @@ fn snapshot_restore_rejects_wrong_topology_with_same_counts() {
     assert!(matches!(
         err,
         PlayableSnapshotError::TopologySpecMismatch {
-            snapshot: TopologySpec::Grid { cols: 2, rows: 1 },
-            expected: TopologySpec::Grid { cols: 1, rows: 2 },
-        }
+            snapshot,
+            expected,
+        } if snapshot == TopologySpec::grid(2, 1)
+            && expected == TopologySpec::grid(1, 2)
     ));
 }
 
 #[test]
-fn snapshot_validation_rejects_mutated_topology_spec_counts() {
+fn snapshot_validation_rejects_mutated_topology_descriptor_counts() {
     let topology = GridTopology::try_new(2, 1).expect("valid grid");
     let playable = PlayableState::new(LogicalState::new(topology.clone()), PlayRules::default());
     let mut snapshot = PlayableSnapshot::from_playable(&playable, None);
-    snapshot.topology = TopologySpec::Grid { cols: 3, rows: 1 };
+    snapshot.topology = TopologySpec::grid(3, 1);
 
     let err = snapshot
         .validate_for_topology(&topology)
@@ -154,9 +151,10 @@ fn snapshot_validation_rejects_mutated_topology_spec_counts() {
     assert!(matches!(
         err,
         PlayableSnapshotError::TopologySpecMismatch {
-            snapshot: TopologySpec::Grid { cols: 3, rows: 1 },
-            expected: TopologySpec::Grid { cols: 2, rows: 1 },
-        }
+            snapshot,
+            expected,
+        } if snapshot == TopologySpec::grid(3, 1)
+            && expected == TopologySpec::grid(2, 1)
     ));
 }
 

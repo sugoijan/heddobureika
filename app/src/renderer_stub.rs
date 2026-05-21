@@ -1,4 +1,4 @@
-use crate::core::{GridChoice, Piece, PiecePaths};
+use crate::core::PuzzleRenderGeometry;
 use std::rc::Rc;
 use wasm_bindgen::JsValue;
 use web_sys::{HtmlCanvasElement, HtmlImageElement};
@@ -57,6 +57,7 @@ pub(crate) struct Instance {
     pub(crate) drag: f32,
     pub(crate) piece_origin: [f32; 2],
     pub(crate) mask_origin: [f32; 2],
+    pub(crate) pose_anchor: [f32; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -78,19 +79,12 @@ pub(crate) struct MaskAtlasData {
     pub(crate) origins: Vec<[f32; 2]>,
 }
 
-pub(crate) fn build_mask_atlas(
-    pieces: &[Piece],
-    _paths: &[PiecePaths],
-    _piece_width: f32,
-    _piece_height: f32,
-    _grid: GridChoice,
-    _padding: f32,
-) -> Result<MaskAtlasData, JsValue> {
+pub(crate) fn build_mask_atlas(geometry: &PuzzleRenderGeometry) -> Result<MaskAtlasData, JsValue> {
     Ok(MaskAtlasData {
         width: 0,
         height: 0,
         pixels: Vec::new(),
-        origins: vec![[0.0, 0.0]; pieces.len()],
+        origins: vec![[0.0, 0.0]; geometry.pieces.len()],
     })
 }
 
@@ -100,11 +94,8 @@ impl WgpuRenderer {
     pub(crate) async fn new(
         _canvas: HtmlCanvasElement,
         _image: HtmlImageElement,
-        _pieces: Vec<Piece>,
-        _paths: Vec<PiecePaths>,
-        _grid: GridChoice,
-        _piece_width: f32,
-        _piece_height: f32,
+        _puzzle_bounds_px: [f32; 2],
+        _typical_piece_extent_px: [f32; 2],
         _view_min_x: f32,
         _view_min_y: f32,
         _view_width: f32,
@@ -172,6 +163,7 @@ impl WgpuRenderer {
                 inst.drag,
                 inst.piece_origin,
                 inst.mask_origin,
+                inst.pose_anchor,
             );
         }
     }

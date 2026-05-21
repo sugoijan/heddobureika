@@ -1,6 +1,6 @@
 //! Game state wrapper used by the app.
 //!
-//! `AppGameState` owns the authoritative `PlayableState<GridTopology>` plus
+//! `AppGameState` owns the authoritative generic `PlayableState` plus
 //! the derived `VisualState` projection cache. It is the live in-memory state
 //! the multiplayer bridge mutates as wire updates arrive.
 //!
@@ -11,13 +11,15 @@
 
 use std::fmt;
 
+use crate::core::PuzzleRenderGeometry;
 use heddobureika_core::{
-    EdgeId, FlipState, GameRules, GridTopology, GroupId, LogicalState, PieceId, PlayableDelta,
-    PlayableGameSnapshot, PlayableGameSnapshotError, PlayableRoomUpdate, PlayableState, Pose2,
-    ProjectionScratch, PuzzleInfo, PuzzleTopology, RestoredPlayableState, VisualState,
+    build_topology_from_spec, EdgeId, FlipState, GameRules, GenericPlayableState, GroupId,
+    LogicalState, PieceId, PlayableDelta, PlayableGameSnapshot, PlayableGameSnapshotError,
+    PlayableRoomUpdate, PlayableState, Pose2, ProjectionScratch, PuzzleInfo, PuzzleTopology,
+    TopologySpec, VisualState,
 };
 
-/// Live app-side game state. Wraps the canonical `PlayableState<GridTopology>`
+/// Live app-side game state. Wraps the canonical generic `PlayableState`
 /// and a `VisualState` projection cache.
 #[derive(Clone)]
 pub(crate) struct AppGameState {
@@ -26,7 +28,7 @@ pub(crate) struct AppGameState {
     pub scramble_nonce: u32,
     pub seq: u64,
     pub focused_piece: Option<u32>,
-    pub playable: PlayableState<GridTopology>,
+    pub playable: GenericPlayableState,
     pub visual: VisualState,
 }
 
@@ -52,28 +54,36 @@ impl From<PlayableGameSnapshotError> for AppGameStateError {
 }
 
 fn piece_aspect_ratio_from_puzzle(puzzle: &PuzzleInfo) -> f32 {
-    if puzzle.cols == 0 || puzzle.rows == 0 || puzzle.image_width == 0 || puzzle.image_height == 0 {
+    // Pixel aspect ratio of a "typical" piece, derived topology-agnostically:
+    //   pose_unit_x = image_w / extent_x
+    //   pose_unit_y = image_h / extent_y
+    //   aspect     = pose_unit_y / pose_unit_x
+    // where `extent_{x,y}` come from `topology.image_extent_in_pose_units()`.
+    // This works for grid, triangular, and any future topology that lays
+    // its pieces out across the puzzle image.
+    if puzzle.image_width == 0 || puzzle.image_height == 0 {
         return 1.0;
     }
-    let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
-    let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
-    if piece_width <= 0.0 {
+    let Some(topology) = build_topology_from_spec(&puzzle.to_spec()) else {
+        return 1.0;
+    };
+    let (extent_x, extent_y) = topology.image_extent_in_pose_units();
+    if extent_x <= 0.0 || extent_y <= 0.0 {
         return 1.0;
     }
-    piece_height / piece_width
+    let pose_unit_x = puzzle.image_width as f32 / extent_x;
+    let pose_unit_y = puzzle.image_height as f32 / extent_y;
+    if pose_unit_x <= 0.0 {
+        return 1.0;
+    }
+    pose_unit_y / pose_unit_x
 }
 
 impl AppGameState {
     /// Builds an `AppGameState` from a complete `PlayableGameSnapshot` (the
     /// transport DTO used for full-state refreshes and persistence).
     pub fn from_snapshot(snapshot: PlayableGameSnapshot) -> Result<Self, AppGameStateError> {
-        let restored = snapshot.restore_playable_from_spec()?;
-        let mut playable = match restored {
-            RestoredPlayableState::Grid(playable) => playable,
-            RestoredPlayableState::TriangularTessellation(_) => {
-                return Err(AppGameStateError::UnsupportedTopology);
-            }
-        };
+        let mut playable = snapshot.restore_playable_from_spec()?;
         playable.set_piece_aspect_ratio(piece_aspect_ratio_from_puzzle(&snapshot.puzzle));
         let visual = VisualState::rebuild_from(&playable);
         Ok(Self {
@@ -93,37 +103,36 @@ impl AppGameState {
     pub fn scrambled(
         puzzle: PuzzleInfo,
         rules: GameRules,
+        descriptor: TopologySpec,
+        geometry: &PuzzleRenderGeometry,
         scramble_nonce: u32,
         positions: &[(f32, f32)],
         rotations: &[f32],
         flips: &[bool],
         piece_order: &[usize],
-        piece_width: f32,
-        piece_height: f32,
     ) -> Result<Self, AppGameStateError> {
-        let topology = GridTopology::try_new(puzzle.cols, puzzle.rows)
-            .ok_or(AppGameStateError::UnsupportedTopology)?;
+        let topology =
+            build_topology_from_spec(&descriptor).ok_or(AppGameStateError::UnsupportedTopology)?;
         let total = topology.piece_count() as usize;
         if positions.len() != total
             || rotations.len() != total
             || flips.len() != total
-            || piece_width <= 0.0
-            || piece_height <= 0.0
+            || geometry.pieces.len() != total
         {
             return Err(AppGameStateError::UnsupportedTopology);
         }
         let play_rules = rules.to_play_rules()?;
         let logical = LogicalState::new(topology);
         let mut playable = PlayableState::new(logical, play_rules);
-        playable.set_piece_aspect_ratio(piece_height / piece_width);
+        if geometry.pose_unit_px[0] > 0.0 && geometry.pose_unit_px[1] > 0.0 {
+            playable.set_piece_aspect_ratio(geometry.pose_unit_px[1] / geometry.pose_unit_px[0]);
+        }
         for idx in 0..total {
             let piece = PieceId(idx as u32);
             let Some(group) = playable.logical.group_of(piece) else {
                 return Err(AppGameStateError::UnsupportedTopology);
             };
-            let mm_x = (positions[idx].0 + piece_width * 0.5) / piece_width;
-            let mm_y = (positions[idx].1 + piece_height * 0.5) / piece_height;
-            let Some(pose) = Pose2::try_from_mm_degrees(mm_x, mm_y, rotations[idx]) else {
+            let Some(pose) = geometry.pixel_to_pose(piece, positions[idx], rotations[idx]) else {
                 return Err(AppGameStateError::UnsupportedTopology);
             };
             if let Some(slot) = playable.group_pose.get_mut(group.as_usize()) {
@@ -160,10 +169,24 @@ impl AppGameState {
     /// Builds an `AppGameState` for the fully-solved puzzle: every edge
     /// active, the single resulting group anchored at the origin pose with
     /// no rotation or flip.
+    #[cfg(test)]
     pub fn solved(puzzle: PuzzleInfo, rules: GameRules) -> Result<Self, AppGameStateError> {
-        let topology = GridTopology::try_new(puzzle.cols, puzzle.rows)
-            .ok_or(AppGameStateError::UnsupportedTopology)?;
+        let descriptor = puzzle.to_spec();
+        Self::solved_with_topology(puzzle, rules, descriptor)
+    }
+
+    pub fn solved_with_topology(
+        puzzle: PuzzleInfo,
+        rules: GameRules,
+        descriptor: TopologySpec,
+    ) -> Result<Self, AppGameStateError> {
+        let topology =
+            build_topology_from_spec(&descriptor).ok_or(AppGameStateError::UnsupportedTopology)?;
         let play_rules = rules.to_play_rules()?;
+        let identity = topology
+            .identity_frame_anchor()
+            .map(|(_, pose)| pose)
+            .unwrap_or_else(|| Pose2::try_from_mm_degrees(0.0, 0.0, 0.0).unwrap_or_default());
         let mut logical = LogicalState::new(topology);
         logical.activate_all_edges();
         logical
@@ -171,13 +194,8 @@ impl AppGameState {
             .map_err(|_| AppGameStateError::UnsupportedTopology)?;
         let mut playable = PlayableState::new(logical, play_rules);
         playable.set_piece_aspect_ratio(piece_aspect_ratio_from_puzzle(&puzzle));
-        // Pose stores the piece-CENTER in piece-count units, so the solved
-        // anchor (piece 0) sits at `(0.5, 0.5)` to land its top-left pixel
-        // at the workspace top-left.
-        let origin = Pose2::try_from_mm_degrees(0.5, 0.5, 0.0)
-            .ok_or(AppGameStateError::UnsupportedTopology)?;
         for pose in playable.group_pose.iter_mut() {
-            *pose = origin;
+            *pose = identity;
         }
         for flip in playable.group_flip.iter_mut() {
             *flip = FlipState::Normal;
@@ -258,7 +276,11 @@ impl AppGameState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heddobureika_core::{PlayableAction, PlayableRoomUpdateKind, Position2, PuzzleImageRef};
+    use crate::core::GridChoice;
+    use heddobureika_core::{
+        build_topology_from_spec, GridShapeSettings, PlayableAction, PlayableRoomUpdateKind,
+        Position2, PuzzleImageRef,
+    };
 
     #[test]
     fn wire_update_snaps_dirty_visual_pose_to_authoritative_pose() {
@@ -267,8 +289,7 @@ mod tests {
             image_ref: PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
-            rows: 1,
-            cols: 2,
+            topology: heddobureika_core::TopologySpec::grid(2, 1).into(),
             shape_seed: 1,
             image_width: 200,
             image_height: 100,
@@ -277,16 +298,31 @@ mod tests {
         let rotations = [0.0, 0.0];
         let flips = [false, false];
         let order = [0, 1];
+        let _grid = GridChoice {
+            target_count: 2,
+            cols: 2,
+            rows: 1,
+            actual_count: 2,
+        };
+        let topology = build_topology_from_spec(&TopologySpec::grid(2, 1)).expect("topology");
+        let geometry = topology
+            .build_render_geometry(
+                puzzle.image_width,
+                puzzle.image_height,
+                puzzle.shape_seed,
+                &GridShapeSettings::default(),
+            )
+            .expect("render geometry");
         let mut game = AppGameState::scrambled(
             puzzle,
             GameRules::default(),
+            TopologySpec::grid(2, 1),
+            &geometry,
             1,
             &positions,
             &rotations,
             &flips,
             &order,
-            100.0,
-            100.0,
         )
         .expect("scrambled app game");
         let stale_pose = Pose2::try_from_mm_degrees(20.0, 0.5, 0.0).expect("finite pose");

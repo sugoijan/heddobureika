@@ -11,9 +11,11 @@ use crate::game_state::AppGameState;
 use crate::input::ClickGesture;
 use crate::runtime::CoreAction;
 use heddobureika_core::{
-    safety_corrections_after_detach, validate_image_ref, AngleDeg, CoreState, EdgeId, FlipState,
-    GameRules, MergePolicy, PieceId, PlayableAction, Pose2, Position2, PuzzleImageRef, PuzzleInfo,
-    PuzzleTopology, RestrictedPlayableAction,
+    angle_delta, build_topology_from_spec, rand_range, safety_corrections_after_detach,
+    scramble_flips, validate_image_ref, AngleDeg, CoreState, FlipState, GameRules, MergePolicy,
+    PieceId, PlayableAction, Pose2, Position2, PuzzleImageRef, PuzzleInfo, PuzzleTopology,
+    RestrictedPlayableAction, TopologySpec, DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE,
+    MAX_LINE_BEND_RATIO,
 };
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
@@ -92,15 +94,28 @@ pub(crate) struct AppSnapshot {
     /// Piece world poses in mm (center-of-piece coords), derived from
     /// `state.game.visual.piece_visual_pose`.
     pub(crate) piece_world_poses: Vec<Pose2>,
+    pub(crate) piece_top_left_px: Vec<(f32, f32)>,
     /// Per-piece flip state, derived from the piece's group's flip in
     /// `state.game.playable.group_flip`.
     pub(crate) piece_flipped: Vec<bool>,
     /// Per-piece group anchor (the canonical group id = min piece in group).
     pub(crate) piece_group_anchor: Vec<u32>,
     pub(crate) scramble_nonce: u32,
-    pub(crate) grid: GridChoice,
-    pub(crate) piece_width: f32,
-    pub(crate) piece_height: f32,
+    /// Pose-mm → pixel scale per axis. Use this (not `piece_width`/`piece_height`)
+    /// for any mm↔px conversion. Equals `render_geometry.pose_unit_px` when
+    /// a puzzle is loaded; `[1.0, 1.0]` otherwise.
+    pub(crate) pose_unit_px: [f32; 2],
+    /// Pose-mm origin in pixel coords. Equals `render_geometry.pose_origin_px`
+    /// when loaded; `[0.0, 0.0]` otherwise.
+    pub(crate) pose_origin_px: [f32; 2],
+    /// Per-axis minimum piece bounding box across all pieces (px). Use this
+    /// for UX tolerances that should react to the smallest piece in the
+    /// puzzle.
+    pub(crate) min_piece_extent_px: [f32; 2],
+    /// Per-axis median piece bounding box across all pieces (px). Use this
+    /// as a "typical piece size" for scramble margins and tolerances that
+    /// should reflect the puzzle's overall scale.
+    pub(crate) typical_piece_extent_px: [f32; 2],
     pub(crate) z_order: Vec<usize>,
     pub(crate) hovered_id: Option<usize>,
     pub(crate) active_id: Option<usize>,
@@ -120,15 +135,7 @@ pub(crate) struct AppSnapshot {
 impl AppSnapshot {
     /// Materializes piece pixel-coord top-left positions as a Vec.
     pub(crate) fn piece_positions_px(&self) -> Vec<(f32, f32)> {
-        self.piece_world_poses
-            .iter()
-            .map(|pose| {
-                (
-                    pose.x_mm() * self.piece_width - self.piece_width * 0.5,
-                    pose.y_mm() * self.piece_height - self.piece_height * 0.5,
-                )
-            })
-            .collect()
+        self.piece_top_left_px.clone()
     }
 
     /// Materializes piece rotations in degrees as a Vec.
@@ -139,46 +146,16 @@ impl AppSnapshot {
             .collect()
     }
 
-    /// Materializes the per-piece connection table derived from
-    /// `state.game.playable.logical`. Returns an empty Vec when no game is
-    /// loaded.
-    pub(crate) fn piece_connections(&self) -> Vec<[bool; 4]> {
-        let Some(game) = self.game.as_ref() else {
-            return Vec::new();
-        };
-        let cols = self.grid.cols as usize;
-        let rows = self.grid.rows as usize;
-        let total = cols.saturating_mul(rows);
-        if total == 0 || game.playable.piece_count() != total {
+    pub(crate) fn group_members_for_piece(&self, piece_id: usize) -> Vec<usize> {
+        if piece_id >= self.piece_group_anchor.len() {
             return Vec::new();
         }
-        let mut out = vec![[false; 4]; total];
-        for edge_idx in 0..game.playable.logical.edge_count() {
-            let edge = EdgeId(edge_idx as u32);
-            if game.playable.logical.is_edge_active(edge) != Some(true) {
-                continue;
-            }
-            let (a, b) = game.playable.logical.topology.edge_endpoints(edge);
-            let a_idx = a.as_usize();
-            let b_idx = b.as_usize();
-            if a_idx >= total || b_idx >= total {
-                continue;
-            }
-            if b_idx == a_idx + 1 && a_idx / cols == b_idx / cols {
-                out[a_idx][DIR_RIGHT] = true;
-                out[b_idx][DIR_LEFT] = true;
-            } else if a_idx == b_idx + 1 && a_idx / cols == b_idx / cols {
-                out[a_idx][DIR_LEFT] = true;
-                out[b_idx][DIR_RIGHT] = true;
-            } else if b_idx == a_idx + cols {
-                out[a_idx][DIR_DOWN] = true;
-                out[b_idx][DIR_UP] = true;
-            } else if a_idx == b_idx + cols {
-                out[a_idx][DIR_UP] = true;
-                out[b_idx][DIR_DOWN] = true;
-            }
-        }
-        out
+        let anchor = self.piece_group_anchor[piece_id];
+        self.piece_group_anchor
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, value)| (*value == anchor).then_some(idx))
+            .collect()
     }
 }
 
@@ -240,8 +217,8 @@ impl SnapshotBuffer {
 pub(crate) struct PuzzleAssets {
     pub(crate) info: PuzzleInfo,
     pub(crate) grid: GridChoice,
-    pub(crate) pieces: Vec<Piece>,
-    pub(crate) paths: Vec<PiecePaths>,
+    pub(crate) topology: TopologySpec,
+    pub(crate) render_geometry: PuzzleRenderGeometry,
     pub(crate) piece_width: f32,
     pub(crate) piece_height: f32,
     pub(crate) mask_pad: f32,
@@ -326,9 +303,19 @@ impl AppCore {
             .get(piece_id)
             .copied()
             .unwrap_or_default();
-        let px = pose.x_mm() * state.core.piece_width - state.core.piece_width * 0.5;
-        let py = pose.y_mm() * state.core.piece_height - state.core.piece_height * 0.5;
-        ((px, py), pose.rotation_degrees())
+        let top_left = state
+            .assets
+            .as_ref()
+            .and_then(|assets| {
+                assets
+                    .render_geometry
+                    .pose_to_piece_top_left(PieceId(piece_id as u32), pose)
+            })
+            .unwrap_or((
+                pose.x_mm() * state.core.piece_width - state.core.piece_width * 0.5,
+                pose.y_mm() * state.core.piece_height - state.core.piece_height * 0.5,
+            ));
+        (top_left, pose.rotation_degrees())
     }
 
     /// Reads a piece's flip state from `state.game.playable.group_flip`.
@@ -349,15 +336,26 @@ impl AppCore {
     fn set_piece_pixel_pose(state: &mut AppState, piece_id: usize, px: (f32, f32), rot_deg: f32) {
         let piece_width = state.core.piece_width;
         let piece_height = state.core.piece_height;
-        let Some(game) = state.game.as_mut() else {
-            return;
-        };
         if piece_width <= 0.0 || piece_height <= 0.0 {
             return;
         }
-        let mm_x = (px.0 + piece_width * 0.5) / piece_width;
-        let mm_y = (px.1 + piece_height * 0.5) / piece_height;
-        if let Some(pose) = Pose2::try_from_mm_degrees(mm_x, mm_y, rot_deg) {
+        let pose = state
+            .assets
+            .as_ref()
+            .and_then(|assets| {
+                assets
+                    .render_geometry
+                    .pixel_to_pose(PieceId(piece_id as u32), px, rot_deg)
+            })
+            .or_else(|| {
+                let mm_x = (px.0 + piece_width * 0.5) / piece_width;
+                let mm_y = (px.1 + piece_height * 0.5) / piece_height;
+                Pose2::try_from_mm_degrees(mm_x, mm_y, rot_deg)
+            });
+        let Some(game) = state.game.as_mut() else {
+            return;
+        };
+        if let Some(pose) = pose {
             game.visual
                 .set_piece_visual_pose(PieceId(piece_id as u32), pose);
         }
@@ -377,23 +375,32 @@ impl AppCore {
         self.state.borrow().assets.clone()
     }
 
-    pub(crate) fn set_puzzle_with_grid(
+    pub(crate) fn set_puzzle_with_topology(
         &self,
         label: String,
         image_ref: PuzzleImageRef,
         dims: (u32, u32),
-        grid_override: Option<GridChoice>,
+        descriptor: TopologySpec,
+        scramble_nonce: Option<u32>,
     ) {
-        self.set_puzzle_with_grid_with_nonce(label, image_ref, dims, grid_override, None);
+        self.set_puzzle_with_topology_seeded(
+            label,
+            image_ref,
+            dims,
+            descriptor,
+            scramble_nonce,
+            random_shape_seed(),
+        );
     }
 
-    pub(crate) fn set_puzzle_with_grid_with_nonce(
+    pub(crate) fn set_puzzle_with_topology_seeded(
         &self,
         label: String,
         image_ref: PuzzleImageRef,
         dims: (u32, u32),
-        grid_override: Option<GridChoice>,
+        descriptor: TopologySpec,
         scramble_nonce: Option<u32>,
+        shape_seed: u32,
     ) {
         let (width, height) = dims;
         if width == 0 || height == 0 {
@@ -403,78 +410,38 @@ impl AppCore {
             return;
         }
         let mut state = self.state.borrow_mut();
-        let grid = match grid_override {
-            Some(grid) if grid.cols > 0 && grid.rows > 0 => grid,
-            Some(_) => return,
-            None => select_grid(width, height),
+        let topology = match build_topology_from_spec(&descriptor) {
+            Some(topology) => topology,
+            None => return,
         };
+        let grid =
+            descriptor_grid_choice(&descriptor, topology.piece_count()).unwrap_or_else(|| {
+                GridChoice {
+                    target_count: topology.piece_count(),
+                    cols: topology.piece_count().max(1),
+                    rows: 1,
+                    actual_count: topology.piece_count(),
+                }
+            });
         log_puzzle_dimensions(&label, &image_ref, width, height, grid);
         let info = PuzzleInfo {
             label,
             image_ref,
-            rows: grid.rows,
-            cols: grid.cols,
-            shape_seed: PUZZLE_SEED,
+            topology: descriptor.clone().into(),
+            shape_seed,
             image_width: width,
             image_height: height,
         };
-        let piece_width = width as f32 / grid.cols as f32;
-        let piece_height = height as f32 / grid.rows as f32;
-        let depth_cap = state
-            .view_settings
-            .shape
-            .tab_depth_cap
-            .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-        let curve_detail = state
-            .view_settings
-            .shape
-            .curve_detail
-            .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
-        let pieces = build_pieces(grid.rows, grid.cols);
-        let (horizontal, vertical) = build_edge_maps(
-            grid.rows,
-            grid.cols,
-            PUZZLE_SEED,
-            &state.view_settings.shape,
-        );
-        let (horizontal_waves, vertical_waves) = build_line_waves(
-            grid.rows,
-            grid.cols,
-            PUZZLE_SEED,
-            piece_width,
-            piece_height,
-            state.view_settings.shape.line_bend_ratio,
-        );
-        let warp_field = WarpField {
-            width: width as f32,
-            height: height as f32,
-            horizontal: &horizontal_waves,
-            vertical: &vertical_waves,
+        let Some((render_geometry, piece_width, piece_height, mask_pad)) =
+            build_assets_for_topology(&info, &descriptor, grid, &state.view_settings)
+        else {
+            return;
         };
-        let mut paths = Vec::with_capacity(pieces.len());
-        for piece in &pieces {
-            paths.push(build_piece_path(
-                piece,
-                piece_width,
-                piece_height,
-                &horizontal,
-                &vertical,
-                &warp_field,
-                depth_cap,
-                curve_detail,
-            ));
-        }
-        let max_depth = piece_width.max(piece_height) * depth_cap;
-        let max_bend = horizontal_waves
-            .iter()
-            .chain(vertical_waves.iter())
-            .fold(0.0_f32, |acc, wave| acc.max(wave.amplitude.abs()));
-        let mask_pad = (max_depth + max_bend).ceil();
         let assets = Rc::new(PuzzleAssets {
             info: info.clone(),
             grid,
-            pieces,
-            paths,
+            topology: descriptor.clone(),
+            render_geometry,
             piece_width,
             piece_height,
             mask_pad,
@@ -491,9 +458,7 @@ impl AppCore {
         );
         let layout = state.core.layout;
         state.view.reset_to_fit(layout);
-        let cols = grid.cols as usize;
-        let rows = grid.rows as usize;
-        let total = cols * rows;
+        let total = topology.piece_count() as usize;
         let view_width = state.core.layout.view_width;
         let view_height = state.core.layout.view_height;
         let view_min_x = state.core.layout.view_min_x;
@@ -503,17 +468,20 @@ impl AppCore {
         let puzzle_view_min_y = view_min_y / puzzle_scale;
         let puzzle_view_width = view_width / puzzle_scale;
         let puzzle_view_height = view_height / puzzle_scale;
-        let margin = piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
+        let margin = piece_width
+            .max(piece_height)
+            .mul_add(DEFAULT_TAB_DEPTH_CAP + MAX_LINE_BEND_RATIO, mask_pad);
         let nonce = scramble_nonce.unwrap_or_else(|| time_nonce(state.core.scramble_nonce));
-        let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
+        let seed = scramble_seed_from_topology(PUZZLE_SEED, nonce, &descriptor);
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-        let (positions, order) = scramble_layout(
+        let (positions, order) = scramble_layout_for_geometry(
             seed,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
+            state
+                .assets
+                .as_ref()
+                .map(|assets| &assets.render_geometry)
+                .expect("assets installed before scramble"),
             puzzle_view_min_x,
             puzzle_view_min_y,
             puzzle_view_width,
@@ -521,19 +489,23 @@ impl AppCore {
             margin,
         );
         let rotations = scramble_rotations(rotation_seed, total, state.core.rules.rotation_enabled);
-        let flips = scramble_flips(flip_seed, total, 0.0);
+        let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
         state.core.scramble_nonce = nonce;
         if let Some(info) = state.core.puzzle_info.clone() {
             state.game = AppGameState::scrambled(
                 info,
                 state.core.rules,
+                descriptor.clone(),
+                &state
+                    .assets
+                    .as_ref()
+                    .expect("assets installed before game")
+                    .render_geometry,
                 nonce,
                 &positions,
                 &rotations,
                 &flips,
                 &order,
-                piece_width,
-                piece_height,
             )
             .ok();
         } else {
@@ -560,7 +532,11 @@ impl AppCore {
         pointer_id: Option<i32>,
     ) {
         let mut state = self.state.borrow_mut();
-        let total = (state.core.grid.cols as usize) * (state.core.grid.rows as usize);
+        let total = state
+            .game
+            .as_ref()
+            .map(|game| game.playable.piece_count())
+            .unwrap_or(0);
         if total == 0 || piece_id >= total {
             return;
         }
@@ -576,6 +552,12 @@ impl AppCore {
         // confirm the same corrected poses.
         if shift_key {
             let rules = state.core.rules;
+            let pose_unit_px = state.assets.as_ref().map(|assets| {
+                (
+                    assets.render_geometry.pose_unit_px[0],
+                    assets.render_geometry.pose_unit_px[1],
+                )
+            });
             if let Some(game) = state.game.as_mut() {
                 let piece = PieceId(piece_id as u32);
                 let pose = game
@@ -605,11 +587,27 @@ impl AppCore {
                     None,
                 );
                 let puzzle_info = game.puzzle.clone();
+                // Pose units default to topology-derived scale when no
+                // render geometry is loaded yet. Works for grid,
+                // triangular, and any future topology because it goes
+                // through `image_extent_in_pose_units`.
+                let pose_unit_px = pose_unit_px.unwrap_or_else(|| {
+                    build_topology_from_spec(&puzzle_info.to_spec())
+                        .map(|t| {
+                            let (ex, ey) = t.image_extent_in_pose_units();
+                            (
+                                puzzle_info.image_width as f32 / ex.max(1.0),
+                                puzzle_info.image_height as f32 / ey.max(1.0),
+                            )
+                        })
+                        .unwrap_or((1.0, 1.0))
+                });
                 let corrections = safety_corrections_after_detach(
                     &game.playable,
                     &original_members,
                     &puzzle_info,
                     &rules,
+                    pose_unit_px,
                 );
                 for (group, drop_pos) in corrections {
                     let _ = game.playable.apply_action_only(
@@ -648,14 +646,32 @@ impl AppCore {
         }
         let piece_width = state.core.piece_width;
         let piece_height = state.core.piece_height;
-        let click_tolerance = piece_width.min(piece_height) * CLICK_MOVE_RATIO;
+        let min_piece_extent = state
+            .assets
+            .as_ref()
+            .map(|assets| {
+                let [w, h] = assets.render_geometry.min_piece_extent_px;
+                w.min(h)
+            })
+            .unwrap_or_else(|| piece_width.min(piece_height));
+        let click_tolerance = min_piece_extent * CLICK_MOVE_RATIO;
         let click_slop = click_slop.max(click_tolerance);
         let now_ms = now_ms_f32();
         let mut click_gesture = ClickGesture::new_with_slop(click_slop);
         click_gesture.arm(x, y, now_ms);
         let base_pos = Self::piece_pixel_pose(&state, piece_id).0;
-        let pivot_x = base_pos.0 + piece_width * 0.5;
-        let pivot_y = base_pos.1 + piece_height * 0.5;
+        let anchor = state
+            .assets
+            .as_ref()
+            .and_then(|assets| {
+                assets
+                    .render_geometry
+                    .piece(PieceId(piece_id as u32))
+                    .map(|piece| piece.pose_anchor_px)
+            })
+            .unwrap_or([piece_width * 0.5, piece_height * 0.5]);
+        let pivot_x = base_pos.0 + anchor[0];
+        let pivot_y = base_pos.1 + anchor[1];
         let start_angle = (y - pivot_y).atan2(x - pivot_x);
         state.drag_state = Some(DragState {
             start_x: x,
@@ -712,10 +728,20 @@ impl AppCore {
             let rotation_delta = if flipped { -delta_deg } else { delta_deg };
             for (idx, id) in drag.members.iter().enumerate() {
                 let start_pos = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
-                let center_x = start_pos.0 + piece_width * 0.5;
-                let center_y = start_pos.1 + piece_height * 0.5;
+                let anchor = state
+                    .assets
+                    .as_ref()
+                    .and_then(|assets| {
+                        assets
+                            .render_geometry
+                            .piece(PieceId(*id as u32))
+                            .map(|piece| piece.pose_anchor_px)
+                    })
+                    .unwrap_or([piece_width * 0.5, piece_height * 0.5]);
+                let center_x = start_pos.0 + anchor[0];
+                let center_y = start_pos.1 + anchor[1];
                 let (rx, ry) = rotate_point(center_x, center_y, pivot_x, pivot_y, delta_deg);
-                let new_px = (rx - piece_width * 0.5, ry - piece_height * 0.5);
+                let new_px = (rx - anchor[0], ry - anchor[1]);
                 let start_rot = drag.start_rotations.get(idx).copied().unwrap_or(0.0);
                 let new_rot = normalize_angle(start_rot + rotation_delta);
                 Self::set_piece_pixel_pose(&mut state, *id, new_px, new_rot);
@@ -744,7 +770,15 @@ impl AppCore {
                 if center_max_y < center_min_y {
                     center_max_y = center_min_y;
                 }
-                let rubber_limit = piece_width.min(piece_height) * RUBBER_BAND_RATIO;
+                let min_extent = state
+                    .assets
+                    .as_ref()
+                    .map(|assets| {
+                        let [w, h] = assets.render_geometry.min_piece_extent_px;
+                        w.min(h)
+                    })
+                    .unwrap_or_else(|| piece_width.min(piece_height));
+                let rubber_limit = min_extent * RUBBER_BAND_RATIO;
                 // Single bound for both single pieces and multi-piece groups —
                 // the tighter group-only inset was removed because it was
                 // disproportionately restrictive for puzzles with few/large
@@ -809,9 +843,11 @@ impl AppCore {
             state.drag_state = Some(drag);
             return;
         }
-        let cols = state.core.grid.cols as usize;
-        let rows = state.core.grid.rows as usize;
-        let total = cols * rows;
+        let total = state
+            .game
+            .as_ref()
+            .map(|game| game.playable.piece_count())
+            .unwrap_or(0);
         let piece_width = state.core.piece_width;
         let piece_height = state.core.piece_height;
         let rotation_snap_tolerance = state.core.rules.rotation_snap_tolerance_deg;
@@ -820,6 +856,10 @@ impl AppCore {
         let click_tolerance_sq = click_tolerance * click_tolerance;
         let click_id = drag.primary_id;
         let primary_piece = PieceId(click_id as u32);
+        let render_geometry = state
+            .assets
+            .as_ref()
+            .map(|assets| assets.render_geometry.clone());
         let Some(game) = state.game.as_mut() else {
             state.drag_state = None;
             state.dragging_members.clear();
@@ -846,15 +886,30 @@ impl AppCore {
         };
         // Check whether the drag moved beyond the click threshold by sampling
         // the current visual pose of each member against its start position.
+        // For Ctrl-drag rotations the piece can rotate around its click point
+        // without its center translating, so also treat any rotation delta
+        // beyond the snap tolerance as movement — otherwise a held Ctrl+drag
+        // would be misinterpreted as a click-flip and lose the rotation.
         let visual_poses = game.visual.piece_visual_pose();
         let moved = drag.members.iter().enumerate().any(|(idx, id)| {
             let start = drag.start_positions.get(idx).copied().unwrap_or((0.0, 0.0));
+            let start_rot = drag.start_rotations.get(idx).copied().unwrap_or(0.0);
             let pose = visual_poses.get(*id).copied().unwrap_or_default();
-            let cx = pose.x_mm() * piece_width - piece_width * 0.5;
-            let cy = pose.y_mm() * piece_height - piece_height * 0.5;
-            let dx = cx - start.0;
-            let dy = cy - start.1;
-            dx * dx + dy * dy > click_tolerance_sq
+            let piece = PieceId(*id as u32);
+            let top_left = render_geometry
+                .as_ref()
+                .and_then(|geom| geom.pose_to_piece_top_left(piece, pose))
+                .unwrap_or((
+                    pose.x_mm() * piece_width - piece_width * 0.5,
+                    pose.y_mm() * piece_height - piece_height * 0.5,
+                ));
+            let dx = top_left.0 - start.0;
+            let dy = top_left.1 - start.1;
+            if dx * dx + dy * dy > click_tolerance_sq {
+                return true;
+            }
+            let rot_delta = angle_delta(pose.rotation_degrees(), start_rot).abs();
+            rot_delta > rotation_snap_tolerance
         });
         let is_click = drag
             .click_gesture
@@ -906,26 +961,50 @@ impl AppCore {
                 self.notify();
                 return;
             }
-            let mut delta = click_rotation_delta(current_angle, 0.0, 0.0, rotation_snap_tolerance);
-            if drag.right_click {
-                delta = -delta;
-            }
+            // Topology-aware step rotation: ask the playable state for the
+            // next discrete rotation toward the relevant symmetry angles
+            // (cardinal 90° for grid, 60°/120° for triangular pieces, etc.).
+            // Falls back to the legacy cardinal-step delta when no step is
+            // available.
+            let clockwise = !drag.right_click;
+            let delta = match game
+                .playable
+                .next_step_rotation(primary_group, clockwise)
+                .map(|angle| angle.as_degrees_f32())
+            {
+                Some(target) => angle_delta(target, current_angle),
+                None => {
+                    let mut d =
+                        click_rotation_delta(current_angle, 0.0, 0.0, rotation_snap_tolerance);
+                    if drag.right_click {
+                        d = -d;
+                    }
+                    d
+                }
+            };
             // Compute the new anchor pose: rotate the anchor's current world
             // position around the click point by delta, and add delta to its
-            // rotation.
-            let click_x_mm = drag.start_x / piece_width;
-            let click_y_mm = drag.start_y / piece_height;
-            let anchor_x_mm = current_pose.x_mm();
-            let anchor_y_mm = current_pose.y_mm();
-            let (rx_px, ry_px) = rotate_point(
-                anchor_x_mm * piece_width,
-                anchor_y_mm * piece_height,
-                click_x_mm * piece_width,
-                click_y_mm * piece_height,
-                delta,
-            );
-            let new_x_mm = rx_px / piece_width;
-            let new_y_mm = ry_px / piece_height;
+            // rotation. The mm↔px conversion uses the topology's pose units
+            // (which can differ from piece_width/piece_height — e.g. for
+            // triangular tessellation where the row height divides the image
+            // by piece_rows rather than rows).
+            let (pose_unit_x, pose_unit_y, pose_origin_x, pose_origin_y) = render_geometry
+                .as_ref()
+                .map(|geom| {
+                    (
+                        geom.pose_unit_px[0],
+                        geom.pose_unit_px[1],
+                        geom.pose_origin_px[0],
+                        geom.pose_origin_px[1],
+                    )
+                })
+                .unwrap_or((piece_width, piece_height, 0.0, 0.0));
+            let anchor_x_px = pose_origin_x + current_pose.x_mm() * pose_unit_x;
+            let anchor_y_px = pose_origin_y + current_pose.y_mm() * pose_unit_y;
+            let (rx_px, ry_px) =
+                rotate_point(anchor_x_px, anchor_y_px, drag.start_x, drag.start_y, delta);
+            let new_x_mm = (rx_px - pose_origin_x) / pose_unit_x;
+            let new_y_mm = (ry_px - pose_origin_y) / pose_unit_y;
             let new_rot = normalize_angle(current_angle + delta);
             let Some(drop_pos) = Position2::try_from_mm(new_x_mm, new_y_mm) else {
                 self.finalize_drag(&mut state);
@@ -1294,9 +1373,22 @@ impl AppCore {
     /// positions/rotations/flips with a new nonce and installs the result.
     /// Dev-panel "scramble" button.
     pub(crate) fn rescramble(&self) {
-        let (info, rules, layout, current_nonce, piece_width, piece_height, depth_cap) = {
+        let (
+            info,
+            rules,
+            layout,
+            current_nonce,
+            piece_width,
+            piece_height,
+            mask_pad,
+            descriptor,
+            geometry,
+        ) = {
             let state = self.state.borrow();
             let Some(info) = state.core.puzzle_info.clone() else {
+                return;
+            };
+            let Some(assets) = state.assets.as_ref() else {
                 return;
             };
             let piece_width = state.core.piece_width;
@@ -1304,11 +1396,6 @@ impl AppCore {
             if piece_width <= 0.0 || piece_height <= 0.0 {
                 return;
             }
-            let depth_cap = state
-                .view_settings
-                .shape
-                .tab_depth_cap
-                .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
             (
                 info,
                 state.core.rules,
@@ -1316,12 +1403,12 @@ impl AppCore {
                 state.core.scramble_nonce,
                 piece_width,
                 piece_height,
-                depth_cap,
+                assets.mask_pad,
+                assets.topology.clone(),
+                assets.render_geometry.clone(),
             )
         };
-        let cols = info.cols as usize;
-        let rows = info.rows as usize;
-        let total = cols * rows;
+        let total = geometry.pieces.len();
         if total == 0 {
             return;
         }
@@ -1330,17 +1417,16 @@ impl AppCore {
         let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
         let puzzle_view_width = layout.view_width / puzzle_scale;
         let puzzle_view_height = layout.view_height / puzzle_scale;
-        let margin = piece_width.max(piece_height) * (depth_cap + MAX_LINE_BEND_RATIO);
+        let margin = piece_width
+            .max(piece_height)
+            .mul_add(DEFAULT_TAB_DEPTH_CAP + MAX_LINE_BEND_RATIO, mask_pad);
         let nonce = time_nonce(current_nonce);
-        let seed = scramble_seed(PUZZLE_SEED, nonce, cols, rows);
+        let seed = scramble_seed_from_topology(PUZZLE_SEED, nonce, &info.to_spec());
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-        let (positions, order) = scramble_layout(
+        let (positions, order) = scramble_layout_for_geometry(
             seed,
-            cols,
-            rows,
-            piece_width,
-            piece_height,
+            &geometry,
             puzzle_view_min_x,
             puzzle_view_min_y,
             puzzle_view_width,
@@ -1348,17 +1434,9 @@ impl AppCore {
             margin,
         );
         let rotations = scramble_rotations(rotation_seed, total, rules.rotation_enabled);
-        let flips = scramble_flips(flip_seed, total, 0.0);
+        let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
         let Ok(game) = AppGameState::scrambled(
-            info,
-            rules,
-            nonce,
-            &positions,
-            &rotations,
-            &flips,
-            &order,
-            piece_width,
-            piece_height,
+            info, rules, descriptor, &geometry, nonce, &positions, &rotations, &flips, &order,
         ) else {
             return;
         };
@@ -1369,14 +1447,19 @@ impl AppCore {
     /// active, the single resulting group anchored at the origin with no
     /// rotation or flip. Dev-panel "solve" button.
     pub(crate) fn solve_puzzle(&self) {
-        let (info, rules) = {
+        let (info, rules, descriptor) = {
             let state = self.state.borrow();
-            (state.core.puzzle_info.clone(), state.core.rules)
+            (
+                state.core.puzzle_info.clone(),
+                state.core.rules,
+                state.assets.as_ref().map(|assets| assets.topology.clone()),
+            )
         };
         let Some(info) = info else {
             return;
         };
-        let Ok(game) = AppGameState::solved(info, rules) else {
+        let descriptor = descriptor.unwrap_or_else(|| info.to_spec());
+        let Ok(game) = AppGameState::solved_with_topology(info, rules, descriptor) else {
             return;
         };
         self.install_game(game, false);
@@ -1429,64 +1512,29 @@ impl AppCore {
             self.notify();
             return;
         };
+        let topology = state
+            .assets
+            .as_ref()
+            .map(|assets| assets.topology.clone())
+            .unwrap_or_else(|| info.to_spec());
         let grid = state.core.grid;
-        let piece_width = info.image_width as f32 / grid.cols as f32;
-        let piece_height = info.image_height as f32 / grid.rows as f32;
-        let depth_cap = state
-            .view_settings
-            .shape
-            .tab_depth_cap
-            .clamp(TAB_DEPTH_CAP_MIN, TAB_DEPTH_CAP_MAX);
-        let curve_detail = state
-            .view_settings
-            .shape
-            .curve_detail
-            .clamp(CURVE_DETAIL_MIN, CURVE_DETAIL_MAX);
-        let pieces = build_pieces(grid.rows, grid.cols);
-        let (horizontal, vertical) = build_edge_maps(
-            grid.rows,
-            grid.cols,
-            PUZZLE_SEED,
-            &state.view_settings.shape,
-        );
-        let (horizontal_waves, vertical_waves) = build_line_waves(
-            grid.rows,
-            grid.cols,
-            PUZZLE_SEED,
-            piece_width,
-            piece_height,
-            state.view_settings.shape.line_bend_ratio,
-        );
-        let warp_field = WarpField {
-            width: info.image_width as f32,
-            height: info.image_height as f32,
-            horizontal: &horizontal_waves,
-            vertical: &vertical_waves,
+        let view_settings = state.view_settings.clone();
+        // Topology-agnostic rebuild: delegate to the same asset builder
+        // `set_puzzle_with_topology` uses. Topologies that don't consume
+        // shape settings (e.g. triangular today) return effectively the
+        // same geometry and the call is a no-op refresh.
+        let Some((render_geometry, piece_width, piece_height, mask_pad)) =
+            build_assets_for_topology(&info, &topology, grid, &view_settings)
+        else {
+            drop(state);
+            self.notify();
+            return;
         };
-        let mut paths = Vec::with_capacity(pieces.len());
-        for piece in &pieces {
-            paths.push(build_piece_path(
-                piece,
-                piece_width,
-                piece_height,
-                &horizontal,
-                &vertical,
-                &warp_field,
-                depth_cap,
-                curve_detail,
-            ));
-        }
-        let max_depth = piece_width.max(piece_height) * depth_cap;
-        let max_bend = horizontal_waves
-            .iter()
-            .chain(vertical_waves.iter())
-            .fold(0.0_f32, |acc, wave| acc.max(wave.amplitude.abs()));
-        let mask_pad = (max_depth + max_bend).ceil();
         state.assets = Some(Rc::new(PuzzleAssets {
             info,
             grid,
-            pieces,
-            paths,
+            topology,
+            render_geometry,
             piece_width,
             piece_height,
             mask_pad,
@@ -1582,12 +1630,14 @@ fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
         rules: state.core.rules,
         game: None,
         piece_world_poses: Vec::new(),
+        piece_top_left_px: Vec::new(),
         piece_flipped: Vec::new(),
         piece_group_anchor: Vec::new(),
         scramble_nonce: 0,
-        grid: state.core.grid,
-        piece_width: state.core.piece_width,
-        piece_height: state.core.piece_height,
+        pose_unit_px: [1.0, 1.0],
+        pose_origin_px: [0.0, 0.0],
+        min_piece_extent_px: [0.0, 0.0],
+        typical_piece_extent_px: [0.0, 0.0],
         z_order: Vec::new(),
         hovered_id: None,
         active_id: None,
@@ -1612,9 +1662,17 @@ fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
     snapshot.rules = state.core.rules;
     snapshot.scramble_nonce = state.core.scramble_nonce;
     fill_game_state_view(state, snapshot);
-    snapshot.grid = state.core.grid;
-    snapshot.piece_width = state.core.piece_width;
-    snapshot.piece_height = state.core.piece_height;
+    if let Some(assets) = state.assets.as_ref() {
+        snapshot.pose_unit_px = assets.render_geometry.pose_unit_px;
+        snapshot.pose_origin_px = assets.render_geometry.pose_origin_px;
+        snapshot.min_piece_extent_px = assets.render_geometry.min_piece_extent_px;
+        snapshot.typical_piece_extent_px = assets.render_geometry.typical_piece_extent_px;
+    } else {
+        snapshot.pose_unit_px = [1.0, 1.0];
+        snapshot.pose_origin_px = [0.0, 0.0];
+        snapshot.min_piece_extent_px = [0.0, 0.0];
+        snapshot.typical_piece_extent_px = [0.0, 0.0];
+    }
     // Derive the per-piece render order from `state.game.playable.z_order`
     // (groups, back-to-front), expanded with each group's member piece
     // ids. Renderers iterate this to draw back-to-front.
@@ -1664,6 +1722,7 @@ fn fill_game_state_view(state: &AppState, snapshot: &mut AppSnapshot) {
     let Some(game) = state.game.as_ref() else {
         snapshot.game = None;
         snapshot.piece_world_poses.clear();
+        snapshot.piece_top_left_px.clear();
         snapshot.piece_flipped.clear();
         snapshot.piece_group_anchor.clear();
         return;
@@ -1672,6 +1731,8 @@ fn fill_game_state_view(state: &AppState, snapshot: &mut AppSnapshot) {
     let total = game.playable.piece_count();
     snapshot.piece_world_poses.clear();
     snapshot.piece_world_poses.reserve(total);
+    snapshot.piece_top_left_px.clear();
+    snapshot.piece_top_left_px.reserve(total);
     snapshot.piece_flipped.clear();
     snapshot.piece_flipped.reserve(total);
     snapshot.piece_group_anchor.clear();
@@ -1682,6 +1743,15 @@ fn fill_game_state_view(state: &AppState, snapshot: &mut AppSnapshot) {
         let piece = heddobureika_core::PieceId(idx as u32);
         let pose = visual_poses.get(idx).copied().unwrap_or_default();
         snapshot.piece_world_poses.push(pose);
+        let top_left = state
+            .assets
+            .as_ref()
+            .and_then(|assets| assets.render_geometry.pose_to_piece_top_left(piece, pose))
+            .unwrap_or((
+                pose.x_mm() * state.core.piece_width - state.core.piece_width * 0.5,
+                pose.y_mm() * state.core.piece_height - state.core.piece_height * 0.5,
+            ));
+        snapshot.piece_top_left_px.push(top_left);
         let group = game.playable.logical.group_of(piece);
         let flipped = group
             .and_then(|g| game.playable.flip_of(g))
@@ -1820,18 +1890,84 @@ impl AppState {
     }
 }
 
-/// After a Shift-detach has been applied to `game.playable`, walks every
-/// alive group containing a piece from `original_members` and force-moves
-fn select_grid(width: u32, height: u32) -> GridChoice {
-    let choices = build_grid_choices(width, height);
-    if choices.is_empty() {
-        return FALLBACK_GRID;
+fn descriptor_grid_choice(descriptor: &TopologySpec, piece_count: u32) -> Option<GridChoice> {
+    let (cols, rows) = build_topology_from_spec(descriptor)?.dims_hint()?;
+    if cols == 0 || rows == 0 || piece_count == 0 {
+        return None;
     }
-    choices
-        .iter()
-        .find(|choice| choice.target_count == DEFAULT_TARGET_COUNT)
-        .copied()
-        .unwrap_or_else(|| choices[0])
+    Some(GridChoice {
+        target_count: piece_count,
+        cols,
+        rows,
+        actual_count: piece_count,
+    })
+}
+
+fn build_assets_for_topology(
+    info: &PuzzleInfo,
+    descriptor: &TopologySpec,
+    _grid: GridChoice,
+    view_settings: &ViewSettings,
+) -> Option<(PuzzleRenderGeometry, f32, f32, f32)> {
+    let topology = build_topology_from_spec(descriptor)?;
+    let render_geometry = topology.build_render_geometry(
+        info.image_width,
+        info.image_height,
+        info.shape_seed,
+        &view_settings.shape,
+    )?;
+    let pose_unit = render_geometry.pose_unit_px;
+    let mask_pad = render_geometry.mask_pad_px;
+    Some((render_geometry, pose_unit[0], pose_unit[1], mask_pad))
+}
+
+fn scramble_layout_for_geometry(
+    seed: u32,
+    geometry: &PuzzleRenderGeometry,
+    view_min_x: f32,
+    view_min_y: f32,
+    view_width: f32,
+    view_height: f32,
+    margin: f32,
+) -> (Vec<(f32, f32)>, Vec<usize>) {
+    let mut positions = Vec::with_capacity(geometry.pieces.len());
+    for piece in &geometry.pieces {
+        let min_x = view_min_x + margin;
+        let mut max_x = view_min_x + view_width - piece.bounds_px.width - margin;
+        let min_y = view_min_y + margin;
+        let mut max_y = view_min_y + view_height - piece.bounds_px.height - margin;
+        if max_x < min_x {
+            max_x = min_x;
+        }
+        if max_y < min_y {
+            max_y = min_y;
+        }
+        let salt = piece.id.as_u32() << 1;
+        positions.push((
+            rand_range(seed, salt, min_x, max_x),
+            rand_range(seed, salt + 1, min_y, max_y),
+        ));
+    }
+
+    let mut order: Vec<usize> = (0..geometry.pieces.len()).collect();
+    for i in (1..order.len()).rev() {
+        let salt = 0xC0DE_u32 + i as u32;
+        let j = (heddobureika_core::rand_unit(seed, salt) * (i as f32 + 1.0)) as usize;
+        order.swap(i, j);
+    }
+    (positions, order)
+}
+
+/// Generates a fresh, non-zero shape seed for a brand-new puzzle. Used
+/// when no saved snapshot pins a specific seed (first boot, picking a
+/// new catalog puzzle, etc.) — every fresh puzzle gets a unique tab/
+/// blank pattern.
+pub(crate) fn random_shape_seed() -> u32 {
+    let mut seed = time_nonce(0);
+    if seed == 0 {
+        seed = 0x9E37_79B9;
+    }
+    seed
 }
 
 fn time_nonce(previous: u32) -> u32 {
@@ -1874,5 +2010,301 @@ fn now_ms_f32() -> f32 {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as f32)
             .unwrap_or(0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triangular_in_bounds_pose_survives_safety_correction() {
+        // Build a solved triangular puzzle and verify that the per-piece
+        // safety correction doesn't drag pieces vertically. Before the fix,
+        // pieces at piece_row > 0 would get force-moved upward because the
+        // mm→px conversion used the wrong y unit for triangular topology.
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "tri".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "tri".to_string(),
+            },
+            (600, 400),
+            TopologySpec::triangular_tessellation(3, 3),
+            Some(2),
+        );
+        let snapshot_before = core.snapshot();
+        let game = snapshot_before.game.as_ref().expect("game");
+        let pose_unit_px = core.assets().expect("assets").render_geometry.pose_unit_px;
+        // Pick a piece in the bottom half (piece_row = 5, well below the
+        // origin) where the wrong y-unit conversion would have produced the
+        // largest displacement.
+        let piece_id = 15usize;
+        let original_pose = game
+            .playable
+            .pose_of(heddobureika_core::GroupId(piece_id as u32))
+            .expect("pose");
+        let puzzle_info = game.puzzle.clone();
+        let rules = snapshot_before.rules;
+        let corrections = heddobureika_core::safety_corrections_after_detach(
+            &game.playable,
+            &[heddobureika_core::PieceId(piece_id as u32)],
+            &puzzle_info,
+            &rules,
+            (pose_unit_px[0], pose_unit_px[1]),
+        );
+        // The piece's canonical position sits inside the workspace, so the
+        // safety helper should produce no correction.
+        assert!(
+            corrections.is_empty(),
+            "expected no safety correction for in-bounds triangular piece, got {corrections:?} (original pose: {original_pose:?})",
+        );
+    }
+
+    #[test]
+    fn set_puzzle_with_grid_wrapper_builds_grid_game() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "grid".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "grid".to_string(),
+            },
+            (300, 200),
+            TopologySpec::grid(3, 2),
+            None,
+        );
+        let snapshot = core.snapshot();
+        let game = snapshot.game.expect("grid game");
+        assert_eq!(game.playable.piece_count(), 6);
+        assert_eq!(
+            game.playable.logical.topology.to_spec(),
+            TopologySpec::grid(3, 2)
+        );
+    }
+
+    #[test]
+    fn scrambled_puzzle_flips_some_pieces() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "flips".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "flips".to_string(),
+            },
+            (800, 600),
+            TopologySpec::grid(8, 5),
+            None,
+        );
+        let snapshot = core.snapshot();
+        let flipped_count = snapshot.piece_flipped.iter().filter(|f| **f).count();
+        // With FLIP_CHANCE = 0.2 over 40 pieces, expect a non-trivial number
+        // of flips. Allow some randomness — just assert >= 1.
+        assert!(
+            flipped_count >= 1,
+            "expected some pieces to be scrambled flipped, got {flipped_count}"
+        );
+    }
+
+    #[test]
+    fn ctrl_click_sets_flipped() {
+        let core = AppCore::new();
+        core.clear_all_group_flips();
+        core.set_puzzle_with_topology(
+            "flip".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "flip".to_string(),
+            },
+            (300, 200),
+            TopologySpec::grid(3, 2),
+            None,
+        );
+        // Force-reset every piece's flip to Normal so the test is deterministic
+        // regardless of scramble seed.
+        core.clear_all_group_flips();
+        let snapshot = core.snapshot();
+        assert!(!snapshot.piece_flipped[0]);
+        let start_top_left = snapshot.piece_top_left_px[0];
+        let piece_w = snapshot.pose_unit_px[0];
+        let piece_h = snapshot.pose_unit_px[1];
+        let pivot_x = start_top_left.0 + piece_w * 0.5;
+        let pivot_y = start_top_left.1 + piece_h * 0.5;
+        core.begin_drag(0, pivot_x, pivot_y, false, true, false, 4.0, Some(1));
+        core.drag_end(Some(1));
+        let snapshot = core.snapshot();
+        assert!(snapshot.piece_flipped[0], "Ctrl-click should flip piece");
+    }
+
+    #[test]
+    fn ctrl_drag_rotates_piece_visual_pose() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "rot".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "rot".to_string(),
+            },
+            (300, 200),
+            TopologySpec::grid(3, 2),
+            None,
+        );
+        // Unflip every piece so the rotation direction in the test is
+        // independent of the random scramble.
+        core.clear_all_group_flips();
+        let snapshot = core.snapshot();
+        let start_top_left = snapshot.piece_top_left_px[0];
+        let start_rot = snapshot.piece_world_poses[0].rotation_degrees();
+        let piece_w = snapshot.pose_unit_px[0];
+        let piece_h = snapshot.pose_unit_px[1];
+        let pivot_x = start_top_left.0 + piece_w * 0.5;
+        let pivot_y = start_top_left.1 + piece_h * 0.5;
+        core.begin_drag(0, pivot_x + 20.0, pivot_y, false, true, false, 4.0, Some(1));
+        // Drag perpendicular — should rotate by 90 deg.
+        core.drag_move(pivot_x, pivot_y + 20.0);
+        let snapshot = core.snapshot();
+        let new_rot = snapshot.piece_world_poses[0].rotation_degrees();
+        assert!(
+            (new_rot - (start_rot + 90.0)).abs() < 0.5
+                || (new_rot - (start_rot - 270.0)).abs() < 0.5,
+            "rotation should change from {start_rot} to ~{}, got {new_rot}",
+            start_rot + 90.0
+        );
+        // After drag end, the rotation should persist (be committed to playable).
+        core.drag_end(Some(1));
+        let snapshot = core.snapshot();
+        let end_rot = snapshot.piece_world_poses[0].rotation_degrees();
+        assert!(
+            (end_rot - new_rot).abs() < 0.5,
+            "rotation should persist after drag end: drag rotation {new_rot}, post-end {end_rot}"
+        );
+    }
+
+    #[test]
+    fn click_rotates_triangular_piece_by_topology_step() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "triangular".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "triangular".to_string(),
+            },
+            (300, 200),
+            TopologySpec::triangular_tessellation(3, 3),
+            Some(1),
+        );
+        core.clear_all_group_flips();
+        // Force every group to a canonical rotation so the next click step
+        // is deterministic. clear_all_group_rotations zeros every group pose,
+        // then we rebuild the visual cache.
+        core.clear_all_group_rotations();
+        let snapshot = core.snapshot();
+        // Pick a regular-triangle piece (middle rows of a triangular
+        // tessellation). With cols=3, piece_rows=7, regular pieces sit in
+        // piece_rows 1..=5, so piece id 3 (row 1, col 0) is regular.
+        let regular_id = 3usize;
+        let start_top_left = snapshot.piece_top_left_px[regular_id];
+        let regular_assets = core.assets().expect("assets");
+        let regular_anchor = regular_assets
+            .render_geometry
+            .pieces
+            .get(regular_id)
+            .map(|p| p.pose_anchor_px)
+            .expect("anchor");
+        let pivot_x = start_top_left.0 + regular_anchor[0];
+        let pivot_y = start_top_left.1 + regular_anchor[1];
+        let start_rot = snapshot.piece_world_poses[regular_id].rotation_degrees();
+        core.begin_drag(
+            regular_id,
+            pivot_x,
+            pivot_y,
+            false,
+            false,
+            false,
+            4.0,
+            Some(2),
+        );
+        core.drag_end(Some(2));
+        let snapshot = core.snapshot();
+        let new_rot = snapshot.piece_world_poses[regular_id].rotation_degrees();
+        let delta = (new_rot - start_rot).rem_euclid(360.0);
+        // Regular-triangle pieces have 60° rotational symmetry, so the
+        // click step should be 60°, not 90°.
+        assert!(
+            (delta - 60.0).abs() < 1.0,
+            "regular-triangle click rotation should step by 60°, got {delta}°"
+        );
+    }
+
+    #[test]
+    fn click_at_canonical_anchor_keeps_triangular_piece_in_place() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "triangular".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "triangular".to_string(),
+            },
+            (300, 200),
+            TopologySpec::triangular_tessellation(3, 3),
+            Some(1),
+        );
+        core.clear_all_group_flips();
+        core.clear_all_group_rotations();
+        let snapshot = core.snapshot();
+        let regular_id = 3usize;
+        let assets = core.assets().expect("assets");
+        let geom = &assets.render_geometry;
+        // Click exactly at the piece's canonical position (its pose anchor).
+        // A rotation around this point must leave pose.x_mm and pose.y_mm
+        // unchanged — the piece pivots in place.
+        let pose_before = snapshot.piece_world_poses[regular_id];
+        let pivot_px = (
+            geom.pose_origin_px[0] + pose_before.x_mm() * geom.pose_unit_px[0],
+            geom.pose_origin_px[1] + pose_before.y_mm() * geom.pose_unit_px[1],
+        );
+        core.begin_drag(
+            regular_id,
+            pivot_px.0,
+            pivot_px.1,
+            false,
+            false,
+            false,
+            4.0,
+            Some(7),
+        );
+        core.drag_end(Some(7));
+        let snapshot = core.snapshot();
+        let pose_after = snapshot.piece_world_poses[regular_id];
+        assert!(
+            (pose_after.x_mm() - pose_before.x_mm()).abs() < 0.01,
+            "x_mm should not move when click pivot == canonical anchor (before {} after {})",
+            pose_before.x_mm(),
+            pose_after.x_mm()
+        );
+        assert!(
+            (pose_after.y_mm() - pose_before.y_mm()).abs() < 0.01,
+            "y_mm should not move when click pivot == canonical anchor (before {} after {})",
+            pose_before.y_mm(),
+            pose_after.y_mm()
+        );
+    }
+
+    #[test]
+    fn set_puzzle_with_topology_builds_triangular_game() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "triangular".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "triangular".to_string(),
+            },
+            (300, 200),
+            TopologySpec::triangular_tessellation(3, 3),
+            Some(1),
+        );
+        let snapshot = core.snapshot();
+        let game = snapshot.game.as_ref().expect("triangular game");
+        assert_eq!(game.playable.piece_count(), 21);
+        assert_eq!(snapshot.piece_positions_px().len(), 21);
+        let assets = core.assets().expect("assets");
+        assert_eq!(assets.render_geometry.pieces.len(), 21);
+        assert_eq!(assets.render_geometry.puzzle_bounds_px.height, 200.0);
+        // For triangular with `rows=3`, pose unit y is image_height /
+        // piece_rows (= 2*rows + 1 = 7), not image_height / rows.
+        assert!((assets.piece_height - 200.0 / 7.0).abs() <= 0.01);
     }
 }

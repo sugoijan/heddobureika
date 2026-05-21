@@ -301,8 +301,12 @@ fn snapshot_fingerprint(snapshot: &AppSnapshot) -> Option<u64> {
     let mut hasher = DefaultHasher::new();
     info.label.hash(&mut hasher);
     info.image_ref.hash(&mut hasher);
-    info.rows.hash(&mut hasher);
-    info.cols.hash(&mut hasher);
+    // The topology spec is opaque from the runtime's perspective; we
+    // hash the tag and the raw payload bytes so any topology that
+    // round-trips through the snapshot codec ends up with a stable cache
+    // fingerprint.
+    info.topology.tag.hash(&mut hasher);
+    info.topology.payload.hash(&mut hasher);
     info.shape_seed.hash(&mut hasher);
     info.image_width.hash(&mut hasher);
     info.image_height.hash(&mut hasher);

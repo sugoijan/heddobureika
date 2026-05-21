@@ -38,6 +38,7 @@ struct VertexIn {
     @location(6) inst_drag: f32,
     @location(7) inst_piece_origin: vec2<f32>,
     @location(8) inst_mask_origin: vec2<f32>,
+    @location(9) inst_pose_anchor: vec2<f32>,
 };
 
 struct VertexOut {
@@ -63,10 +64,17 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let local = (input.pos + vec2<f32>(0.5, 0.5)) * full_size;
     var local_geom = local;
     let is_flipped = input.inst_flip > 0.5;
+    // Flip pivot is the topology-defined canonical anchor (centroid for
+    // triangles, geometric center for grid pieces). Mirroring around the
+    // same point we rotate around keeps the canonical position fixed when a
+    // piece is flipped — pose.xy stays put visually, which is also what the
+    // SVG renderer does. For grid pieces this is equivalent to mirroring
+    // around the bounding-box center, so behavior is preserved.
+    let anchor_padded = globals.mask_pad + input.inst_pose_anchor;
     if (is_flipped) {
-        local_geom.x = full_size.x - local_geom.x;
+        local_geom.x = 2.0 * anchor_padded.x - local_geom.x;
     }
-    let center = globals.mask_pad + input.inst_size * 0.5;
+    let center = anchor_padded;
     let drag = input.inst_drag;
     let drag_active = abs(drag) > 1e-4;
     let drag_scale = select(1.0, 1.02, drag_active);

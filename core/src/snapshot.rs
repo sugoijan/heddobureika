@@ -5,7 +5,11 @@ use crate::game::{
     SNAP_DISTANCE_RATIO_DEFAULT, WORKSPACE_PADDING_RATIO_DEFAULT,
 };
 
-pub const PLAYABLE_GAME_SNAPSHOT_VERSION: u32 = 4;
+/// Bumped to 6 in the kind-agnostic refactor: `PlayableTopologySnapshot`
+/// changed from `{ kind: String, u32_params: Vec<(String, u32)> }` to
+/// `{ tag: String, payload: Vec<u8> }`. Any v5-or-earlier persisted
+/// snapshot is incompatible and is rejected at load.
+pub const PLAYABLE_GAME_SNAPSHOT_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
 pub enum PuzzleImageRef {
@@ -75,52 +79,76 @@ impl GameRules {
 pub struct PuzzleInfo {
     pub label: String,
     pub image_ref: PuzzleImageRef,
-    pub rows: u32,
-    pub cols: u32,
+    /// Topology identity + parameters. The single source of truth for
+    /// piece count and any topology-specific layout dimensions. Grid
+    /// puzzles encode `(cols, rows)` here; non-grid topologies encode
+    /// whatever their own payload format requires.
+    pub topology: PlayableTopologySnapshot,
     pub shape_seed: u32,
     pub image_width: u32,
     pub image_height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
-pub enum PlayableTopologySnapshot {
-    Unknown { piece_count: u32, edge_count: u32 },
-    Grid { cols: u32, rows: u32 },
-    TriangularTessellation { cols: u32, rows: u32 },
+impl PuzzleInfo {
+    /// Returns the puzzle's topology spec (the transport form).
+    pub fn to_spec(&self) -> heddobureika_game::TopologySpec {
+        self.topology.clone().into()
+    }
+
+    /// Returns `(cols, rows)` when the topology is a grid (the catalog
+    /// grid picker uses this to populate its UI). Returns `None` for any
+    /// other topology — non-display callers should derive dimensions
+    /// through topology trait queries instead.
+    pub fn grid_dims(&self) -> Option<(u32, u32)> {
+        if self.topology.tag != "grid" {
+            return None;
+        }
+        // The grid topology encodes `(cols, rows)` as two little-endian
+        // u32 values. We replicate the read here rather than calling the
+        // game crate to avoid a `build_topology` round-trip just to read
+        // dimensions — but this is the only place outside game/ that
+        // knows the grid payload format.
+        if self.topology.payload.len() != 8 {
+            return None;
+        }
+        let cols = u32::from_le_bytes(self.topology.payload[0..4].try_into().ok()?);
+        let rows = u32::from_le_bytes(self.topology.payload[4..8].try_into().ok()?);
+        Some((cols, rows))
+    }
+
+    /// Total piece count for this puzzle, derived from the topology.
+    /// Returns `0` if the topology can't be constructed.
+    pub fn piece_count(&self) -> u32 {
+        heddobureika_game::build_topology_from_spec(&self.to_spec())
+            .map(|topology| topology.piece_count())
+            .unwrap_or(0)
+    }
+}
+
+/// Wire form of a `TopologySpec`. `tag` identifies the topology family;
+/// `payload` is opaque bytes that the corresponding topology knows how
+/// to decode. Consumers should treat the payload as opaque — only the
+/// owning topology and `build_topology_from_spec` interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+pub struct PlayableTopologySnapshot {
+    pub tag: String,
+    pub payload: Vec<u8>,
 }
 
 impl From<heddobureika_game::TopologySpec> for PlayableTopologySnapshot {
     fn from(value: heddobureika_game::TopologySpec) -> Self {
-        match value {
-            heddobureika_game::TopologySpec::Unknown {
-                piece_count,
-                edge_count,
-            } => Self::Unknown {
-                piece_count,
-                edge_count,
-            },
-            heddobureika_game::TopologySpec::Grid { cols, rows } => Self::Grid { cols, rows },
-            heddobureika_game::TopologySpec::TriangularTessellation { cols, rows } => {
-                Self::TriangularTessellation { cols, rows }
-            }
+        Self {
+            tag: value.tag,
+            payload: value.payload,
         }
     }
 }
 
 impl From<PlayableTopologySnapshot> for heddobureika_game::TopologySpec {
     fn from(value: PlayableTopologySnapshot) -> Self {
-        match value {
-            PlayableTopologySnapshot::Unknown {
-                piece_count,
-                edge_count,
-            } => Self::Unknown {
-                piece_count,
-                edge_count,
-            },
-            PlayableTopologySnapshot::Grid { cols, rows } => Self::Grid { cols, rows },
-            PlayableTopologySnapshot::TriangularTessellation { cols, rows } => {
-                Self::TriangularTessellation { cols, rows }
-            }
+        Self {
+            tag: value.tag,
+            payload: value.payload,
         }
     }
 }
@@ -245,7 +273,7 @@ impl PlayableGameStateSnapshot {
     pub fn from_game_snapshot(value: &heddobureika_game::PlayableSnapshot) -> Self {
         Self {
             revision: value.revision,
-            topology: value.topology.into(),
+            topology: value.topology.clone().into(),
             topology_piece_count: value.topology_piece_count,
             topology_edge_count: value.topology_edge_count,
             rules: PlayableRulesSnapshot::from_rules(value.rules),
@@ -282,7 +310,7 @@ impl PlayableGameStateSnapshot {
     ) -> Result<heddobureika_game::PlayableSnapshot, PlayableGameSnapshotError> {
         Ok(heddobureika_game::PlayableSnapshot {
             revision: self.revision,
-            topology: self.topology.into(),
+            topology: self.topology.clone().into(),
             topology_piece_count: self.topology_piece_count,
             topology_edge_count: self.topology_edge_count,
             rules: self.rules.to_rules()?,
@@ -328,7 +356,7 @@ impl PlayableGameStateSnapshot {
 
     pub fn restore_from_spec(
         &self,
-    ) -> Result<heddobureika_game::RestoredPlayableState, PlayableGameSnapshotError> {
+    ) -> Result<heddobureika_game::GenericPlayableState, PlayableGameSnapshotError> {
         Ok(self.to_game_snapshot()?.restore_from_spec()?)
     }
 }
@@ -364,7 +392,7 @@ impl PlayableGameSnapshot {
 
     pub fn restore_playable_from_spec(
         &self,
-    ) -> Result<heddobureika_game::RestoredPlayableState, PlayableGameSnapshotError> {
+    ) -> Result<heddobureika_game::GenericPlayableState, PlayableGameSnapshotError> {
         self.state.restore_from_spec()
     }
 
@@ -374,18 +402,10 @@ impl PlayableGameSnapshot {
         action_id: Option<heddobureika_game::ActionId>,
         policy: heddobureika_game::MergePolicy,
     ) -> Result<heddobureika_game::PlayableUpdateBatch, PlayableGameSnapshotError> {
-        match self.restore_playable_from_spec()? {
-            heddobureika_game::RestoredPlayableState::Grid(mut playable) => {
-                let batch = playable.apply_action_with_snap(action, action_id, policy);
-                self.replace_state_from_playable(&playable);
-                Ok(batch)
-            }
-            heddobureika_game::RestoredPlayableState::TriangularTessellation(mut playable) => {
-                let batch = playable.apply_action_with_snap(action, action_id, policy);
-                self.replace_state_from_playable(&playable);
-                Ok(batch)
-            }
-        }
+        let mut playable = self.restore_playable_from_spec()?;
+        let batch = playable.apply_action_with_snap(action, action_id, policy);
+        self.replace_state_from_playable(&playable);
+        Ok(batch)
     }
 
     pub fn apply_action_only(
@@ -393,18 +413,10 @@ impl PlayableGameSnapshot {
         action: heddobureika_game::PlayableAction,
         action_id: Option<heddobureika_game::ActionId>,
     ) -> Result<heddobureika_game::PlayableUpdateBatch, PlayableGameSnapshotError> {
-        match self.restore_playable_from_spec()? {
-            heddobureika_game::RestoredPlayableState::Grid(mut playable) => {
-                let batch = playable.apply_action_only(action, action_id);
-                self.replace_state_from_playable(&playable);
-                Ok(batch)
-            }
-            heddobureika_game::RestoredPlayableState::TriangularTessellation(mut playable) => {
-                let batch = playable.apply_action_only(action, action_id);
-                self.replace_state_from_playable(&playable);
-                Ok(batch)
-            }
-        }
+        let mut playable = self.restore_playable_from_spec()?;
+        let batch = playable.apply_action_only(action, action_id);
+        self.replace_state_from_playable(&playable);
+        Ok(batch)
     }
 
     pub fn apply_restricted_action(
@@ -412,18 +424,10 @@ impl PlayableGameSnapshot {
         action: heddobureika_game::RestrictedPlayableAction,
         action_id: Option<heddobureika_game::ActionId>,
     ) -> Result<heddobureika_game::PlayableUpdateBatch, PlayableGameSnapshotError> {
-        match self.restore_playable_from_spec()? {
-            heddobureika_game::RestoredPlayableState::Grid(mut playable) => {
-                let batch = playable.apply_restricted_action_batch(action, action_id);
-                self.replace_state_from_playable(&playable);
-                Ok(batch)
-            }
-            heddobureika_game::RestoredPlayableState::TriangularTessellation(mut playable) => {
-                let batch = playable.apply_restricted_action_batch(action, action_id);
-                self.replace_state_from_playable(&playable);
-                Ok(batch)
-            }
-        }
+        let mut playable = self.restore_playable_from_spec()?;
+        let batch = playable.apply_restricted_action_batch(action, action_id);
+        self.replace_state_from_playable(&playable);
+        Ok(batch)
     }
 
     fn replace_state_from_playable<T: heddobureika_game::PuzzleTopology>(

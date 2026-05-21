@@ -340,20 +340,20 @@ pub(crate) fn request_render() {
 #[derive(Clone, PartialEq)]
 struct PuzzleKey {
     image_ref: PuzzleImageRef,
-    cols: u32,
-    rows: u32,
+    topology: heddobureika_core::PlayableTopologySnapshot,
     width: u32,
     height: u32,
+    shape_seed: u32,
 }
 
 impl PuzzleKey {
     fn from_info(info: &PuzzleInfo) -> Self {
         Self {
             image_ref: info.image_ref.clone(),
-            cols: info.cols,
-            rows: info.rows,
+            topology: info.topology.clone(),
             width: info.image_width,
             height: info.image_height,
+            shape_seed: info.shape_seed,
         }
     }
 }
@@ -1018,8 +1018,9 @@ impl WgpuView {
                     if gate.pointer_id != drag_id {
                         gate.moved = true;
                     } else if !gate.moved {
-                        let click_tolerance =
-                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        let click_tolerance = snapshot.min_piece_extent_px[0]
+                            .min(snapshot.min_piece_extent_px[1])
+                            * CLICK_MOVE_RATIO;
                         let slop = screen_slop_to_puzzle(
                             TOUCH_DRAG_SLOP_PX,
                             &self.canvas,
@@ -1186,8 +1187,9 @@ impl WgpuView {
                     .map(|(last_x, last_y)| {
                         let dx = px - last_x;
                         let dy = py - last_y;
-                        let slop =
-                            snapshot.piece_width.min(snapshot.piece_height) * CLICK_MOVE_RATIO;
+                        let slop = snapshot.min_piece_extent_px[0]
+                            .min(snapshot.min_piece_extent_px[1])
+                            * CLICK_MOVE_RATIO;
                         dx * dx + dy * dy > slop * slop
                     })
                     .unwrap_or(true);
@@ -2787,9 +2789,7 @@ impl WgpuView {
             &snapshot.piece_flipped,
             &snapshot.z_order,
             mask_atlas,
-            assets.grid.cols as usize,
-            assets.piece_width,
-            assets.piece_height,
+            &assets.render_geometry,
             assets.mask_pad,
         )
     }
@@ -2893,14 +2893,7 @@ impl WgpuView {
         };
         if self.mask_atlas.borrow().is_none() {
             boot::set_phase("Preparing pieces", "Building mask atlas.");
-            let mask_atlas_data = match build_mask_atlas(
-                &assets.pieces,
-                &assets.paths,
-                assets.piece_width,
-                assets.piece_height,
-                assets.grid,
-                assets.mask_pad,
-            ) {
+            let mask_atlas_data = match build_mask_atlas(&assets.render_geometry) {
                 Ok(atlas) => Rc::new(atlas),
                 Err(err) => {
                     boot::fail(
@@ -2952,21 +2945,23 @@ impl WgpuView {
         }
         let is_dark = is_dark_theme(snapshot.app_settings.theme_mode);
         let (connections_label, border_connections_label) =
-            if let Some(info) = snapshot.puzzle_info.as_ref() {
-                let cols = info.cols as usize;
-                let rows = info.rows as usize;
-                let total = cols * rows;
-                let connections = snapshot.piece_connections();
-                if connections.len() == total {
-                    let (connected, border_connected, total_expected, border_expected) =
-                        count_connections(&connections, cols, rows);
-                    (
-                        format_progress(connected, total_expected),
-                        format_progress(border_connected, border_expected),
-                    )
+            if let Some(game) = snapshot.game.as_ref() {
+                let connections_label = format_progress(
+                    game.playable.logical.active_edge_count(),
+                    game.playable.logical.edge_count(),
+                );
+                // Topology-agnostic "border connections" count: every
+                // edge whose both endpoints are frame-border pieces is
+                // counted as a "border edge"; we report how many of those
+                // are currently active. Works for grid, triangular, and
+                // any future topology that defines `is_frame_border_piece`.
+                let (border_connected, border_expected) = count_border_connections(&game.playable);
+                let border_connections_label = if border_expected > 0 {
+                    format_progress(border_connected, border_expected)
                 } else {
-                    ("--".to_string(), "--".to_string())
-                }
+                    "--".to_string()
+                };
+                (connections_label, border_connections_label)
             } else {
                 ("--".to_string(), "--".to_string())
             };
@@ -3043,19 +3038,15 @@ impl WgpuView {
         let ownership_by_anchor = sync_view.ownership_by_anchor();
         let positions = snapshot.piece_positions_px();
         let rotations = snapshot.piece_rotations_deg();
-        let connections = snapshot.piece_connections();
         let instances = build_wgpu_instances(
             &positions,
             &rotations,
             &snapshot.piece_flipped,
             &snapshot.z_order,
-            &connections,
             snapshot.hovered_id,
             snapshot.app_settings.show_debug,
-            assets.grid.cols as usize,
-            assets.grid.rows as usize,
-            assets.piece_width,
-            assets.piece_height,
+            snapshot,
+            &assets.render_geometry,
             mask_atlas,
             highlight_members,
             drag_origin,
@@ -3100,11 +3091,11 @@ impl WgpuView {
         self.creating.set(true);
         let canvas = self.canvas.clone();
         let image = image.clone();
-        let pieces = assets.pieces.clone();
-        let paths = assets.paths.clone();
-        let grid = assets.grid;
-        let piece_width = assets.piece_width;
-        let piece_height = assets.piece_height;
+        let puzzle_bounds_px = [
+            assets.render_geometry.puzzle_bounds_px.width,
+            assets.render_geometry.puzzle_bounds_px.height,
+        ];
+        let typical_piece_extent_px = assets.render_geometry.typical_piece_extent_px;
         let view_min_x = view_rect.min_x;
         let view_min_y = view_rect.min_y;
         let view_width = view_rect.width;
@@ -3136,11 +3127,8 @@ impl WgpuView {
             match WgpuRenderer::new(
                 canvas,
                 image,
-                pieces,
-                paths,
-                grid,
-                piece_width,
-                piece_height,
+                puzzle_bounds_px,
+                typical_piece_extent_px,
                 view_min_x,
                 view_min_y,
                 view_width,
@@ -3301,8 +3289,7 @@ fn drag_angle_for_group(count: usize) -> f32 {
 fn drag_group_center(
     positions: &[(f32, f32)],
     members: &[usize],
-    piece_width: f32,
-    piece_height: f32,
+    geometry: &PuzzleRenderGeometry,
 ) -> Option<(f32, f32)> {
     if members.is_empty() {
         return None;
@@ -3311,9 +3298,9 @@ fn drag_group_center(
     let mut sum_y = 0.0;
     let mut count = 0.0;
     for id in members {
-        if let Some(pos) = positions.get(*id) {
-            sum_x += pos.0 + piece_width * 0.5;
-            sum_y += pos.1 + piece_height * 0.5;
+        if let (Some(pos), Some(piece)) = (positions.get(*id), geometry.pieces.get(*id)) {
+            sum_x += pos.0 + piece.pose_anchor_px[0];
+            sum_y += pos.1 + piece.pose_anchor_px[1];
             count += 1.0;
         }
     }
@@ -3329,10 +3316,9 @@ fn drag_group_position(
     center: (f32, f32),
     scale: f32,
     rotation_deg: f32,
-    piece_width: f32,
-    piece_height: f32,
+    pose_anchor_px: [f32; 2],
 ) -> (f32, f32) {
-    let piece_center = (pos.0 + piece_width * 0.5, pos.1 + piece_height * 0.5);
+    let piece_center = (pos.0 + pose_anchor_px[0], pos.1 + pose_anchor_px[1]);
     let mut dx = piece_center.0 - center.0;
     let mut dy = piece_center.1 - center.1;
     dx *= scale;
@@ -3340,8 +3326,8 @@ fn drag_group_position(
     let (rx, ry) = rotate_vec(dx, dy, rotation_deg);
     let new_center = (center.0 + rx, center.1 + ry);
     (
-        new_center.0 - piece_width * 0.5,
-        new_center.1 - piece_height * 0.5,
+        new_center.0 - pose_anchor_px[0],
+        new_center.1 - pose_anchor_px[1],
     )
 }
 
@@ -3350,13 +3336,10 @@ fn build_wgpu_instances(
     rotations: &[f32],
     flips: &[bool],
     z_order: &[usize],
-    connections: &[[bool; 4]],
     hovered_id: Option<usize>,
     show_debug: bool,
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
+    snapshot: &AppSnapshot,
+    geometry: &PuzzleRenderGeometry,
     mask_atlas: &MaskAtlasData,
     highlighted_members: Option<&[usize]>,
     drag_origin: Option<(f32, f32)>,
@@ -3364,7 +3347,7 @@ fn build_wgpu_instances(
     ownership_by_anchor: &HashMap<u32, ClientId>,
     own_client_id: Option<ClientId>,
 ) -> InstanceSet {
-    let total = cols * rows;
+    let total = geometry.pieces.len();
     if total == 0 {
         return InstanceSet {
             instances: Vec::new(),
@@ -3390,8 +3373,12 @@ fn build_wgpu_instances(
             }
         }
     } else if let Some(id) = hovered_id {
-        if id < total && id < connections.len() {
-            for member in collect_group(connections, id, cols, rows) {
+        if id < total {
+            let members = snapshot.group_members_for_piece(id);
+            if members.is_empty() {
+                hovered_mask[id] = true;
+            }
+            for member in members {
                 if member < hovered_mask.len() {
                     hovered_mask[member] = true;
                 }
@@ -3418,9 +3405,7 @@ fn build_wgpu_instances(
     let drag_scale = if drag_active { DRAG_SCALE } else { 1.0 };
     let drag_center = if drag_active {
         drag_origin.or_else(|| {
-            highlighted_members.and_then(|members| {
-                drag_group_center(positions, members, piece_width, piece_height)
-            })
+            highlighted_members.and_then(|members| drag_group_center(positions, members, geometry))
         })
     } else {
         None
@@ -3440,14 +3425,10 @@ fn build_wgpu_instances(
         queue.push(start);
         while let Some(id) = queue.pop() {
             members.push(id);
-            for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-                if connections.get(id).map(|edges| edges[dir]).unwrap_or(false) {
-                    if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
-                        if group_id[neighbor] == usize::MAX {
-                            group_id[neighbor] = gid;
-                            queue.push(neighbor);
-                        }
-                    }
+            for neighbor in snapshot.group_members_for_piece(id) {
+                if neighbor < total && group_id[neighbor] == usize::MAX {
+                    group_id[neighbor] = gid;
+                    queue.push(neighbor);
                 }
             }
         }
@@ -3490,10 +3471,11 @@ fn build_wgpu_instances(
         }
         let start = instances.len() as u32;
         for &id in members {
-            let col = id % cols;
-            let row = id / cols;
-            let base_x = col as f32 * piece_width;
-            let base_y = row as f32 * piece_height;
+            let Some(piece) = geometry.pieces.get(id) else {
+                continue;
+            };
+            let base_x = piece.bounds_px.x;
+            let base_y = piece.bounds_px.y;
             let pos = positions.get(id).copied().unwrap_or((base_x, base_y));
             let render_pos = if drag_mask.get(id).copied().unwrap_or(false) {
                 if let Some(center) = drag_center {
@@ -3502,8 +3484,7 @@ fn build_wgpu_instances(
                         center,
                         drag_scale,
                         drag_rotation,
-                        piece_width,
-                        piece_height,
+                        piece.pose_anchor_px,
                     )
                 } else {
                     pos
@@ -3518,7 +3499,7 @@ fn build_wgpu_instances(
             let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
             instances.push(Instance {
                 pos: [render_pos.0, render_pos.1],
-                size: [piece_width, piece_height],
+                size: [piece.bounds_px.width, piece.bounds_px.height],
                 rotation,
                 flip: if flipped { 1.0 } else { 0.0 },
                 hover: if show_debug {
@@ -3537,6 +3518,7 @@ fn build_wgpu_instances(
                 },
                 piece_origin: [base_x, base_y],
                 mask_origin,
+                pose_anchor: piece.pose_anchor_px,
             });
         }
         let count = (instances.len() as u32) - start;
@@ -3573,17 +3555,10 @@ fn piece_owned_by_other(
     if ownership.is_empty() {
         return false;
     }
-    let cols = snapshot.grid.cols as usize;
-    let rows = snapshot.grid.rows as usize;
-    if cols == 0 || rows == 0 {
+    if piece_id >= snapshot.piece_group_anchor.len() {
         return false;
     }
-    let total = cols * rows;
-    let connections = snapshot.piece_connections();
-    if piece_id >= total || connections.len() < total {
-        return false;
-    }
-    let mut members = collect_group(&connections, piece_id, cols, rows);
+    let mut members = snapshot.group_members_for_piece(piece_id);
     if members.is_empty() {
         members.push(piece_id);
     }
@@ -3602,41 +3577,33 @@ fn pick_piece_at(
     flips: &[bool],
     z_order: &[usize],
     mask_atlas: &MaskAtlasData,
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
+    geometry: &PuzzleRenderGeometry,
     mask_pad: f32,
 ) -> Option<usize> {
-    if cols == 0 || piece_width <= 0.0 || piece_height <= 0.0 {
+    if geometry.pieces.is_empty() {
         return None;
     }
-    let center_x = piece_width * 0.5;
-    let center_y = piece_height * 0.5;
-    let min_x = -mask_pad;
-    let min_y = -mask_pad;
-    let max_x = piece_width + mask_pad;
-    let max_y = piece_height + mask_pad;
     let atlas_width = mask_atlas.width as i32;
     let atlas_height = mask_atlas.height as i32;
     for &piece_id in z_order.iter().rev() {
-        let col = piece_id % cols;
-        let row = piece_id / cols;
-        let base_x = col as f32 * piece_width;
-        let base_y = row as f32 * piece_height;
-        let pos = positions.get(piece_id).copied().unwrap_or((base_x, base_y));
+        let Some(piece) = geometry.pieces.get(piece_id) else {
+            continue;
+        };
+        let pos = positions
+            .get(piece_id)
+            .copied()
+            .unwrap_or((piece.bounds_px.x, piece.bounds_px.y));
         let rotation = rotations.get(piece_id).copied().unwrap_or(0.0);
         let flipped = flips.get(piece_id).copied().unwrap_or(false);
-        let mut local_x = x - pos.0;
-        let mut local_y = y - pos.1;
-        if rotation.abs() > f32::EPSILON {
-            let rot = if flipped { rotation } else { -rotation };
-            let (rx, ry) = rotate_point(local_x, local_y, center_x, center_y, rot);
-            local_x = rx;
-            local_y = ry;
-        }
-        if flipped {
-            local_x = piece_width - local_x;
-        }
+        let Some((local_x, local_y)) =
+            geometry.hit_test_local_coords(piece.id, (x, y), pos, rotation, flipped)
+        else {
+            continue;
+        };
+        let min_x = -mask_pad;
+        let min_y = -mask_pad;
+        let max_x = piece.bounds_px.width + mask_pad;
+        let max_y = piece.bounds_px.height + mask_pad;
         if local_x < min_x || local_y < min_y || local_x > max_x || local_y > max_y {
             continue;
         }

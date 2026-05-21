@@ -7,10 +7,10 @@ use crate::ids::{GroupId, PieceId};
 use crate::logical::{GroupSlot, LogicalInvariantError, LogicalState, PieceSlot};
 use crate::playable::{FlipState, PlayableInvariantError, PlayableState, Pose2};
 use crate::rules::PlayRules;
-use crate::topology::{GridTopology, TopologySpec, TriangularTessellationTopology};
+use crate::topology::{build_topology_from_spec, GenericPlayableState, TopologySpec};
 use crate::traits::topology::PuzzleTopology;
 
-pub const PLAYABLE_SNAPSHOT_VERSION: u32 = 1;
+pub const PLAYABLE_SNAPSHOT_VERSION: u32 = 2;
 
 /// Snapshot validation/restore failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,7 +107,7 @@ impl PlayableSnapshot {
     ) -> Self {
         Self {
             revision: playable.revision,
-            topology: playable.logical.topology.topology_spec(),
+            topology: playable.logical.topology.to_spec(),
             topology_piece_count: playable.logical.piece_count() as u32,
             topology_edge_count: playable.logical.edge_count() as u32,
             rules: playable.rules,
@@ -134,7 +134,7 @@ impl PlayableSnapshot {
     ) -> Result<(), PlayableSnapshotError> {
         let piece_count = topology.piece_count() as usize;
         let edge_count = topology.edge_count() as usize;
-        self.validate_topology_spec(topology.topology_spec())?;
+        self.validate_topology_descriptor(topology.to_spec())?;
         self.validate_lengths(piece_count, edge_count)?;
 
         let canonical = PlayableState::new(LogicalState::new(topology), self.rules);
@@ -174,47 +174,40 @@ impl PlayableSnapshot {
         Ok(playable)
     }
 
-    pub fn restore_from_spec(&self) -> Result<RestoredPlayableState, PlayableSnapshotError> {
-        match self.topology {
-            TopologySpec::Grid { cols, rows } => {
-                let topology = GridTopology::try_new(cols, rows).ok_or(
-                    PlayableSnapshotError::UnknownTopologySpec {
-                        topology: self.topology,
-                    },
-                )?;
-                Ok(RestoredPlayableState::Grid(self.restore(topology)?))
+    pub fn restore_from_descriptor(&self) -> Result<GenericPlayableState, PlayableSnapshotError> {
+        let topology = build_topology_from_spec(&self.topology).ok_or_else(|| {
+            PlayableSnapshotError::UnknownTopologySpec {
+                topology: self.topology.clone(),
             }
-            TopologySpec::TriangularTessellation { cols, rows } => {
-                let topology = TriangularTessellationTopology::try_new(cols, rows).ok_or(
-                    PlayableSnapshotError::UnknownTopologySpec {
-                        topology: self.topology,
-                    },
-                )?;
-                Ok(RestoredPlayableState::TriangularTessellation(
-                    self.restore(topology)?,
-                ))
-            }
-            TopologySpec::Unknown { .. } => Err(PlayableSnapshotError::UnknownTopologySpec {
-                topology: self.topology,
-            }),
-        }
+        })?;
+        self.restore(topology)
     }
 
-    fn validate_topology_spec(&self, expected: TopologySpec) -> Result<(), PlayableSnapshotError> {
+    pub fn restore_from_spec(&self) -> Result<GenericPlayableState, PlayableSnapshotError> {
+        self.restore_from_descriptor()
+    }
+
+    fn validate_topology_descriptor(
+        &self,
+        expected: TopologySpec,
+    ) -> Result<(), PlayableSnapshotError> {
         if self.topology != expected {
             return Err(PlayableSnapshotError::TopologySpecMismatch {
-                snapshot: self.topology,
+                snapshot: self.topology.clone(),
                 expected,
             });
         }
-        if !self
-            .topology
-            .matches_counts(self.topology_piece_count, self.topology_edge_count)
-        {
-            return Err(PlayableSnapshotError::TopologySpecMismatch {
-                snapshot: self.topology,
-                expected,
-            });
+        // The snapshot carries piece/edge counts redundantly with the
+        // topology spec; rebuild the topology to confirm they line up.
+        if let Some(topology) = build_topology_from_spec(&self.topology) {
+            if topology.piece_count() != self.topology_piece_count
+                || topology.edge_count() != self.topology_edge_count
+            {
+                return Err(PlayableSnapshotError::TopologySpecMismatch {
+                    snapshot: self.topology.clone(),
+                    expected,
+                });
+            }
         }
         Ok(())
     }
@@ -319,10 +312,7 @@ impl PlayableSnapshot {
     }
 }
 
-pub enum RestoredPlayableState {
-    Grid(PlayableState<GridTopology>),
-    TriangularTessellation(PlayableState<TriangularTessellationTopology>),
-}
+pub type RestoredPlayableState = GenericPlayableState;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotEnvelope {
@@ -385,30 +375,4 @@ fn build_logical_state<T: PuzzleTopology>(
         scratch_queue: Vec::with_capacity(piece_count),
         scratch_marks: vec![false; piece_count],
     })
-}
-
-impl<T: PuzzleTopology> PuzzleTopology for &T {
-    fn topology_spec(&self) -> TopologySpec {
-        (*self).topology_spec()
-    }
-
-    fn piece_count(&self) -> u32 {
-        (*self).piece_count()
-    }
-
-    fn edge_count(&self) -> u32 {
-        (*self).edge_count()
-    }
-
-    fn edge_endpoints(&self, edge: crate::ids::EdgeId) -> (PieceId, PieceId) {
-        (*self).edge_endpoints(edge)
-    }
-
-    fn expected_relative_pose(&self, a: PieceId, b: PieceId) -> crate::topology::RelativePose {
-        (*self).expected_relative_pose(a, b)
-    }
-
-    fn symmetry_angles(&self, piece: PieceId) -> &[crate::units::AngleDeg] {
-        (*self).symmetry_angles(piece)
-    }
 }

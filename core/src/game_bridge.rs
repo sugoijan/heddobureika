@@ -11,10 +11,14 @@
 //! has been removed.
 
 pub use heddobureika_game::{
-    ActionId, AngleDeg, EdgeId, FlipState, GridTopology, GroupId, LengthMm, LogicalState,
-    MergePolicy, PieceId, PlayRules, PlayableAction, PlayableDelta, PlayableState,
-    PlayableUpdateBatch, Pose2, Position2, ProjectionScratch, PuzzleTopology,
-    RestoredPlayableState, RestrictedPlayableAction, VisualState,
+    build_topology_from_spec, cache_to_svg_paths, path_to_svg_d, ActionId, AngleDeg, EdgeId,
+    FlipState, GenericPlayableState, GenericTopology, GridShapeSettings, GridTopology, GroupId,
+    LengthMm, LogicalState, MergePolicy, PathMm, PathSegMm, PieceEdgeRef, PieceGeometryProvider,
+    PieceId, PiecePaths, PieceRenderGeometry, PlayRules, PlayableAction, PlayableDelta,
+    PlayableState, PlayableUpdateBatch, PointMm, Pose2, Position2, ProjectionScratch,
+    PuzzleFrameShape, PuzzleRenderGeometry, PuzzleTopology, RectPx, RestoredPlayableState,
+    RestrictedPlayableAction, TopologyShaper, TopologySpec, TriangularTessellationShapeSettings,
+    TriangularTessellationShaper, TriangularTessellationTopology, VisualState,
 };
 
 use crate::snapshot::PlayableGameSnapshotError;

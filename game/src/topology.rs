@@ -1,10 +1,13 @@
 //! Topology contracts for geometry-agnostic puzzle behavior.
 
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
+use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 use crate::ids::{EdgeId, PieceId};
-pub use crate::traits::topology::{FrameSnapKind, PuzzleTopology};
+use crate::playable::{PlayableState, Pose2};
+use crate::rotation_step::SymmetryStrength;
+pub use crate::traits::topology::{FrameBounds, PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
 
 /// Relative transform expectation for topology-defined neighbor relationships.
@@ -15,66 +18,133 @@ pub struct RelativePose {
     pub drot: AngleDeg,
 }
 
-/// Transport-friendly topology identity for canonical snapshots.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TopologySpec {
-    Unknown { piece_count: u32, edge_count: u32 },
-    Grid { cols: u32, rows: u32 },
-    TriangularTessellation { cols: u32, rows: u32 },
+pub type GenericTopology = Arc<dyn PuzzleTopology>;
+pub type GenericPlayableState = PlayableState<GenericTopology>;
+
+/// Topology-neutral, transport-friendly puzzle identity. Carries a `tag`
+/// (which topology family this is) and an opaque `payload` (the bytes
+/// that family uses to reconstruct itself). Consumers should treat the
+/// `payload` as opaque — only the topology that emitted it knows how
+/// to read it.
+///
+/// The only code that should look at `tag` is `build_topology_from_spec`
+/// below. Everywhere else, two `TopologySpec`s are interchangeable iff
+/// they are byte-equal.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TopologySpec {
+    pub tag: String,
+    pub payload: Vec<u8>,
 }
 
 impl TopologySpec {
-    pub fn piece_count(self) -> u32 {
-        match self {
-            Self::Unknown { piece_count, .. } => piece_count,
-            Self::Grid { cols, rows } => cols * rows,
-            Self::TriangularTessellation { cols, rows } => cols * (rows * 2 + 1),
+    /// Constructs a placeholder spec used in tests / fallback paths. Not
+    /// resolvable back to a `PuzzleTopology`.
+    pub fn unknown() -> Self {
+        Self {
+            tag: "unknown".to_string(),
+            payload: Vec::new(),
         }
     }
 
-    pub fn edge_count(self) -> u32 {
-        match self {
-            Self::Unknown { edge_count, .. } => edge_count,
-            Self::Grid { cols, rows } => {
-                rows * cols.saturating_sub(1) + cols * rows.saturating_sub(1)
-            }
-            Self::TriangularTessellation { cols, rows } => {
-                let piece_rows = rows * 2 + 1;
-                let vertical = piece_rows.saturating_sub(1) * cols;
-                let horizontal = (0..piece_rows)
-                    .map(|piece_row| {
-                        let start = if piece_row % 2 == 0 { 0 } else { 1 };
-                        if start >= cols {
-                            0
-                        } else {
-                            (cols - start) / 2
-                        }
-                    })
-                    .sum::<u32>();
-                vertical + horizontal
-            }
-        }
+    /// Convenience constructor for a `GridTopology` spec.
+    pub fn grid(cols: u32, rows: u32) -> Self {
+        GridTopology::new_spec(cols, rows)
     }
 
-    pub fn matches_counts(self, piece_count: u32, edge_count: u32) -> bool {
-        self.piece_count() == piece_count && self.edge_count() == edge_count
+    /// Convenience constructor for a `TriangularTessellationTopology` spec.
+    pub fn triangular_tessellation(cols: u32, rows: u32) -> Self {
+        TriangularTessellationTopology::new_spec(cols, rows)
     }
 
-    pub fn grid_topology(self) -> Option<GridTopology> {
-        match self {
-            Self::Grid { cols, rows } => GridTopology::try_new(cols, rows),
-            _ => None,
-        }
+    /// Convenience constructor for a `HexagonalTopology` spec. `cols`
+    /// must be odd (see `HexagonalTopology::new`). `aspect_ratio` is
+    /// the puzzle image's `W/H`; it controls how much the outer
+    /// columns stretch to keep inner hexes regular.
+    pub fn hexagonal(cols: u32, rows: u32, aspect_ratio: f32) -> Self {
+        crate::hexagonal_topology::HexagonalTopology::new_spec(cols, rows, aspect_ratio)
     }
 
-    pub fn triangular_tessellation_topology(self) -> Option<TriangularTessellationTopology> {
-        match self {
-            Self::TriangularTessellation { cols, rows } => {
-                TriangularTessellationTopology::try_new(cols, rows)
-            }
-            _ => None,
+    /// Convenience constructor for a `VoronoiTopology` spec.
+    ///
+    /// `aspect_ratio` is the image's width / height. Voronoi identity
+    /// depends on aspect because the cell geometry would distort if the
+    /// tessellation were stretched to a different aspect after the fact.
+    pub fn voronoi(piece_count: u32, seed: u32, aspect_ratio: f32) -> Self {
+        crate::voronoi_topology::VoronoiTopology::new_spec(piece_count, seed, aspect_ratio)
+    }
+}
+
+/// Trait implemented by every concrete `PuzzleTopology` that can be
+/// serialized to / deserialized from a `TopologySpec`. Each topology owns
+/// its own tag string and the encoding of its parameters; nobody outside
+/// the topology should interpret the payload.
+pub trait SerializableTopology: PuzzleTopology + Sized {
+    const TAG: &'static str;
+
+    /// Encode `self`'s parameters into a byte payload. The reverse of
+    /// `read_payload`.
+    fn write_payload(&self) -> Vec<u8>;
+
+    /// Decode a `(cols, rows)`-style payload into a topology instance.
+    /// Returns `None` for malformed input.
+    fn read_payload(bytes: &[u8]) -> Option<Self>;
+
+    /// Builds a `TopologySpec` for this concrete topology.
+    fn to_spec(&self) -> TopologySpec {
+        TopologySpec {
+            tag: Self::TAG.to_string(),
+            payload: self.write_payload(),
         }
     }
+}
+
+/// The single dispatch site that interprets `TopologySpec::tag`. Every
+/// other consumer of `TopologySpec` should treat the spec as opaque and
+/// route through this function (or `PuzzleTopology::to_spec` for the
+/// inverse direction).
+///
+/// Adding a new topology means: implement `SerializableTopology` on the
+/// new topology and add one match arm here.
+pub fn build_topology_from_spec(spec: &TopologySpec) -> Option<GenericTopology> {
+    match spec.tag.as_str() {
+        GridTopology::TAG => GridTopology::read_payload(&spec.payload)
+            .map(|t| Arc::new(t) as Arc<dyn PuzzleTopology>),
+        TriangularTessellationTopology::TAG => {
+            TriangularTessellationTopology::read_payload(&spec.payload)
+                .map(|t| Arc::new(t) as Arc<dyn PuzzleTopology>)
+        }
+        <crate::hexagonal_topology::HexagonalTopology as SerializableTopology>::TAG => {
+            crate::hexagonal_topology::HexagonalTopology::read_payload(&spec.payload)
+                .map(|t| Arc::new(t) as Arc<dyn PuzzleTopology>)
+        }
+        <crate::voronoi_topology::VoronoiTopology as SerializableTopology>::TAG => {
+            crate::voronoi_topology::VoronoiTopology::read_payload(&spec.payload)
+                .map(|t| Arc::new(t) as Arc<dyn PuzzleTopology>)
+        }
+        tag if tag == crate::voronoi_topology::VoronoiTopology::legacy_tag() => {
+            crate::voronoi_topology::VoronoiTopology::read_legacy_payload(&spec.payload)
+                .map(|t| Arc::new(t) as Arc<dyn PuzzleTopology>)
+        }
+        _ => None,
+    }
+}
+
+/// Helper: pack two `u32`s into 8 little-endian bytes. Used by grid and
+/// triangular topologies for their `(cols, rows)` payloads.
+fn write_two_u32_payload(a: u32, b: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8);
+    bytes.extend_from_slice(&a.to_le_bytes());
+    bytes.extend_from_slice(&b.to_le_bytes());
+    bytes
+}
+
+fn read_two_u32_payload(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let a = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let b = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    Some((a, b))
 }
 
 /// Rectangular grid puzzle topology.
@@ -176,12 +246,33 @@ impl GridTopology {
     }
 }
 
-impl PuzzleTopology for GridTopology {
-    fn topology_spec(&self) -> TopologySpec {
-        TopologySpec::Grid {
-            cols: self.cols.get(),
-            rows: self.rows.get(),
+impl GridTopology {
+    /// Convenience constructor for a `TopologySpec` describing a grid of
+    /// the given dimensions. Equivalent to `TopologySpec::grid(cols, rows)`.
+    pub fn new_spec(cols: u32, rows: u32) -> TopologySpec {
+        TopologySpec {
+            tag: <Self as SerializableTopology>::TAG.to_string(),
+            payload: write_two_u32_payload(cols, rows),
         }
+    }
+}
+
+impl SerializableTopology for GridTopology {
+    const TAG: &'static str = "grid";
+
+    fn write_payload(&self) -> Vec<u8> {
+        write_two_u32_payload(self.cols.get(), self.rows.get())
+    }
+
+    fn read_payload(bytes: &[u8]) -> Option<Self> {
+        let (cols, rows) = read_two_u32_payload(bytes)?;
+        Self::try_new(cols, rows)
+    }
+}
+
+impl PuzzleTopology for GridTopology {
+    fn to_spec(&self) -> TopologySpec {
+        <Self as SerializableTopology>::to_spec(self)
     }
 
     fn piece_count(&self) -> u32 {
@@ -238,8 +329,128 @@ impl PuzzleTopology for GridTopology {
         grid_symmetry_angles()
     }
 
-    fn frame_snap_kind(&self) -> FrameSnapKind {
-        FrameSnapKind::Grid
+    fn frame_bounds(&self) -> Option<FrameBounds> {
+        Some(FrameBounds {
+            min_x: 0.5,
+            min_y: 0.5,
+            max_x: self.cols.get().saturating_sub(1) as f32 + 0.5,
+            max_y: self.rows.get().saturating_sub(1) as f32 + 0.5,
+        })
+    }
+
+    fn is_frame_border_piece(&self, piece: PieceId) -> bool {
+        let Some((row, col)) = self.piece_row_col(piece) else {
+            return false;
+        };
+        row == 0 || row + 1 == self.rows.get() || col == 0 || col + 1 == self.cols.get()
+    }
+
+    fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
+        let Some((row, col)) = self.piece_row_col(piece) else {
+            return;
+        };
+        let cols = self.cols.get();
+        let rows = self.rows.get();
+        // Grid pieces are unit squares in pose units centred on the
+        // anchor; outer edges sit at ±0.5 in piece-local coords.
+        // Corner pieces emit *two* BorderEdges; the universal solver
+        // turns those into a two-axis snap, so no CornerAttachment is
+        // needed.
+        if row == 0 {
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (-0.5, -0.5),
+                p2: (0.5, -0.5),
+            });
+        }
+        if col + 1 == cols {
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (0.5, -0.5),
+                p2: (0.5, 0.5),
+            });
+        }
+        if row + 1 == rows {
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (-0.5, 0.5),
+                p2: (0.5, 0.5),
+            });
+        }
+        if col == 0 {
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (-0.5, -0.5),
+                p2: (-0.5, 0.5),
+            });
+        }
+    }
+
+    fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
+        Some((
+            PieceId(0),
+            Pose2::try_from_mm_degrees(0.5, 0.5, 0.0).unwrap_or_default(),
+        ))
+    }
+
+    fn dims_hint(&self) -> Option<(u32, u32)> {
+        Some((self.cols.get(), self.rows.get()))
+    }
+
+    fn image_extent_in_pose_units(&self) -> (f32, f32) {
+        (self.cols.get() as f32, self.rows.get() as f32)
+    }
+
+    fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
+        let (row, col) = self.piece_row_col(piece)?;
+        Some((col as f32 + 0.5, row as f32 + 0.5))
+    }
+
+    fn build_render_geometry(
+        &self,
+        image_width: u32,
+        image_height: u32,
+        shape_seed: u32,
+        settings: &dyn std::any::Any,
+    ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
+        let default_settings = crate::grid_shape::GridShapeSettings::default();
+        let settings = settings
+            .downcast_ref::<crate::grid_shape::GridShapeSettings>()
+            .unwrap_or(&default_settings);
+        let piece_width = LengthMm::try_new(image_width as f32 / self.cols.get() as f32)?;
+        let piece_height = LengthMm::try_new(image_height as f32 / self.rows.get() as f32)?;
+        use crate::traits::shaping::TopologyShaper;
+        let cache = crate::grid_shape::GridJigsawShaper
+            .build_cache(self, piece_width, piece_height, shape_seed, settings)
+            .ok()?;
+        let pose_unit_x = piece_width.as_mm_f32();
+        let pose_unit_y = piece_height.as_mm_f32();
+        let cols = self.cols.get();
+        let mask_pad_px = cache.mask_pad.as_mm_f32().ceil();
+        // Grid pieces are uniform; the typical piece bbox is the pose
+        // unit on each axis, so frame radius == grid's historical
+        // `min(piece_w, piece_h) * 0.05`.
+        let frame_shape = crate::render_geometry::PuzzleFrameShape::from_image_and_pieces(
+            image_width,
+            image_height,
+            [pose_unit_x, pose_unit_y],
+        );
+        crate::render_geometry::build_render_geometry_from_atlas(
+            self,
+            &cache.atlas,
+            image_width,
+            image_height,
+            [pose_unit_x, pose_unit_y],
+            [0.0, 0.0],
+            mask_pad_px,
+            frame_shape,
+            |piece| {
+                let (x, y) = self.canonical_position_in_pose_units(piece)?;
+                Some((x * pose_unit_x, y * pose_unit_y))
+            },
+            |piece| {
+                let id = piece.as_u32();
+                let col = id % cols;
+                let row = id / cols;
+                (col as f32 * pose_unit_x, row as f32 * pose_unit_y)
+            },
+        )
     }
 }
 
@@ -451,12 +662,33 @@ impl TriangularTessellationTopology {
     }
 }
 
-impl PuzzleTopology for TriangularTessellationTopology {
-    fn topology_spec(&self) -> TopologySpec {
-        TopologySpec::TriangularTessellation {
-            cols: self.cols.get(),
-            rows: self.rows.get(),
+impl TriangularTessellationTopology {
+    /// Convenience constructor for a `TopologySpec` describing a
+    /// triangular-tessellation puzzle of the given dimensions.
+    pub fn new_spec(cols: u32, rows: u32) -> TopologySpec {
+        TopologySpec {
+            tag: <Self as SerializableTopology>::TAG.to_string(),
+            payload: write_two_u32_payload(cols, rows),
         }
+    }
+}
+
+impl SerializableTopology for TriangularTessellationTopology {
+    const TAG: &'static str = "triangular_tessellation";
+
+    fn write_payload(&self) -> Vec<u8> {
+        write_two_u32_payload(self.cols.get(), self.rows.get())
+    }
+
+    fn read_payload(bytes: &[u8]) -> Option<Self> {
+        let (cols, rows) = read_two_u32_payload(bytes)?;
+        Self::try_new(cols, rows)
+    }
+}
+
+impl PuzzleTopology for TriangularTessellationTopology {
+    fn to_spec(&self) -> TopologySpec {
+        <Self as SerializableTopology>::to_spec(self)
     }
 
     fn piece_count(&self) -> u32 {
@@ -493,6 +725,582 @@ impl PuzzleTopology for TriangularTessellationTopology {
             Some(TrianglePieceKind::HalfRegular) => triangular_half_symmetry_angles(),
             _ => triangular_regular_symmetry_angles(),
         }
+    }
+
+    fn frame_bounds(&self) -> Option<FrameBounds> {
+        let mut iter = self.canonical_positions_mm.iter();
+        let first = iter.next()?;
+        let mut min_x = first.0.as_mm_f32();
+        let mut min_y = first.1.as_mm_f32();
+        let mut max_x = min_x;
+        let mut max_y = min_y;
+        for (x, y) in iter {
+            min_x = min_x.min(x.as_mm_f32());
+            min_y = min_y.min(y.as_mm_f32());
+            max_x = max_x.max(x.as_mm_f32());
+            max_y = max_y.max(y.as_mm_f32());
+        }
+        Some(FrameBounds {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        })
+    }
+
+    fn is_frame_border_piece(&self, piece: PieceId) -> bool {
+        let Some((piece_row, col)) = self.piece_row_col(piece) else {
+            return false;
+        };
+        // Top/bottom half-rows always touch a horizontal frame edge.
+        // Regular-row pieces in the first or last column touch one of
+        // the vertical frame edges via the mesh boundary.
+        piece_row == 0
+            || piece_row + 1 == self.piece_row_count()
+            || col == 0
+            || col + 1 == self.cols.get()
+    }
+
+    fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
+        let Some((piece_row, col)) = self.piece_row_col(piece) else {
+            return;
+        };
+        let piece_rows = self.piece_row_count();
+        let cols = self.cols.get();
+        if !self.is_frame_border_piece(piece) {
+            return;
+        }
+
+        let on_top = piece_row == 0;
+        let on_bottom = piece_row + 1 == piece_rows;
+        let on_left = col == 0;
+        let on_right = col + 1 == cols;
+        let is_corner = (on_top || on_bottom) && (on_left || on_right);
+
+        // The triangular layout has piece anchors at canonical
+        // `(col, piece_row)` for even rows and `(col+0.5, piece_row)`
+        // for odd rows. The visual frame runs from `(0, 0)` to
+        // `(cols, piece_rows)`. Half-row anchors are NOT symmetric
+        // about the puzzle interior: top half-row anchors sit ON the
+        // top frame line, while bottom half-row anchors sit one pose
+        // unit ABOVE the bottom frame line (the piece body extends
+        // downward to the frame). The piece-local offsets below model
+        // that asymmetry so each outer feature's world position lands
+        // on the actual visual frame line.
+        let anchor_x = if piece_row % 2 == 0 {
+            col as f32
+        } else {
+            col as f32 + 0.5
+        };
+        let anchor_y = piece_row as f32;
+        let frame_x_left = 0.0_f32;
+        let frame_x_right = cols as f32;
+        let frame_y_top = 0.0_f32;
+        let frame_y_bottom = piece_rows as f32;
+
+        if on_top {
+            let local_y = frame_y_top - anchor_y;
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (-0.5, local_y),
+                p2: (0.5, local_y),
+            });
+        }
+        if on_bottom {
+            let local_y = frame_y_bottom - anchor_y;
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (-0.5, local_y),
+                p2: (0.5, local_y),
+            });
+        }
+        // Regular-row left/right pieces touch the side frame at a
+        // single mesh vertex — we model that as a unit-long vertical
+        // "edge" whose midpoint sits on the frame line in world coords.
+        if !is_corner && (on_left || on_right) {
+            let local_x = if on_left {
+                frame_x_left - anchor_x
+            } else {
+                frame_x_right - anchor_x
+            };
+            visitor(PieceOuterFeature::BorderEdge {
+                p1: (local_x, -0.5),
+                p2: (local_x, 0.5),
+            });
+        }
+        // Half-row corner pieces: the outer corner sits at the puzzle
+        // frame corner, NOT at the anchor. Compute the piece-local
+        // offset accordingly so the CornerAttachment lands on the
+        // correct frame corner under all four rotations.
+        if is_corner {
+            let local_x = if on_left {
+                frame_x_left - anchor_x
+            } else {
+                frame_x_right - anchor_x
+            };
+            let local_y = if on_top {
+                frame_y_top - anchor_y
+            } else {
+                frame_y_bottom - anchor_y
+            };
+            visitor(PieceOuterFeature::CornerAttachment {
+                point: (local_x, local_y),
+            });
+        }
+    }
+
+    fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
+        Some((PieceId(0), Pose2::try_from_mm_degrees(0.0, 0.0, 0.0)?))
+    }
+
+    fn dims_hint(&self) -> Option<(u32, u32)> {
+        Some((self.cols.get(), self.rows.get()))
+    }
+
+    fn image_extent_in_pose_units(&self) -> (f32, f32) {
+        // Triangular pieces stack `2 * rows + 1` piece-rows vertically (a
+        // half-row above and below the regular triangles) — that's the
+        // actual y-axis span in pose units, not `rows`.
+        (self.cols.get() as f32, self.piece_row_count() as f32)
+    }
+
+    fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
+        // The visual puzzle frame matches `image_extent_in_pose_units`:
+        // pieces and the rendered rounded-rectangle border both run
+        // from `0` to `(cols, piece_row_count)` in pose units. The
+        // half-row pieces' geometry sits asymmetrically — top half-row
+        // anchors lie on the top frame line, bottom half-row anchors
+        // sit one pose unit above the bottom frame line — but the
+        // FRAME ITSELF is symmetric. `visit_outer_features` accounts
+        // for the asymmetric anchor placement in the per-piece offsets.
+        self.image_extent_in_pose_units()
+    }
+
+    fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
+        let (x, y) = self.canonical_position_mm(piece)?;
+        Some((x.as_mm_f32(), y.as_mm_f32()))
+    }
+
+    fn build_render_geometry(
+        &self,
+        image_width: u32,
+        image_height: u32,
+        shape_seed: u32,
+        _settings: &dyn std::any::Any,
+    ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
+        use crate::traits::shaping::TopologyShaper;
+        let piece_rows = self.piece_row_count().max(1);
+        let pose_unit_x = image_width as f32 / self.cols.get().max(1) as f32;
+        let pose_unit_y = image_height as f32 / piece_rows as f32;
+        // Estimate the regular triangle bbox in pixels: in canonical
+        // units a unit-side equilateral triangle has a bbox of
+        // `(1, sqrt(3)/2)`; the canonical mesh occupies
+        // `(1.5*cols, (sqrt(3)/2)*piece_row_count)` and is stretched to
+        // `(image_w, image_h)`, so the per-axis stretch factors give
+        // typical bbox = `(pose_unit_x / 1.5, pose_unit_y)`.
+        let typical_x = pose_unit_x / 1.5;
+        let typical_y = pose_unit_y;
+        let frame_shape = crate::render_geometry::PuzzleFrameShape::from_image_and_pieces(
+            image_width,
+            image_height,
+            [typical_x, typical_y],
+        );
+        let shaper = crate::triangular_shape::TriangularTessellationShaper;
+        let settings = crate::triangular_shape::TriangularTessellationShapeSettings {
+            corner_radius_px: frame_shape.corner_radius_px,
+        };
+        let cache = shaper
+            .build_cache(
+                self,
+                LengthMm::try_new(image_width as f32)?,
+                LengthMm::try_new(image_height as f32)?,
+                shape_seed,
+                &settings,
+            )
+            .ok()?;
+        let mask_pad_px = cache.mask_pad.as_mm_f32().ceil();
+        crate::render_geometry::build_render_geometry_from_atlas(
+            self,
+            &cache.atlas,
+            image_width,
+            image_height,
+            [pose_unit_x, pose_unit_y],
+            [0.0, 0.0],
+            mask_pad_px,
+            frame_shape,
+            |piece| {
+                let (x, y) = self.canonical_position_in_pose_units(piece)?;
+                Some((x * pose_unit_x, y * pose_unit_y))
+            },
+            |_piece| (0.0, 0.0),
+        )
+    }
+}
+
+impl<T: PuzzleTopology + ?Sized> PuzzleTopology for &T {
+    fn to_spec(&self) -> TopologySpec {
+        (*self).to_spec()
+    }
+
+    fn piece_count(&self) -> u32 {
+        (*self).piece_count()
+    }
+
+    fn edge_count(&self) -> u32 {
+        (*self).edge_count()
+    }
+
+    fn edge_endpoints(&self, edge: EdgeId) -> (PieceId, PieceId) {
+        (*self).edge_endpoints(edge)
+    }
+
+    fn expected_relative_pose(&self, a: PieceId, b: PieceId) -> RelativePose {
+        (*self).expected_relative_pose(a, b)
+    }
+
+    fn symmetry_angles(&self, piece: PieceId) -> &[AngleDeg] {
+        (*self).symmetry_angles(piece)
+    }
+
+    fn symmetry_strength(&self, piece: PieceId) -> SymmetryStrength {
+        (*self).symmetry_strength(piece)
+    }
+
+    fn step_rotation_cw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        (*self).step_rotation_cw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn step_rotation_ccw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        (*self).step_rotation_ccw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn frame_bounds(&self) -> Option<FrameBounds> {
+        (*self).frame_bounds()
+    }
+
+    fn is_frame_border_piece(&self, piece: PieceId) -> bool {
+        (*self).is_frame_border_piece(piece)
+    }
+
+    fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
+        (*self).visit_outer_features(piece, visitor)
+    }
+
+    fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
+        (*self).identity_frame_anchor()
+    }
+
+    fn dims_hint(&self) -> Option<(u32, u32)> {
+        (*self).dims_hint()
+    }
+
+    fn image_extent_in_pose_units(&self) -> (f32, f32) {
+        (*self).image_extent_in_pose_units()
+    }
+
+    fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
+        (*self).snap_frame_extent_in_pose_units()
+    }
+
+    fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
+        (*self).canonical_position_in_pose_units(piece)
+    }
+
+    fn build_render_geometry(
+        &self,
+        image_width: u32,
+        image_height: u32,
+        shape_seed: u32,
+        settings: &dyn std::any::Any,
+    ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
+        (*self).build_render_geometry(image_width, image_height, shape_seed, settings)
+    }
+}
+
+impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Box<T> {
+    fn to_spec(&self) -> TopologySpec {
+        self.as_ref().to_spec()
+    }
+
+    fn piece_count(&self) -> u32 {
+        self.as_ref().piece_count()
+    }
+
+    fn edge_count(&self) -> u32 {
+        self.as_ref().edge_count()
+    }
+
+    fn edge_endpoints(&self, edge: EdgeId) -> (PieceId, PieceId) {
+        self.as_ref().edge_endpoints(edge)
+    }
+
+    fn expected_relative_pose(&self, a: PieceId, b: PieceId) -> RelativePose {
+        self.as_ref().expected_relative_pose(a, b)
+    }
+
+    fn symmetry_angles(&self, piece: PieceId) -> &[AngleDeg] {
+        self.as_ref().symmetry_angles(piece)
+    }
+
+    fn symmetry_strength(&self, piece: PieceId) -> SymmetryStrength {
+        self.as_ref().symmetry_strength(piece)
+    }
+
+    fn step_rotation_cw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        self.as_ref()
+            .step_rotation_cw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn step_rotation_ccw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        self.as_ref()
+            .step_rotation_ccw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn frame_bounds(&self) -> Option<FrameBounds> {
+        self.as_ref().frame_bounds()
+    }
+
+    fn is_frame_border_piece(&self, piece: PieceId) -> bool {
+        self.as_ref().is_frame_border_piece(piece)
+    }
+
+    fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
+        self.as_ref().visit_outer_features(piece, visitor)
+    }
+
+    fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
+        self.as_ref().identity_frame_anchor()
+    }
+
+    fn dims_hint(&self) -> Option<(u32, u32)> {
+        self.as_ref().dims_hint()
+    }
+
+    fn image_extent_in_pose_units(&self) -> (f32, f32) {
+        self.as_ref().image_extent_in_pose_units()
+    }
+
+    fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
+        self.as_ref().snap_frame_extent_in_pose_units()
+    }
+
+    fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
+        self.as_ref().canonical_position_in_pose_units(piece)
+    }
+
+    fn build_render_geometry(
+        &self,
+        image_width: u32,
+        image_height: u32,
+        shape_seed: u32,
+        settings: &dyn std::any::Any,
+    ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
+        self.as_ref()
+            .build_render_geometry(image_width, image_height, shape_seed, settings)
+    }
+}
+
+impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Rc<T> {
+    fn to_spec(&self) -> TopologySpec {
+        self.as_ref().to_spec()
+    }
+
+    fn piece_count(&self) -> u32 {
+        self.as_ref().piece_count()
+    }
+
+    fn edge_count(&self) -> u32 {
+        self.as_ref().edge_count()
+    }
+
+    fn edge_endpoints(&self, edge: EdgeId) -> (PieceId, PieceId) {
+        self.as_ref().edge_endpoints(edge)
+    }
+
+    fn expected_relative_pose(&self, a: PieceId, b: PieceId) -> RelativePose {
+        self.as_ref().expected_relative_pose(a, b)
+    }
+
+    fn symmetry_angles(&self, piece: PieceId) -> &[AngleDeg] {
+        self.as_ref().symmetry_angles(piece)
+    }
+
+    fn symmetry_strength(&self, piece: PieceId) -> SymmetryStrength {
+        self.as_ref().symmetry_strength(piece)
+    }
+
+    fn step_rotation_cw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        self.as_ref()
+            .step_rotation_cw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn step_rotation_ccw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        self.as_ref()
+            .step_rotation_ccw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn frame_bounds(&self) -> Option<FrameBounds> {
+        self.as_ref().frame_bounds()
+    }
+
+    fn is_frame_border_piece(&self, piece: PieceId) -> bool {
+        self.as_ref().is_frame_border_piece(piece)
+    }
+
+    fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
+        self.as_ref().visit_outer_features(piece, visitor)
+    }
+
+    fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
+        self.as_ref().identity_frame_anchor()
+    }
+
+    fn dims_hint(&self) -> Option<(u32, u32)> {
+        self.as_ref().dims_hint()
+    }
+
+    fn image_extent_in_pose_units(&self) -> (f32, f32) {
+        self.as_ref().image_extent_in_pose_units()
+    }
+
+    fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
+        self.as_ref().snap_frame_extent_in_pose_units()
+    }
+
+    fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
+        self.as_ref().canonical_position_in_pose_units(piece)
+    }
+
+    fn build_render_geometry(
+        &self,
+        image_width: u32,
+        image_height: u32,
+        shape_seed: u32,
+        settings: &dyn std::any::Any,
+    ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
+        self.as_ref()
+            .build_render_geometry(image_width, image_height, shape_seed, settings)
+    }
+}
+
+impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Arc<T> {
+    fn to_spec(&self) -> TopologySpec {
+        self.as_ref().to_spec()
+    }
+
+    fn piece_count(&self) -> u32 {
+        self.as_ref().piece_count()
+    }
+
+    fn edge_count(&self) -> u32 {
+        self.as_ref().edge_count()
+    }
+
+    fn edge_endpoints(&self, edge: EdgeId) -> (PieceId, PieceId) {
+        self.as_ref().edge_endpoints(edge)
+    }
+
+    fn expected_relative_pose(&self, a: PieceId, b: PieceId) -> RelativePose {
+        self.as_ref().expected_relative_pose(a, b)
+    }
+
+    fn symmetry_angles(&self, piece: PieceId) -> &[AngleDeg] {
+        self.as_ref().symmetry_angles(piece)
+    }
+
+    fn symmetry_strength(&self, piece: PieceId) -> SymmetryStrength {
+        self.as_ref().symmetry_strength(piece)
+    }
+
+    fn step_rotation_cw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        self.as_ref()
+            .step_rotation_cw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn step_rotation_ccw(
+        &self,
+        piece: PieceId,
+        current: AngleDeg,
+        rotation_snap_tolerance: AngleDeg,
+    ) -> AngleDeg {
+        self.as_ref()
+            .step_rotation_ccw(piece, current, rotation_snap_tolerance)
+    }
+
+    fn frame_bounds(&self) -> Option<FrameBounds> {
+        self.as_ref().frame_bounds()
+    }
+
+    fn is_frame_border_piece(&self, piece: PieceId) -> bool {
+        self.as_ref().is_frame_border_piece(piece)
+    }
+
+    fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
+        self.as_ref().visit_outer_features(piece, visitor)
+    }
+
+    fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
+        self.as_ref().identity_frame_anchor()
+    }
+
+    fn dims_hint(&self) -> Option<(u32, u32)> {
+        self.as_ref().dims_hint()
+    }
+
+    fn image_extent_in_pose_units(&self) -> (f32, f32) {
+        self.as_ref().image_extent_in_pose_units()
+    }
+
+    fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
+        self.as_ref().snap_frame_extent_in_pose_units()
+    }
+
+    fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
+        self.as_ref().canonical_position_in_pose_units(piece)
+    }
+
+    fn build_render_geometry(
+        &self,
+        image_width: u32,
+        image_height: u32,
+        shape_seed: u32,
+        settings: &dyn std::any::Any,
+    ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
+        self.as_ref()
+            .build_render_geometry(image_width, image_height, shape_seed, settings)
     }
 }
 

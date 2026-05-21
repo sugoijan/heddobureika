@@ -4,7 +4,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::snapshot::{
     PlayableGameSnapshot, PlayableGameStateSnapshot, PlayablePoseSnapshot,
-    PlayablePositionSnapshot, PuzzleImageRef,
+    PlayablePositionSnapshot, PlayableTopologySnapshot, PuzzleImageRef,
 };
 use heddobureika_game::{
     EdgeId, FlipState, GroupId, GroupMergeUpdate, PlayableState, PlayableUpdateBatch, Pose2,
@@ -25,8 +25,20 @@ pub enum RoomPersistence {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct PuzzleSpec {
     pub image_ref: PuzzleImageRef,
+    /// Target piece count. Only consulted when `topology` is `None`, where
+    /// it drives the back-compat grid fallback (CLI, older clients).
     pub pieces: Option<u32>,
+    /// Scramble seed — controls how pieces are scattered. `None` randomises.
     pub seed: Option<u32>,
+    /// Fully resolved topology to build. When `Some`, the worker re-fits it
+    /// to the room's image dimensions (so aspect-dependent topologies stay
+    /// correct) and builds it directly. When `None`, falls back to a grid
+    /// derived from `pieces`.
+    pub topology: Option<PlayableTopologySnapshot>,
+    /// Tab/blank edge-direction seed (`PuzzleInfo::shape_seed`). `None` uses
+    /// the worker default; the UI "Regenerate" action bumps it so the layout
+    /// re-rolls.
+    pub shape_seed: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Archive, Serialize, Deserialize)]
@@ -555,10 +567,8 @@ impl PlayableRoomUpdate {
             for edge_idx in 0..edge_count {
                 let edge = EdgeId(edge_idx as u32);
                 let (a, b) = playable.logical.topology.edge_endpoints(edge);
-                let same_group = match (
-                    playable.logical.group_of(a),
-                    playable.logical.group_of(b),
-                ) {
+                let same_group = match (playable.logical.group_of(a), playable.logical.group_of(b))
+                {
                     (Some(ga), Some(gb)) => ga == gb,
                     _ => false,
                 };
@@ -593,10 +603,15 @@ pub enum AdminMsg {
     UploadPrivateEnd {
         pieces: Option<u32>,
         seed: Option<u32>,
+        topology: Option<PlayableTopologySnapshot>,
+        shape_seed: Option<u32>,
     },
     Scramble {
         seed: Option<u32>,
     },
+    /// Place every piece in its solved position (one connected group),
+    /// authoritatively, and broadcast the result to the room.
+    Solve,
     RecordingSet {
         enabled: bool,
         max_events: Option<u32>,
@@ -813,5 +828,62 @@ mod tests {
             vec![PieceId(0)],
             "piece 0 must remain a singleton after the second local detach (otherwise the puzzle flickers back together)"
         );
+    }
+
+    #[test]
+    fn puzzle_spec_round_trips_topology_and_shape_seed() {
+        use crate::codec::{decode, encode};
+
+        let topology: crate::PlayableTopologySnapshot =
+            heddobureika_game::TopologySpec::voronoi(80, 3, 1.5).into();
+        let msg = AdminMsg::Create {
+            persistence: RoomPersistence::Durable,
+            puzzle: PuzzleSpec {
+                image_ref: crate::PuzzleImageRef::BuiltIn {
+                    slug: "demo".to_string(),
+                },
+                pieces: Some(80),
+                seed: Some(42),
+                topology: Some(topology.clone()),
+                shape_seed: Some(7),
+            },
+        };
+        let bytes = encode(&msg).expect("encode");
+        let decoded: AdminMsg = decode(&bytes).expect("decode");
+        match decoded {
+            AdminMsg::Create { puzzle, .. } => {
+                assert_eq!(puzzle.seed, Some(42));
+                assert_eq!(puzzle.shape_seed, Some(7));
+                assert_eq!(puzzle.topology, Some(topology));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_private_end_round_trips_topology_and_shape_seed() {
+        use crate::codec::{decode, encode};
+
+        let topology: crate::PlayableTopologySnapshot =
+            heddobureika_game::TopologySpec::grid(4, 3).into();
+        let msg = AdminMsg::UploadPrivateEnd {
+            pieces: Some(12),
+            seed: None,
+            topology: Some(topology.clone()),
+            shape_seed: Some(99),
+        };
+        let bytes = encode(&msg).expect("encode");
+        let decoded: AdminMsg = decode(&bytes).expect("decode");
+        match decoded {
+            AdminMsg::UploadPrivateEnd {
+                topology: decoded_topology,
+                shape_seed,
+                ..
+            } => {
+                assert_eq!(shape_seed, Some(99));
+                assert_eq!(decoded_topology, Some(topology));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

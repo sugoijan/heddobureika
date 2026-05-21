@@ -1,6 +1,6 @@
 use crate::app_core::{AppCore, AppSnapshot};
 use crate::game_state::AppGameState;
-use heddobureika_core::PlayableGameSnapshot;
+use heddobureika_core::{PlayableGameSnapshot, PuzzleTopology};
 
 pub(crate) fn build_playable_snapshot_from_app(
     snapshot: &AppSnapshot,
@@ -43,12 +43,23 @@ pub(crate) fn apply_playable_snapshot_to_core(
         }
         return ApplySnapshotResult::Mismatch;
     }
-    if info.cols != snapshot.puzzle.cols || info.rows != snapshot.puzzle.rows {
+    if info.topology != snapshot.puzzle.topology {
         #[cfg(target_arch = "wasm32")]
         {
-            gloo::console::log!("local snapshot: restore mismatch grid");
+            gloo::console::log!("local snapshot: restore mismatch topology descriptor");
         }
         return ApplySnapshotResult::Mismatch;
+    }
+    if let Some(game) = current.game.as_ref() {
+        let snapshot_topology: heddobureika_core::TopologySpec =
+            snapshot.state.topology.clone().into();
+        if game.playable.logical.topology.to_spec() != snapshot_topology {
+            #[cfg(target_arch = "wasm32")]
+            {
+                gloo::console::log!("local snapshot: restore mismatch topology");
+            }
+            return ApplySnapshotResult::Mismatch;
+        }
     }
     if info.shape_seed != snapshot.puzzle.shape_seed {
         #[cfg(target_arch = "wasm32")]
@@ -57,13 +68,11 @@ pub(crate) fn apply_playable_snapshot_to_core(
         }
         return ApplySnapshotResult::Mismatch;
     }
-    let cols = snapshot.puzzle.cols as usize;
-    let rows = snapshot.puzzle.rows as usize;
-    let total = cols * rows;
+    let total = snapshot.puzzle.piece_count() as usize;
     if total == 0 {
         #[cfg(target_arch = "wasm32")]
         {
-            gloo::console::log!("local snapshot: restore not ready (empty grid)");
+            gloo::console::log!("local snapshot: restore not ready (empty topology)");
         }
         return ApplySnapshotResult::NotReady;
     }

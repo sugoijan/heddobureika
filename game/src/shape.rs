@@ -170,7 +170,10 @@ impl ShapeAtlasMm {
     }
 
     /// Validates atlas invariants against topology and ring continuity rules.
-    pub fn validate<T: PuzzleTopology>(&self, topology: &T) -> Result<(), GeometryInvariantError> {
+    pub fn validate<T: PuzzleTopology + ?Sized>(
+        &self,
+        topology: &T,
+    ) -> Result<(), GeometryInvariantError> {
         if self.pieces.len() != topology.piece_count() as usize {
             return Err(GeometryInvariantError::PieceCountMismatch);
         }

@@ -4,7 +4,7 @@ use heddobureika_core::{
 };
 use heddobureika_game::{
     ActionId, GridTopology, LogicalState, MergePolicy, PlayRules, PlayableAction, PlayableState,
-    Position2, ProposalApplyStatus, RestoredPlayableState, RestrictedPlayableAction,
+    Position2, ProposalApplyStatus, RestrictedPlayableAction,
 };
 
 #[test]
@@ -33,12 +33,9 @@ fn playable_game_state_snapshot_round_trips_through_core_codec() {
     assert_eq!(decoded.revision, playable.revision);
     assert_eq!(decoded.focused_piece, Some(1));
 
-    let RestoredPlayableState::Grid(restored) = decoded
+    let restored = decoded
         .restore_from_spec()
-        .expect("snapshot should restore")
-    else {
-        panic!("expected restored grid state");
-    };
+        .expect("snapshot should restore");
     assert_eq!(restored.revision, playable.revision);
     assert_eq!(restored.logical.active_edge_count(), 1);
     assert_eq!(restored.logical.group_count(), 1);
@@ -66,12 +63,9 @@ fn playable_game_snapshot_wraps_puzzle_metadata_and_revision() {
     assert_eq!(decoded.seq, 17);
     assert_eq!(decoded.puzzle.label, puzzle.label);
     assert_eq!(decoded.scramble_nonce, 99);
-    let RestoredPlayableState::Grid(restored) = decoded
+    let restored = decoded
         .restore_playable_from_spec()
-        .expect("snapshot should restore")
-    else {
-        panic!("expected restored grid state");
-    };
+        .expect("snapshot should restore");
     assert_eq!(restored.revision, 17);
     assert_eq!(restored.logical.piece_count(), 1);
 }
@@ -106,12 +100,9 @@ fn playable_game_snapshot_applies_snapping_action_in_place() {
     assert_eq!(batch.revision_after, 1);
     assert_eq!(snapshot.seq, 1);
     assert_eq!(snapshot.state.revision, 1);
-    let RestoredPlayableState::Grid(restored) = snapshot
+    let restored = snapshot
         .restore_playable_from_spec()
-        .expect("snapshot should restore")
-    else {
-        panic!("expected restored grid state");
-    };
+        .expect("snapshot should restore");
     assert_eq!(restored.logical.active_edge_count(), 1);
     assert_eq!(restored.logical.group_count(), 1);
 }
@@ -143,12 +134,9 @@ fn playable_game_snapshot_applies_action_only_without_joining() {
     assert_eq!(batch.revision_before, 0);
     assert_eq!(batch.revision_after, 1);
     assert_eq!(snapshot.seq, 1);
-    let RestoredPlayableState::Grid(restored) = snapshot
+    let restored = snapshot
         .restore_playable_from_spec()
-        .expect("snapshot should restore")
-    else {
-        panic!("expected restored grid state");
-    };
+        .expect("snapshot should restore");
     assert_eq!(restored.logical.active_edge_count(), 0);
     assert_eq!(restored.logical.group_count(), 2);
 }
@@ -202,8 +190,7 @@ fn puzzle_info(cols: u32, rows: u32) -> PuzzleInfo {
         image_ref: PuzzleImageRef::BuiltIn {
             slug: "test".to_string(),
         },
-        rows,
-        cols,
+        topology: heddobureika_game::TopologySpec::grid(cols, rows).into(),
         shape_seed: 1,
         image_width: cols * 100,
         image_height: rows * 100,

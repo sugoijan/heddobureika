@@ -3,10 +3,10 @@
 use crate::delta::PlayableDelta;
 use crate::ids::{EdgeId, GroupId, PieceId};
 use crate::logical::{LogicalInvariantError, LogicalState, LogicalStateSummary};
-use crate::rotation_step::{intersect_symmetry_angles, next_step_canonical, StepDirection};
+use crate::rotation_step::{group_symmetry_angles, next_step_canonical, StepDirection};
 use crate::rules::PlayRules;
 use crate::snap::{angle_matches, ActionId, MergePolicy, SnapProposal};
-use crate::topology::{PuzzleTopology, TopologySpec};
+use crate::topology::{PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
 use crate::update::{
     AppliedProposal, GroupMergeUpdate, GroupPoseUpdate, PlayableUpdateBatch,
@@ -897,17 +897,23 @@ impl<T: PuzzleTopology> PlayableState<T> {
         true
     }
 
-    fn next_step_rotation(&self, group: GroupId, clockwise: bool) -> Option<AngleDeg> {
+    pub fn next_step_rotation(&self, group: GroupId, clockwise: bool) -> Option<AngleDeg> {
         let current = self.pose_of(group)?.rotation;
-        let mut members = self.logical.members_of(group);
-        let first = members.next()?;
-        let mut group_angles = self.logical.topology.symmetry_angles(first).to_vec();
-        for piece in members {
-            group_angles = intersect_symmetry_angles(
-                &group_angles,
-                self.logical.topology.symmetry_angles(piece),
-            );
+        let topology = &self.logical.topology;
+        let members: Vec<PieceId> = self.logical.members_of(group).collect();
+        if members.is_empty() {
+            return None;
         }
+        let entries: Vec<(&[AngleDeg], _)> = members
+            .iter()
+            .map(|piece| {
+                (
+                    topology.symmetry_angles(*piece),
+                    topology.symmetry_strength(*piece),
+                )
+            })
+            .collect();
+        let group_angles = group_symmetry_angles(&entries);
 
         let direction = if clockwise {
             StepDirection::Cw
@@ -1396,27 +1402,9 @@ impl<T: PuzzleTopology> PlayableState<T> {
         self.activate_stable_internal_edges(keep_group, delta);
     }
 
-    /// Dispatches to the topology-specific frame-snap policy. Returns `true`
-    /// when the group's pose was adjusted.
-    ///
-    /// Topologies opt in via `PuzzleTopology::frame_snap_kind()`.
-    /// `GridTopology` returns `Grid`; everything else returns `None` and
-    /// short-circuits this method.
+    /// Applies topology-neutral frame snap hooks. Returns `true` when the
+    /// group's pose was adjusted.
     fn apply_topology_frame_snap(
-        &mut self,
-        group: GroupId,
-        complete_snap: bool,
-        delta: &mut PlayableDelta,
-    ) -> bool {
-        match self.logical.topology.frame_snap_kind() {
-            crate::traits::topology::FrameSnapKind::Grid => {
-                self.apply_grid_frame_snap(group, complete_snap, delta)
-            }
-            crate::traits::topology::FrameSnapKind::None => false,
-        }
-    }
-
-    fn apply_grid_frame_snap(
         &mut self,
         group: GroupId,
         complete_snap: bool,
@@ -1425,7 +1413,7 @@ impl<T: PuzzleTopology> PlayableState<T> {
         let Some(group) = self.current_group_for(group) else {
             return false;
         };
-        let Some(target_pose) = self.grid_frame_snap_pose(group, complete_snap) else {
+        let Some(target_pose) = self.frame_snap_pose(group, complete_snap) else {
             return false;
         };
         let Some(pose) = self.group_pose.get_mut(group.as_usize()) else {
@@ -1440,17 +1428,10 @@ impl<T: PuzzleTopology> PlayableState<T> {
         true
     }
 
-    fn grid_frame_snap_pose(&self, group: GroupId, complete_snap: bool) -> Option<Pose2> {
+    fn frame_snap_pose(&self, group: GroupId, complete_snap: bool) -> Option<Pose2> {
         if self.flip_of(group) == Some(FlipState::Flipped) {
             return None;
         }
-        let TopologySpec::Grid { cols, rows } = self.logical.topology.topology_spec() else {
-            return None;
-        };
-        if cols == 0 || rows == 0 {
-            return None;
-        }
-
         let members = self.logical.members_of(group).collect::<Vec<_>>();
         if members.is_empty() {
             return None;
@@ -1461,260 +1442,277 @@ impl<T: PuzzleTopology> PlayableState<T> {
         let total = self.logical.piece_count();
         let is_complete_group = members.len() == total;
 
+        // Completing the puzzle force-snaps to canonical (UX: once all
+        // pieces are joined we don't want the assembly drifting). Uses
+        // the topology-supplied identity anchor — the universal solver
+        // would also handle this, but the identity path's `force` flag
+        // is what lets the user "finish" by dropping the assembly near,
+        // not exactly at, the solved pose.
         if is_complete_group {
-            return self.grid_identity_frame_candidate(group, complete_snap, snap_distance * 2.0);
+            return self.identity_frame_candidate(group, complete_snap, snap_distance * 2.0);
         }
 
         if snap_distance <= 0.0 {
             return None;
         }
-
-        if let Some(candidate) =
-            self.best_grid_corner_frame_candidate(group, cols, rows, snap_distance)
-        {
-            return Some(candidate.pose);
-        }
-
-        if let Some(candidate) =
-            self.best_grid_edge_frame_candidate(group, cols, rows, snap_distance)
-        {
-            return Some(candidate.pose);
-        }
-
-        if self.group_contains_all_grid_border_pieces(&members, cols, rows) {
-            return self.grid_identity_frame_candidate(group, false, snap_distance);
-        }
-
-        None
+        self.universal_frame_snap_pose(group, snap_distance)
     }
 
-    fn grid_identity_frame_candidate(
+    /// Universal frame-snap solver: walks every member piece's outer
+    /// features (border-edge segments + corner-attachment points in
+    /// piece-local pose units), lifts them to world coords via the
+    /// group's current pose, and aggregates per-feature corrections
+    /// into a single (Δrot, Δx, Δy) for the whole group.
+    ///
+    /// Per-feature contracts:
+    /// - `BorderEdge`: parallel-snap to the closest of the four frame
+    ///   sides; contributes a rotation correction Δθ and a 1-axis
+    ///   position correction along the perpendicular. Rejected if Δθ
+    ///   exceeds the rotation tolerance or perpendicular distance
+    ///   exceeds `snap_distance`.
+    /// - `CornerAttachment`: point-snap to the closest of the four
+    ///   frame corners; contributes a 2-axis position correction.
+    ///   Rejected if distance exceeds `snap_distance`. No rotation
+    ///   correction (BorderEdges drive rotation; CornerAttachments
+    ///   live alongside them).
+    ///
+    /// Multiple features behave the same whether they come from one
+    /// piece or N pieces in a group — each is evaluated independently
+    /// and surviving constraints union by axis (BorderEdges add 1 axis,
+    /// CornerAttachments add 2). If a `BorderEdge` exists anywhere and
+    /// none survive the rotation check, the group does not snap.
+    fn universal_frame_snap_pose(&self, group: GroupId, snap_distance: f32) -> Option<Pose2> {
+        let group_pose = self.pose_of(group)?;
+        let anchor = self.anchor_piece_of_group(group)?;
+        let anchor_local = self.piece_local_pose_of(anchor)?;
+        let flipped = self.flip_of(group) == Some(FlipState::Flipped);
+        let flip_sign: f32 = if flipped { -1.0 } else { 1.0 };
+        let aspect = self.piece_aspect_ratio;
+        let (extent_x, extent_y) = self.logical.topology.snap_frame_extent_in_pose_units();
+        let rot_tol = self.rules.rotation_snap_tolerance.as_degrees_f32().abs();
+
+        // Collect features in group-anchor-local coords.
+        let mut features: Vec<LocalSnapFeature> = Vec::new();
+        for piece in self.logical.members_of(group) {
+            let Some(piece_local) = self.piece_local_pose_of(piece) else {
+                continue;
+            };
+            let dxp = (piece_local.x_mm() - anchor_local.x_mm()) * flip_sign;
+            let dyp = piece_local.y_mm() - anchor_local.y_mm();
+            let map_pt = |(px, py): (f32, f32)| (dxp + px * flip_sign, dyp + py);
+            self.logical
+                .topology
+                .visit_outer_features(piece, &mut |f| match f {
+                    PieceOuterFeature::BorderEdge { p1, p2 } => {
+                        features.push(LocalSnapFeature::BorderEdge {
+                            p1: map_pt(p1),
+                            p2: map_pt(p2),
+                        });
+                    }
+                    PieceOuterFeature::CornerAttachment { point } => {
+                        features.push(LocalSnapFeature::CornerAttachment {
+                            point: map_pt(point),
+                        });
+                    }
+                });
+        }
+        if features.is_empty() {
+            return None;
+        }
+
+        // Pass 1: per-BorderEdge angular correction to nearest axis.
+        let group_rot = group_pose.rotation_degrees();
+        let mut rotation_corrections: Vec<f32> = Vec::new();
+        let mut accepted_border_idx: Vec<usize> = Vec::new();
+        let mut has_any_border_edge = false;
+        for (idx, f) in features.iter().enumerate() {
+            if let LocalSnapFeature::BorderEdge { p1, p2 } = f {
+                has_any_border_edge = true;
+                let w1 = rotate_offset_with_aspect(p1.0, p1.1, group_rot, aspect);
+                let w2 = rotate_offset_with_aspect(p2.0, p2.1, group_rot, aspect);
+                let dx = w2.0 - w1.0;
+                let dy = w2.1 - w1.1;
+                if dx.hypot(dy) < 1.0e-6 {
+                    continue;
+                }
+                let angle = dy.atan2(dx).to_degrees();
+                let delta = rotation_correction_to_axis(angle);
+                if delta.abs() > rot_tol {
+                    continue;
+                }
+                rotation_corrections.push(delta);
+                accepted_border_idx.push(idx);
+            }
+        }
+        if has_any_border_edge && rotation_corrections.is_empty() {
+            return None;
+        }
+        let rot_delta = if rotation_corrections.is_empty() {
+            0.0_f32
+        } else {
+            rotation_corrections.iter().sum::<f32>() / rotation_corrections.len() as f32
+        };
+        let new_rot = group_rot + rot_delta;
+
+        // Pass 2: post-rotation position corrections per surviving feature.
+        let mut x_corr: Vec<f32> = Vec::new();
+        let mut y_corr: Vec<f32> = Vec::new();
+        for (idx, f) in features.iter().enumerate() {
+            match f {
+                LocalSnapFeature::BorderEdge { p1, p2 } => {
+                    if !accepted_border_idx.contains(&idx) {
+                        continue;
+                    }
+                    let w1 = rotate_offset_with_aspect(p1.0, p1.1, new_rot, aspect);
+                    let w2 = rotate_offset_with_aspect(p2.0, p2.1, new_rot, aspect);
+                    let dx = w2.0 - w1.0;
+                    let dy = w2.1 - w1.1;
+                    if dx.hypot(dy) < 1.0e-6 {
+                        continue;
+                    }
+                    let mid_x = group_pose.x_mm() + (w1.0 + w2.0) * 0.5;
+                    let mid_y = group_pose.y_mm() + (w1.1 + w2.1) * 0.5;
+                    let horizontal = dx.abs() >= dy.abs();
+                    if horizontal {
+                        let target_y = if (mid_y).abs() <= (mid_y - extent_y).abs() {
+                            0.0
+                        } else {
+                            extent_y
+                        };
+                        let d = target_y - mid_y;
+                        if d.abs() > snap_distance {
+                            continue;
+                        }
+                        y_corr.push(d);
+                    } else {
+                        let target_x = if (mid_x).abs() <= (mid_x - extent_x).abs() {
+                            0.0
+                        } else {
+                            extent_x
+                        };
+                        let d = target_x - mid_x;
+                        if d.abs() > snap_distance {
+                            continue;
+                        }
+                        x_corr.push(d);
+                    }
+                }
+                LocalSnapFeature::CornerAttachment { point } => {
+                    let w = rotate_offset_with_aspect(point.0, point.1, new_rot, aspect);
+                    let wx = group_pose.x_mm() + w.0;
+                    let wy = group_pose.y_mm() + w.1;
+                    let corners = [
+                        (0.0_f32, 0.0_f32),
+                        (extent_x, 0.0),
+                        (extent_x, extent_y),
+                        (0.0, extent_y),
+                    ];
+                    let mut best: Option<((f32, f32), f32)> = None;
+                    for c in corners.iter() {
+                        let d = (wx - c.0).hypot(wy - c.1);
+                        if best.map_or(true, |(_, bd)| d < bd) {
+                            best = Some((*c, d));
+                        }
+                    }
+                    if let Some((c, d)) = best {
+                        if d > snap_distance {
+                            continue;
+                        }
+                        x_corr.push(c.0 - wx);
+                        y_corr.push(c.1 - wy);
+                    }
+                }
+            }
+        }
+
+        let avg = |v: &[f32]| -> f32 {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            }
+        };
+        let dx = avg(&x_corr);
+        let dy = avg(&y_corr);
+        let rotation_changed = rot_delta.abs() > 1.0e-5;
+        if x_corr.is_empty() && y_corr.is_empty() && !rotation_changed {
+            return None;
+        }
+
+        let new_pose =
+            Pose2::try_from_mm_degrees(group_pose.x_mm() + dx, group_pose.y_mm() + dy, new_rot)?;
+        let bounds = self
+            .logical
+            .topology
+            .frame_bounds()
+            .unwrap_or(crate::topology::FrameBounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: extent_x,
+                max_y: extent_y,
+            });
+        let frame_slop = snap_distance * 0.25;
+        if !self.group_fits_frame(group, new_pose, bounds, frame_slop) {
+            return None;
+        }
+        Some(new_pose)
+    }
+
+    fn identity_frame_candidate(
         &self,
         group: GroupId,
         force: bool,
         snap_distance: f32,
     ) -> Option<Pose2> {
-        let target_rotation = AngleDeg::zero();
-        if !force && !self.rotation_matches_frame_target(group, 0.0) {
+        let (anchor, target_piece_pose) = self.logical.topology.identity_frame_anchor()?;
+        if !force && !self.rotation_matches_frame_target(group, target_piece_pose.rotation) {
             return None;
         }
 
-        let anchor = PieceId(0);
         if self.logical.group_of(anchor) != Some(group) {
             return None;
         }
-        // Piece poses are piece-CENTERS in piece-count units, so piece 0
-        // (top-left) sits at pose `(0.5, 0.5)` when its top-left pixel is at
-        // the workspace top-left.
-        let target_piece_pose =
-            Pose2::try_from_mm_degrees(0.5, 0.5, 0.0).unwrap_or_else(Pose2::default);
         let current_anchor = self.piece_world_pose(anchor)?;
         let distance = (current_anchor.x_mm() - target_piece_pose.x_mm())
             .hypot(current_anchor.y_mm() - target_piece_pose.y_mm());
         if !force && distance > snap_distance {
             return None;
         }
-        self.group_pose_to_place_piece(group, anchor, target_piece_pose, target_rotation)
+        self.group_pose_to_place_piece(group, anchor, target_piece_pose, target_piece_pose.rotation)
     }
 
-    fn best_grid_corner_frame_candidate(
-        &self,
-        group: GroupId,
-        cols: u32,
-        rows: u32,
-        snap_distance: f32,
-    ) -> Option<FrameSnapCandidate> {
-        let mut best = None;
-        for piece in self.logical.members_of(group) {
-            let (row, col) = grid_row_col(piece, cols, rows)?;
-            let piece_corner = if row == 0 && col == 0 {
-                Some(0)
-            } else if row == 0 && col + 1 == cols {
-                Some(1)
-            } else if row + 1 == rows && col + 1 == cols {
-                Some(2)
-            } else if row + 1 == rows && col == 0 {
-                Some(3)
-            } else {
-                None
-            };
-            let Some(piece_corner) = piece_corner else {
-                continue;
-            };
-
-            for target_corner in 0..4 {
-                let steps = (target_corner + 4 - piece_corner) % 4;
-                let target_rotation = steps as f32 * 90.0;
-                if !self.rotation_matches_frame_target(group, target_rotation) {
-                    continue;
-                }
-                let (target_x, target_y) = grid_corner_target(cols, rows, target_corner);
-                let Some(candidate) = self.grid_frame_candidate_for_piece(
-                    group,
-                    piece,
-                    target_x,
-                    target_y,
-                    target_rotation,
-                    None,
-                    cols,
-                    rows,
-                    snap_distance,
-                ) else {
-                    continue;
-                };
-                replace_best_frame_candidate(&mut best, candidate);
-            }
-        }
-        best
-    }
-
-    fn best_grid_edge_frame_candidate(
-        &self,
-        group: GroupId,
-        cols: u32,
-        rows: u32,
-        snap_distance: f32,
-    ) -> Option<FrameSnapCandidate> {
-        let mut best = None;
-        for piece in self.logical.members_of(group) {
-            let (row, col) = grid_row_col(piece, cols, rows)?;
-            let is_corner = (row == 0 || row + 1 == rows) && (col == 0 || col + 1 == cols);
-            if is_corner {
-                continue;
-            }
-
-            let edge_side = if row == 0 {
-                Some(0)
-            } else if col + 1 == cols {
-                Some(1)
-            } else if row + 1 == rows {
-                Some(2)
-            } else if col == 0 {
-                Some(3)
-            } else {
-                None
-            };
-            let Some(edge_side) = edge_side else {
-                continue;
-            };
-            let current = self.piece_world_pose(piece)?;
-
-            for target_edge in 0..4 {
-                let steps = (target_edge + 4 - edge_side) % 4;
-                let target_rotation = steps as f32 * 90.0;
-                if !self.rotation_matches_frame_target(group, target_rotation) {
-                    continue;
-                }
-                let (target_x, target_y, distance_axis) =
-                    grid_edge_target(cols, rows, current, target_edge);
-                let Some(candidate) = self.grid_frame_candidate_for_piece(
-                    group,
-                    piece,
-                    target_x,
-                    target_y,
-                    target_rotation,
-                    Some(distance_axis),
-                    cols,
-                    rows,
-                    snap_distance,
-                ) else {
-                    continue;
-                };
-                replace_best_frame_candidate(&mut best, candidate);
-            }
-        }
-        best
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn grid_frame_candidate_for_piece(
-        &self,
-        group: GroupId,
-        piece: PieceId,
-        target_x: f32,
-        target_y: f32,
-        target_rotation: f32,
-        distance_axis: Option<FrameDistanceAxis>,
-        cols: u32,
-        rows: u32,
-        snap_distance: f32,
-    ) -> Option<FrameSnapCandidate> {
-        let current = self.piece_world_pose(piece)?;
-        let distance = match distance_axis {
-            Some(FrameDistanceAxis::X) => (current.x_mm() - target_x).abs(),
-            Some(FrameDistanceAxis::Y) => (current.y_mm() - target_y).abs(),
-            None => (current.x_mm() - target_x).hypot(current.y_mm() - target_y),
-        };
-        if distance > snap_distance {
-            return None;
-        }
-
-        let rotation = AngleDeg::try_new(target_rotation)?;
-        let target_piece_pose = Pose2::try_from_mm_degrees(target_x, target_y, target_rotation)?;
-        let pose = self.group_pose_to_place_piece(group, piece, target_piece_pose, rotation)?;
-        let frame_slop = snap_distance * 0.25;
-        if !self.group_fits_grid_frame(group, pose, cols, rows, frame_slop) {
-            return None;
-        }
-
-        Some(FrameSnapCandidate { pose, distance })
-    }
-
-    fn group_fits_grid_frame(
+    fn group_fits_frame(
         &self,
         group: GroupId,
         group_pose: Pose2,
-        cols: u32,
-        rows: u32,
+        bounds: crate::topology::FrameBounds,
         slop: f32,
     ) -> bool {
-        // Piece poses are piece-CENTERS in piece-count units. A piece at
-        // canonical cell `(col, row)` sits at center `(col + 0.5, row + 0.5)`,
-        // so all valid piece-center poses lie in `[0.5, cols - 0.5]` ×
-        // `[0.5, rows - 0.5]`.
-        let min_x = 0.5_f32;
-        let min_y = 0.5_f32;
-        let max_x = cols.saturating_sub(1) as f32 + 0.5;
-        let max_y = rows.saturating_sub(1) as f32 + 0.5;
+        // Use the full puzzle frame extent rather than canonical
+        // piece-center bounds: a non-square piece rotated 90° lands its
+        // center outside `[0.5, cols-0.5]` (canonical-rotation bounds) but
+        // still entirely inside the puzzle frame. The topology already
+        // produced a valid snap target; this check exists to catch
+        // multi-piece groups whose other members would land far outside
+        // the puzzle area when the anchor moves to the snap pose.
+        let (extent_x, extent_y) = self.logical.topology.image_extent_in_pose_units();
+        let min_x = bounds.min_x.min(0.0) - slop;
+        let min_y = bounds.min_y.min(0.0) - slop;
+        let max_x = bounds.max_x.max(extent_x) + slop;
+        let max_y = bounds.max_y.max(extent_y) + slop;
         self.logical.members_of(group).all(|piece| {
             self.piece_world_pose_with_group_pose(group, group_pose, piece)
                 .map(|pose| {
-                    pose.x_mm() >= min_x - slop
-                        && pose.x_mm() <= max_x + slop
-                        && pose.y_mm() >= min_y - slop
-                        && pose.y_mm() <= max_y + slop
+                    pose.x_mm() >= min_x
+                        && pose.x_mm() <= max_x
+                        && pose.y_mm() >= min_y
+                        && pose.y_mm() <= max_y
                 })
                 .unwrap_or(false)
         })
     }
 
-    fn group_contains_all_grid_border_pieces(
-        &self,
-        members: &[PieceId],
-        cols: u32,
-        rows: u32,
-    ) -> bool {
-        let mut in_group = vec![false; self.logical.piece_count()];
-        for piece in members {
-            if let Some(slot) = in_group.get_mut(piece.as_usize()) {
-                *slot = true;
-            }
-        }
-
-        for row in 0..rows {
-            for col in 0..cols {
-                if row == 0 || row + 1 == rows || col == 0 || col + 1 == cols {
-                    let idx = (row * cols + col) as usize;
-                    if !in_group.get(idx).copied().unwrap_or(false) {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    fn rotation_matches_frame_target(&self, group: GroupId, target_rotation: f32) -> bool {
+    fn rotation_matches_frame_target(&self, group: GroupId, target_rotation: AngleDeg) -> bool {
         if !self.rules.rotation_enabled {
             return true;
         }
@@ -1723,7 +1721,7 @@ impl<T: PuzzleTopology> PlayableState<T> {
         };
         angle_matches(
             pose.rotation_degrees(),
-            target_rotation,
+            target_rotation.as_degrees_f32(),
             self.rules.rotation_snap_tolerance.as_degrees_f32().abs(),
         )
     }
@@ -1828,16 +1826,23 @@ impl<T: PuzzleTopology> PlayableState<T> {
     }
 }
 
+/// A piece's outer feature in group-anchor-local coords (already
+/// flattened across piece position offsets and flip).
 #[derive(Clone, Copy, Debug)]
-struct FrameSnapCandidate {
-    pose: Pose2,
-    distance: f32,
+enum LocalSnapFeature {
+    BorderEdge { p1: (f32, f32), p2: (f32, f32) },
+    CornerAttachment { point: (f32, f32) },
 }
 
-#[derive(Clone, Copy, Debug)]
-enum FrameDistanceAxis {
-    X,
-    Y,
+/// Smallest-magnitude Δ such that `angle + Δ` lands on a multiple of
+/// 90°. Returned in degrees, in (-45, 45].
+fn rotation_correction_to_axis(angle: f32) -> f32 {
+    let m = angle.rem_euclid(90.0);
+    if m > 45.0 {
+        90.0 - m
+    } else {
+        -m
+    }
 }
 
 fn mark_group_dirty<T: PuzzleTopology>(
@@ -1968,59 +1973,6 @@ fn pose_approx_eq(a: Pose2, b: Pose2) -> bool {
     approx_zero(a.x_mm() - b.x_mm())
         && approx_zero(a.y_mm() - b.y_mm())
         && angle_matches(a.rotation_degrees(), b.rotation_degrees(), 1.0e-4)
-}
-
-fn grid_row_col(piece: PieceId, cols: u32, rows: u32) -> Option<(u32, u32)> {
-    let id = piece.as_u32();
-    if cols == 0 || id >= cols * rows {
-        return None;
-    }
-    Some((id / cols, id % cols))
-}
-
-fn grid_corner_target(cols: u32, rows: u32, corner: u32) -> (f32, f32) {
-    // Piece poses encode the piece CENTER in piece-count units (a piece at
-    // pose `(c + 0.5, r + 0.5)` has its top-left pixel at `(c*W, r*H)`), so
-    // the canonical solved position of corner piece `(col, row)` is
-    // `(col + 0.5, row + 0.5)`. Frame-snap targets must match — otherwise
-    // the user would need to drop the piece half outside the workspace
-    // frame to land within `snap_distance`.
-    let max_x = cols.saturating_sub(1) as f32 + 0.5;
-    let max_y = rows.saturating_sub(1) as f32 + 0.5;
-    match corner {
-        1 => (max_x, 0.5),
-        2 => (max_x, max_y),
-        3 => (0.5, max_y),
-        _ => (0.5, 0.5),
-    }
-}
-
-fn grid_edge_target(
-    cols: u32,
-    rows: u32,
-    current: Pose2,
-    edge: u32,
-) -> (f32, f32, FrameDistanceAxis) {
-    let max_x = cols.saturating_sub(1) as f32 + 0.5;
-    let max_y = rows.saturating_sub(1) as f32 + 0.5;
-    match edge {
-        1 => (max_x, current.y_mm(), FrameDistanceAxis::X),
-        2 => (current.x_mm(), max_y, FrameDistanceAxis::Y),
-        3 => (0.5, current.y_mm(), FrameDistanceAxis::X),
-        _ => (current.x_mm(), 0.5, FrameDistanceAxis::Y),
-    }
-}
-
-fn replace_best_frame_candidate(
-    best: &mut Option<FrameSnapCandidate>,
-    candidate: FrameSnapCandidate,
-) {
-    let should_replace = best
-        .map(|best| candidate.distance < best.distance)
-        .unwrap_or(true);
-    if should_replace {
-        *best = Some(candidate);
-    }
 }
 
 fn build_piece_local_poses<T: PuzzleTopology>(topology: &T) -> Box<[Pose2]> {

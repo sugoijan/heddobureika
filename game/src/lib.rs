@@ -14,20 +14,27 @@ pub mod edge_host;
 pub mod edge_profile;
 pub mod grid_puzzle;
 pub mod grid_shape;
+pub mod hexagonal_shape;
+pub mod hexagonal_topology;
 pub mod ids;
 pub mod logical;
 pub mod playable;
 pub mod projection;
+pub mod render_geometry;
 pub mod rotation_step;
 pub mod rules;
 pub mod shape;
+pub mod shape_atlas_builder;
+pub mod shape_profiles;
 pub mod shape_svg;
 pub mod snap;
 pub mod snapshot;
 pub mod topology;
 pub mod traits;
+pub mod triangular_shape;
 pub mod units;
 pub mod update;
+pub mod voronoi_topology;
 
 pub use delta::{IdList, PlayableDelta};
 pub use edge_compose::ConnectorSeg;
@@ -41,6 +48,10 @@ pub use grid_shape::{
     GridEdgeProfilePreview, GridEdgeProfileSample, GridHostShapePreview, GridJigsawShaper,
     GridShapeBuildError, GridShapeCache, GridShapeSettings,
 };
+pub use hexagonal_shape::{
+    HexagonalShapeBuildError, HexagonalShapeCache, HexagonalShapeSettings, HexagonalShaper,
+};
+pub use hexagonal_topology::{HexPieceKind, HexagonalTopology};
 pub use ids::{BorderEdgeId, EdgeId, FrameEdgeId, GroupId, PieceId};
 pub use logical::{
     GroupSlot, LogicalInvariantError, LogicalMerge, LogicalState, LogicalStateSummary, PieceSlot,
@@ -52,9 +63,13 @@ pub use playable::{
 pub use projection::{
     IdentityPhysicalState, InteractableState, PhysicalProjection, ProjectionScratch, VisualState,
 };
+pub use render_geometry::{
+    PiecePaths, PieceRenderGeometry, PuzzleFrameShape, PuzzleRenderGeometry, RectPx,
+    PUZZLE_FRAME_CORNER_RADIUS_RATIO,
+};
 pub use rotation_step::{
-    canonicalize_symmetry_angles, intersect_symmetry_angles, next_step_canonical, next_step_target,
-    StepDirection, StepRotationTarget,
+    canonicalize_symmetry_angles, group_symmetry_angles, intersect_symmetry_angles,
+    next_step_canonical, next_step_target, StepDirection, StepRotationTarget, SymmetryStrength,
 };
 pub use rules::PlayRules;
 pub use shape::{
@@ -62,6 +77,7 @@ pub use shape::{
     InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceEdgeRef, PieceGeometryMm, PointMm,
     ShapeAtlasMm,
 };
+pub use shape_atlas_builder::{PieceEdgeBuilderSpec, ShapeAtlasBuildError, ShapeAtlasBuilder};
 pub use shape_svg::{
     cache_to_svg_paths, frame_to_svg_paths, path_to_svg_d, piece_to_svg_paths, SvgPiecePaths,
 };
@@ -71,16 +87,22 @@ pub use snapshot::{
     PLAYABLE_SNAPSHOT_VERSION,
 };
 pub use topology::{
-    GridTopology, RelativePose, TopologySpec, TrianglePieceKind, TriangularTessellationTopology,
+    build_topology_from_spec, GenericPlayableState, GenericTopology, GridTopology, RelativePose,
+    SerializableTopology, TopologySpec, TrianglePieceKind, TriangularTessellationTopology,
 };
 pub use traits::edge_profile::EdgeProfileStrategy;
 pub use traits::shaping::{PieceGeometryProvider, TopologyShaper};
-pub use traits::topology::PuzzleTopology;
+pub use traits::topology::{FrameBounds, PieceOuterFeature, PuzzleTopology};
+pub use triangular_shape::{
+    TriangularTessellationShapeBuildError, TriangularTessellationShapeCache,
+    TriangularTessellationShapeSettings, TriangularTessellationShaper,
+};
 pub use units::{AngleDeg, Dpi, LengthMm};
 pub use update::{
     AppliedProposal, GroupMergeUpdate, GroupPoseUpdate, PlayableUpdateBatch,
     ProposalApplyRejection, ProposalApplyStatus,
 };
+pub use voronoi_topology::VoronoiTopology;
 
 #[cfg(test)]
 mod tests {

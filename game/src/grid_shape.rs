@@ -16,12 +16,23 @@ use crate::edge_profile::{
 };
 use crate::ids::{BorderEdgeId, EdgeId, FrameEdgeId, PieceId};
 use crate::shape::{
-    BorderEdgeGeometryMm, EdgeSide, EdgeSideGeometryMm, FrameGeometryMm, GeometryInvariantError,
-    InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceEdgeRef, PieceGeometryMm,
-    PieceGeometryProvider, PointMm, ShapeAtlasMm, TopologyShaper,
+    BorderEdgeGeometryMm, EdgeSideGeometryMm, FrameGeometryMm, GeometryInvariantError,
+    InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceGeometryMm, PieceGeometryProvider, PointMm,
+    ShapeAtlasMm, TopologyShaper,
 };
+use crate::shape_atlas_builder::{PieceEdgeBuilderSpec, ShapeAtlasBuildError, ShapeAtlasBuilder};
 use crate::topology::{GridTopology, PuzzleTopology};
 use crate::units::LengthMm;
+
+fn atlas_build_error_to_grid_error(err: ShapeAtlasBuildError) -> GridShapeBuildError {
+    match err {
+        ShapeAtlasBuildError::Invariant(invariant) => GridShapeBuildError::Invariant(invariant),
+        // Every other variant signals an internal consistency bug in the
+        // grid shaper (wrong piece order, missing pieces, etc.), not a
+        // topology mismatch the caller could fix.
+        _ => GridShapeBuildError::InternalConstruction,
+    }
+}
 
 const MAX_LINE_BEND_RATIO: f32 = 0.2;
 const TAB_WIDTH_MIN: f32 = 0.2;
@@ -432,13 +443,6 @@ struct GridPieceSides {
     topology_edges: [Option<EdgeId>; 4],
 }
 
-#[derive(Clone, Debug)]
-struct InteriorEdgeSlots {
-    endpoints: (PieceId, PieceId),
-    side_a: Option<EdgeSideGeometryMm>,
-    side_b: Option<EdgeSideGeometryMm>,
-}
-
 fn build_shape_atlas(
     topology: &GridTopology,
     rows: u32,
@@ -449,122 +453,39 @@ fn build_shape_atlas(
         return Err(GridShapeBuildError::TopologyMismatch);
     }
 
-    let mut interior_slots = (0..topology.edge_count())
-        .map(|edge| InteriorEdgeSlots {
-            endpoints: topology.edge_endpoints(EdgeId(edge)),
-            side_a: None,
-            side_b: None,
-        })
-        .collect::<Vec<_>>();
-
-    let frame_count = (2 * (rows + cols)) as usize;
-    let mut frame_edges = vec![None; frame_count];
-    let mut border_edges = vec![None; frame_count];
-    let mut pieces = Vec::with_capacity(piece_sides.len());
-
+    let mut builder = ShapeAtlasBuilder::new(topology);
     for (piece_idx, piece_side) in piece_sides.into_iter().enumerate() {
         let piece_id = PieceId(piece_idx as u32);
         let row = piece_idx as u32 / cols;
         let col = piece_idx as u32 % cols;
-        let mut edge_refs = Vec::with_capacity(piece_side.sides.len());
-
+        let mut edges = Vec::with_capacity(piece_side.sides.len());
         for (side_idx, side_geometry) in piece_side.sides.into_iter().enumerate() {
-            let maybe_topology_edge = piece_side.topology_edges[side_idx];
-            if let Some(topology_edge) = maybe_topology_edge {
-                let edge_idx = topology_edge.as_usize();
-                let slot = interior_slots
-                    .get_mut(edge_idx)
-                    .ok_or(GridShapeBuildError::TopologyMismatch)?;
-
-                let side = if slot.endpoints.0 == piece_id {
-                    EdgeSide::A
-                } else if slot.endpoints.1 == piece_id {
-                    EdgeSide::B
-                } else {
-                    return Err(GridShapeBuildError::TopologyMismatch);
-                };
-
-                match side {
-                    EdgeSide::A => {
-                        if slot.side_a.replace(side_geometry).is_some() {
-                            return Err(GridShapeBuildError::InternalConstruction);
-                        }
-                    }
-                    EdgeSide::B => {
-                        if slot.side_b.replace(side_geometry).is_some() {
-                            return Err(GridShapeBuildError::InternalConstruction);
-                        }
-                    }
+            match piece_side.topology_edges[side_idx] {
+                Some(edge) => edges.push(PieceEdgeBuilderSpec::Interior {
+                    edge,
+                    side_geometry,
+                }),
+                None => {
+                    // Pass the canonical frame-edge index as the sort key
+                    // so the builder's stable sort reproduces the original
+                    // FrameEdgeId / BorderEdgeId assignment that
+                    // `grid_boundary_frame_edge` would have computed.
+                    let frame_edge = grid_boundary_frame_edge(rows, cols, row, col, side_idx)
+                        .ok_or(GridShapeBuildError::InternalConstruction)?;
+                    edges.push(PieceEdgeBuilderSpec::Border {
+                        side_geometry,
+                        frame_sort_key: frame_edge.as_u32() as f32,
+                    });
                 }
-                edge_refs.push(PieceEdgeRef::Interior {
-                    edge: topology_edge,
-                    side,
-                });
-            } else {
-                let frame_edge = grid_boundary_frame_edge(rows, cols, row, col, side_idx)
-                    .ok_or(GridShapeBuildError::InternalConstruction)?;
-                let frame_idx = frame_edge.as_usize();
-                let border_edge = BorderEdgeId(frame_edge.as_u32());
-                let border_idx = border_edge.as_usize();
-
-                if frame_edges.get(frame_idx).is_none() || border_edges.get(border_idx).is_none() {
-                    return Err(GridShapeBuildError::InternalConstruction);
-                }
-                if frame_edges[frame_idx].is_some() || border_edges[border_idx].is_some() {
-                    return Err(GridShapeBuildError::InternalConstruction);
-                }
-
-                frame_edges[frame_idx] = Some(side_geometry.path.clone());
-                border_edges[border_idx] = Some(BorderEdgeGeometryMm {
-                    piece: piece_id,
-                    side: side_geometry,
-                    frame_edge,
-                });
-                edge_refs.push(PieceEdgeRef::Border { edge: border_edge });
             }
         }
-
-        pieces.push(PieceGeometryMm {
-            edges: edge_refs.into_boxed_slice(),
-        });
+        builder
+            .push_piece(piece_id, edges)
+            .map_err(|err| atlas_build_error_to_grid_error(err))?;
     }
-
-    let mut interior_edges = Vec::with_capacity(interior_slots.len());
-    for slot in interior_slots {
-        let side_a = slot
-            .side_a
-            .ok_or(GridShapeBuildError::InternalConstruction)?;
-        let side_b = slot
-            .side_b
-            .ok_or(GridShapeBuildError::InternalConstruction)?;
-        interior_edges.push(InteriorEdgeGeometryMm {
-            endpoints: slot.endpoints,
-            side_a,
-            side_b,
-        });
-    }
-
-    let frame_edges = frame_edges
-        .into_iter()
-        .map(|edge| edge.ok_or(GridShapeBuildError::InternalConstruction))
-        .collect::<Result<Vec<_>, _>>()?;
-    let border_edges = border_edges
-        .into_iter()
-        .map(|edge| edge.ok_or(GridShapeBuildError::InternalConstruction))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let atlas = ShapeAtlasMm {
-        pieces: pieces.into_boxed_slice(),
-        interior_edges: interior_edges.into_boxed_slice(),
-        border_edges: border_edges.into_boxed_slice(),
-        frame: FrameGeometryMm {
-            edges: frame_edges.into_boxed_slice(),
-        },
-    };
-    atlas
-        .validate(topology)
-        .map_err(GridShapeBuildError::Invariant)?;
-    Ok(atlas)
+    builder
+        .build()
+        .map_err(|err| atlas_build_error_to_grid_error(err))
 }
 
 fn build_piece_sides(

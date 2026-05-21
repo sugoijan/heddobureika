@@ -6,7 +6,7 @@ use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
     AdminMsg, ClientMsg, GameRules, GridTopology, LogicalState, PieceId, PlayRules,
     PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableState, Pose2,
-    PuzzleImageRef, PuzzleInfo, PuzzleSpec, RestoredPlayableState, RoomPersistence, ServerMsg,
+    PuzzleImageRef, PuzzleInfo, PuzzleSpec, RoomPersistence, ServerMsg, TopologySpec,
     ASSET_CHUNK_BYTES,
 };
 
@@ -214,8 +214,7 @@ fn build_init_payload() -> (PuzzleInfo, SingletonFixture) {
         image_ref: PuzzleImageRef::BuiltIn {
             slug: DEFAULT_PUZZLE_SLUG.to_string(),
         },
-        rows,
-        cols,
+        topology: TopologySpec::grid(cols, rows).into(),
         shape_seed: 0,
         image_width,
         image_height,
@@ -232,9 +231,10 @@ fn singleton_playable(
     puzzle: &PuzzleInfo,
     state: &SingletonFixture,
 ) -> PlayableState<GridTopology> {
-    let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
-    let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
-    let topology = GridTopology::try_new(puzzle.cols, puzzle.rows).expect("valid grid");
+    let (cols, rows) = puzzle.grid_dims().expect("grid puzzle in test");
+    let piece_width = puzzle.image_width as f32 / cols as f32;
+    let piece_height = puzzle.image_height as f32 / rows as f32;
+    let topology = GridTopology::try_new(cols, rows).expect("valid grid");
     let logical = LogicalState::new(topology);
     let mut playable = PlayableState::new(logical, PlayRules::default());
     for (idx, &(x, y)) in state.positions.iter().enumerate() {
@@ -264,8 +264,9 @@ fn playable_position(
     anchor_id: u32,
     pos: (f32, f32),
 ) -> PlayablePositionSnapshot {
-    let cols = puzzle.cols as usize;
-    let rows = puzzle.rows as usize;
+    let (cols, rows) = puzzle.grid_dims().expect("grid puzzle in test");
+    let cols = cols as usize;
+    let rows = rows as usize;
     assert!(cols > 0 && rows > 0);
     assert!((anchor_id as usize) < cols * rows);
     let piece_width = puzzle.image_width as f32 / cols as f32;
@@ -309,6 +310,8 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
             },
             pieces: None,
             seed: None,
+            topology: None,
+            shape_seed: None,
         },
     };
     if let Some(bytes) = encode(&admin_msg) {
@@ -399,16 +402,14 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
         match msg {
             ServerMsg::State { snapshot, .. } => {
                 let restored = match snapshot.restore_playable_from_spec() {
-                    Ok(RestoredPlayableState::Grid(p)) => p,
-                    Ok(_) => {
-                        return Err("unsupported topology in state message".into());
-                    }
+                    Ok(p) => p,
                     Err(err) => {
                         return Err(format!("restore state snapshot failed: {err:?}").into());
                     }
                 };
-                let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
-                let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+                let (cols, rows) = puzzle.grid_dims().expect("grid puzzle in test");
+                let piece_width = puzzle.image_width as f32 / cols as f32;
+                let piece_height = puzzle.image_height as f32 / rows as f32;
                 let pos = restored
                     .piece_world_pose(PieceId(anchor_id))
                     .map(|pose| {
@@ -424,8 +425,9 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
                 }
             }
             ServerMsg::PlayableUpdate { update, .. } => {
-                let piece_width = puzzle.image_width as f32 / puzzle.cols as f32;
-                let piece_height = puzzle.image_height as f32 / puzzle.rows as f32;
+                let (cols, rows) = puzzle.grid_dims().expect("grid puzzle in test");
+                let piece_width = puzzle.image_width as f32 / cols as f32;
+                let piece_height = puzzle.image_height as f32 / rows as f32;
                 let pos = update
                     .group_changes
                     .iter()
@@ -471,6 +473,8 @@ async fn multiplayer_private_upload_reloads_and_serves_asset(
             },
             pieces: None,
             seed: None,
+            topology: None,
+            shape_seed: None,
         },
     };
     if let Some(bytes) = encode(&create_msg) {
@@ -520,6 +524,8 @@ async fn multiplayer_private_upload_reloads_and_serves_asset(
     let upload_end = AdminMsg::UploadPrivateEnd {
         pieces: None,
         seed: None,
+        topology: None,
+        shape_seed: None,
     };
     if let Some(bytes) = encode(&upload_end) {
         admin_write.send(Message::Binary(bytes.into())).await?;
@@ -633,6 +639,8 @@ async fn recording_caps_and_exports_rows() -> Result<(), Box<dyn std::error::Err
                 },
                 pieces: None,
                 seed: None,
+                topology: None,
+                shape_seed: None,
             },
         },
     )

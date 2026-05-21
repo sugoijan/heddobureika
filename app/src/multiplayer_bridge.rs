@@ -7,7 +7,6 @@ use js_sys::Date;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app_core::{AppCore, AppSubscription};
-use crate::core::{build_grid_choices, grid_choice_index, GridChoice, FALLBACK_GRID};
 use crate::game_state::AppGameState;
 use crate::local_snapshot::build_playable_snapshot_from_app;
 use crate::persisted::{PrivateImageEntry, PrivateImageRefs};
@@ -16,8 +15,8 @@ use crate::runtime::{AssetEvent, SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use heddobureika_core::{
     angle_matches, safety_corrections_after_detach, AngleDeg, ClientId, ClientMsg, FlipState,
-    GameRules, GridTopology, MergePolicy, PieceId, PlayableAction, PlayableGameSnapshot,
-    PlayableRoomUpdate, PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo,
+    GameRules, MergePolicy, PieceId, PlayableAction, PlayableGameSnapshot, PlayableRoomUpdate,
+    PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo, PuzzleTopology,
     RestrictedPlayableAction, RoomControlUpdate, RoomPersistence, PRIVATE_ASSET_MAX_BYTES,
 };
 
@@ -495,8 +494,20 @@ impl MultiplayerBridgeState {
 
     fn prune_pending_against_state(&self, game: &AppGameState) {
         let active_drag_anchor = self.active_drag_anchor();
-        let piece_width = game.puzzle.image_width as f32 / game.puzzle.cols as f32;
-        let piece_height = game.puzzle.image_height as f32 / game.puzzle.rows as f32;
+        // Topology-agnostic pose-unit derivation: ask the topology how
+        // many pose-mm units it spans and divide image pixels into that.
+        // Falls back to `(1.0, 1.0)` so the comparison still runs (with a
+        // looser tolerance) for puzzles whose topology can't be built.
+        let (piece_width, piece_height) =
+            heddobureika_core::build_topology_from_spec(&game.puzzle.to_spec())
+                .map(|topology| {
+                    let (ex, ey) = topology.image_extent_in_pose_units();
+                    (
+                        game.puzzle.image_width as f32 / ex.max(1.0),
+                        game.puzzle.image_height as f32 / ey.max(1.0),
+                    )
+                })
+                .unwrap_or((1.0, 1.0));
         self.pending_snaps
             .borrow_mut()
             .retain(|(anchor_id, entry)| {
@@ -734,14 +745,11 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer snapshot missing image size");
             return false;
         }
-        let cols = snapshot.puzzle.cols as usize;
-        let rows = snapshot.puzzle.rows as usize;
-        let total = cols * rows;
+        let total = snapshot.puzzle.piece_count() as usize;
         if total == 0 {
-            console::warn!("multiplayer snapshot invalid grid");
+            console::warn!("multiplayer snapshot invalid topology");
             return false;
         }
-        let grid_override = grid_override_for_puzzle(&snapshot.puzzle);
         let core_snapshot = self.core.snapshot();
         let should_update_core = core_snapshot
             .puzzle_info
@@ -750,17 +758,17 @@ impl MultiplayerBridgeState {
                 info.image_ref != snapshot.puzzle.image_ref
                     || info.image_width != snapshot.puzzle.image_width
                     || info.image_height != snapshot.puzzle.image_height
-                    || info.cols != snapshot.puzzle.cols
-                    || info.rows != snapshot.puzzle.rows
+                    || info.topology != snapshot.puzzle.topology
             })
             .unwrap_or(true);
         let preserve_drag = !should_update_core && !core_snapshot.dragging_members.is_empty();
         if should_update_core {
-            self.core.set_puzzle_with_grid(
+            self.core.set_puzzle_with_topology(
                 snapshot.puzzle.label.clone(),
                 snapshot.puzzle.image_ref.clone(),
                 (snapshot.puzzle.image_width, snapshot.puzzle.image_height),
-                Some(grid_override),
+                snapshot.puzzle.to_spec(),
+                None,
             );
         }
         self.prune_pending_against_state(&game_state);
@@ -792,9 +800,7 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer prediction skipped (puzzle info not ready)");
             return false;
         };
-        let cols = info.cols as usize;
-        let rows = info.rows as usize;
-        let total = cols * rows;
+        let total = info.piece_count() as usize;
         if total == 0 {
             return false;
         }
@@ -802,8 +808,23 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer prediction skipped (state not ready)");
             return false;
         };
-        let piece_width = info.image_width as f32 / info.cols as f32;
-        let piece_height = info.image_height as f32 / info.rows as f32;
+        // Pose unit comes from the rendered geometry; if that's not yet
+        // populated, fall back to deriving it from the topology's
+        // declared image span (topology-agnostic — works for grid,
+        // triangular, future Voronoi).
+        let unit_x = snapshot.pose_unit_px[0];
+        let unit_y = snapshot.pose_unit_px[1];
+        let (fallback_x, fallback_y) = heddobureika_core::build_topology_from_spec(&info.to_spec())
+            .map(|topology| {
+                let (ex, ey) = topology.image_extent_in_pose_units();
+                (
+                    info.image_width as f32 / ex.max(1.0),
+                    info.image_height as f32 / ey.max(1.0),
+                )
+            })
+            .unwrap_or((1.0, 1.0));
+        let piece_width = if unit_x > 0.0 { unit_x } else { fallback_x };
+        let piece_height = if unit_y > 0.0 { unit_y } else { fallback_y };
         let pending_detaches_snapshot = self.pending_detaches.borrow().clone();
         if !pending_detaches_snapshot.is_empty() {
             let mut invalid = Vec::new();
@@ -812,13 +833,8 @@ impl MultiplayerBridgeState {
             let puzzle = predicted_state.puzzle.clone();
             let rules = predicted_state.rules;
             for piece_id in pending_detaches {
-                if predict_pending_detach(
-                    &mut predicted_state.playable,
-                    piece_id,
-                    &puzzle,
-                    &rules,
-                )
-                .is_err()
+                if predict_pending_detach(&mut predicted_state.playable, piece_id, &puzzle, &rules)
+                    .is_err()
                 {
                     invalid.push(piece_id);
                 }
@@ -914,9 +930,7 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer update dropped (puzzle info not ready)");
             return;
         };
-        let cols = info.cols as usize;
-        let rows = info.rows as usize;
-        let total = cols * rows;
+        let total = info.piece_count() as usize;
         if total == 0 {
             return;
         }
@@ -964,8 +978,8 @@ pub(crate) fn hooks_for_tests(core: Rc<AppCore>) -> SyncHooks {
     state.build_hooks()
 }
 
-fn predict_pending_transform(
-    playable: &mut PlayableState<GridTopology>,
+fn predict_pending_transform<T: PuzzleTopology>(
+    playable: &mut PlayableState<T>,
     anchor_id: u32,
     pos: (f32, f32),
     rot_deg: Option<f32>,
@@ -1017,8 +1031,8 @@ fn predict_pending_transform(
     Ok(())
 }
 
-fn predict_pending_flip(
-    playable: &mut PlayableState<GridTopology>,
+fn predict_pending_flip<T: PuzzleTopology>(
+    playable: &mut PlayableState<T>,
     piece_id: u32,
     flipped: bool,
 ) -> Result<(), ()> {
@@ -1047,8 +1061,8 @@ fn predict_pending_flip(
     Ok(())
 }
 
-fn predict_pending_detach(
-    playable: &mut PlayableState<GridTopology>,
+fn predict_pending_detach<T: PuzzleTopology>(
+    playable: &mut PlayableState<T>,
     piece_id: u32,
     puzzle: &PuzzleInfo,
     rules: &GameRules,
@@ -1074,12 +1088,20 @@ fn predict_pending_detach(
     let _ = playable.apply_restricted_action_batch(action, None);
     // Mirror the server's post-detach safety force-move so the predicted
     // state matches the wire echo and we don't snap poses when it arrives.
-    let corrections = safety_corrections_after_detach(playable, &original_members, puzzle, rules);
+    let pose_unit_px = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
+        .map(|t| {
+            let (ex, ey) = t.image_extent_in_pose_units();
+            (
+                puzzle.image_width as f32 / ex.max(1.0),
+                puzzle.image_height as f32 / ey.max(1.0),
+            )
+        })
+        .unwrap_or((1.0, 1.0));
+    let corrections =
+        safety_corrections_after_detach(playable, &original_members, puzzle, rules, pose_unit_px);
     for (group, drop_pos) in corrections {
-        let _ = playable.apply_action_only(
-            PlayableAction::TranslateGroup { group, drop_pos },
-            None,
-        );
+        let _ =
+            playable.apply_action_only(PlayableAction::TranslateGroup { group, drop_pos }, None);
     }
     Ok(())
 }
@@ -1115,43 +1137,20 @@ fn pending_transform_matches_state(
     Some(pos_match && rot_match)
 }
 
-fn apply_group_order_to_playable(
-    playable: &mut PlayableState<GridTopology>,
+fn apply_group_order_to_playable<T: PuzzleTopology>(
+    playable: &mut PlayableState<T>,
     anchors: &[u32],
 ) -> bool {
     playable.set_z_order_by_anchors(anchors)
 }
 
-fn grid_override_for_puzzle(puzzle: &PuzzleInfo) -> GridChoice {
-    let mut choices = build_grid_choices(puzzle.image_width, puzzle.image_height);
-    if choices.is_empty() {
-        choices.push(FALLBACK_GRID);
-    }
-    if let Some(index) = grid_choice_index(&choices, puzzle.cols, puzzle.rows) {
-        return choices
-            .get(index)
-            .copied()
-            .unwrap_or_else(|| fallback_grid(puzzle));
-    }
-    fallback_grid(puzzle)
-}
-
-fn fallback_grid(puzzle: &PuzzleInfo) -> GridChoice {
-    let count = puzzle.cols.saturating_mul(puzzle.rows);
-    GridChoice {
-        target_count: count,
-        cols: puzzle.cols,
-        rows: puzzle.rows,
-        actual_count: count,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::GridChoice;
     use heddobureika_core::{
-        EdgeId, GameRules, LogicalState, PlayRules, PlayableRoomUpdateKind,
-        ProposalApplyStatusSnapshot,
+        build_topology_from_spec, EdgeId, GameRules, GridShapeSettings, GridTopology, LogicalState,
+        PlayRules, PlayableRoomUpdateKind, ProposalApplyStatusSnapshot, TopologySpec,
     };
 
     fn two_piece_puzzle() -> PuzzleInfo {
@@ -1160,8 +1159,7 @@ mod tests {
             image_ref: PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
-            rows: 1,
-            cols: 2,
+            topology: TopologySpec::grid(2, 1).into(),
             shape_seed: 0,
             image_width: 200,
             image_height: 100,
@@ -1169,16 +1167,32 @@ mod tests {
     }
 
     fn unsnapped_two_piece_game() -> AppGameState {
+        let puzzle = two_piece_puzzle();
+        let _grid = GridChoice {
+            target_count: 2,
+            cols: 2,
+            rows: 1,
+            actual_count: 2,
+        };
+        let topology = build_topology_from_spec(&TopologySpec::grid(2, 1)).expect("topology");
+        let geometry = topology
+            .build_render_geometry(
+                puzzle.image_width,
+                puzzle.image_height,
+                puzzle.shape_seed,
+                &GridShapeSettings::default(),
+            )
+            .expect("render geometry");
         AppGameState::scrambled(
-            two_piece_puzzle(),
+            puzzle,
             GameRules::default(),
+            TopologySpec::grid(2, 1),
+            &geometry,
             0,
             &[(0.0, 0.0), (250.0, 0.0)],
             &[0.0, 0.0],
             &[false, false],
             &[0, 1],
-            100.0,
-            100.0,
         )
         .expect("valid test game")
     }
@@ -1276,18 +1290,14 @@ mod tests {
     #[test]
     fn pending_place_prediction_keeps_optimistic_snap_membership() {
         let core = AppCore::new();
-        core.set_puzzle_with_grid(
+        core.set_puzzle_with_topology(
             "test".to_string(),
             PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
             (200, 100),
-            Some(GridChoice {
-                target_count: 2,
-                cols: 2,
-                rows: 1,
-                actual_count: 2,
-            }),
+            TopologySpec::grid(2, 1),
+            None,
         );
 
         let bridge = MultiplayerBridgeState::new(core.clone());
@@ -1306,18 +1316,14 @@ mod tests {
     #[test]
     fn pending_shift_drag_prediction_places_detached_piece_only() {
         let core = AppCore::new();
-        core.set_puzzle_with_grid(
+        core.set_puzzle_with_topology(
             "test".to_string(),
             PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
             (200, 100),
-            Some(GridChoice {
-                target_count: 2,
-                cols: 2,
-                rows: 1,
-                actual_count: 2,
-            }),
+            TopologySpec::grid(2, 1),
+            None,
         );
 
         let bridge = MultiplayerBridgeState::new(core.clone());
@@ -1353,18 +1359,14 @@ mod tests {
     #[test]
     fn solved_authoritative_state_prunes_stale_pending_flip() {
         let core = AppCore::new();
-        core.set_puzzle_with_grid(
+        core.set_puzzle_with_topology(
             "test".to_string(),
             PuzzleImageRef::BuiltIn {
                 slug: "test".to_string(),
             },
             (200, 100),
-            Some(GridChoice {
-                target_count: 2,
-                cols: 2,
-                rows: 1,
-                actual_count: 2,
-            }),
+            TopologySpec::grid(2, 1),
+            None,
         );
 
         let bridge = MultiplayerBridgeState::new(core.clone());
