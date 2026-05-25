@@ -31,6 +31,7 @@ pub mod snap;
 pub mod snapshot;
 pub mod topology;
 pub mod traits;
+pub mod triangular_lattice;
 pub mod triangular_shape;
 pub mod units;
 pub mod update;
@@ -93,6 +94,7 @@ pub use topology::{
 pub use traits::edge_profile::EdgeProfileStrategy;
 pub use traits::shaping::{PieceGeometryProvider, TopologyShaper};
 pub use traits::topology::{FrameBounds, PieceOuterFeature, PuzzleTopology};
+pub use triangular_lattice::{TriDirection, TriLattice};
 pub use triangular_shape::{
     TriangularTessellationShapeBuildError, TriangularTessellationShapeCache,
     TriangularTessellationShapeSettings, TriangularTessellationShaper,

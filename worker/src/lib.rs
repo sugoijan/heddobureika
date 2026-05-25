@@ -328,12 +328,27 @@ struct Ownership {
 struct RoomLivePuzzle {
     snapshot: PlayableGameSnapshot,
     playable: heddobureika_game::GenericPlayableState,
+    /// Cached pixel geometry for the bounds clamp. `None` only when the
+    /// puzzle is degenerate (zero image size / pieces). Recomputed only here,
+    /// since a live puzzle's topology, image size, and rules never change
+    /// once set — actions just move pieces.
+    geometry: Option<RoomGeometry>,
 }
 
 impl RoomLivePuzzle {
     fn from_snapshot(snapshot: PlayableGameSnapshot) -> Option<Self> {
         let playable = snapshot.restore_playable_from_spec().ok()?;
-        Some(Self { snapshot, playable })
+        let geometry = RoomGeometry::from_topology(
+            &playable.logical.topology,
+            snapshot.puzzle.image_width,
+            snapshot.puzzle.image_height,
+            snapshot.rules.workspace_padding_ratio,
+        );
+        Some(Self {
+            snapshot,
+            playable,
+            geometry,
+        })
     }
 
     fn sync_snapshot_from_playable(&mut self) {
@@ -519,16 +534,23 @@ fn apply_bridge_flip(
     live: &mut RoomLivePuzzle,
     piece_id: u32,
     flipped: bool,
+    drop_pose: Option<PlayablePoseSnapshot>,
     action_id: ActionId,
 ) -> Result<PlayableUpdateBatch, GameBridgeError> {
     let piece = heddobureika_game::PieceId(piece_id);
     if piece.as_usize() >= live.playable.piece_count() {
         return Err(GameBridgeError::InvalidPieceId { piece_id });
     }
-    let target_pose = live
-        .playable
-        .piece_world_pose(piece)
-        .ok_or(GameBridgeError::InvalidPieceId { piece_id })?;
+    // The client computes the click-pivoted post-flip pose and sends it, so
+    // the authoritative state reproduces that exact pose. Fall back to the
+    // current world pose (reflect-about-anchor) when none is supplied.
+    let target_pose = match drop_pose.and_then(|pose| pose.to_pose().ok()) {
+        Some(pose) => pose,
+        None => live
+            .playable
+            .piece_world_pose(piece)
+            .ok_or(GameBridgeError::InvalidPieceId { piece_id })?,
+    };
     let target_flip = if flipped {
         heddobureika_game::FlipState::Flipped
     } else {
@@ -1047,8 +1069,12 @@ impl DurableObject for Room {
             ClientMsg::Flip {
                 piece_id,
                 flipped,
+                drop_pose,
                 base_revision: _,
-            } => self.handle_flip(client_id, piece_id, flipped).await,
+            } => {
+                self.handle_flip(client_id, piece_id, flipped, drop_pose)
+                    .await
+            }
             ClientMsg::Detach {
                 piece_id,
                 base_revision: _,
@@ -1150,13 +1176,73 @@ impl DurableObject for Room {
     }
 }
 
+/// Topology-agnostic pixel geometry for the authoritative bounds clamp.
+///
+/// `pose_unit_x/y` convert pose-mm to puzzle pixels (`image_dim / extent`);
+/// for a grid this equals the per-cell pixel size, so grid behaviour is
+/// unchanged. `piece_half_*` hold each piece's half bounding-box in pixels
+/// (`piece_extent_mm * pose_unit / 2`), so the clamp is exact per piece for
+/// any topology. `view_*` is the workspace rect in puzzle pixels.
+///
+/// Built once per puzzle (cached on `RoomLivePuzzle`) — actions only move
+/// pieces, never change the topology, image size, or rules it derives from.
 struct RoomGeometry {
-    piece_width: f32,
-    piece_height: f32,
-    center_min_x: f32,
-    center_max_x: f32,
-    center_min_y: f32,
-    center_max_y: f32,
+    pose_unit_x: f32,
+    pose_unit_y: f32,
+    view_min_x: f32,
+    view_max_x: f32,
+    view_min_y: f32,
+    view_max_y: f32,
+    piece_half_w: Vec<f32>,
+    piece_half_h: Vec<f32>,
+}
+
+impl RoomGeometry {
+    fn from_topology(
+        topology: &heddobureika_game::GenericTopology,
+        image_width: u32,
+        image_height: u32,
+        workspace_padding_ratio: f32,
+    ) -> Option<Self> {
+        let image_width = image_width as f32;
+        let image_height = image_height as f32;
+        if image_width <= 0.0 || image_height <= 0.0 {
+            return None;
+        }
+        let (extent_x, extent_y) = topology.image_extent_in_pose_units();
+        if extent_x <= 0.0 || extent_y <= 0.0 {
+            return None;
+        }
+        let total = topology.piece_count() as usize;
+        if total == 0 {
+            return None;
+        }
+        let pose_unit_x = image_width / extent_x;
+        let pose_unit_y = image_height / extent_y;
+        let layout = compute_workspace_layout(image_width, image_height, workspace_padding_ratio);
+        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
+        let view_min_x = layout.view_min_x / puzzle_scale;
+        let view_min_y = layout.view_min_y / puzzle_scale;
+        let view_max_x = view_min_x + layout.view_width / puzzle_scale;
+        let view_max_y = view_min_y + layout.view_height / puzzle_scale;
+        let mut piece_half_w = Vec::with_capacity(total);
+        let mut piece_half_h = Vec::with_capacity(total);
+        for idx in 0..total as u32 {
+            let (ex, ey) = topology.piece_extent_mm(heddobureika_game::PieceId(idx));
+            piece_half_w.push(ex.as_mm_f32() * pose_unit_x * 0.5);
+            piece_half_h.push(ey.as_mm_f32() * pose_unit_y * 0.5);
+        }
+        Some(Self {
+            pose_unit_x,
+            pose_unit_y,
+            view_min_x,
+            view_max_x,
+            view_min_y,
+            view_max_y,
+            piece_half_w,
+            piece_half_h,
+        })
+    }
 }
 
 impl Room {
@@ -1849,52 +1935,6 @@ impl Room {
             .command_store_post("https://command/events/clear", None)
             .await?;
         Ok(())
-    }
-
-    fn geometry_for_playable_snapshot(snapshot: &PlayableGameSnapshot) -> Option<RoomGeometry> {
-        // Grid-only geometry helper: returns None for non-grid topologies.
-        let (cols, rows) = grid_dims_for_topology(&snapshot.state.topology)?;
-        if cols == 0 || rows == 0 {
-            return None;
-        }
-        if snapshot.state.topology_piece_count as usize != cols.saturating_mul(rows) {
-            return None;
-        }
-        let image_width = snapshot.puzzle.image_width as f32;
-        let image_height = snapshot.puzzle.image_height as f32;
-        if image_width <= 0.0 || image_height <= 0.0 {
-            return None;
-        }
-        let piece_width = image_width / cols as f32;
-        let piece_height = image_height / rows as f32;
-        let layout = compute_workspace_layout(
-            image_width,
-            image_height,
-            snapshot.rules.workspace_padding_ratio,
-        );
-        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
-        let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
-        let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
-        let puzzle_view_width = layout.view_width / puzzle_scale;
-        let puzzle_view_height = layout.view_height / puzzle_scale;
-        let center_min_x = puzzle_view_min_x + piece_width * 0.5;
-        let center_min_y = puzzle_view_min_y + piece_height * 0.5;
-        let mut center_max_x = puzzle_view_min_x + puzzle_view_width - piece_width * 0.5;
-        let mut center_max_y = puzzle_view_min_y + puzzle_view_height - piece_height * 0.5;
-        if center_max_x < center_min_x {
-            center_max_x = center_min_x;
-        }
-        if center_max_y < center_min_y {
-            center_max_y = center_min_y;
-        }
-        Some(RoomGeometry {
-            piece_width,
-            piece_height,
-            center_min_x,
-            center_max_x,
-            center_min_y,
-            center_max_y,
-        })
     }
 
     fn build_puzzle_from_spec(
@@ -3020,7 +3060,6 @@ impl Room {
             if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
                 owner.since_ms = now;
             }
-            let geometry = Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot);
             let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if anchor_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
@@ -3047,39 +3086,43 @@ impl Room {
                 inner.live = Some(runtime_snapshot);
                 return Ok(());
             }
-            // The server-side bounds clamp needs per-piece pixel rects, which
-            // only the grid topology exposes. For other topologies we skip it
-            // and trust the client's optimistic placement — the move still
-            // applies below.
-            if let Some(geometry) = &geometry {
-                let Some((_anchor_pos, anchor_rot)) =
-                    playable_piece_grid_pose(&runtime_snapshot.snapshot, anchor_id_usize, geometry)
-                else {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                };
-                let pos = legacy_top_left_from_playable_position(drop_pos, geometry);
-                let Some(next_positions) = playable_projected_group_positions(
+            // A move keeps the group's current rotation; project members about
+            // the proposed drop center and reject only if the whole group would
+            // leave the workspace.
+            let out_of_bounds = if let Some(geometry) = runtime_snapshot.geometry.as_ref() {
+                let group = runtime_snapshot
+                    .snapshot
+                    .state
+                    .piece_group
+                    .get(anchor_id_usize)
+                    .map(|g| *g as usize)
+                    .unwrap_or(0);
+                let anchor_rot = runtime_snapshot
+                    .snapshot
+                    .state
+                    .group_pose
+                    .get(group)
+                    .map(|pose| pose.rotation_deg)
+                    .unwrap_or(0.0);
+                !group_in_bounds(
                     &runtime_snapshot.snapshot,
+                    geometry,
                     &members,
                     anchor_id_usize,
-                    pos,
+                    (drop_pos.x_mm, drop_pos.y_mm),
                     anchor_rot,
-                    geometry,
-                ) else {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                };
-
-                if !self.group_in_bounds(&members, &next_positions, geometry) {
-                    console_log!(
-                        "move ignored: out of bounds (client={} anchor={})",
-                        client_id,
-                        anchor_id
-                    );
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
+                )
+            } else {
+                false
+            };
+            if out_of_bounds {
+                console_log!(
+                    "move ignored: out of bounds (client={} anchor={})",
+                    client_id,
+                    anchor_id
+                );
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
             }
 
             let action_id =
@@ -3155,7 +3198,6 @@ impl Room {
             if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
                 owner.since_ms = now;
             }
-            let geometry = Self::geometry_for_playable_snapshot(&runtime_snapshot.snapshot);
             let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
             if anchor_id as usize >= total {
                 inner.live = Some(runtime_snapshot);
@@ -3183,36 +3225,28 @@ impl Room {
                 return Ok(());
             }
 
-            // Grid-only server-side bounds clamp (see `handle_move`).
-            if let Some(geometry) = &geometry {
-                let pos = legacy_top_left_from_playable_position(
-                    PlayablePositionSnapshot {
-                        x_mm: drop_pose.x_mm,
-                        y_mm: drop_pose.y_mm,
-                    },
-                    geometry,
-                );
-                let Some(next_positions) = playable_projected_group_positions(
+            // A transform sets the group's rotation to the drop pose's; project
+            // members about the proposed center + rotation.
+            let out_of_bounds = if let Some(geometry) = runtime_snapshot.geometry.as_ref() {
+                !group_in_bounds(
                     &runtime_snapshot.snapshot,
+                    geometry,
                     &members,
                     anchor_id_usize,
-                    pos,
+                    (drop_pose.x_mm, drop_pose.y_mm),
                     drop_pose.rotation_deg,
-                    geometry,
-                ) else {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                };
-
-                if !self.group_in_bounds(&members, &next_positions, geometry) {
-                    console_log!(
-                        "transform ignored: out of bounds (client={} anchor={})",
-                        client_id,
-                        anchor_id
-                    );
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
+                )
+            } else {
+                false
+            };
+            if out_of_bounds {
+                console_log!(
+                    "transform ignored: out of bounds (client={} anchor={})",
+                    client_id,
+                    anchor_id
+                );
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
             }
 
             let action_id =
@@ -3265,7 +3299,13 @@ impl Room {
         Ok(())
     }
 
-    async fn handle_flip(&self, client_id: ClientId, piece_id: u32, flipped: bool) -> Result<()> {
+    async fn handle_flip(
+        &self,
+        client_id: ClientId,
+        piece_id: u32,
+        flipped: bool,
+        drop_pose: PlayablePoseSnapshot,
+    ) -> Result<()> {
         let now = now_ms();
         let updates = {
             let mut inner = self.inner.borrow_mut();
@@ -3318,8 +3358,13 @@ impl Room {
             }
 
             let action_id = bridge_action_id(client_id, None, runtime_snapshot.snapshot.seq);
-            let batch = match apply_bridge_flip(&mut runtime_snapshot, piece_id, flipped, action_id)
-            {
+            let batch = match apply_bridge_flip(
+                &mut runtime_snapshot,
+                piece_id,
+                flipped,
+                Some(drop_pose),
+                action_id,
+            ) {
                 Ok(batch) => batch,
                 Err(err) => {
                     console_log!(
@@ -3654,50 +3699,6 @@ impl Room {
             self.schedule_alarm().await?;
         }
         Ok(())
-    }
-
-    fn group_in_bounds(
-        &self,
-        members: &[usize],
-        positions: &[(usize, (f32, f32))],
-        geometry: &RoomGeometry,
-    ) -> bool {
-        let (bounds_min_x, bounds_max_x, bounds_min_y, bounds_max_y) = if members.len() > 1 {
-            let mut min_x = geometry.center_min_x + geometry.piece_width;
-            let mut max_x = geometry.center_max_x - geometry.piece_width;
-            let mut min_y = geometry.center_min_y + geometry.piece_height;
-            let mut max_y = geometry.center_max_y - geometry.piece_height;
-            if max_x < min_x {
-                let mid = (geometry.center_min_x + geometry.center_max_x) * 0.5;
-                min_x = mid;
-                max_x = mid;
-            }
-            if max_y < min_y {
-                let mid = (geometry.center_min_y + geometry.center_max_y) * 0.5;
-                min_y = mid;
-                max_y = mid;
-            }
-            (min_x, max_x, min_y, max_y)
-        } else {
-            (
-                geometry.center_min_x,
-                geometry.center_max_x,
-                geometry.center_min_y,
-                geometry.center_max_y,
-            )
-        };
-        for &(_id, pos) in positions {
-            let center_x = pos.0 + geometry.piece_width * 0.5;
-            let center_y = pos.1 + geometry.piece_height * 0.5;
-            if center_x >= bounds_min_x
-                && center_x <= bounds_max_x
-                && center_y >= bounds_min_y
-                && center_y <= bounds_max_y
-            {
-                return true;
-            }
-        }
-        false
     }
 
     fn release_by_client(&self, client_id: ClientId, reason: OwnershipReason) -> Result<()> {
@@ -4814,77 +4815,90 @@ fn playable_group_order_anchors(snapshot: &PlayableGameSnapshot) -> Vec<u32> {
     order
 }
 
-fn playable_piece_grid_pose(
+/// Authoritative bounds clamp for a proposed group move/transform.
+///
+/// Projects every member piece to its pixel center for the proposed anchor
+/// pose, then accepts the placement when at least one piece center stays
+/// inside the workspace (inset by that piece's own half extent — and a full
+/// extent for multi-piece groups, matching the original grid heuristic). The
+/// rejection condition is "the whole group would leave the workspace".
+///
+/// Works for any topology: `pose_unit_*` scale pose-mm to pixels (equal to a
+/// grid cell's pixel size for grids, so grid behaviour is preserved) and
+/// `piece_half_*` carry each piece's true bounding box.
+fn group_in_bounds(
     snapshot: &PlayableGameSnapshot,
-    piece_id: usize,
     geometry: &RoomGeometry,
-) -> Option<((f32, f32), f32)> {
-    let group = *snapshot.state.piece_group.get(piece_id)? as usize;
-    let group_pose = *snapshot.state.group_pose.get(group)?;
-    let anchor = playable_group_anchor(snapshot, group as u32)?;
-    let anchor_local = *snapshot.state.piece_local_pose.get(anchor)?;
-    let piece_local = *snapshot.state.piece_local_pose.get(piece_id)?;
-    let mut dx = piece_local.x_mm - anchor_local.x_mm;
-    let dy = piece_local.y_mm - anchor_local.y_mm;
-    if snapshot
-        .state
-        .group_flip
-        .get(group)
-        .copied()
-        .unwrap_or(false)
-    {
-        dx = -dx;
-    }
-    let (rx, ry) = rotate_vec(dx, dy, group_pose.rotation_deg);
-    let center_x = group_pose.x_mm + rx;
-    let center_y = group_pose.y_mm + ry;
-    Some((
-        (
-            center_x * geometry.piece_width - geometry.piece_width * 0.5,
-            center_y * geometry.piece_height - geometry.piece_height * 0.5,
-        ),
-        group_pose.rotation_deg + piece_local.rotation_deg - anchor_local.rotation_deg,
-    ))
-}
-
-fn playable_projected_group_positions(
-    snapshot: &PlayableGameSnapshot,
     members: &[usize],
     anchor_id: usize,
-    anchor_pos: (f32, f32),
+    anchor_center_mm: (f32, f32),
     anchor_rot_deg: f32,
-    geometry: &RoomGeometry,
-) -> Option<Vec<(usize, (f32, f32))>> {
-    let group = *snapshot.state.piece_group.get(anchor_id)? as usize;
-    let anchor_local = *snapshot.state.piece_local_pose.get(anchor_id)?;
+) -> bool {
+    let Some(group) = snapshot
+        .state
+        .piece_group
+        .get(anchor_id)
+        .map(|g| *g as usize)
+    else {
+        return false;
+    };
+    let Some(anchor_local) = snapshot.state.piece_local_pose.get(anchor_id).copied() else {
+        return false;
+    };
     let flipped = snapshot
         .state
         .group_flip
         .get(group)
         .copied()
         .unwrap_or(false);
-    let mut next_positions = Vec::with_capacity(members.len());
+    let multi = members.len() > 1;
+    let anchor_px = (
+        anchor_center_mm.0 * geometry.pose_unit_x,
+        anchor_center_mm.1 * geometry.pose_unit_y,
+    );
     for &id in members {
-        let piece_local = *snapshot.state.piece_local_pose.get(id)?;
-        let mut dx = (piece_local.x_mm - anchor_local.x_mm) * geometry.piece_width;
-        let dy = (piece_local.y_mm - anchor_local.y_mm) * geometry.piece_height;
+        let Some(piece_local) = snapshot.state.piece_local_pose.get(id).copied() else {
+            continue;
+        };
+        // Scale the local offset to pixels first, THEN rotate — the same
+        // aspect-aware order the renderer uses (pose units are not square).
+        let mut dx = (piece_local.x_mm - anchor_local.x_mm) * geometry.pose_unit_x;
+        let dy = (piece_local.y_mm - anchor_local.y_mm) * geometry.pose_unit_y;
         if flipped {
             dx = -dx;
         }
         let (rx, ry) = rotate_vec(dx, dy, anchor_rot_deg);
-        next_positions.push((id, (anchor_pos.0 + rx, anchor_pos.1 + ry)));
+        let center_x = anchor_px.0 + rx;
+        let center_y = anchor_px.1 + ry;
+        let half_w = geometry
+            .piece_half_w
+            .get(id)
+            .copied()
+            .unwrap_or(geometry.pose_unit_x * 0.5);
+        let half_h = geometry
+            .piece_half_h
+            .get(id)
+            .copied()
+            .unwrap_or(geometry.pose_unit_y * 0.5);
+        let inset_w = if multi { half_w * 3.0 } else { half_w };
+        let inset_h = if multi { half_h * 3.0 } else { half_h };
+        let (mut min_x, mut max_x) = (geometry.view_min_x + inset_w, geometry.view_max_x - inset_w);
+        if max_x < min_x {
+            let mid = (geometry.view_min_x + geometry.view_max_x) * 0.5;
+            min_x = mid;
+            max_x = mid;
+        }
+        let (mut min_y, mut max_y) = (geometry.view_min_y + inset_h, geometry.view_max_y - inset_h);
+        if max_y < min_y {
+            let mid = (geometry.view_min_y + geometry.view_max_y) * 0.5;
+            min_y = mid;
+            max_y = mid;
+        }
+        if center_x >= min_x && center_x <= max_x && center_y >= min_y && center_y <= max_y {
+            return true;
+        }
     }
-    Some(next_positions)
-}
-
-fn legacy_top_left_from_playable_position(
-    pos: PlayablePositionSnapshot,
-    geometry: &RoomGeometry,
-) -> (f32, f32) {
-    (
-        pos.x_mm * geometry.piece_width - geometry.piece_width * 0.5,
-        pos.y_mm * geometry.piece_height - geometry.piece_height * 0.5,
-    )
+    false
 }
 
 #[cfg(test)]
@@ -5116,7 +5130,8 @@ mod tests {
         .expect("live puzzle");
         let action_id = ActionId(14);
 
-        let batch = apply_bridge_flip(&mut live, 1, true, action_id).expect("flip should apply");
+        let batch =
+            apply_bridge_flip(&mut live, 1, true, None, action_id).expect("flip should apply");
 
         assert_eq!(batch.proposal.action_id, Some(action_id));
         assert_eq!(batch.revision_before, 5);
@@ -5507,32 +5522,133 @@ mod tests {
     }
 
     #[test]
-    fn non_grid_actions_apply_even_though_geometry_is_grid_only() {
-        // Regression: every action handler bailed when
-        // `geometry_for_playable_snapshot` returned `None`, which it always
-        // does for non-grid topologies — so no move/flip/etc. processed on
-        // triangular/hexagonal/Voronoi rooms. The grid-only geometry now only
-        // gates an optional server-side bounds clamp; the action itself must
-        // still apply.
-        let grid = snapshot_for_topology(TopologySpec::grid(3, 2), 600, 400);
-        assert!(
-            Room::geometry_for_playable_snapshot(&grid).is_some(),
-            "grid keeps its bounds-clamp geometry"
-        );
+    fn every_topology_gets_per_piece_bounds_geometry() {
+        // Regression: the bounds geometry used to be grid-only, so every
+        // action handler bailed for non-grid topologies and no move/flip/etc.
+        // processed on triangular/hexagonal/Voronoi rooms. Geometry is now
+        // built from each topology's per-piece extents, so it's present for
+        // all of them — and the action still applies.
+        for spec in [
+            TopologySpec::grid(3, 2),
+            TopologySpec::triangular_tessellation(3, 2),
+            TopologySpec::hexagonal(5, 4, 1.5),
+            TopologySpec::voronoi(40, 1, 1.5),
+        ] {
+            let tag = spec.tag.clone();
+            let live = RoomLivePuzzle::from_snapshot(snapshot_for_topology(spec, 600, 400))
+                .expect("live puzzle");
+            let geometry = live
+                .geometry
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tag} should have bounds geometry"));
+            assert_eq!(
+                geometry.piece_half_w.len(),
+                live.snapshot.state.topology_piece_count as usize,
+                "{tag} has a half-extent per piece"
+            );
+            assert!(
+                geometry.piece_half_w.iter().all(|w| *w > 0.0),
+                "{tag} piece extents are positive"
+            );
+        }
 
+        // The action itself applies on a non-grid topology.
         let triangular =
             snapshot_for_topology(TopologySpec::triangular_tessellation(3, 2), 600, 400);
-        assert!(
-            Room::geometry_for_playable_snapshot(&triangular).is_none(),
-            "non-grid yields no geometry, so the clamp is skipped (not the whole action)"
-        );
-
-        // The topology-agnostic apply path the handler now reaches must
-        // mutate the non-grid snapshot.
         let mut live = RoomLivePuzzle::from_snapshot(triangular).expect("live puzzle");
-        let batch = apply_bridge_flip(&mut live, 0, true, ActionId(7)).expect("flip applies");
+        let batch = apply_bridge_flip(&mut live, 0, true, None, ActionId(7)).expect("flip applies");
         assert_eq!(batch.proposal.action_id, Some(ActionId(7)));
         assert_eq!(batch.revision_after, batch.revision_before + 1);
         assert_eq!(live.snapshot.seq, batch.revision_after);
+    }
+
+    #[test]
+    fn bridge_flip_honors_client_supplied_drop_pose() {
+        // The click-pivot adjustment is computed client-side; the server must
+        // reproduce it by applying the post-flip pose carried on the wire,
+        // not by recomputing the pre-flip world pose.
+        let triangular =
+            snapshot_for_topology(TopologySpec::triangular_tessellation(3, 2), 600, 400);
+        let mut live = RoomLivePuzzle::from_snapshot(triangular).expect("live puzzle");
+        let group = heddobureika_game::GroupId(0);
+        let pivoted = PlayablePoseSnapshot {
+            x_mm: 4.25,
+            y_mm: 1.75,
+            rotation_deg: 0.0,
+        };
+        let _ = apply_bridge_flip(&mut live, 0, true, Some(pivoted.clone()), ActionId(9))
+            .expect("flip applies");
+        let pose = live.playable.pose_of(group).expect("group pose");
+        assert!(
+            (pose.x_mm() - pivoted.x_mm).abs() <= 1.0e-3
+                && (pose.y_mm() - pivoted.y_mm).abs() <= 1.0e-3,
+            "server must adopt the wire drop_pose ({pivoted:?}) but got {pose:?}"
+        );
+        assert_eq!(live.playable.flip_of(group), Some(FlipState::Flipped));
+    }
+
+    #[test]
+    fn admin_solve_anchors_at_each_topologys_frame_anchor() {
+        // The solved puzzle must sit at the topology's canonical frame anchor
+        // so it lines up with the frame outline. Regression: the worker used
+        // `(0.5, 0.5)` for every topology, which only aligns the grid and left
+        // non-grid puzzles offset down/right of the frame.
+        for spec in [
+            TopologySpec::grid(3, 2),
+            TopologySpec::triangular_tessellation(3, 2),
+            TopologySpec::hexagonal(5, 4, 1.5),
+            TopologySpec::voronoi(40, 1, 1.5),
+        ] {
+            let tag = spec.tag.clone();
+            let topology =
+                heddobureika_core::build_topology_from_spec(&spec).expect("buildable topology");
+            let expected = topology
+                .identity_frame_anchor()
+                .map(|(_, pose)| pose)
+                .unwrap_or_default();
+            let puzzle = snapshot_for_topology(spec, 600, 400).puzzle;
+            let solved = Room::build_solved_snapshot(puzzle, GameRules::default())
+                .unwrap_or_else(|| panic!("{tag} solved snapshot"));
+            let anchor = solved.state.group_pose[0];
+            assert!(
+                (anchor.x_mm - expected.x_mm()).abs() < 1.0e-4
+                    && (anchor.y_mm - expected.y_mm()).abs() < 1.0e-4,
+                "{tag}: solved anchor {:?} != frame anchor ({}, {})",
+                (anchor.x_mm, anchor.y_mm),
+                expected.x_mm(),
+                expected.y_mm(),
+            );
+        }
+    }
+
+    #[test]
+    fn group_in_bounds_accepts_centered_and_rejects_offscreen() {
+        let live = RoomLivePuzzle::from_snapshot(snapshot_for_topology(
+            TopologySpec::grid(3, 2),
+            600,
+            400,
+        ))
+        .expect("live puzzle");
+        let geometry = live.geometry.as_ref().expect("geometry");
+        let members = [0usize];
+        // The image center in pose-mm (extent 3x2 → center ~ (1.5, 1.0)) sits
+        // comfortably inside the workspace.
+        assert!(group_in_bounds(
+            &live.snapshot,
+            geometry,
+            &members,
+            0,
+            (1.5, 1.0),
+            0.0
+        ));
+        // A wildly off-screen anchor is rejected.
+        assert!(!group_in_bounds(
+            &live.snapshot,
+            geometry,
+            &members,
+            0,
+            (100.0, 100.0),
+            0.0
+        ));
     }
 }

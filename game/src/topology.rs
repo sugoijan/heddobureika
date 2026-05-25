@@ -1,8 +1,11 @@
 //! Topology contracts for geometry-agnostic puzzle behavior.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+
+pub use crate::triangular_lattice::{TriDirection, TriLattice};
 
 use crate::ids::{EdgeId, PieceId};
 use crate::playable::{PlayableState, Pose2};
@@ -51,9 +54,22 @@ impl TopologySpec {
         GridTopology::new_spec(cols, rows)
     }
 
-    /// Convenience constructor for a `TriangularTessellationTopology` spec.
-    pub fn triangular_tessellation(cols: u32, rows: u32) -> Self {
-        TriangularTessellationTopology::new_spec(cols, rows)
+    /// Convenience constructor for a `TriangularTessellationTopology` spec
+    /// with the default (horizontal) guide-line direction. `lines` is the
+    /// number of strips across the spanned axis; `points` the number of
+    /// points along each line.
+    pub fn triangular_tessellation(lines: u32, points: u32) -> Self {
+        TriangularTessellationTopology::new_spec(lines, points)
+    }
+
+    /// Convenience constructor for a `TriangularTessellationTopology` spec
+    /// with an explicit guide-line direction.
+    pub fn triangular_tessellation_directed(
+        direction: TriDirection,
+        lines: u32,
+        points: u32,
+    ) -> Self {
+        TriangularTessellationTopology::new_spec_directed(direction, lines, points)
     }
 
     /// Convenience constructor for a `HexagonalTopology` spec. `cols`
@@ -145,6 +161,26 @@ fn read_two_u32_payload(bytes: &[u8]) -> Option<(u32, u32)> {
     let a = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
     let b = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     Some((a, b))
+}
+
+/// Helper: pack three `u32`s into 12 little-endian bytes. Used by the
+/// triangular topology for its `(direction, lines, points)` payload.
+fn write_three_u32_payload(a: u32, b: u32, c: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12);
+    bytes.extend_from_slice(&a.to_le_bytes());
+    bytes.extend_from_slice(&b.to_le_bytes());
+    bytes.extend_from_slice(&c.to_le_bytes());
+    bytes
+}
+
+fn read_three_u32_payload(bytes: &[u8]) -> Option<(u32, u32, u32)> {
+    if bytes.len() != 12 {
+        return None;
+    }
+    let a = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let b = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let c = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    Some((a, b, c))
 }
 
 /// Rectangular grid puzzle topology.
@@ -454,174 +490,173 @@ impl PuzzleTopology for GridTopology {
     }
 }
 
-/// Piece shape class for triangular tessellation.
+/// Whether a triangular piece is a regular interior triangle or an
+/// irregular border filler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrianglePieceKind {
+    /// Interior triangle — all three sides shared with neighbours, so it is
+    /// exactly equilateral.
     Regular,
-    HalfRegular,
+    /// Border filler closing the jagged lattice edge to the frame. Has at
+    /// least one frame edge and is generally not equilateral.
+    Border,
 }
 
-/// Triangular tessellation over a rectangular region with:
-/// - top row of half triangles,
-/// - middle rows of regular triangles,
-/// - bottom row of half triangles.
+/// Equilateral-triangle tiling of a rectangle (see [`crate::triangular_lattice`]).
 ///
-/// For `cols=3, rows=2`, this yields:
-/// - piece rows: `2 * rows + 1 = 5`
-/// - regular triangles: `cols * (2 * rows - 1) = 9`
-/// - half triangles on top+bottom edges: `2 * cols = 6`
-/// - total pieces: `15`
+/// A guide-line `direction` is chosen; evenly spaced lines span one axis
+/// fully while points step along them at the equilateral spacing, so every
+/// interior (3-shared-side) triangle is exactly regular. The jagged
+/// line-ends are closed with non-regular border fillers, yielding a clean
+/// rectangular puzzle. `lines` is the number of strips across the spanned
+/// axis; `points` the number of points along each line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriangularTessellationTopology {
-    cols: NonZeroU32,
-    rows: NonZeroU32,
-    piece_kinds: Box<[TrianglePieceKind]>,
+    direction: TriDirection,
+    lines: NonZeroU32,
+    points: NonZeroU32,
+    /// Per-piece lattice vertex indices (into `vertices`).
+    faces: Box<[[u32; 3]]>,
+    /// Lattice vertices in pose units.
+    vertices: Box<[(f32, f32)]>,
+    /// Per-piece: regular interior triangle (`true`) vs border filler.
+    inner: Box<[bool]>,
+    /// Per-piece canonical centroid in pose units (the solved anchor).
+    centroids: Box<[(f32, f32)]>,
     edges: Box<[(PieceId, PieceId)]>,
-    canonical_positions_mm: Box<[(LengthMm, LengthMm)]>,
+    /// Pose-unit extent `(width, height)` of the tiled rectangle.
+    extent: (f32, f32),
 }
 
 impl TriangularTessellationTopology {
-    pub fn new(cols: NonZeroU32, rows: NonZeroU32) -> Self {
-        let piece_rows = rows.get() * 2 + 1;
-        let total_piece_count = cols.get() * piece_rows;
+    /// Horizontal-direction constructor (the default). `lines` strips span
+    /// the vertical axis; `points` step along each horizontal line.
+    pub fn new(lines: NonZeroU32, points: NonZeroU32) -> Self {
+        Self::new_directed(TriDirection::Horizontal, lines, points)
+    }
 
-        let mut piece_kinds = Vec::with_capacity(total_piece_count as usize);
-        for piece_row in 0..piece_rows {
-            let kind = if piece_row == 0 || piece_row + 1 == piece_rows {
-                TrianglePieceKind::HalfRegular
-            } else {
-                TrianglePieceKind::Regular
-            };
-            for _ in 0..cols.get() {
-                piece_kinds.push(kind);
-            }
-        }
-
-        let mut canonical_positions_mm =
-            vec![(LengthMm::zero(), LengthMm::zero()); total_piece_count as usize];
-
-        for piece_row in 0..piece_rows {
-            for col in 0..cols.get() {
-                let piece = Self::piece_id_at_unchecked(cols, piece_row, col).as_usize();
-                let x = if piece_row % 2 == 0 {
-                    col as f32
-                } else {
-                    col as f32 + 0.5
-                };
-                let y = piece_row as f32;
-                canonical_positions_mm[piece] = (
-                    LengthMm::try_new(x).unwrap_or_default(),
-                    LengthMm::try_new(y).unwrap_or_default(),
-                );
-            }
-        }
-
-        let mut edges = Vec::new();
-        // Vertical edges between consecutive piece rows (same column).
-        for piece_row in 0..(piece_rows - 1) {
-            for col in 0..cols.get() {
-                edges.push((
-                    Self::piece_id_at_unchecked(cols, piece_row, col),
-                    Self::piece_id_at_unchecked(cols, piece_row + 1, col),
-                ));
-            }
-        }
-
-        // Horizontal zig-zag edges by row parity:
-        // even rows connect (0-1), (2-3), ...
-        // odd rows connect (1-2), (3-4), ...
-        for piece_row in 0..piece_rows {
-            let start = if piece_row % 2 == 0 { 0 } else { 1 };
-            let mut col = start;
-            while col + 1 < cols.get() {
-                edges.push((
-                    Self::piece_id_at_unchecked(cols, piece_row, col),
-                    Self::piece_id_at_unchecked(cols, piece_row, col + 1),
-                ));
-                col += 2;
-            }
-        }
-
+    pub fn new_directed(direction: TriDirection, lines: NonZeroU32, points: NonZeroU32) -> Self {
+        let lattice = TriLattice::build(direction, lines.get(), points.get().max(2))
+            .expect("valid triangular lattice parameters");
+        let faces: Box<[[u32; 3]]> = lattice
+            .faces
+            .iter()
+            .map(|f| [f[0] as u32, f[1] as u32, f[2] as u32])
+            .collect();
+        let centroids: Box<[(f32, f32)]> = (0..lattice.faces.len())
+            .map(|i| lattice.face_centroid(i))
+            .collect();
+        let edges = derive_triangular_edges(&lattice.faces);
         Self {
-            cols,
-            rows,
-            piece_kinds: piece_kinds.into_boxed_slice(),
-            edges: edges.into_boxed_slice(),
-            canonical_positions_mm: canonical_positions_mm.into_boxed_slice(),
+            direction,
+            lines,
+            points,
+            faces,
+            vertices: lattice.vertices.into_boxed_slice(),
+            inner: lattice.inner.into_boxed_slice(),
+            centroids,
+            edges,
+            extent: lattice.extent,
         }
     }
 
-    pub fn try_new(cols: u32, rows: u32) -> Option<Self> {
-        Some(Self::new(NonZeroU32::new(cols)?, NonZeroU32::new(rows)?))
+    pub fn try_new(lines: u32, points: u32) -> Option<Self> {
+        Self::try_new_directed(TriDirection::Horizontal, lines, points)
+    }
+
+    pub fn try_new_directed(direction: TriDirection, lines: u32, points: u32) -> Option<Self> {
+        Some(Self::new_directed(
+            direction,
+            NonZeroU32::new(lines)?,
+            NonZeroU32::new(points.max(2))?,
+        ))
     }
 
     pub fn example_3x2() -> Self {
-        Self::new(
-            NonZeroU32::new(3).expect("3 must be non-zero"),
-            NonZeroU32::new(2).expect("2 must be non-zero"),
-        )
+        Self::try_new(3, 5).expect("valid example")
     }
 
-    pub fn cols(&self) -> NonZeroU32 {
-        self.cols
+    pub fn direction(&self) -> TriDirection {
+        self.direction
     }
 
-    pub fn rows(&self) -> NonZeroU32 {
-        self.rows
+    pub fn lines(&self) -> NonZeroU32 {
+        self.lines
     }
 
-    pub fn regular_piece_count(&self) -> u32 {
-        self.cols.get() * (self.piece_row_count().saturating_sub(2))
+    pub fn points(&self) -> NonZeroU32 {
+        self.points
     }
 
-    pub fn half_piece_count(&self) -> u32 {
-        self.cols.get() * 2
+    /// Pose-unit extent `(width, height)` of the tiled rectangle.
+    pub fn pose_extent(&self) -> (f32, f32) {
+        self.extent
     }
 
-    pub fn piece_row_count(&self) -> u32 {
-        self.rows.get() * 2 + 1
-    }
-
-    pub fn piece_id_at(&self, piece_row: u32, col: u32) -> Option<PieceId> {
-        if piece_row >= self.piece_row_count() || col >= self.cols.get() {
-            return None;
-        }
-        Some(Self::piece_id_at_unchecked(self.cols, piece_row, col))
-    }
-
-    pub fn piece_row_col(&self, piece: PieceId) -> Option<(u32, u32)> {
-        let id = piece.as_u32();
-        let total = self.piece_count();
-        if id >= total {
-            return None;
-        }
-        Some((id / self.cols.get(), id % self.cols.get()))
+    /// Lattice vertices (pose units) and per-piece vertex-index triples —
+    /// consumed by the shaper to build the scaled mesh.
+    pub fn lattice_geometry(&self) -> (&[(f32, f32)], &[[u32; 3]]) {
+        (&self.vertices, &self.faces)
     }
 
     pub fn piece_kind(&self, piece: PieceId) -> Option<TrianglePieceKind> {
-        self.piece_kinds.get(piece.as_usize()).copied()
+        self.inner.get(piece.as_usize()).map(|&inner| {
+            if inner {
+                TrianglePieceKind::Regular
+            } else {
+                TrianglePieceKind::Border
+            }
+        })
     }
 
-    pub fn top_half_piece_id(&self, col: u32) -> Option<PieceId> {
-        self.piece_id_at(0, col)
-    }
-
-    pub fn bottom_half_piece_id(&self, col: u32) -> Option<PieceId> {
-        self.piece_id_at(self.piece_row_count().saturating_sub(1), col)
-    }
-
-    pub fn regular_piece_id(&self, piece_row: u32, col: u32) -> Option<PieceId> {
-        if piece_row == 0 || piece_row + 1 >= self.piece_row_count() {
-            return None;
-        }
-        if col >= self.cols.get() {
-            return None;
-        }
-        self.piece_id_at(piece_row, col)
-    }
-
+    /// Canonical (solved) centroid of a piece in pose units.
     pub fn canonical_position_mm(&self, piece: PieceId) -> Option<(LengthMm, LengthMm)> {
-        self.canonical_positions_mm.get(piece.as_usize()).copied()
+        let (x, y) = self.centroids.get(piece.as_usize()).copied()?;
+        Some((
+            LengthMm::try_new(x).unwrap_or_default(),
+            LengthMm::try_new(y).unwrap_or_default(),
+        ))
+    }
+
+    /// Frame (border) edges of a piece, as endpoint pairs in pose units
+    /// relative to the piece centroid (BEFORE rotation) — used by
+    /// `visit_outer_features`. Empty for interior pieces.
+    fn border_edges_local(&self, piece: PieceId) -> Vec<((f32, f32), (f32, f32))> {
+        let idx = piece.as_usize();
+        let Some(face) = self.faces.get(idx) else {
+            return Vec::new();
+        };
+        if self.inner.get(idx).copied().unwrap_or(false) {
+            return Vec::new();
+        }
+        let (cx, cy) = self.centroids[idx];
+        let mut out = Vec::new();
+        for k in 0..3 {
+            let a = face[k] as usize;
+            let b = face[(k + 1) % 3] as usize;
+            if self.edge_is_border(a, b) {
+                let (ax, ay) = self.vertices[a];
+                let (bx, by) = self.vertices[b];
+                out.push(((ax - cx, ay - cy), (bx - cx, by - cy)));
+            }
+        }
+        out
+    }
+
+    /// Whether the undirected vertex edge `(a, b)` is on the frame (owned by
+    /// exactly one face).
+    fn edge_is_border(&self, a: usize, b: usize) -> bool {
+        let mut count = 0;
+        for face in self.faces.iter() {
+            let f = [face[0] as usize, face[1] as usize, face[2] as usize];
+            for k in 0..3 {
+                let (u, v) = (f[k], f[(k + 1) % 3]);
+                if (u == a && v == b) || (u == b && v == a) {
+                    count += 1;
+                }
+            }
+        }
+        count == 1
     }
 
     pub fn debug_dot_graph(&self) -> String {
@@ -635,14 +670,13 @@ impl TriangularTessellationTopology {
             let (x, y) = self
                 .canonical_position_mm(piece)
                 .unwrap_or((LengthMm::zero(), LengthMm::zero()));
-            let (piece_row, col) = self.piece_row_col(piece).unwrap_or((0, 0));
             let (shape, color, kind_label) = match self.piece_kind(piece) {
-                Some(TrianglePieceKind::HalfRegular) => ("box", "#d7ecff", "half"),
+                Some(TrianglePieceKind::Border) => ("box", "#d7ecff", "border"),
                 Some(TrianglePieceKind::Regular) => ("triangle", "#f7e7c3", "regular"),
                 None => ("ellipse", "#eeeeee", "unknown"),
             };
             lines.push(format!(
-                "  p{id} [label=\"{id}\\n{kind_label}\\nr{piece_row}c{col}\", shape={shape}, fillcolor=\"{color}\", pos=\"{:.3},{:.3}!\"];",
+                "  p{id} [label=\"{id}\\n{kind_label}\", shape={shape}, fillcolor=\"{color}\", pos=\"{:.3},{:.3}!\"];",
                 x.as_mm_f32(),
                 -y.as_mm_f32()
             ));
@@ -656,19 +690,19 @@ impl TriangularTessellationTopology {
         lines.push("}".to_string());
         lines.join("\n")
     }
-
-    fn piece_id_at_unchecked(cols: NonZeroU32, piece_row: u32, col: u32) -> PieceId {
-        PieceId(piece_row * cols.get() + col)
-    }
 }
 
 impl TriangularTessellationTopology {
-    /// Convenience constructor for a `TopologySpec` describing a
-    /// triangular-tessellation puzzle of the given dimensions.
-    pub fn new_spec(cols: u32, rows: u32) -> TopologySpec {
+    /// Convenience constructor for a `TopologySpec` (horizontal direction).
+    pub fn new_spec(lines: u32, points: u32) -> TopologySpec {
+        Self::new_spec_directed(TriDirection::Horizontal, lines, points)
+    }
+
+    /// Convenience constructor for a `TopologySpec` with explicit direction.
+    pub fn new_spec_directed(direction: TriDirection, lines: u32, points: u32) -> TopologySpec {
         TopologySpec {
             tag: <Self as SerializableTopology>::TAG.to_string(),
-            payload: write_two_u32_payload(cols, rows),
+            payload: write_three_u32_payload(direction.as_u32(), lines, points),
         }
     }
 }
@@ -677,13 +711,39 @@ impl SerializableTopology for TriangularTessellationTopology {
     const TAG: &'static str = "triangular_tessellation";
 
     fn write_payload(&self) -> Vec<u8> {
-        write_two_u32_payload(self.cols.get(), self.rows.get())
+        write_three_u32_payload(self.direction.as_u32(), self.lines.get(), self.points.get())
     }
 
     fn read_payload(bytes: &[u8]) -> Option<Self> {
-        let (cols, rows) = read_two_u32_payload(bytes)?;
-        Self::try_new(cols, rows)
+        let (dir, lines, points) = read_three_u32_payload(bytes)?;
+        Self::try_new_directed(TriDirection::from_u32(dir), lines, points)
     }
+}
+
+/// Interior (shared) edges of a triangular lattice, as `(faceA, faceB)`
+/// piece pairs with `faceA < faceB`, in a deterministic order.
+fn derive_triangular_edges(faces: &[[usize; 3]]) -> Box<[(PieceId, PieceId)]> {
+    let key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    let mut owners: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (fi, f) in faces.iter().enumerate() {
+        for k in 0..3 {
+            owners
+                .entry(key(f[k], f[(k + 1) % 3]))
+                .or_default()
+                .push(fi);
+        }
+    }
+    let mut pairs: Vec<(u32, u32)> = owners
+        .values()
+        .filter(|o| o.len() == 2)
+        .map(|o| (o[0].min(o[1]) as u32, o[0].max(o[1]) as u32))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+        .into_iter()
+        .map(|(a, b)| (PieceId(a), PieceId(b)))
+        .collect()
 }
 
 impl PuzzleTopology for TriangularTessellationTopology {
@@ -692,7 +752,7 @@ impl PuzzleTopology for TriangularTessellationTopology {
     }
 
     fn piece_count(&self) -> u32 {
-        self.piece_kinds.len() as u32
+        self.faces.len() as u32
     }
 
     fn edge_count(&self) -> u32 {
@@ -722,23 +782,32 @@ impl PuzzleTopology for TriangularTessellationTopology {
 
     fn symmetry_angles(&self, piece: PieceId) -> &[AngleDeg] {
         match self.piece_kind(piece) {
-            Some(TrianglePieceKind::HalfRegular) => triangular_half_symmetry_angles(),
-            _ => triangular_regular_symmetry_angles(),
+            Some(TrianglePieceKind::Regular) => triangular_regular_symmetry_angles(),
+            // Border fillers aren't equilateral; treat their rotation hints
+            // like the grid's 90° steps (weak).
+            _ => triangular_half_symmetry_angles(),
+        }
+    }
+
+    fn symmetry_strength(&self, piece: PieceId) -> SymmetryStrength {
+        match self.piece_kind(piece) {
+            Some(TrianglePieceKind::Regular) => SymmetryStrength::Strong,
+            _ => SymmetryStrength::Weak,
         }
     }
 
     fn frame_bounds(&self) -> Option<FrameBounds> {
-        let mut iter = self.canonical_positions_mm.iter();
+        let mut iter = self.centroids.iter();
         let first = iter.next()?;
-        let mut min_x = first.0.as_mm_f32();
-        let mut min_y = first.1.as_mm_f32();
+        let mut min_x = first.0;
+        let mut min_y = first.1;
         let mut max_x = min_x;
         let mut max_y = min_y;
         for (x, y) in iter {
-            min_x = min_x.min(x.as_mm_f32());
-            min_y = min_y.min(y.as_mm_f32());
-            max_x = max_x.max(x.as_mm_f32());
-            max_y = max_y.max(y.as_mm_f32());
+            min_x = min_x.min(*x);
+            min_y = min_y.min(*y);
+            max_x = max_x.max(*x);
+            max_y = max_y.max(*y);
         }
         Some(FrameBounds {
             min_x,
@@ -749,134 +818,42 @@ impl PuzzleTopology for TriangularTessellationTopology {
     }
 
     fn is_frame_border_piece(&self, piece: PieceId) -> bool {
-        let Some((piece_row, col)) = self.piece_row_col(piece) else {
-            return false;
-        };
-        // Top/bottom half-rows always touch a horizontal frame edge.
-        // Regular-row pieces in the first or last column touch one of
-        // the vertical frame edges via the mesh boundary.
-        piece_row == 0
-            || piece_row + 1 == self.piece_row_count()
-            || col == 0
-            || col + 1 == self.cols.get()
+        // Border (filler) pieces are exactly the non-interior faces.
+        !self.inner.get(piece.as_usize()).copied().unwrap_or(false)
     }
 
     fn visit_outer_features(&self, piece: PieceId, visitor: &mut dyn FnMut(PieceOuterFeature)) {
-        let Some((piece_row, col)) = self.piece_row_col(piece) else {
-            return;
-        };
-        let piece_rows = self.piece_row_count();
-        let cols = self.cols.get();
-        if !self.is_frame_border_piece(piece) {
-            return;
-        }
-
-        let on_top = piece_row == 0;
-        let on_bottom = piece_row + 1 == piece_rows;
-        let on_left = col == 0;
-        let on_right = col + 1 == cols;
-        let is_corner = (on_top || on_bottom) && (on_left || on_right);
-
-        // The triangular layout has piece anchors at canonical
-        // `(col, piece_row)` for even rows and `(col+0.5, piece_row)`
-        // for odd rows. The visual frame runs from `(0, 0)` to
-        // `(cols, piece_rows)`. Half-row anchors are NOT symmetric
-        // about the puzzle interior: top half-row anchors sit ON the
-        // top frame line, while bottom half-row anchors sit one pose
-        // unit ABOVE the bottom frame line (the piece body extends
-        // downward to the frame). The piece-local offsets below model
-        // that asymmetry so each outer feature's world position lands
-        // on the actual visual frame line.
-        let anchor_x = if piece_row % 2 == 0 {
-            col as f32
-        } else {
-            col as f32 + 0.5
-        };
-        let anchor_y = piece_row as f32;
-        let frame_x_left = 0.0_f32;
-        let frame_x_right = cols as f32;
-        let frame_y_top = 0.0_f32;
-        let frame_y_bottom = piece_rows as f32;
-
-        if on_top {
-            let local_y = frame_y_top - anchor_y;
-            visitor(PieceOuterFeature::BorderEdge {
-                p1: (-0.5, local_y),
-                p2: (0.5, local_y),
-            });
-        }
-        if on_bottom {
-            let local_y = frame_y_bottom - anchor_y;
-            visitor(PieceOuterFeature::BorderEdge {
-                p1: (-0.5, local_y),
-                p2: (0.5, local_y),
-            });
-        }
-        // Regular-row left/right pieces touch the side frame at a
-        // single mesh vertex — we model that as a unit-long vertical
-        // "edge" whose midpoint sits on the frame line in world coords.
-        if !is_corner && (on_left || on_right) {
-            let local_x = if on_left {
-                frame_x_left - anchor_x
-            } else {
-                frame_x_right - anchor_x
-            };
-            visitor(PieceOuterFeature::BorderEdge {
-                p1: (local_x, -0.5),
-                p2: (local_x, 0.5),
-            });
-        }
-        // Half-row corner pieces: the outer corner sits at the puzzle
-        // frame corner, NOT at the anchor. Compute the piece-local
-        // offset accordingly so the CornerAttachment lands on the
-        // correct frame corner under all four rotations.
-        if is_corner {
-            let local_x = if on_left {
-                frame_x_left - anchor_x
-            } else {
-                frame_x_right - anchor_x
-            };
-            let local_y = if on_top {
-                frame_y_top - anchor_y
-            } else {
-                frame_y_bottom - anchor_y
-            };
-            visitor(PieceOuterFeature::CornerAttachment {
-                point: (local_x, local_y),
-            });
+        // Each frame edge of a border piece is emitted directly from the
+        // lattice, in piece-local pose units (relative to the centroid,
+        // before rotation). The frame-snap solver matches each to the
+        // nearest/most-parallel frame side; a corner filler has two such
+        // edges, giving a 2-axis constraint without a special corner case.
+        for (p1, p2) in self.border_edges_local(piece) {
+            visitor(PieceOuterFeature::BorderEdge { p1, p2 });
         }
     }
 
     fn identity_frame_anchor(&self) -> Option<(PieceId, Pose2)> {
-        Some((PieceId(0), Pose2::try_from_mm_degrees(0.0, 0.0, 0.0)?))
+        // Solved group pose = the anchor piece's (piece 0's) canonical
+        // centroid, so the assembled puzzle lands at its frame position.
+        let (x, y) = self.centroids.first().copied()?;
+        Some((PieceId(0), Pose2::try_from_mm_degrees(x, y, 0.0)?))
     }
 
     fn dims_hint(&self) -> Option<(u32, u32)> {
-        Some((self.cols.get(), self.rows.get()))
+        Some((self.lines.get(), self.points.get()))
     }
 
     fn image_extent_in_pose_units(&self) -> (f32, f32) {
-        // Triangular pieces stack `2 * rows + 1` piece-rows vertically (a
-        // half-row above and below the regular triangles) — that's the
-        // actual y-axis span in pose units, not `rows`.
-        (self.cols.get() as f32, self.piece_row_count() as f32)
+        self.extent
     }
 
     fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
-        // The visual puzzle frame matches `image_extent_in_pose_units`:
-        // pieces and the rendered rounded-rectangle border both run
-        // from `0` to `(cols, piece_row_count)` in pose units. The
-        // half-row pieces' geometry sits asymmetrically — top half-row
-        // anchors lie on the top frame line, bottom half-row anchors
-        // sit one pose unit above the bottom frame line — but the
-        // FRAME ITSELF is symmetric. `visit_outer_features` accounts
-        // for the asymmetric anchor placement in the per-piece offsets.
-        self.image_extent_in_pose_units()
+        self.extent
     }
 
     fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
-        let (x, y) = self.canonical_position_mm(piece)?;
-        Some((x.as_mm_f32(), y.as_mm_f32()))
+        self.centroids.get(piece.as_usize()).copied()
     }
 
     fn build_render_geometry(
@@ -887,31 +864,46 @@ impl PuzzleTopology for TriangularTessellationTopology {
         _settings: &dyn std::any::Any,
     ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
         use crate::traits::shaping::TopologyShaper;
-        let piece_rows = self.piece_row_count().max(1);
-        let pose_unit_x = image_width as f32 / self.cols.get().max(1) as f32;
-        let pose_unit_y = image_height as f32 / piece_rows as f32;
-        // Estimate the regular triangle bbox in pixels: in canonical
-        // units a unit-side equilateral triangle has a bbox of
-        // `(1, sqrt(3)/2)`; the canonical mesh occupies
-        // `(1.5*cols, (sqrt(3)/2)*piece_row_count)` and is stretched to
-        // `(image_w, image_h)`, so the per-axis stretch factors give
-        // typical bbox = `(pose_unit_x / 1.5, pose_unit_y)`.
-        let typical_x = pose_unit_x / 1.5;
-        let typical_y = pose_unit_y;
-        let frame_shape = crate::render_geometry::PuzzleFrameShape::from_image_and_pieces(
-            image_width,
-            image_height,
-            [typical_x, typical_y],
-        );
-        let shaper = crate::triangular_shape::TriangularTessellationShaper;
-        let settings = crate::triangular_shape::TriangularTessellationShapeSettings {
-            corner_radius_px: frame_shape.corner_radius_px,
+        let img_w = image_width as f32;
+        let img_h = image_height as f32;
+        let (ex, ey) = self.extent;
+        if ex <= 0.0 || ey <= 0.0 {
+            return None;
+        }
+        // The lattice is exactly equilateral, so scale it UNIFORMLY (same
+        // factor on both axes) to fit inside the image, centred. The image
+        // area outside the centred rectangle is the (sub-triangle, by
+        // construction) crop/letterbox margin. Pose units are square, so
+        // `pose_unit_x == pose_unit_y == scale` and pieces never distort.
+        let scale = (img_w / ex).min(img_h / ey);
+        let frame_w = ex * scale;
+        let frame_h = ey * scale;
+        let origin_x = (img_w - frame_w) * 0.5;
+        let origin_y = (img_h - frame_h) * 0.5;
+
+        let corner_radius_px = crate::render_geometry::PuzzleFrameShape::from_image_and_pieces(
+            frame_w.max(1.0) as u32,
+            frame_h.max(1.0) as u32,
+            [scale, scale * crate::triangular_lattice::TRI_ROW_HEIGHT],
+        )
+        .corner_radius_px;
+        let frame_shape = crate::render_geometry::PuzzleFrameShape {
+            bounds: crate::render_geometry::RectPx {
+                x: origin_x,
+                y: origin_y,
+                width: frame_w,
+                height: frame_h,
+            },
+            corner_radius_px,
         };
+        let shaper = crate::triangular_shape::TriangularTessellationShaper;
+        let settings =
+            crate::triangular_shape::TriangularTessellationShapeSettings { corner_radius_px };
         let cache = shaper
             .build_cache(
                 self,
-                LengthMm::try_new(image_width as f32)?,
-                LengthMm::try_new(image_height as f32)?,
+                LengthMm::try_new(frame_w)?,
+                LengthMm::try_new(frame_h)?,
                 shape_seed,
                 &settings,
             )
@@ -922,15 +914,15 @@ impl PuzzleTopology for TriangularTessellationTopology {
             &cache.atlas,
             image_width,
             image_height,
-            [pose_unit_x, pose_unit_y],
-            [0.0, 0.0],
+            [scale, scale],
+            [origin_x, origin_y],
             mask_pad_px,
             frame_shape,
             |piece| {
                 let (x, y) = self.canonical_position_in_pose_units(piece)?;
-                Some((x * pose_unit_x, y * pose_unit_y))
+                Some((origin_x + x * scale, origin_y + y * scale))
             },
-            |_piece| (0.0, 0.0),
+            move |_piece| (origin_x, origin_y),
         )
     }
 }

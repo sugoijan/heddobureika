@@ -3095,6 +3095,10 @@ impl WgpuView {
             assets.render_geometry.puzzle_bounds_px.width,
             assets.render_geometry.puzzle_bounds_px.height,
         ];
+        // The dashed outline uses the topology's actual frame (centred,
+        // possibly letterboxed sub-rect), not the full image rectangle.
+        let frame = assets.render_geometry.frame_shape.bounds;
+        let frame_rect_px = [frame.x, frame.y, frame.width, frame.height];
         let typical_piece_extent_px = assets.render_geometry.typical_piece_extent_px;
         let view_min_x = view_rect.min_x;
         let view_min_y = view_rect.min_y;
@@ -3128,6 +3132,7 @@ impl WgpuView {
                 canvas,
                 image,
                 puzzle_bounds_px,
+                frame_rect_px,
                 typical_piece_extent_px,
                 view_min_x,
                 view_min_y,

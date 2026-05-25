@@ -860,6 +860,19 @@ impl AppCore {
             .assets
             .as_ref()
             .map(|assets| assets.render_geometry.clone());
+        // World-space pivot for a click-driven flip/unflip: the press point,
+        // converted from puzzle-pixel coords to pose-mm units. Pinning this
+        // point keeps it under the cursor across the toggle so the user can
+        // immediately grab the (un)flipped piece without it sliding away.
+        let flip_pivot = render_geometry.as_ref().and_then(|geom| {
+            let [ox, oy] = geom.pose_origin_px;
+            let [ux, uy] = geom.pose_unit_px;
+            if ux > 0.0 && uy > 0.0 {
+                Position2::try_from_mm((drag.start_x - ox) / ux, (drag.start_y - oy) / uy)
+            } else {
+                None
+            }
+        });
         let Some(game) = state.game.as_mut() else {
             state.drag_state = None;
             state.dragging_members.clear();
@@ -920,6 +933,7 @@ impl AppCore {
             game.playable.apply_restricted_action_batch(
                 RestrictedPlayableAction::FlipGroup {
                     group: primary_group,
+                    pivot: flip_pivot,
                 },
                 None,
             );
@@ -934,6 +948,7 @@ impl AppCore {
             game.playable.apply_action_with_snap(
                 PlayableAction::UnflipGroup {
                     group: primary_group,
+                    pivot: flip_pivot,
                 },
                 None,
                 MergePolicy::KeepFixedGroup,
@@ -2036,10 +2051,25 @@ mod tests {
         let snapshot_before = core.snapshot();
         let game = snapshot_before.game.as_ref().expect("game");
         let pose_unit_px = core.assets().expect("assets").render_geometry.pose_unit_px;
-        // Pick a piece in the bottom half (piece_row = 5, well below the
-        // origin) where the wrong y-unit conversion would have produced the
-        // largest displacement.
-        let piece_id = 15usize;
+        // Pick the piece nearest the lattice centre — solidly in-bounds, so a
+        // correct safety helper produces no correction. (The old y-unit bug
+        // would still drag such an interior piece.)
+        let topo = heddobureika_core::TriangularTessellationTopology::try_new(3, 3).expect("topo");
+        let (ex, ey) = topo.pose_extent();
+        let (cx, cy) = (ex * 0.5, ey * 0.5);
+        let piece_id = (0..topo.piece_count())
+            .min_by(|&a, &b| {
+                let da = topo
+                    .canonical_position_in_pose_units(heddobureika_core::PieceId(a))
+                    .map(|(x, y)| (x - cx).powi(2) + (y - cy).powi(2))
+                    .unwrap_or(f32::INFINITY);
+                let db = topo
+                    .canonical_position_in_pose_units(heddobureika_core::PieceId(b))
+                    .map(|(x, y)| (x - cx).powi(2) + (y - cy).powi(2))
+                    .unwrap_or(f32::INFINITY);
+                da.total_cmp(&db)
+            })
+            .expect("a piece") as usize;
         let original_pose = game
             .playable
             .pose_of(heddobureika_core::GroupId(piece_id as u32))
@@ -2194,10 +2224,12 @@ mod tests {
         // then we rebuild the visual cache.
         core.clear_all_group_rotations();
         let snapshot = core.snapshot();
-        // Pick a regular-triangle piece (middle rows of a triangular
-        // tessellation). With cols=3, piece_rows=7, regular pieces sit in
-        // piece_rows 1..=5, so piece id 3 (row 1, col 0) is regular.
-        let regular_id = 3usize;
+        // Pick any regular (interior, equilateral) triangular piece — those
+        // have 60° rotational symmetry.
+        let topo = heddobureika_core::TriangularTessellationTopology::try_new(3, 3).expect("topo");
+        let regular_id = (0..topo.piece_count())
+            .find(|&p| !topo.is_frame_border_piece(heddobureika_core::PieceId(p)))
+            .expect("an interior piece") as usize;
         let start_top_left = snapshot.piece_top_left_px[regular_id];
         let regular_assets = core.assets().expect("assets");
         let regular_anchor = regular_assets
@@ -2298,13 +2330,18 @@ mod tests {
         );
         let snapshot = core.snapshot();
         let game = snapshot.game.as_ref().expect("triangular game");
-        assert_eq!(game.playable.piece_count(), 21);
-        assert_eq!(snapshot.piece_positions_px().len(), 21);
+        let count = game.playable.piece_count();
+        assert!(count > 0, "triangular game should have pieces");
+        assert_eq!(snapshot.piece_positions_px().len(), count);
         let assets = core.assets().expect("assets");
-        assert_eq!(assets.render_geometry.pieces.len(), 21);
+        assert_eq!(assets.render_geometry.pieces.len(), count);
+        // puzzle_bounds is the full image; the lattice frame is centred inside.
         assert_eq!(assets.render_geometry.puzzle_bounds_px.height, 200.0);
-        // For triangular with `rows=3`, pose unit y is image_height /
-        // piece_rows (= 2*rows + 1 = 7), not image_height / rows.
-        assert!((assets.piece_height - 200.0 / 7.0).abs() <= 0.01);
+        // Pose units are square (uniform scale), so x and y units match.
+        let [ux, uy] = assets.render_geometry.pose_unit_px;
+        assert!(
+            (ux - uy).abs() / ux.max(uy) < 1.0e-3,
+            "pose units not square"
+        );
     }
 }

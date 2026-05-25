@@ -20,8 +20,11 @@ fn triangular_shaper_validates_atlas_invariants() {
         )
         .expect("triangular cache should build");
 
-    assert_eq!(cache.piece_count(), 15);
-    assert_eq!(cache.atlas.interior_edges.len(), 17);
+    assert_eq!(cache.piece_count(), topology.piece_count());
+    assert_eq!(
+        cache.atlas.interior_edges.len(),
+        topology.edge_count() as usize
+    );
     cache
         .atlas
         .validate(&topology)
@@ -50,8 +53,8 @@ fn triangular_interior_edge_sides_match_in_board_space() {
 
 #[test]
 fn triangular_shapes_cover_source_frame_for_3x2_and_larger() {
-    assert_triangular_coverage(3, 2, 300.0, 210.0);
-    assert_triangular_coverage(3, 3, 480.0, 270.0);
+    assert_triangular_coverage(3, 5);
+    assert_triangular_coverage(4, 6);
 }
 
 #[test]
@@ -93,8 +96,14 @@ fn triangular_cache(
         .expect("triangular cache should build")
 }
 
-fn assert_triangular_coverage(cols: u32, rows: u32, width: f32, height: f32) {
-    let topology = TriangularTessellationTopology::try_new(cols, rows).expect("topology");
+fn assert_triangular_coverage(lines: u32, points: u32) {
+    let topology = TriangularTessellationTopology::try_new(lines, points).expect("topology");
+    // Frame must match the lattice's pose-extent aspect so the uniform scale
+    // fills it exactly (otherwise the mesh fills only one axis).
+    let (ex, ey) = topology.pose_extent();
+    let scale = 60.0_f32;
+    let width = ex * scale;
+    let height = ey * scale;
     let cache = triangular_cache(&topology, width, height);
     let outlines = (0..topology.piece_count())
         .map(|piece| {

@@ -15,10 +15,6 @@ use crate::shape::{
 use crate::topology::{PuzzleTopology, TriangularTessellationTopology};
 use crate::units::LengthMm;
 
-const SQRT_3_OVER_2: f32 = 0.866_025_4;
-const RELAX_ITERATIONS: usize = 2_000;
-const RELAX_EPSILON: f32 = 1.0e-5;
-const POINT_KEY_SCALE: f32 = 10_000.0;
 const TAB_DEPTH_LIMIT: f32 = 0.24;
 const TAB_WIDTH_AVG_MIN: f32 = 0.075;
 const TAB_WIDTH_AVG_MAX: f32 = 0.115;
@@ -136,9 +132,6 @@ struct Mesh {
     faces: Vec<[usize; 3]>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PointKey(i64, i64);
-
 fn build_triangular_atlas(
     topology: &TriangularTessellationTopology,
     frame_width: LengthMm,
@@ -146,13 +139,42 @@ fn build_triangular_atlas(
     seed: u32,
     corner_radius_px: f32,
 ) -> Result<ShapeAtlasMm, TriangularTessellationShapeBuildError> {
-    let mut mesh = build_honeycomb_dual_mesh(topology)?;
-    rectangularize_mesh(
+    // The topology already carries an exact equilateral lattice in pose
+    // units; scale it UNIFORMLY into the frame (pose units are square) and
+    // feed it straight to the generic faces→atlas builder. No honeycomb
+    // construction, no rectangularization, no relaxation — interior pieces
+    // stay exactly equilateral.
+    let (verts, faces) = topology.lattice_geometry();
+    let (ex, _ey) = topology.pose_extent();
+    let scale = if ex > 0.0 {
+        frame_width.as_mm_f32() / ex
+    } else {
+        1.0
+    };
+    let mut mesh = Mesh {
+        vertices: verts
+            .iter()
+            .map(|&(x, y)| Point2 {
+                x: x * scale,
+                y: y * scale,
+            })
+            .collect(),
+        faces: faces
+            .iter()
+            .map(|f| [f[0] as usize, f[1] as usize, f[2] as usize])
+            .collect(),
+    };
+    // Round the four rectangle corners: pull the single mesh vertex sitting on
+    // each corner onto that corner's arc midpoint. Because the vertex is shared
+    // by both border edges AND the interior hypotenuse meeting there, moving it
+    // as one keeps every piece ring closed; the arc↔straight routing in
+    // `build_atlas_from_mesh` then draws the rounded edges automatically.
+    snap_corner_vertices(
         &mut mesh,
         frame_width.as_mm_f32(),
         frame_height.as_mm_f32(),
         corner_radius_px,
-    )?;
+    );
     build_atlas_from_mesh(
         topology,
         &mesh,
@@ -163,187 +185,40 @@ fn build_triangular_atlas(
     )
 }
 
-fn build_honeycomb_dual_mesh(
-    topology: &TriangularTessellationTopology,
-) -> Result<Mesh, TriangularTessellationShapeBuildError> {
-    let mut vertices = Vec::<Point2>::new();
-    let mut vertex_ids = HashMap::<PointKey, usize>::new();
-    let mut faces = Vec::<[usize; 3]>::with_capacity(topology.piece_count() as usize);
-
-    for piece_idx in 0..topology.piece_count() {
-        let piece = PieceId(piece_idx);
-        let (row, col) = topology
-            .piece_row_col(piece)
-            .ok_or(TriangularTessellationShapeBuildError::InternalConstruction)?;
-        let center = honeycomb_center(row, col);
-        let normals = honeycomb_normals(row, col);
-        let points = triangle_from_normals(center, normals)?;
-        let mut face = [0usize; 3];
-        for (idx, point) in points.into_iter().enumerate() {
-            let key = point_key(point);
-            let id = if let Some(id) = vertex_ids.get(&key).copied() {
-                id
-            } else {
-                let id = vertices.len();
-                vertices.push(point);
-                vertex_ids.insert(key, id);
-                id
-            };
-            face[idx] = id;
-        }
-        faces.push(face);
+/// Pulls every mesh vertex that lies exactly on a rectangle corner onto that
+/// corner's rounded-arc midpoint (the 45° point), so the corner reads as a
+/// smooth round rather than a sharp tip. The offset `r·(1 − √2/2)` along each
+/// axis lands the vertex exactly on the corner arc of radius `r`, where the
+/// `arc_index` classifier picks it up. No-op when `radius <= 0`.
+fn snap_corner_vertices(mesh: &mut Mesh, width: f32, height: f32, radius: f32) {
+    if radius <= 0.0 {
+        return;
     }
-
-    Ok(Mesh { vertices, faces })
-}
-
-fn rectangularize_mesh(
-    mesh: &mut Mesh,
-    frame_width: f32,
-    frame_height: f32,
-    corner_radius_px: f32,
-) -> Result<(), TriangularTessellationShapeBuildError> {
-    let boundary_edges = boundary_edges(mesh)?;
-    let boundary = ordered_boundary_vertices(&boundary_edges, &mesh.vertices)?;
-    if boundary.len() < 4 {
-        return Err(TriangularTessellationShapeBuildError::InternalConstruction);
-    }
-
-    // Clamp the radius so the two arc halves never overlap the
-    // straight section: the absolute upper bound is half of the
-    // shorter side; we also guard against negative or NaN inputs.
-    let radius = corner_radius_px
-        .max(0.0)
-        .min(frame_width * 0.5)
-        .min(frame_height * 0.5);
-
-    let corner_indices = boundary_corner_indices(&boundary, &mesh.vertices);
-    let mut fixed = vec![None::<Point2>; mesh.vertices.len()];
-    if radius > 0.0 {
-        // Round corners by mapping each boundary chain along a path
-        // that includes the two adjacent corner arcs (half each, split
-        // at the corner's "midpoint" — the arc's 45° point).
-        for side_idx in 0..4 {
-            let start = corner_indices[side_idx];
-            let end = corner_indices[(side_idx + 1) % 4];
-            let side = match side_idx {
-                0 => RoundedSide::Top,
-                1 => RoundedSide::Right,
-                2 => RoundedSide::Bottom,
-                _ => RoundedSide::Left,
-            };
-            map_boundary_chain_rounded(
-                mesh,
-                &boundary,
-                start,
-                end,
-                side,
-                frame_width,
-                frame_height,
-                radius,
-                &mut fixed,
-            );
-        }
-    } else {
-        // Original behaviour: map each chain to a straight rect side.
-        map_boundary_chain(
-            mesh,
-            &boundary,
-            corner_indices[0],
-            corner_indices[1],
-            Point2 { x: 0.0, y: 0.0 },
-            Point2 {
-                x: frame_width,
-                y: 0.0,
-            },
-            &mut fixed,
-        );
-        map_boundary_chain(
-            mesh,
-            &boundary,
-            corner_indices[1],
-            corner_indices[2],
-            Point2 {
-                x: frame_width,
-                y: 0.0,
-            },
-            Point2 {
-                x: frame_width,
-                y: frame_height,
-            },
-            &mut fixed,
-        );
-        map_boundary_chain(
-            mesh,
-            &boundary,
-            corner_indices[2],
-            corner_indices[3],
-            Point2 {
-                x: frame_width,
-                y: frame_height,
-            },
-            Point2 {
-                x: 0.0,
-                y: frame_height,
-            },
-            &mut fixed,
-        );
-        map_boundary_chain(
-            mesh,
-            &boundary,
-            corner_indices[3],
-            corner_indices[0],
-            Point2 {
-                x: 0.0,
-                y: frame_height,
-            },
-            Point2 { x: 0.0, y: 0.0 },
-            &mut fixed,
-        );
-    }
-
-    let adjacency = vertex_adjacency(mesh);
-    for (idx, point) in mesh.vertices.iter_mut().enumerate() {
-        if let Some(fixed_point) = fixed[idx] {
-            *point = fixed_point;
+    let k = radius * (1.0 - std::f32::consts::FRAC_1_SQRT_2);
+    let tol = (radius * 0.08).max(1.0e-3);
+    let near = |a: f32, b: f32| (a - b).abs() <= tol;
+    for v in mesh.vertices.iter_mut() {
+        // `sx`/`sy`: which way to push off each corner-aligned axis (+1 from a
+        // min edge, −1 from a max edge); `None` means not on that edge.
+        let sx = if near(v.x, 0.0) {
+            Some((0.0, 1.0))
+        } else if near(v.x, width) {
+            Some((width, -1.0))
+        } else {
+            None
+        };
+        let sy = if near(v.y, 0.0) {
+            Some((0.0, 1.0))
+        } else if near(v.y, height) {
+            Some((height, -1.0))
+        } else {
+            None
+        };
+        if let (Some((cx, sx)), Some((cy, sy))) = (sx, sy) {
+            v.x = cx + sx * k;
+            v.y = cy + sy * k;
         }
     }
-
-    let mut current = mesh.vertices.clone();
-    let mut next = current.clone();
-    for _ in 0..RELAX_ITERATIONS {
-        let mut max_delta = 0.0_f32;
-        for idx in 0..current.len() {
-            if let Some(fixed_point) = fixed[idx] {
-                next[idx] = fixed_point;
-                continue;
-            }
-            let neighbors = &adjacency[idx];
-            if neighbors.is_empty() {
-                return Err(TriangularTessellationShapeBuildError::InternalConstruction);
-            }
-            let mut x = 0.0;
-            let mut y = 0.0;
-            for neighbor in neighbors {
-                x += current[*neighbor].x;
-                y += current[*neighbor].y;
-            }
-            let denom = neighbors.len() as f32;
-            let updated = Point2 {
-                x: x / denom,
-                y: y / denom,
-            };
-            max_delta = max_delta.max(distance(current[idx], updated));
-            next[idx] = updated;
-        }
-        std::mem::swap(&mut current, &mut next);
-        if max_delta <= RELAX_EPSILON {
-            break;
-        }
-    }
-    mesh.vertices = current;
-
-    Ok(())
 }
 
 fn build_atlas_from_mesh(
@@ -539,415 +414,6 @@ fn average_interior_edge_len(
     }
 }
 
-fn honeycomb_center(row: u32, col: u32) -> Point2 {
-    let black = is_black_triangle(row, col);
-    Point2 {
-        x: if black {
-            1.5 * col as f32
-        } else {
-            1.5 * col as f32 - 0.5
-        },
-        y: row as f32 * SQRT_3_OVER_2,
-    }
-}
-
-fn honeycomb_normals(row: u32, col: u32) -> [Point2; 3] {
-    let normals = [
-        Point2 { x: 1.0, y: 0.0 },
-        Point2 {
-            x: -0.5,
-            y: SQRT_3_OVER_2,
-        },
-        Point2 {
-            x: -0.5,
-            y: -SQRT_3_OVER_2,
-        },
-    ];
-    if is_black_triangle(row, col) {
-        normals
-    } else {
-        normals.map(|normal| Point2 {
-            x: -normal.x,
-            y: -normal.y,
-        })
-    }
-}
-
-fn is_black_triangle(row: u32, col: u32) -> bool {
-    row % 2 == col % 2
-}
-
-fn triangle_from_normals(
-    center: Point2,
-    normals: [Point2; 3],
-) -> Result<[Point2; 3], TriangularTessellationShapeBuildError> {
-    let mut points = Vec::<Point2>::with_capacity(3);
-    for idx in 0..3 {
-        let a = normals[idx];
-        let b = normals[(idx + 1) % 3];
-        points.push(
-            bisector_intersection(center, a, b)
-                .ok_or(TriangularTessellationShapeBuildError::InternalConstruction)?,
-        );
-    }
-    if signed_area(&[points[0], points[1], points[2]]) < 0.0 {
-        points.reverse();
-    }
-    Ok([points[0], points[1], points[2]])
-}
-
-fn bisector_intersection(center: Point2, a: Point2, b: Point2) -> Option<Point2> {
-    let ar = dot(a, a) * 0.5;
-    let br = dot(b, b) * 0.5;
-    let det = a.x * b.y - a.y * b.x;
-    if det.abs() <= 1.0e-6 {
-        return None;
-    }
-    let x = (ar * b.y - a.y * br) / det;
-    let y = (a.x * br - ar * b.x) / det;
-    Some(Point2 {
-        x: center.x + x,
-        y: center.y + y,
-    })
-}
-
-fn boundary_edges(
-    mesh: &Mesh,
-) -> Result<Vec<(usize, usize)>, TriangularTessellationShapeBuildError> {
-    let mut uses = HashMap::<(usize, usize), Vec<(usize, usize)>>::new();
-    for face in &mesh.faces {
-        for idx in 0..3 {
-            let a = face[idx];
-            let b = face[(idx + 1) % 3];
-            uses.entry(ordered_edge_key(a, b)).or_default().push((a, b));
-        }
-    }
-
-    let mut boundary = Vec::new();
-    for owners in uses.values() {
-        if owners.len() == 1 {
-            boundary.push(owners[0]);
-        } else if owners.len() != 2 {
-            return Err(TriangularTessellationShapeBuildError::InternalConstruction);
-        }
-    }
-    Ok(boundary)
-}
-
-fn ordered_boundary_vertices(
-    boundary_edges: &[(usize, usize)],
-    vertices: &[Point2],
-) -> Result<Vec<usize>, TriangularTessellationShapeBuildError> {
-    let mut boundary = Vec::<usize>::new();
-    for (a, b) in boundary_edges {
-        push_unique(&mut boundary, *a);
-        push_unique(&mut boundary, *b);
-    }
-
-    if boundary.len() < 3 {
-        return Err(TriangularTessellationShapeBuildError::InternalConstruction);
-    }
-
-    let mut center = Point2 { x: 0.0, y: 0.0 };
-    for vertex in &boundary {
-        center.x += vertices[*vertex].x;
-        center.y += vertices[*vertex].y;
-    }
-    let denom = boundary.len() as f32;
-    center.x /= denom;
-    center.y /= denom;
-
-    boundary.sort_by(|a, b| {
-        let pa = vertices[*a];
-        let pb = vertices[*b];
-        let aa = (pa.y - center.y).atan2(pa.x - center.x);
-        let bb = (pb.y - center.y).atan2(pb.x - center.x);
-        aa.partial_cmp(&bb)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.cmp(b))
-    });
-
-    Ok(boundary)
-}
-
-fn boundary_corner_indices(boundary: &[usize], vertices: &[Point2]) -> [usize; 4] {
-    let mut min_x = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for vertex in boundary {
-        let point = vertices[*vertex];
-        min_x = min_x.min(point.x);
-        max_x = max_x.max(point.x);
-        min_y = min_y.min(point.y);
-        max_y = max_y.max(point.y);
-    }
-
-    let targets = [
-        Point2 { x: min_x, y: min_y },
-        Point2 { x: max_x, y: min_y },
-        Point2 { x: max_x, y: max_y },
-        Point2 { x: min_x, y: max_y },
-    ];
-    let mut corners = [0usize; 4];
-    for (target_idx, target) in targets.into_iter().enumerate() {
-        let mut best_idx = 0usize;
-        let mut best_dist = f32::INFINITY;
-        for (boundary_idx, vertex) in boundary.iter().copied().enumerate() {
-            let dist = distance(vertices[vertex], target);
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = boundary_idx;
-            }
-        }
-        corners[target_idx] = best_idx;
-    }
-    corners.sort_unstable();
-    corners
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RoundedSide {
-    Top,
-    Right,
-    Bottom,
-    Left,
-}
-
-/// Maps a boundary chain (from one rect corner to the next, going CW)
-/// onto the corresponding side of a rounded rect. The path along each
-/// side is `half-arc → straight → half-arc`, with the chain's
-/// endpoints landing at the *corner arc midpoints* (the 45° points
-/// shared with the adjacent sides) and intermediate boundary vertices
-/// distributed by arc-length along the path. Adjacent boundary
-/// vertices that both land on an arc form chords of the arc; piece
-/// outlines visibly round at the corners as a polyline.
-fn map_boundary_chain_rounded(
-    mesh: &Mesh,
-    boundary: &[usize],
-    start_idx: usize,
-    end_idx: usize,
-    side: RoundedSide,
-    width: f32,
-    height: f32,
-    radius: f32,
-    fixed: &mut [Option<Point2>],
-) {
-    let chain = boundary_chain(boundary, start_idx, end_idx);
-    let arc_half_len = std::f32::consts::FRAC_PI_4 * radius; // π·r/4
-    let side_length = match side {
-        RoundedSide::Top | RoundedSide::Bottom => width,
-        RoundedSide::Left | RoundedSide::Right => height,
-    };
-    let straight_len = (side_length - 2.0 * radius).max(0.0);
-    let total_len = 2.0 * arc_half_len + straight_len;
-    if total_len <= 1.0e-6 {
-        return;
-    }
-
-    let mut total = 0.0_f32;
-    let mut lengths = vec![0.0_f32; chain.len()];
-    for idx in 1..chain.len() {
-        total += distance(mesh.vertices[chain[idx - 1]], mesh.vertices[chain[idx]]);
-        lengths[idx] = total;
-    }
-    let denom = total.max(1.0e-6);
-    for (idx, vertex) in chain.iter().copied().enumerate() {
-        let t = (lengths[idx] / denom).clamp(0.0, 1.0);
-        let d = t * total_len;
-        let point = rounded_side_point(d, side, width, height, radius, arc_half_len, straight_len);
-        fixed[vertex] = Some(point);
-    }
-}
-
-/// Returns the position at arc-length `d` along the rounded side path.
-/// Each side runs `start arc midpoint → start arc end → straight
-/// section → end arc start → end arc midpoint`.
-fn rounded_side_point(
-    d: f32,
-    side: RoundedSide,
-    width: f32,
-    height: f32,
-    radius: f32,
-    arc_half_len: f32,
-    straight_len: f32,
-) -> Point2 {
-    // For each side we encode:
-    //   start_center        — arc center of the side's starting corner
-    //   start_angle_deg     — angle (math convention, 0° = +x, 90° = +y)
-    //                         at which the start arc *midpoint* sits;
-    //                         the arc continues for +45° to reach the
-    //                         straight section.
-    //   straight_start/_end — endpoints of the straight section.
-    //   end_center          — arc center of the side's ending corner
-    //   end_angle_deg       — angle at which the end arc begins; it
-    //                         sweeps +45° more to the end midpoint.
-    let (start_center, start_angle_deg, straight_start, straight_end, end_center, end_angle_deg) =
-        match side {
-            RoundedSide::Top => (
-                Point2 {
-                    x: radius,
-                    y: radius,
-                },
-                225.0_f32,
-                Point2 { x: radius, y: 0.0 },
-                Point2 {
-                    x: width - radius,
-                    y: 0.0,
-                },
-                Point2 {
-                    x: width - radius,
-                    y: radius,
-                },
-                270.0_f32,
-            ),
-            RoundedSide::Right => (
-                Point2 {
-                    x: width - radius,
-                    y: radius,
-                },
-                315.0,
-                Point2 {
-                    x: width,
-                    y: radius,
-                },
-                Point2 {
-                    x: width,
-                    y: height - radius,
-                },
-                Point2 {
-                    x: width - radius,
-                    y: height - radius,
-                },
-                0.0,
-            ),
-            RoundedSide::Bottom => (
-                Point2 {
-                    x: width - radius,
-                    y: height - radius,
-                },
-                45.0,
-                Point2 {
-                    x: width - radius,
-                    y: height,
-                },
-                Point2 {
-                    x: radius,
-                    y: height,
-                },
-                Point2 {
-                    x: radius,
-                    y: height - radius,
-                },
-                90.0,
-            ),
-            RoundedSide::Left => (
-                Point2 {
-                    x: radius,
-                    y: height - radius,
-                },
-                135.0,
-                Point2 {
-                    x: 0.0,
-                    y: height - radius,
-                },
-                Point2 { x: 0.0, y: radius },
-                Point2 {
-                    x: radius,
-                    y: radius,
-                },
-                180.0,
-            ),
-        };
-
-    if d <= arc_half_len {
-        // Start half-arc: midpoint → arc end.
-        let s = (d / arc_half_len.max(1.0e-6)).clamp(0.0, 1.0);
-        let angle = (start_angle_deg + s * 45.0).to_radians();
-        Point2 {
-            x: start_center.x + radius * angle.cos(),
-            y: start_center.y + radius * angle.sin(),
-        }
-    } else if d <= arc_half_len + straight_len {
-        // Straight section.
-        let s = if straight_len > 0.0 {
-            ((d - arc_half_len) / straight_len).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        Point2 {
-            x: straight_start.x + s * (straight_end.x - straight_start.x),
-            y: straight_start.y + s * (straight_end.y - straight_start.y),
-        }
-    } else {
-        // End half-arc: arc start → midpoint.
-        let s = ((d - arc_half_len - straight_len) / arc_half_len.max(1.0e-6)).clamp(0.0, 1.0);
-        let angle = (end_angle_deg + s * 45.0).to_radians();
-        Point2 {
-            x: end_center.x + radius * angle.cos(),
-            y: end_center.y + radius * angle.sin(),
-        }
-    }
-}
-
-fn map_boundary_chain(
-    mesh: &Mesh,
-    boundary: &[usize],
-    start_idx: usize,
-    end_idx: usize,
-    start_point: Point2,
-    end_point: Point2,
-    fixed: &mut [Option<Point2>],
-) {
-    let chain = boundary_chain(boundary, start_idx, end_idx);
-    let mut total = 0.0_f32;
-    let mut lengths = vec![0.0_f32; chain.len()];
-    for idx in 1..chain.len() {
-        total += distance(mesh.vertices[chain[idx - 1]], mesh.vertices[chain[idx]]);
-        lengths[idx] = total;
-    }
-    let denom = total.max(1.0e-6);
-    for (idx, vertex) in chain.iter().copied().enumerate() {
-        let t = (lengths[idx] / denom).clamp(0.0, 1.0);
-        fixed[vertex] = Some(Point2 {
-            x: start_point.x + (end_point.x - start_point.x) * t,
-            y: start_point.y + (end_point.y - start_point.y) * t,
-        });
-    }
-}
-
-fn boundary_chain(boundary: &[usize], start_idx: usize, end_idx: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut idx = start_idx;
-    loop {
-        out.push(boundary[idx]);
-        if idx == end_idx {
-            break;
-        }
-        idx = (idx + 1) % boundary.len();
-    }
-    out
-}
-
-fn vertex_adjacency(mesh: &Mesh) -> Vec<Vec<usize>> {
-    let mut adjacency = vec![Vec::<usize>::new(); mesh.vertices.len()];
-    for face in &mesh.faces {
-        for idx in 0..3 {
-            let a = face[idx];
-            let b = face[(idx + 1) % 3];
-            push_unique(&mut adjacency[a], b);
-            push_unique(&mut adjacency[b], a);
-        }
-    }
-    adjacency
-}
-
-fn push_unique(out: &mut Vec<usize>, value: usize) {
-    if !out.contains(&value) {
-        out.push(value);
-    }
-}
-
 fn straight_path(
     start: Point2,
     end: Point2,
@@ -999,6 +465,14 @@ enum Corner {
     TopRight,
     BottomRight,
     BottomLeft,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FrameSide {
+    Top,
+    Bottom,
+    Left,
+    Right,
 }
 
 impl BoundaryArcClassifier {
@@ -1136,8 +610,76 @@ impl BoundaryArcClassifier {
                 // fall back to a chord if it ever does.
                 straight_path(a, b)
             }
-            (None, None) => straight_path(a, b),
+            (None, None) => {
+                // Both endpoints on straight sections. If they're on the
+                // SAME side this is a normal flat edge (chord). If they're
+                // on adjacent sides, the edge spans a corner (a corner piece
+                // touching two frame edges) and must wrap the rounded corner
+                // instead of cutting straight across it.
+                match self.corner_arc_between(a, b) {
+                    Some(arc_idx) => {
+                        let arc = &self.arcs[arc_idx];
+                        let t_a = nearest_transition(arc, a);
+                        let t_b = if t_a == arc.transitions[0] {
+                            arc.transitions[1]
+                        } else {
+                            arc.transitions[0]
+                        };
+                        self.compose_line_arc_line(a, t_a, t_b, arc.center, b)
+                    }
+                    None => straight_path(a, b),
+                }
+            }
         }
+    }
+
+    /// Identifies the corner arc lying between two boundary points that
+    /// sit on different (adjacent) frame edges, or `None` when they share
+    /// an edge / aren't on a corner-spanning chord. Arc order is fixed by
+    /// `new`: TL=0, TR=1, BR=2, BL=3.
+    fn corner_arc_between(&self, a: Point2, b: Point2) -> Option<usize> {
+        match (self.frame_side(a)?, self.frame_side(b)?) {
+            (FrameSide::Top, FrameSide::Left) | (FrameSide::Left, FrameSide::Top) => Some(0),
+            (FrameSide::Top, FrameSide::Right) | (FrameSide::Right, FrameSide::Top) => Some(1),
+            (FrameSide::Bottom, FrameSide::Right) | (FrameSide::Right, FrameSide::Bottom) => {
+                Some(2)
+            }
+            (FrameSide::Bottom, FrameSide::Left) | (FrameSide::Left, FrameSide::Bottom) => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Which frame edge a (snapped) boundary point lies on.
+    fn frame_side(&self, p: Point2) -> Option<FrameSide> {
+        let tol = self.tolerance.max(1.0e-3);
+        if p.y.abs() <= tol {
+            Some(FrameSide::Top)
+        } else if (p.y - self.height).abs() <= tol {
+            Some(FrameSide::Bottom)
+        } else if p.x.abs() <= tol {
+            Some(FrameSide::Left)
+        } else if (p.x - self.width).abs() <= tol {
+            Some(FrameSide::Right)
+        } else {
+            None
+        }
+    }
+
+    fn compose_line_arc_line(
+        &self,
+        start: Point2,
+        t_a: Point2,
+        t_b: Point2,
+        arc_center: Point2,
+        end: Point2,
+    ) -> Result<PathMm, TriangularTessellationShapeBuildError> {
+        let mut segs: Vec<PathSegMm> = Vec::with_capacity(3);
+        segs.push(PathSegMm::LineTo { to: point(t_a)? });
+        if !push_arc_cubic_seg(&mut segs, t_a, t_b, arc_center)? {
+            segs.push(PathSegMm::LineTo { to: point(t_b)? });
+        }
+        segs.push(PathSegMm::LineTo { to: point(end)? });
+        Ok(PathMm::new(point(start)?, segs.into_boxed_slice(), false))
     }
 
     fn compose_arc_then_line(
@@ -1548,13 +1090,6 @@ fn point(value: Point2) -> Result<PointMm, TriangularTessellationShapeBuildError
     PointMm::try_from_mm(x, y).ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
 }
 
-fn point_key(point: Point2) -> PointKey {
-    PointKey(
-        (point.x * POINT_KEY_SCALE).round() as i64,
-        (point.y * POINT_KEY_SCALE).round() as i64,
-    )
-}
-
 fn ordered_edge_key(a: usize, b: usize) -> (usize, usize) {
     if a <= b {
         (a, b)
@@ -1563,24 +1098,10 @@ fn ordered_edge_key(a: usize, b: usize) -> (usize, usize) {
     }
 }
 
-fn signed_area(points: &[Point2]) -> f32 {
-    let mut area = 0.0_f32;
-    for idx in 0..points.len() {
-        let a = points[idx];
-        let b = points[(idx + 1) % points.len()];
-        area += a.x * b.y - b.x * a.y;
-    }
-    area * 0.5
-}
-
 fn distance(a: Point2, b: Point2) -> f32 {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     (dx * dx + dy * dy).sqrt()
-}
-
-fn dot(a: Point2, b: Point2) -> f32 {
-    a.x * b.x + a.y * b.y
 }
 
 fn splitmix32(mut value: u32) -> u32 {

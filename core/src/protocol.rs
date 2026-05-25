@@ -661,6 +661,10 @@ pub enum ClientMsg {
     Flip {
         piece_id: u32,
         flipped: bool,
+        /// Post-flip world pose of the (singleton) piece. The server applies
+        /// it as the target pose so the click-pivot adjustment computed by
+        /// the originating client is reproduced authoritatively.
+        drop_pose: PlayablePoseSnapshot,
         base_revision: u64,
     },
     Detach {

@@ -35,6 +35,15 @@ struct PendingTransform {
     snap: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingFlip {
+    flipped: bool,
+    /// Post-flip world pose of the singleton, so the predicted state pins
+    /// the same click-pivoted pose the originating client (and server) use.
+    pos: (f32, f32),
+    rot_deg: f32,
+}
+
 #[derive(Clone, Debug)]
 struct AssetDownload {
     mime: String,
@@ -50,7 +59,7 @@ struct MultiplayerBridgeState {
     local_state: RefCell<Option<AppGameState>>,
     pending_by_anchor: RefCell<HashMap<u32, PendingTransform>>,
     pending_snaps: RefCell<Vec<(u32, PendingTransform)>>,
-    pending_flips: RefCell<HashMap<u32, bool>>,
+    pending_flips: RefCell<HashMap<u32, PendingFlip>>,
     pending_detaches: RefCell<HashSet<u32>>,
     init_pending: Cell<bool>,
     subscription: RefCell<Option<AppSubscription>>,
@@ -87,8 +96,8 @@ impl MultiplayerBridgeState {
         )));
         let state = Rc::clone(self);
         sync_runtime::set_multiplayer_local_flip_observer(Some(Rc::new(
-            move |piece_id, flipped| {
-                state.record_pending_flip(piece_id, flipped);
+            move |piece_id, flipped, pos, rot_deg| {
+                state.record_pending_flip(piece_id, flipped, pos, rot_deg);
             },
         )));
         let state = Rc::clone(self);
@@ -478,8 +487,15 @@ impl MultiplayerBridgeState {
         }
     }
 
-    fn record_pending_flip(&self, piece_id: u32, flipped: bool) {
-        self.pending_flips.borrow_mut().insert(piece_id, flipped);
+    fn record_pending_flip(&self, piece_id: u32, flipped: bool, pos: (f32, f32), rot_deg: f32) {
+        self.pending_flips.borrow_mut().insert(
+            piece_id,
+            PendingFlip {
+                flipped,
+                pos,
+                rot_deg,
+            },
+        );
         if self.core.snapshot().dragging_members.is_empty() {
             let _ = self.apply_predicted_state(false);
         }
@@ -556,14 +572,14 @@ impl MultiplayerBridgeState {
             return;
         }
         let mut flips_remove = Vec::new();
-        for (piece_id, desired) in pending_flips.iter() {
+        for (piece_id, pending) in pending_flips.iter() {
             let piece = PieceId(*piece_id);
             let Some(group) = game.playable.logical.group_of(piece) else {
                 flips_remove.push(*piece_id);
                 continue;
             };
             let current = game.playable.flip_of(group) == Some(FlipState::Flipped);
-            if current == *desired {
+            if current == pending.flipped {
                 flips_remove.push(*piece_id);
             }
         }
@@ -895,8 +911,15 @@ impl MultiplayerBridgeState {
         let pending_flips_snapshot = self.pending_flips.borrow().clone();
         if !pending_flips_snapshot.is_empty() {
             let mut invalid = Vec::new();
-            for (piece_id, flipped) in pending_flips_snapshot.iter() {
-                if predict_pending_flip(&mut predicted_state.playable, *piece_id, *flipped).is_err()
+            for (piece_id, pending) in pending_flips_snapshot.iter() {
+                if predict_pending_flip(
+                    &mut predicted_state.playable,
+                    *piece_id,
+                    pending.flipped,
+                    pending.pos,
+                    pending.rot_deg,
+                )
+                .is_err()
                 {
                     invalid.push(*piece_id);
                 }
@@ -1035,6 +1058,8 @@ fn predict_pending_flip<T: PuzzleTopology>(
     playable: &mut PlayableState<T>,
     piece_id: u32,
     flipped: bool,
+    pos: (f32, f32),
+    rot_deg: f32,
 ) -> Result<(), ()> {
     let piece = PieceId(piece_id);
     if piece.as_usize() >= playable.piece_count() {
@@ -1046,7 +1071,13 @@ fn predict_pending_flip<T: PuzzleTopology>(
     {
         return Err(());
     }
-    let target_pose = playable.piece_world_pose(piece).ok_or(())?;
+    // Use the click-pivoted post-flip pose carried with the action so the
+    // prediction matches the authoritative echo (server applies the same
+    // target pose). Falls back to the current world pose if it can't be
+    // built.
+    let target_pose = Pose2::try_from_mm_degrees(pos.0, pos.1, rot_deg)
+        .or_else(|| playable.piece_world_pose(piece))
+        .ok_or(())?;
     let target_flip = if flipped {
         FlipState::Flipped
     } else {
@@ -1352,7 +1383,7 @@ mod tests {
         let topology = GridTopology::try_new(2, 1).expect("valid grid");
         let mut playable = PlayableState::solved(topology, PlayRules::default());
 
-        assert!(predict_pending_flip(&mut playable, 0, true).is_err());
+        assert!(predict_pending_flip(&mut playable, 0, true, (0.0, 0.0), 0.0).is_err());
         assert!(playable.is_solved());
     }
 
@@ -1373,7 +1404,14 @@ mod tests {
         let game = AppGameState::solved(two_piece_puzzle(), GameRules::default())
             .expect("valid solved game");
         *bridge.local_state.borrow_mut() = Some(game);
-        bridge.pending_flips.borrow_mut().insert(0, true);
+        bridge.pending_flips.borrow_mut().insert(
+            0,
+            PendingFlip {
+                flipped: true,
+                pos: (0.0, 0.0),
+                rot_deg: 0.0,
+            },
+        );
 
         assert!(bridge.apply_predicted_state(false));
 

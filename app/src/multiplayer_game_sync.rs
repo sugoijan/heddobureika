@@ -36,7 +36,7 @@ pub(crate) struct MultiplayerGameSync {
     hooks: RefCell<SyncHooks>,
     local_transform_observer:
         Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>>>,
-    local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool)>>>>,
+    local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>>>,
     local_detach_observer: Rc<RefCell<Option<Rc<dyn Fn(u32)>>>>,
 }
 
@@ -123,7 +123,10 @@ impl MultiplayerGameSync {
         *self.local_transform_observer.borrow_mut() = observer;
     }
 
-    pub(crate) fn set_local_flip_observer(&self, observer: Option<Rc<dyn Fn(u32, bool)>>) {
+    pub(crate) fn set_local_flip_observer(
+        &self,
+        observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
+    ) {
         *self.local_flip_observer.borrow_mut() = observer;
     }
 
@@ -500,14 +503,25 @@ impl GameSync for MultiplayerGameSync {
                         observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq, true);
                     }
                 }
-                SyncAction::Flip { piece_id, flipped } => {
+                SyncAction::Flip {
+                    piece_id,
+                    flipped,
+                    pos,
+                    rot_deg,
+                } => {
+                    let Some(drop_pose) = playable_pose_from_core_pose(*piece_id, *pos, *rot_deg)
+                    else {
+                        console::warn!("multiplayer flip skipped (invalid playable pose)");
+                        return;
+                    };
                     self.send(ClientMsg::Flip {
                         piece_id: *piece_id as u32,
                         flipped: *flipped,
+                        drop_pose,
                         base_revision: 0,
                     });
                     if let Some(observer) = self.local_flip_observer.borrow().as_ref() {
-                        observer(*piece_id as u32, *flipped);
+                        observer(*piece_id as u32, *flipped, *pos, *rot_deg);
                     }
                 }
                 SyncAction::Release { anchor_id } => {

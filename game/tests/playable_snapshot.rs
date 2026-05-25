@@ -64,21 +64,24 @@ fn playable_snapshot_restores_known_grid_topology_from_spec() {
 #[test]
 fn playable_snapshot_records_triangular_topology_descriptor() {
     let topology = TriangularTessellationTopology::example_3x2();
+    let expected_pieces = topology.piece_count();
+    let expected_edges = topology.edge_count();
     let playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
     let snapshot = PlayableSnapshot::from_playable(&playable, None);
 
+    // `example_3x2` is a horizontal (3 lines, 5 points) lattice.
     assert_eq!(
         snapshot.topology,
-        TopologySpec::triangular_tessellation(3, 2)
+        TopologySpec::triangular_tessellation(3, 5)
     );
-    assert_eq!(snapshot.topology_piece_count, 15);
-    assert_eq!(snapshot.topology_edge_count, 17);
+    assert_eq!(snapshot.topology_piece_count, expected_pieces);
+    assert_eq!(snapshot.topology_edge_count, expected_edges);
 
     let restored = snapshot
         .restore_from_spec()
         .expect("triangular snapshot should restore from spec");
-    assert_eq!(restored.logical.piece_count(), 15);
-    assert_eq!(restored.logical.edge_count(), 17);
+    assert_eq!(restored.logical.piece_count() as u32, expected_pieces);
+    assert_eq!(restored.logical.edge_count() as u32, expected_edges);
 }
 
 #[test]

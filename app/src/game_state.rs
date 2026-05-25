@@ -64,7 +64,16 @@ fn piece_aspect_ratio_from_puzzle(puzzle: &PuzzleInfo) -> f32 {
     if puzzle.image_width == 0 || puzzle.image_height == 0 {
         return 1.0;
     }
-    let Some(topology) = build_topology_from_spec(&puzzle.to_spec()) else {
+    let spec = puzzle.to_spec();
+    // The triangular lattice is scaled UNIFORMLY into the image (square pose
+    // units — see `TriangularTessellationTopology::build_render_geometry`), so
+    // a piece's pose-unit aspect is exactly 1 regardless of image size. The
+    // generic image-extent formula below would instead report the full-image
+    // stretch, which the lattice never applies.
+    if spec.tag == "triangular_tessellation" {
+        return 1.0;
+    }
+    let Some(topology) = build_topology_from_spec(&spec) else {
         return 1.0;
     };
     let (extent_x, extent_y) = topology.image_extent_in_pose_units();

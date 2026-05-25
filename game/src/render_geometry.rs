@@ -76,6 +76,11 @@ pub struct PieceRenderGeometry {
     pub id: PieceId,
     pub bounds_px: RectPx,
     pub pose_anchor_px: [f32; 2],
+    /// On-curve points of the piece outline, in the same bounds-relative
+    /// pixel frame as `pose_anchor_px` (cubic control points flattened to
+    /// their endpoints). Lets callers point-test against the real piece
+    /// shape rather than only its bounding box.
+    pub outline_px: Box<[[f32; 2]]>,
     pub image_origin_px: [f32; 2],
     pub outline_svg: String,
     pub edge_svgs: Vec<String>,
@@ -161,6 +166,30 @@ impl PuzzleRenderGeometry {
         Some([-piece.image_origin_px[0], -piece.image_origin_px[1]])
     }
 
+    /// Whether the given world-space pixel point lands inside a piece's
+    /// outline at the supplied pose, using the same casting transform as
+    /// the renderer's hit test. Mirrors the geometric core of the UI's
+    /// `pick_piece_at` (minus the alpha-mask lookup): it tests the actual
+    /// outline polygon, not just the bounding box.
+    pub fn piece_contains_world_point(
+        &self,
+        id: PieceId,
+        world_px: (f32, f32),
+        top_left_px: (f32, f32),
+        rotation_deg: f32,
+        flipped: bool,
+    ) -> bool {
+        let Some(piece) = self.piece(id) else {
+            return false;
+        };
+        let Some(local) =
+            self.hit_test_local_coords(id, world_px, top_left_px, rotation_deg, flipped)
+        else {
+            return false;
+        };
+        point_in_polygon(local, &piece.outline_px)
+    }
+
     pub fn hit_test_local_coords(
         &self,
         id: PieceId,
@@ -224,6 +253,42 @@ fn path_bounds(path: &PathMm) -> Option<RectPx> {
         width: (max_x - min_x).max(0.0),
         height: (max_y - min_y).max(0.0),
     })
+}
+
+/// On-curve points of a path (cubic control points dropped), in the
+/// path's own coordinate frame. Used to capture a piece outline as a
+/// polygon for point-in-shape hit testing.
+fn path_on_curve_points(path: &PathMm) -> Box<[[f32; 2]]> {
+    let mut points: Vec<[f32; 2]> = Vec::with_capacity(path.segs.len() + 1);
+    points.push([path.start.x_mm(), path.start.y_mm()]);
+    for seg in path.segs.iter() {
+        let to = match seg {
+            PathSegMm::LineTo { to } => *to,
+            PathSegMm::CubicTo { to, .. } => *to,
+        };
+        points.push([to.x_mm(), to.y_mm()]);
+    }
+    points.into_boxed_slice()
+}
+
+/// Standard even-odd ray-cast point-in-polygon test.
+fn point_in_polygon(point: (f32, f32), polygon: &[[f32; 2]]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let (px, py) = point;
+    let mut inside = false;
+    let mut j = polygon.len() - 1;
+    for i in 0..polygon.len() {
+        let [xi, yi] = polygon[i];
+        let [xj, yj] = polygon[j];
+        let intersects = (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi;
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 fn include_point(
@@ -322,6 +387,7 @@ where
             id: piece,
             bounds_px: bounds,
             pose_anchor_px: [anchor_x - bounds.x, anchor_y - bounds.y],
+            outline_px: path_on_curve_points(&local_outline),
             image_origin_px: [bounds.x, bounds.y],
             outline_svg: path_to_svg_d(&local_outline),
             edge_svgs,

@@ -122,6 +122,10 @@ pub enum PlayableAction {
     },
     UnflipGroup {
         group: GroupId,
+        /// World-space point to pivot the flip about (the cursor position
+        /// when the unflip comes from a click), so that point stays fixed.
+        /// `None` reflects about the group anchor (no pose change).
+        pivot: Option<Position2>,
     },
 }
 
@@ -133,6 +137,10 @@ pub enum PlayableAction {
 pub enum RestrictedPlayableAction {
     FlipGroup {
         group: GroupId,
+        /// World-space point to pivot the flip about (the cursor position
+        /// when the flip comes from a click), so that point stays fixed.
+        /// `None` reflects about the group anchor (no pose change).
+        pivot: Option<Position2>,
     },
     /// Detaches one piece into its own singleton group and immediately applies
     /// the requested pose/flip to that detached group.
@@ -146,9 +154,7 @@ pub enum RestrictedPlayableAction {
     /// order of the remaining alive groups. Anchor ids that don't resolve to
     /// alive groups are silently ignored. No-op if the order would not
     /// change.
-    SetGroupOrder {
-        anchors: Vec<u32>,
-    },
+    SetGroupOrder { anchors: Vec<u32> },
 }
 
 /// High-level progress stage for a playable state snapshot.
@@ -253,14 +259,19 @@ impl<T: PuzzleTopology + Clone> Clone for PlayableState<T> {
 
 impl<T: PuzzleTopology> PlayableState<T> {
     pub fn solved(topology: T, rules: PlayRules) -> Self {
+        // Anchor the assembled group at the topology's canonical frame anchor
+        // so the solved puzzle lines up with the frame outline — every
+        // topology reports its own aligned pose, so there's no per-topology
+        // special case here. Read it before `topology` is moved into the
+        // solved logical state; the placeholder `unknown` topology has no
+        // anchor and falls back to the origin.
+        let identity = topology
+            .identity_frame_anchor()
+            .map(|(_, pose)| pose)
+            .unwrap_or_default();
         let mut state = Self::new(LogicalState::solved(topology), rules);
-        // Canonical solved anchor pose is `(0.5, 0.5)` — piece-center
-        // pose-units placing piece 0's top-left pixel at the workspace TL.
-        // See the comment on `grid_corner_target`.
         if let Some(slot) = state.group_pose.first_mut() {
-            if let Some(pose) = Pose2::try_from_mm_degrees(0.5, 0.5, 0.0) {
-                *slot = pose;
-            }
+            *slot = identity;
         }
         state
     }
@@ -494,6 +505,63 @@ impl<T: PuzzleTopology> PlayableState<T> {
         )
     }
 
+    /// Sets a group's flip state, optionally pivoting the reflection about a
+    /// world-space point (the cursor position when the toggle comes from a
+    /// click) so that point stays fixed under the cursor.
+    ///
+    /// A flip renders as a screen-space horizontal mirror (`scale(-1, 1)`)
+    /// applied *after* the group's rotation, so a piece-local point maps to
+    /// `world = A(P) + S·Rot(p − c₀)`, where `A(P)` is the anchor's world
+    /// position (affine in the pose `P`), `Rot` is the group rotation and
+    /// `S` is the screen-axis mirror. Pinning a world point `W` across a
+    /// toggle requires `A(P') = W − S·(W − A(P))`; the `Rot(p − c₀)` term
+    /// cancels, so the correction is independent of rotation and aspect and
+    /// reduces to `P'ₓ = 2·pivotₓ − Pₓ` with `P'_y = P_y` in pose-mm units.
+    ///
+    /// With `pivot == None` the pose is left untouched (reflect about the
+    /// group anchor) — used for non-interactive toggles. No-op when the
+    /// group is already in `target`.
+    fn set_group_flip(
+        &mut self,
+        group: GroupId,
+        target: FlipState,
+        pivot: Option<Position2>,
+        delta: &mut PlayableDelta,
+    ) {
+        let Some(current) = self.flip_of(group) else {
+            return;
+        };
+        if current == target {
+            return;
+        }
+        // Only individual pieces may be flipped — a multi-piece group is
+        // never put into the flipped state. (Flipped pieces are also barred
+        // from snapping/joining, so a group can't become flipped by merging
+        // either.) This matches the server's singleton-only flip check and
+        // keeps the click-pivot adjustment, which is exact for singletons,
+        // the only case it ever runs on.
+        if target == FlipState::Flipped && self.logical.members_of(group).take(2).count() != 1 {
+            return;
+        }
+        if let (Some(pivot), Some(pose)) = (pivot, self.pose_of(group)) {
+            // Mirror is screen-x-aligned, so only the x coordinate moves and
+            // only the pivot's x matters; the conversion to pose units cancels
+            // the per-axis pixel scale, leaving no rotation/aspect dependence.
+            let new_x = 2.0 * pivot.x_mm() - pose.x_mm();
+            if let Some(pose_mut) = self.group_pose.get_mut(group.as_usize()) {
+                if let Some(updated) =
+                    Pose2::try_from_mm_degrees(new_x, pose_mut.y_mm(), pose_mut.rotation_degrees())
+                {
+                    *pose_mut = updated;
+                }
+            }
+        }
+        if let Some(group_flip) = self.group_flip.get_mut(group.as_usize()) {
+            *group_flip = target;
+        }
+        mark_group_dirty(self, group, delta);
+    }
+
     pub fn probe_snaps(&self, mover_group: GroupId, proposed_pose: Pose2) -> SnapProposal {
         crate::snap::probe_snaps(self, mover_group, proposed_pose)
     }
@@ -552,7 +620,7 @@ impl<T: PuzzleTopology> PlayableState<T> {
     ) -> PlayableUpdateBatch {
         let revision_before = self.revision;
         let mover_group = match &action {
-            RestrictedPlayableAction::FlipGroup { group } => *group,
+            RestrictedPlayableAction::FlipGroup { group, .. } => *group,
             RestrictedPlayableAction::DetachPieceAsGroup { piece, .. } => GroupId(piece.as_u32()),
             RestrictedPlayableAction::SetGroupOrder { anchors } => anchors
                 .first()
@@ -815,11 +883,8 @@ impl<T: PuzzleTopology> PlayableState<T> {
                 }
                 group
             }
-            PlayableAction::UnflipGroup { group } => {
-                if let Some(group_flip) = self.group_flip.get_mut(group.as_usize()) {
-                    *group_flip = FlipState::Normal;
-                    mark_group_dirty(self, group, &mut delta);
-                }
+            PlayableAction::UnflipGroup { group, pivot } => {
+                self.set_group_flip(group, FlipState::Normal, pivot, &mut delta);
                 group
             }
         };
@@ -835,11 +900,8 @@ impl<T: PuzzleTopology> PlayableState<T> {
         let mut delta = PlayableDelta::for_revision(self.revision);
 
         let anchor_group = match action {
-            RestrictedPlayableAction::FlipGroup { group } => {
-                if let Some(group_flip) = self.group_flip.get_mut(group.as_usize()) {
-                    *group_flip = FlipState::Flipped;
-                    mark_group_dirty(self, group, &mut delta);
-                }
+            RestrictedPlayableAction::FlipGroup { group, pivot } => {
+                self.set_group_flip(group, FlipState::Flipped, pivot, &mut delta);
                 group
             }
             RestrictedPlayableAction::DetachPieceAsGroup {
@@ -965,7 +1027,7 @@ impl<T: PuzzleTopology> PlayableState<T> {
                 pose.rotation = self.next_step_rotation(group, false)?;
                 Some((group, pose))
             }
-            PlayableAction::UnflipGroup { group } => Some((group, self.pose_of(group)?)),
+            PlayableAction::UnflipGroup { group, .. } => Some((group, self.pose_of(group)?)),
         }
     }
 
@@ -1033,11 +1095,8 @@ impl<T: PuzzleTopology> PlayableState<T> {
                     }
                 }
             }
-            PlayableAction::UnflipGroup { group } => {
-                if let Some(group_flip) = self.group_flip.get_mut(group.as_usize()) {
-                    *group_flip = FlipState::Normal;
-                    mark_group_dirty(self, group, &mut delta);
-                }
+            PlayableAction::UnflipGroup { group, pivot } => {
+                self.set_group_flip(group, FlipState::Normal, pivot, &mut delta);
             }
         }
 
@@ -1883,7 +1942,7 @@ fn group_from_action(action: PlayableAction) -> GroupId {
         | PlayableAction::RotateGroupTo { group, .. }
         | PlayableAction::StepRotateGroupCw { group }
         | PlayableAction::StepRotateGroupCcw { group }
-        | PlayableAction::UnflipGroup { group } => group,
+        | PlayableAction::UnflipGroup { group, .. } => group,
     }
 }
 

@@ -95,6 +95,7 @@ impl WgpuRenderer {
         _canvas: HtmlCanvasElement,
         _image: HtmlImageElement,
         _puzzle_bounds_px: [f32; 2],
+        _frame_rect_px: [f32; 4],
         _typical_piece_extent_px: [f32; 2],
         _view_min_x: f32,
         _view_min_y: f32,

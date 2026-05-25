@@ -36,7 +36,7 @@ struct SyncRuntimeState {
     sync_view_hooks: Vec<(u64, Rc<dyn Fn()>)>,
     next_sync_view_hook_id: u64,
     mp_local_transform_observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
-    mp_local_flip_observer: Option<Rc<dyn Fn(u32, bool)>>,
+    mp_local_flip_observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
     mp_local_detach_observer: Option<Rc<dyn Fn(u32)>>,
 }
 
@@ -435,7 +435,9 @@ pub(crate) fn set_multiplayer_local_transform_observer(
     });
 }
 
-pub(crate) fn set_multiplayer_local_flip_observer(observer: Option<Rc<dyn Fn(u32, bool)>>) {
+pub(crate) fn set_multiplayer_local_flip_observer(
+    observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
+) {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         state.mp_local_flip_observer = observer.clone();
@@ -624,9 +626,16 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
             if let (Some(primary_id), Some(before_flip)) = (drag_primary_before, flip_before) {
                 if let Some(after_flip) = snapshot.piece_flipped.get(primary_id).copied() {
                     if after_flip != before_flip {
+                        // Carry the post-flip world pose so the server and
+                        // peers reproduce the click-pivot adjustment rather
+                        // than recomputing the pre-flip pose.
+                        let (pos, rot_deg) =
+                            piece_grid_pose(&snapshot, primary_id).unwrap_or(((0.0, 0.0), 0.0));
                         handle_local_action(&CoreAction::Sync(SyncAction::Flip {
                             piece_id: primary_id,
                             flipped: after_flip,
+                            pos,
+                            rot_deg,
                         }));
                         return;
                     }

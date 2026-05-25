@@ -41,7 +41,7 @@ fn grid_9x9_solved_shuffled_and_progression_story() {
         let group = heddobureika_game::GroupId(id);
 
         if shuffled.flip_of(group) == Some(FlipState::Flipped) {
-            let _ = shuffled.apply_action(PlayableAction::UnflipGroup { group });
+            let _ = shuffled.apply_action(PlayableAction::UnflipGroup { group, pivot: None });
         }
 
         // Rotations are shuffled in 90-degree steps, so <=4 clockwise steps

@@ -2995,21 +2995,24 @@ impl SvgView {
             "transform",
             &format!("scale({})", fmt_f32(layout.puzzle_scale)),
         );
+        // The dashed outline traces the generated puzzle's actual frame
+        // (`frame_shape.bounds`), which may be a centred, letterboxed
+        // sub-rect of the image (e.g. triangular's equilateral frame) — not
+        // the full image rectangle.
+        let frame = assets.render_geometry.frame_shape.bounds;
         let bounds_inset = 1.0;
         let _ = self
             .puzzle_bounds
-            .set_attribute("x", &fmt_f32(bounds_inset));
+            .set_attribute("x", &fmt_f32(frame.x + bounds_inset));
         let _ = self
             .puzzle_bounds
-            .set_attribute("y", &fmt_f32(bounds_inset));
-        let _ = self.puzzle_bounds.set_attribute(
-            "width",
-            &fmt_f32(assets.info.image_width as f32 - 2.0 * bounds_inset),
-        );
-        let _ = self.puzzle_bounds.set_attribute(
-            "height",
-            &fmt_f32(assets.info.image_height as f32 - 2.0 * bounds_inset),
-        );
+            .set_attribute("y", &fmt_f32(frame.y + bounds_inset));
+        let _ = self
+            .puzzle_bounds
+            .set_attribute("width", &fmt_f32(frame.width - 2.0 * bounds_inset));
+        let _ = self
+            .puzzle_bounds
+            .set_attribute("height", &fmt_f32(frame.height - 2.0 * bounds_inset));
         // Dashed workspace outline shares the same `PuzzleFrameShape`
         // every topology uses for its border pieces, so a given puzzle
         // has a single corner radius regardless of topology kind.

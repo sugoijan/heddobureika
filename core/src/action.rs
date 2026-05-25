@@ -17,6 +17,11 @@ pub enum SyncAction {
     Flip {
         piece_id: usize,
         flipped: bool,
+        /// Post-flip world pose of the (singleton) piece, so the server and
+        /// other clients reproduce the click-pivot adjustment instead of
+        /// recomputing the pre-flip pose. Mirrors `Place`'s `pos`/`rot_deg`.
+        pos: (f32, f32),
+        rot_deg: f32,
     },
     Release {
         anchor_id: usize,

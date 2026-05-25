@@ -801,10 +801,7 @@ fn request_local_puzzle_change(
     shape_seed: u32,
 ) {
     // Grid catalog entries get a dedicated path that also saves the
-    // current grid pick for restore-on-reload. Every other topology goes
-    // through the generic `set_puzzle_with_topology`; the descriptor is
-    // already complete because each topology's `resolve_target` builds
-    // it against the active image dimensions before we get here.
+    // current grid pick for restore-on-reload.
     if descriptor.tag == "grid" {
         app_builder::request_puzzle_change(
             app_core,
@@ -817,6 +814,15 @@ fn request_local_puzzle_change(
     }
     let (logical_width, logical_height) =
         logical_image_size(entry.width, entry.height, image_max_dim);
+    // Re-fit the spec to THIS entry's dimensions. When the user switches art,
+    // the descriptor was resolved against the previously-active image, so an
+    // aspect-dependent topology (triangular re-picks direction + lines/points;
+    // Voronoi/hex re-derive their stretch) would otherwise carry a layout that
+    // doesn't match the new aspect. `rebuild_for_image` preserves piece count
+    // and is a no-op / idempotent for aspect-independent specs.
+    let descriptor = topology_kind_for_tag(&descriptor.tag)
+        .map(|kind| (kind.rebuild_for_image)(&descriptor, logical_width, logical_height))
+        .unwrap_or(descriptor);
     app_core.set_puzzle_with_topology_seeded(
         entry.label.to_string(),
         PuzzleImageRef::BuiltIn {
@@ -940,6 +946,11 @@ fn app(props: &AppProps) -> Html {
         .unwrap_or(0);
     let puzzle_art_index = use_state(|| initial_puzzle_art_index);
     let puzzle_art_index_value = *puzzle_art_index;
+    // Whether the "Custom…" puzzle-art option is selected. It reveals the
+    // private-image upload controls; the snapshot observer keeps it in sync
+    // with the live puzzle (a private image selects "Custom").
+    let puzzle_art_custom = use_state(|| false);
+    let puzzle_art_custom_value = *puzzle_art_custom;
     let puzzle_art = PUZZLE_ARTS
         .get(puzzle_art_index_value)
         .copied()
@@ -949,11 +960,19 @@ fn app(props: &AppProps) -> Html {
         .enumerate()
         .map(|(index, art)| {
             html! {
-                <option value={index.to_string()} selected={index == puzzle_art_index_value}>
+                <option
+                    value={index.to_string()}
+                    selected={!puzzle_art_custom_value && index == puzzle_art_index_value}
+                >
                     {art.label}
                 </option>
             }
         })
+        .chain(std::iter::once(html! {
+            <option value="custom" selected={puzzle_art_custom_value}>
+                { "Custom\u{2026}" }
+            </option>
+        }))
         .collect();
     let private_label = use_state(|| String::new());
     let private_label_value = (*private_label).clone();
@@ -1787,6 +1806,7 @@ fn app(props: &AppProps) -> Html {
         let bump_ui_revision = bump_ui_revision.clone();
         let puzzle_info = puzzle_info_store.clone();
         let puzzle_art_index = puzzle_art_index.clone();
+        let puzzle_art_custom = puzzle_art_custom.clone();
         let grid_index = grid_index.clone();
         let grid_custom_count = grid_custom_count.clone();
         let local_topology = local_topology.clone();
@@ -1852,14 +1872,12 @@ fn app(props: &AppProps) -> Html {
                                     .or_else(|| {
                                         choices.iter().find(|c| c.actual_count == actual_count)
                                     });
-                                if let Some(matched) = matched {
-                                    if *non_grid_target_count != matched.target_count {
-                                        non_grid_target_count.set(matched.target_count);
-                                    }
-                                    if non_grid_custom_count.is_some() {
-                                        non_grid_custom_count.set(None);
-                                    }
-                                } else {
+                                // Sticky custom: once the user has opened the
+                                // custom input we keep it open (just reflect the
+                                // live count) even if that count happens to equal
+                                // a preset. Collapsing to a preset here is what
+                                // made selecting "Custom" snap back to the list.
+                                if non_grid_custom_count.is_some() {
                                     let custom = clamp_custom_piece_count(actual_count);
                                     if *non_grid_custom_count != Some(custom) {
                                         non_grid_custom_count.set(Some(custom));
@@ -1867,17 +1885,39 @@ fn app(props: &AppProps) -> Html {
                                     if *non_grid_target_count != custom {
                                         non_grid_target_count.set(custom);
                                     }
+                                } else if let Some(matched) = matched {
+                                    if *non_grid_target_count != matched.target_count {
+                                        non_grid_target_count.set(matched.target_count);
+                                    }
+                                } else {
+                                    let custom = clamp_custom_piece_count(actual_count);
+                                    non_grid_custom_count.set(Some(custom));
+                                    if *non_grid_target_count != custom {
+                                        non_grid_target_count.set(custom);
+                                    }
                                 }
                             }
                         }
                     }
-                    let desired_index = match &info.image_ref {
-                        PuzzleImageRef::BuiltIn { slug } => puzzle_art_index_by_slug(slug),
-                        _ => None,
-                    };
-                    if let Some(index) = desired_index {
-                        if *puzzle_art_index != index {
-                            puzzle_art_index.set(index);
+                    // Reflect the room's image in the art picker: a built-in
+                    // image selects its catalog entry (and leaves custom mode);
+                    // a private image selects the "Custom…" option so its upload
+                    // controls stay visible.
+                    match &info.image_ref {
+                        PuzzleImageRef::BuiltIn { slug } => {
+                            if *puzzle_art_custom {
+                                puzzle_art_custom.set(false);
+                            }
+                            if let Some(index) = puzzle_art_index_by_slug(slug) {
+                                if *puzzle_art_index != index {
+                                    puzzle_art_index.set(index);
+                                }
+                            }
+                        }
+                        PuzzleImageRef::Private { .. } => {
+                            if !*puzzle_art_custom {
+                                puzzle_art_custom.set(true);
+                            }
                         }
                     }
                     if info.image_width > 0 && info.image_height > 0 {
@@ -1891,16 +1931,20 @@ fn app(props: &AppProps) -> Html {
                             if choices.is_empty() {
                                 choices.push(FALLBACK_GRID);
                             }
-                            if let Some(index) = grid_choice_index(&choices, cols, rows) {
+                            // Sticky custom (see the non-grid picker above):
+                            // keep the custom input open once the user opened it.
+                            if (*grid_custom_count).is_some() {
+                                let actual_count = cols.saturating_mul(rows);
+                                if actual_count > 0 && *grid_custom_count != Some(actual_count) {
+                                    grid_custom_count.set(Some(actual_count));
+                                }
+                            } else if let Some(index) = grid_choice_index(&choices, cols, rows) {
                                 if *grid_index != index {
                                     grid_index.set(index);
                                 }
-                                if (*grid_custom_count).is_some() {
-                                    grid_custom_count.set(None);
-                                }
                             } else {
                                 let actual_count = cols.saturating_mul(rows);
-                                if actual_count > 0 && *grid_custom_count != Some(actual_count) {
+                                if actual_count > 0 {
                                     grid_custom_count.set(Some(actual_count));
                                 }
                             }
@@ -2156,6 +2200,15 @@ fn app(props: &AppProps) -> Html {
                 let Some(ws_base) = app_router::default_ws_base() else {
                     return;
                 };
+                // Re-fit the spec to the new image's aspect (see the local
+                // path in `request_local_puzzle_change` for the rationale).
+                let (logical_width, logical_height) =
+                    logical_image_size(req.entry.width, req.entry.height, image_max_dim);
+                let descriptor = topology_kind_for_tag(&req.descriptor.tag)
+                    .map(|kind| {
+                        (kind.rebuild_for_image)(&req.descriptor, logical_width, logical_height)
+                    })
+                    .unwrap_or_else(|| req.descriptor.clone());
                 admin_socket.borrow_mut().send(
                     ws_base,
                     room_id.clone(),
@@ -2167,7 +2220,7 @@ fn app(props: &AppProps) -> Html {
                             },
                             pieces: None,
                             seed: parse_optional_seed(&admin_seed_value),
-                            topology: Some(req.descriptor.clone().into()),
+                            topology: Some(descriptor.into()),
                             shape_seed: Some(req.shape_seed),
                         },
                     },
@@ -2193,7 +2246,6 @@ fn app(props: &AppProps) -> Html {
         let apply_puzzle_change = apply_puzzle_change.clone();
         let puzzle_art = puzzle_art;
         let preset_grid = preset_grid;
-        let puzzle_dims_value = puzzle_dims_value;
         let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
@@ -2202,18 +2254,11 @@ fn app(props: &AppProps) -> Html {
             let select: HtmlSelectElement = event.target_unchecked_into();
             let raw = select.value();
             if raw == "custom" {
+                // Reveal the free-entry input, pre-filled with the current
+                // count. The change applies on input commit; applying here
+                // would re-scramble the board and snap the picker back.
                 let initial = clamp_custom_piece_count(preset_grid.target_count.max(1));
                 grid_custom_count.set(Some(initial));
-                clear_saved_game();
-                if let Some((width, height)) = puzzle_dims_value {
-                    let grid = nearest_valid_grid(width, height, initial).unwrap_or(preset_grid);
-                    apply_puzzle_change.emit(PuzzleChangeRequest {
-                        entry: puzzle_art,
-                        grid_override: Some(grid),
-                        descriptor: TopologySpec::grid(grid.cols, grid.rows),
-                        shape_seed: regenerate_seed_value,
-                    });
-                }
                 return;
             }
             if let Ok(value) = raw.parse::<usize>() {
@@ -2368,19 +2413,12 @@ fn app(props: &AppProps) -> Html {
             let select: HtmlSelectElement = event.target_unchecked_into();
             let value = select.value();
             if value == "custom" {
-                let (w, h) = logical_image_size(puzzle_art.width, puzzle_art.height, image_max_dim);
+                // Just reveal the free-entry input, pre-filled with the current
+                // count. Applying here would re-scramble the board for an
+                // unchanged count and let the snapshot observer snap the picker
+                // back to a preset. The actual change happens on input commit.
                 let initial = clamp_custom_piece_count(*non_grid_target_count);
                 non_grid_custom_count.set(Some(initial));
-                if let Some(choice) =
-                    (active_kind.resolve_target)(initial, w, h, regenerate_seed_value)
-                {
-                    apply_puzzle_change.emit(PuzzleChangeRequest {
-                        entry: puzzle_art,
-                        grid_override: None,
-                        descriptor: choice.spec,
-                        shape_seed: regenerate_seed_value,
-                    });
-                }
                 return;
             }
             let Ok(index) = value.parse::<usize>() else {
@@ -2497,6 +2535,7 @@ fn app(props: &AppProps) -> Html {
     };
     let on_puzzle_art_change = {
         let puzzle_art_index = puzzle_art_index.clone();
+        let puzzle_art_custom = puzzle_art_custom.clone();
         let puzzle_art_len = PUZZLE_ARTS.len();
         let lock_puzzle_controls = lock_puzzle_controls;
         let apply_puzzle_change = apply_puzzle_change.clone();
@@ -2508,8 +2547,16 @@ fn app(props: &AppProps) -> Html {
                 return;
             }
             let select: HtmlSelectElement = event.target_unchecked_into();
-            if let Ok(value) = select.value().parse::<usize>() {
+            let raw = select.value();
+            if raw == "custom" {
+                // Reveal the private-image upload controls. The puzzle only
+                // changes once a file is actually uploaded.
+                puzzle_art_custom.set(true);
+                return;
+            }
+            if let Ok(value) = raw.parse::<usize>() {
                 if value < puzzle_art_len {
+                    puzzle_art_custom.set(false);
                     puzzle_art_index.set(value);
                     clear_saved_game();
                     let entry = PUZZLE_ARTS.get(value).copied().unwrap_or(PUZZLE_ARTS[0]);
@@ -2605,9 +2652,9 @@ fn app(props: &AppProps) -> Html {
                     logical_image_size(width, height, image_max_dim);
                 // The descriptor was built against the previously-active
                 // image's dimensions. Each topology decides whether its
-                // identity depends on image aspect (Voronoi rebuilds;
-                // grid + triangular are aspect-independent and pass
-                // through unchanged).
+                // identity depends on image aspect (Voronoi, hexagonal and
+                // triangular re-fit their layout to the new aspect; grid
+                // passes through unchanged).
                 let descriptor = topology_kind_for_tag(&descriptor.tag)
                     .map(|kind| {
                         (kind.rebuild_for_image)(&descriptor, logical_width, logical_height)
@@ -3493,6 +3540,7 @@ fn app(props: &AppProps) -> Html {
                     <button
                         type="button"
                         id="non-grid-regenerate"
+                        class="control-button"
                         onclick={on_regenerate_click.clone()}
                     >
                         { "Regenerate" }
@@ -3527,6 +3575,8 @@ fn app(props: &AppProps) -> Html {
                     </div>
                 }
             } }
+            { if puzzle_art_custom_value { html! {
+                <>
             <hr class="control-separator" />
             <div class="control">
                 <label for="private-file">
@@ -3606,6 +3656,8 @@ fn app(props: &AppProps) -> Html {
                     </>
                 }
             } }
+                </>
+            } } else { html! {} } }
             { if !multiplayer_active || admin_enabled {
                 html! {
                     <>

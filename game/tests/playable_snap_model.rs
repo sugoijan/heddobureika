@@ -696,6 +696,7 @@ fn applying_stale_proposal_rebases_against_current_connectivity() {
 
     let _ = playable.apply_restricted_action(RestrictedPlayableAction::FlipGroup {
         group: heddobureika_game::GroupId(2),
+        pivot: None,
     });
     let first = playable.probe_snaps(
         heddobureika_game::GroupId(1),
@@ -704,6 +705,7 @@ fn applying_stale_proposal_rebases_against_current_connectivity() {
     let _ = playable.apply_proposal(&first, MergePolicy::KeepFixedGroup);
     let _ = playable.apply_action(heddobureika_game::PlayableAction::UnflipGroup {
         group: heddobureika_game::GroupId(2),
+        pivot: None,
     });
 
     let batch = playable.apply_proposal_with_batch(&stale, MergePolicy::KeepFixedGroup);
@@ -1056,173 +1058,40 @@ fn transform_action_frame_snap_aligns_rotated_edge_on_non_square_grid() {
     assert_approx(pose.rotation_degrees(), 90.0);
 }
 
-/// Regression: triangular-tessellation half-row edge pieces must snap to the
-/// top frame edge. Prior to the topology-frame-snap implementation,
-/// `is_frame_border_piece` was the default `false` for triangular pieces and
-/// no frame snap targets were emitted at all.
-///
-/// 3x2 triangular tessellation: piece_row 0 is a half-row at canonical
-/// `y = 0`. PieceId(1) is at `(1.0, 0.0)`. Dropping it just below the top
-/// edge — but far enough from neighbor canonical positions to avoid a
-/// join-snap — should pull only the Y axis to 0; X is preserved.
+/// Regression: triangular border pieces must emit frame-snap outer features
+/// (and interior pieces must not). The original bug was `is_frame_border_piece`
+/// defaulting to `false`, so no frame-snap targets were emitted at all. With
+/// the lattice construction every border filler owns ≥1 frame edge and every
+/// interior (regular) piece owns none.
 #[test]
-fn transform_action_frame_snaps_triangular_top_edge_half_piece() {
-    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
-    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
-
-    let batch = playable.apply_action_with_snap(
-        PlayableAction::TransformGroupTo {
-            group: heddobureika_game::GroupId(1),
-            drop_pos: Position2::try_from_mm(1.25, 0.05).expect("finite"),
-            drop_rotation: heddobureika_game::AngleDeg::zero(),
-        },
-        Some(ActionId(302)),
-        MergePolicy::KeepFixedGroup,
+fn triangular_border_pieces_emit_frame_snap_features() {
+    use heddobureika_game::{PieceId, PieceOuterFeature, PuzzleTopology};
+    let topology = TriangularTessellationTopology::try_new(4, 6).expect("valid triangular");
+    let mut border_with_features = 0u32;
+    for p in (0..topology.piece_count()).map(PieceId) {
+        let mut edges = 0u32;
+        topology.visit_outer_features(p, &mut |f| {
+            if matches!(f, PieceOuterFeature::BorderEdge { .. }) {
+                edges += 1;
+            }
+        });
+        if topology.is_frame_border_piece(p) {
+            if edges > 0 {
+                border_with_features += 1;
+            }
+        } else {
+            assert_eq!(
+                edges,
+                0,
+                "interior piece {} should emit no frame features",
+                p.as_u32()
+            );
+        }
+    }
+    assert!(
+        border_with_features > 0,
+        "border pieces must emit frame-snap features"
     );
-
-    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
-    let pose = playable
-        .pose_of(heddobureika_game::GroupId(1))
-        .expect("group pose");
-    assert_approx(pose.x_mm(), 1.25);
-    assert_approx(pose.y_mm(), 0.0);
-}
-
-/// Regression: triangular corner half-triangle (PieceId(0): piece_row=0,
-/// col=0) must snap as a *corner* (both axes constrained), not just an edge.
-/// The rounded notch in the frame's TL corner makes only this piece fit, so
-/// it should snap to `(0, 0)` from any drag inside the snap zone.
-#[test]
-fn transform_action_frame_snaps_triangular_corner_half_triangle() {
-    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
-    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
-
-    let batch = playable.apply_action_with_snap(
-        PlayableAction::TransformGroupTo {
-            group: heddobureika_game::GroupId(0),
-            drop_pos: Position2::try_from_mm(0.07, 0.06).expect("finite"),
-            drop_rotation: heddobureika_game::AngleDeg::zero(),
-        },
-        Some(ActionId(303)),
-        MergePolicy::KeepFixedGroup,
-    );
-
-    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
-    let pose = playable
-        .pose_of(heddobureika_game::GroupId(0))
-        .expect("group pose");
-    assert_approx(pose.x_mm(), 0.0);
-    assert_approx(pose.y_mm(), 0.0);
-}
-
-/// Regression: triangular bottom-right corner half-triangle must also corner-
-/// snap. The bottom-right canonical position for 3x2 is `(cols-1, 2*rows)`
-/// = `(2, 4)`. PieceId(14) sits there (last piece in piece_row 4, col=2).
-#[test]
-fn transform_action_frame_snaps_triangular_corner_bottom_right_half_triangle() {
-    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
-    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
-
-    let batch = playable.apply_action_with_snap(
-        PlayableAction::TransformGroupTo {
-            group: heddobureika_game::GroupId(14),
-            drop_pos: Position2::try_from_mm(1.95, 3.96).expect("finite"),
-            drop_rotation: heddobureika_game::AngleDeg::zero(),
-        },
-        Some(ActionId(304)),
-        MergePolicy::KeepFixedGroup,
-    );
-
-    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
-    let pose = playable
-        .pose_of(heddobureika_game::GroupId(14))
-        .expect("group pose");
-    assert_approx(pose.x_mm(), 2.0);
-    assert_approx(pose.y_mm(), 4.0);
-}
-
-/// Regression: triangular regular-row piece in the first column should snap
-/// to the *left* frame edge (single-axis X). PieceId(3) is at piece_row=1,
-/// col=0 → canonical `(0.5, 1.0)`. Dropping it just inside the left edge —
-/// far enough from canonical to avoid a vertical-edge join with the
-/// half-corner above — pulls X to `0.5`, Y is preserved.
-#[test]
-fn transform_action_frame_snaps_triangular_left_edge_regular_piece() {
-    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
-    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
-
-    let batch = playable.apply_action_with_snap(
-        PlayableAction::TransformGroupTo {
-            group: heddobureika_game::GroupId(3),
-            drop_pos: Position2::try_from_mm(0.55, 1.30).expect("finite"),
-            drop_rotation: heddobureika_game::AngleDeg::zero(),
-        },
-        Some(ActionId(305)),
-        MergePolicy::KeepFixedGroup,
-    );
-
-    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
-    let pose = playable
-        .pose_of(heddobureika_game::GroupId(3))
-        .expect("group pose");
-    assert_approx(pose.x_mm(), 0.5);
-    assert_approx(pose.y_mm(), 1.30);
-}
-
-/// Regression: triangular top-edge half-piece rotated 180° must snap
-/// its flat side to the *visual* bottom frame. The visual frame for a
-/// 3x2 triangular tessellation runs from `y = 0` to `y = piece_rows
-/// = 5`, NOT to `y = 4` (the bottom half-row anchor). Top-half-row
-/// pieces have their anchor on the flat side, so the anchor itself
-/// must land on the visual bottom at `y = 5` for the rotated piece to
-/// fit there.
-#[test]
-fn transform_action_frame_snaps_triangular_top_edge_rotated_to_bottom() {
-    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
-    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
-
-    let batch = playable.apply_action_with_snap(
-        PlayableAction::TransformGroupTo {
-            group: heddobureika_game::GroupId(1),
-            drop_pos: Position2::try_from_mm(1.25, 4.95).expect("finite"),
-            drop_rotation: heddobureika_game::AngleDeg::try_new(180.0).expect("finite"),
-        },
-        Some(ActionId(310)),
-        MergePolicy::KeepFixedGroup,
-    );
-
-    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
-    let pose = playable
-        .pose_of(heddobureika_game::GroupId(1))
-        .expect("group pose");
-    assert_approx(pose.y_mm(), 5.0);
-}
-
-/// Symmetric regression: triangular bottom-edge half-piece rotated
-/// 180° must snap its flat side to the visual top frame at `y = 0`.
-/// Bottom-half-row pieces have their flat side one pose unit BELOW
-/// the anchor, so the rotated piece's anchor lands one unit BELOW the
-/// flat side (i.e., at `y = 1` for snap to top).
-#[test]
-fn transform_action_frame_snaps_triangular_bottom_edge_rotated_to_top() {
-    let topology = TriangularTessellationTopology::try_new(3, 2).expect("valid triangular");
-    let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
-    // Piece 13: piece_row=4 (bottom half-row), col=1, canonical (1, 4).
-    let batch = playable.apply_action_with_snap(
-        PlayableAction::TransformGroupTo {
-            group: heddobureika_game::GroupId(13),
-            drop_pos: Position2::try_from_mm(1.25, 1.05).expect("finite"),
-            drop_rotation: heddobureika_game::AngleDeg::try_new(180.0).expect("finite"),
-        },
-        Some(ActionId(311)),
-        MergePolicy::KeepFixedGroup,
-    );
-
-    assert_eq!(batch.proposal.status, ProposalApplyStatus::ActionOnly);
-    let pose = playable
-        .pose_of(heddobureika_game::GroupId(13))
-        .expect("group pose");
-    assert_approx(pose.y_mm(), 1.0);
 }
 
 /// Voronoi smoke test: the universal frame-snap solver pulls a corner

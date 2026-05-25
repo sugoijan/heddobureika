@@ -158,6 +158,7 @@ fn playable_game_snapshot_applies_restricted_action_in_place() {
         .apply_restricted_action(
             RestrictedPlayableAction::FlipGroup {
                 group: heddobureika_game::GroupId(0),
+                pivot: None,
             },
             Some(ActionId(23)),
         )

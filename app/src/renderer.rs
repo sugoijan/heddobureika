@@ -684,6 +684,7 @@ impl WgpuRenderer {
         canvas: HtmlCanvasElement,
         image: HtmlImageElement,
         puzzle_bounds_px: [f32; 2],
+        frame_rect_px: [f32; 4],
         typical_piece_extent_px: [f32; 2],
         view_min_x: f32,
         view_min_y: f32,
@@ -1378,12 +1379,16 @@ impl WgpuRenderer {
                 contents: bytemuck::cast_slice(&frame_stroke_instances),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
+        // The dashed outline traces the puzzle's actual frame, which for
+        // letterboxed topologies (e.g. triangular) is a centred sub-rect of
+        // the image — not the full image. `image_size` (texture UV) still uses
+        // the full image dims via `logical_width/height` above.
         let frame_inset = 0.0;
         let frame_stroke = 1.5;
-        let frame_x = frame_inset + frame_stroke * 0.5;
-        let frame_y = frame_inset + frame_stroke * 0.5;
-        let frame_w = logical_width - 2.0 * (frame_inset + frame_stroke * 0.5);
-        let frame_h = logical_height - 2.0 * (frame_inset + frame_stroke * 0.5);
+        let frame_x = frame_rect_px[0] + frame_inset + frame_stroke * 0.5;
+        let frame_y = frame_rect_px[1] + frame_inset + frame_stroke * 0.5;
+        let frame_w = frame_rect_px[2] - 2.0 * (frame_inset + frame_stroke * 0.5);
+        let frame_h = frame_rect_px[3] - 2.0 * (frame_inset + frame_stroke * 0.5);
         let corner_radius = (frame_corner_radius - frame_inset - frame_stroke * 0.5).max(0.0);
         let frame_instances = build_frame_dashes(
             frame_x,

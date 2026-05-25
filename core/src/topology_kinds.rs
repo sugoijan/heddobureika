@@ -11,7 +11,7 @@
 
 use heddobureika_game::{
     GridTopology, HexagonalTopology, PuzzleTopology, SerializableTopology, TopologySpec,
-    TriangularTessellationTopology, VoronoiTopology,
+    TriDirection, TriangularTessellationTopology, VoronoiTopology,
 };
 
 use crate::grid::{
@@ -62,10 +62,10 @@ pub struct TopologyKind {
     /// debug overlays. Returning `None` falls back to the display name.
     pub spec_label: fn(spec: &TopologySpec) -> Option<String>,
     /// Rebuilds the spec for a fresh image size when the user swaps the
-    /// puzzle image. Topologies whose identity is aspect-independent
-    /// (grid, triangular) return the spec unchanged; aspect-dependent
-    /// topologies (Voronoi) re-resolve their layout against the new
-    /// dimensions. Implementations should be infallible — if anything
+    /// puzzle image. Grid is aspect-independent and returns the spec
+    /// unchanged; aspect-dependent topologies (triangular, hexagonal,
+    /// Voronoi) re-fit their layout to the new dimensions while preserving
+    /// piece count. Implementations should be infallible — if anything
     /// goes wrong, return the input spec untouched so saved games stay
     /// loadable.
     pub rebuild_for_image: fn(spec: &TopologySpec, image_w: u32, image_h: u32) -> TopologySpec,
@@ -170,8 +170,21 @@ const TRIANGULAR_KIND: TopologyKind = TopologyKind {
     piece_count_choices: triangular_piece_count_choices,
     resolve_target: triangular_resolve_target,
     spec_label: triangular_spec_label,
-    rebuild_for_image: identity_rebuild,
+    rebuild_for_image: triangular_rebuild_for_image,
 };
+
+/// The triangular layout is aspect-dependent (its `(lines, points)` and
+/// chosen direction fit the image), so re-resolve for a new image while
+/// preserving the current piece count.
+fn triangular_rebuild_for_image(spec: &TopologySpec, image_w: u32, image_h: u32) -> TopologySpec {
+    let Some(existing) = TriangularTessellationTopology::read_payload(&spec.payload) else {
+        return spec.clone();
+    };
+    let count = existing.piece_count().max(1);
+    triangular_resolve_target(count, image_w, image_h, 0)
+        .map(|choice| choice.spec)
+        .unwrap_or_else(|| spec.clone())
+}
 
 fn triangular_piece_count_choices(image_w: u32, image_h: u32) -> Vec<PieceCountChoice> {
     TARGET_PIECE_COUNTS
@@ -180,23 +193,12 @@ fn triangular_piece_count_choices(image_w: u32, image_h: u32) -> Vec<PieceCountC
         .collect()
 }
 
-/// Triangular tessellation has `piece_count = cols * (2*rows + 1)`.
-///
-/// **Aspect target.** The canonical (un-stretched) mesh occupies roughly
-/// `1.5 * cols` units horizontally and `(sqrt(3)/2) * piece_rows` units
-/// vertically. `rectangularize_mesh` in `triangular_shape.rs` stretches
-/// this canonical mesh to fit the image rectangle, so pieces remain
-/// near-equilateral only when the stretch is uniform:
-///
-/// ```text
-/// image_w / (1.5 * cols) ≈ image_h / ((sqrt(3)/2) * piece_rows)
-/// → cols / piece_rows ≈ aspect / sqrt(3)
-/// ```
-///
-/// We solve for `cols * piece_rows = target` with the above ratio,
-/// giving `piece_rows = sqrt(target * sqrt(3) / aspect)` and
-/// `cols = target / piece_rows`. This avoids the "thin sliver" pieces
-/// that `cols/piece_rows ≈ aspect` would produce.
+/// Resolves a target piece count to the best triangular tessellation. For each
+/// guide-line direction it finds the `(lines, points)` that best hits the
+/// target count, then auto-picks the direction whose layout deviates least
+/// from the image's aspect ratio (lowest letterbox waste — `waste` is a pure,
+/// monotonic function of aspect mismatch). Count breaks only near-ties in
+/// aspect, so the chosen direction always honours the image's proportions.
 fn triangular_resolve_target(
     target: u32,
     image_w: u32,
@@ -207,59 +209,112 @@ fn triangular_resolve_target(
         return None;
     }
     let target = clamp_custom_piece_count(target.max(1));
-    let aspect = image_aspect_ratio(image_w, image_h);
-    let target_pose_aspect = triangular_target_pose_aspect(aspect);
+    let w = image_w as f32;
+    let h = image_h as f32;
 
-    // Initial guess: count = cols * piece_rows ≈ piece_rows^2 * target_pose_aspect.
-    let piece_rows_f = (target as f32 / target_pose_aspect).sqrt().max(3.0);
-    let init_piece_rows = piece_rows_f.round() as u32;
-    // piece_rows = 2 * rows + 1 → rows = (piece_rows - 1) / 2.
-    let init_rows = ((init_piece_rows.saturating_sub(1)) / 2).max(1);
-
-    // Combined score per candidate: relative-count-error squared plus
-    // aspect-error (log-ratio distance) squared, weighted so that a
-    // ~5% count miss costs roughly the same as a ~0.16 log-distance
-    // aspect miss. Without this, the resolver would lock onto whichever
-    // (cols, rows) hit the count exactly and ignore aspect entirely —
-    // producing thin pieces for square-ish images.
-    let mut best: Option<(u32, u32, u32)> = None; // (cols, rows, count)
-    let mut best_score = f32::INFINITY;
-    for d_rows in -5i32..=5 {
-        let rows = (init_rows as i32 + d_rows).max(1) as u32;
-        let piece_rows = 2 * rows + 1;
-        // Try cols around the formula-suggested value.
-        let cols_centre = ((target as f32 / piece_rows as f32).round() as i32).max(1);
-        for d_cols in -5i32..=5 {
-            let cols = (cols_centre + d_cols).max(1) as u32;
-            let count = cols.saturating_mul(piece_rows);
-            if count == 0 {
-                continue;
-            }
-            let rel_err = diff_abs(count, target) as f32 / target as f32;
-            let count_term = rel_err.powi(2);
-            let aspect_term = aspect_err(cols, piece_rows, target_pose_aspect).powi(2);
-            let score = count_term + 0.5 * aspect_term;
-            if score < best_score {
-                best_score = score;
-                best = Some((cols, rows, count));
+    let mut best: Option<(TriDirection, u32, u32, u32, f32)> = None; // dir, lines, points, count, waste
+    for &direction in &[TriDirection::Horizontal, TriDirection::Vertical] {
+        if let Some((lines, points, count, waste)) = best_triangular_params(direction, target, w, h)
+        {
+            let take = match best {
+                None => true,
+                Some((_, _, _, best_count, best_waste)) => {
+                    // Lower waste == closer to the image aspect. Only when the
+                    // two directions match the aspect about equally (within 1%
+                    // of image area) does the closer piece count decide.
+                    if (waste - best_waste).abs() > 0.01 {
+                        waste < best_waste
+                    } else {
+                        diff_abs(count, target) < diff_abs(best_count, target)
+                    }
+                }
+            };
+            if take {
+                best = Some((direction, lines, points, count, waste));
             }
         }
     }
 
-    let (cols, rows, actual_count) = best?;
+    let (direction, lines, points, actual_count, _waste) = best?;
+    let dir_label = match direction {
+        TriDirection::Horizontal => "H",
+        TriDirection::Vertical => "V",
+    };
     Some(PieceCountChoice {
         target_count: target,
         actual_count,
         label: if actual_count == target {
-            format!("{} pieces ({}x{})", target, cols, rows)
+            format!("{target} pieces ({dir_label} {lines}x{points})")
         } else {
-            format!(
-                "{} pieces ({}x{}, actual {})",
-                target, cols, rows, actual_count
-            )
+            format!("{target} pieces ({dir_label} {lines}x{points}, actual {actual_count})")
         },
-        spec: TopologySpec::triangular_tessellation(cols, rows),
+        spec: TopologySpec::triangular_tessellation_directed(direction, lines, points),
     })
+}
+
+/// Row height of a unit-side equilateral triangle (`√3/2`); mirrors
+/// `triangular_lattice::TRI_ROW_HEIGHT`. Kept local so the resolver stays
+/// pure arithmetic and never builds a lattice.
+const TRI_ROW_HEIGHT: f32 = 0.866_025_4;
+
+/// Searches `(lines, points)` for one direction, returning the best
+/// `(lines, points, count, waste)`. The internal score balances count error
+/// and wasted (letterbox) area so the representative hits the target count
+/// well; `waste` is reported separately so the caller can pick the direction
+/// that deviates least from the image aspect. Uses the lattice's closed-form
+/// `count` and `extent` (NOT a built lattice) — this runs on every UI render,
+/// so it must stay cheap arithmetic like the grid resolver.
+fn best_triangular_params(
+    direction: TriDirection,
+    target: u32,
+    w: f32,
+    h: f32,
+) -> Option<(u32, u32, u32, f32)> {
+    // Closed forms (see `triangular_lattice`): for `(lines, points)`,
+    //   count  = lines·(2·points − 1)
+    //   extent = (points−1, lines·h)   [Horizontal]
+    //          = (lines·h, points−1)   [Vertical]
+    // with h = √3/2. The equilateral aspect wants points−1 ≈ lines·h·aspect
+    // (and the transpose for vertical), giving lines ≈ √(target/(√3·a)).
+    const SQRT_3: f32 = 1.732_050_8;
+    let aspect = (w / h).max(f32::EPSILON);
+    let a = match direction {
+        TriDirection::Horizontal => aspect,
+        TriDirection::Vertical => 1.0 / aspect,
+    };
+    let lines_est = (target as f32 / (SQRT_3 * a).max(0.05))
+        .sqrt()
+        .round()
+        .max(1.0) as i32;
+
+    let mut best: Option<(u32, u32, u32, f32, f32)> = None; // lines, points, count, waste, score
+    for d_lines in -3i32..=3 {
+        let lines = (lines_est + d_lines).max(1) as u32;
+        let points_est = (target as f32 / lines as f32 / 2.0).round().max(2.0) as i32;
+        for d_points in -3i32..=4 {
+            let points = (points_est + d_points).max(2) as u32;
+            let count = lines * (2 * points - 1);
+            if count == 0 {
+                continue;
+            }
+            let (ex, ey) = match direction {
+                TriDirection::Horizontal => ((points - 1) as f32, lines as f32 * TRI_ROW_HEIGHT),
+                TriDirection::Vertical => (lines as f32 * TRI_ROW_HEIGHT, (points - 1) as f32),
+            };
+            if ex <= 0.0 || ey <= 0.0 {
+                continue;
+            }
+            let scale = (w / ex).min(h / ey);
+            let covered = (ex * scale) * (ey * scale);
+            let waste = 1.0 - (covered / (w * h)).clamp(0.0, 1.0);
+            let count_rel = diff_abs(count, target) as f32 / target as f32;
+            let score = count_rel.powi(2) + 2.0 * waste.powi(2);
+            if best.map(|(_, _, _, _, s)| score < s).unwrap_or(true) {
+                best = Some((lines, points, count, waste, score));
+            }
+        }
+    }
+    best.map(|(lines, points, count, waste, _score)| (lines, points, count, waste))
 }
 
 fn diff_abs(a: u32, b: u32) -> u32 {
@@ -270,31 +325,21 @@ fn diff_abs(a: u32, b: u32) -> u32 {
     }
 }
 
-/// Distance between the proposed `cols/piece_rows` ratio and a target
-/// pose-aspect, in log space (so over- and under-shoot are weighted
-/// symmetrically).
-fn aspect_err(cols: u32, piece_rows: u32, target_pose_aspect: f32) -> f32 {
-    let pose_aspect = cols as f32 / piece_rows as f32;
-    (pose_aspect.ln() - target_pose_aspect.ln()).abs()
-}
-
-/// Target `cols / piece_rows` ratio that produces near-equilateral
-/// interior triangles for the given image aspect. The canonical
-/// triangular mesh is `1.5 * cols` wide and `(sqrt(3)/2) * piece_rows`
-/// tall; uniform stretch to the image rectangle keeps triangles
-/// equilateral when `cols/piece_rows = aspect / sqrt(3)`.
-fn triangular_target_pose_aspect(aspect: f32) -> f32 {
-    const SQRT_3: f32 = 1.732_050_8;
-    (aspect / SQRT_3).max(f32::EPSILON)
-}
-
 fn triangular_spec_label(spec: &TopologySpec) -> Option<String> {
     if spec.tag != <TriangularTessellationTopology as SerializableTopology>::TAG {
         return None;
     }
     let topology = TriangularTessellationTopology::read_payload(&spec.payload)?;
-    let (cols, rows) = (topology.cols().get(), topology.rows().get());
-    Some(format!("{}x{}", cols, rows))
+    let dir = match topology.direction() {
+        TriDirection::Horizontal => "H",
+        TriDirection::Vertical => "V",
+    };
+    Some(format!(
+        "{} {}x{}",
+        dir,
+        topology.lines().get(),
+        topology.points().get()
+    ))
 }
 
 // ---- Hexagonal ------------------------------------------------------------
@@ -628,60 +673,123 @@ mod tests {
     }
 
     #[test]
-    fn triangular_resolve_target_favours_near_equilateral_pieces() {
-        // For each (image_w, image_h, target), the resolved (cols, rows)
-        // should land near the equilateral-aspect target — i.e. the
-        // pose-aspect `cols / piece_rows` should be within a tight band
-        // around `aspect / sqrt(3)`. Without the fix this used to come
-        // in at ≈ `aspect`, producing thin pieces (e.g. a square image
-        // got cols/piece_rows ≈ 1 instead of ≈ 0.577).
+    fn triangular_resolve_target_low_waste_across_aspects() {
+        // The chosen lattice should fill nearly all of the image (small
+        // letterbox/crop), confirming the resolver picked a direction +
+        // (lines, points) whose natural extent hugs the image aspect.
         for (w, h, target) in [
             (1000u32, 1000u32, 100u32),
             (1000, 1000, 500),
             (1600, 900, 300),
             (900, 1600, 300),
             (1920, 1080, 1000),
+            (4096, 2194, 50),
         ] {
-            let aspect = w as f32 / h as f32;
-            let target_pose_aspect = triangular_target_pose_aspect(aspect);
             let choice = (TRIANGULAR_KIND.resolve_target)(target, w, h, 0).expect("triangular");
-            let spec_payload = choice.spec.payload.clone();
-            let topology = TriangularTessellationTopology::read_payload(&spec_payload)
+            let topology = TriangularTessellationTopology::read_payload(&choice.spec.payload)
                 .expect("triangular topology");
-            let cols = topology.cols().get() as f32;
-            let piece_rows = (2 * topology.rows().get() + 1) as f32;
-            let actual_pose_aspect = cols / piece_rows;
-            // log-ratio distance must be small (under ~0.30 ≈ 35% off).
-            let err = (actual_pose_aspect.ln() - target_pose_aspect.ln()).abs();
+            let (ex, ey) = topology.pose_extent();
+            let scale = (w as f32 / ex).min(h as f32 / ey);
+            let covered = (ex * scale) * (ey * scale) / (w as f32 * h as f32);
             assert!(
-                err < 0.30,
-                "pose-aspect {} far from equilateral target {} for {}x{} target={}",
-                actual_pose_aspect,
-                target_pose_aspect,
-                w,
-                h,
-                target
+                covered > 0.88,
+                "triangular {w}x{h} target={target}: only covers {:.3} of the image",
+                covered
             );
         }
     }
 
     #[test]
     fn triangular_resolve_target_round_trips_into_buildable_topology() {
-        // Mid-sized target across a few aspects.
         for (w, h) in [(800u32, 600u32), (300, 900), (1600, 400)] {
             let choice = (TRIANGULAR_KIND.resolve_target)(300, w, h, 0).expect("triangular");
             let topology = build_topology_from_spec(&choice.spec).expect("buildable");
             assert_eq!(topology.piece_count(), choice.actual_count);
-            // Should be roughly near the target.
             let diff = diff_abs(choice.actual_count, 300);
             assert!(
-                diff < 100,
+                diff < 120,
                 "triangular target=300 actual={} for ({},{})",
                 choice.actual_count,
                 w,
                 h
             );
         }
+    }
+
+    #[test]
+    fn triangular_resolve_picks_min_aspect_deviation_direction() {
+        // The auto-pick must choose the guide-line direction whose layout
+        // deviates least from the image aspect (lowest letterbox waste),
+        // within the near-tie margin where piece count decides.
+        for (w, h, target) in [
+            (1600u32, 900u32, 150u32),
+            (900, 1600, 150),
+            (1000, 1000, 200),
+            (2000, 700, 80),
+            (700, 2000, 80),
+        ] {
+            let (wf, hf) = (w as f32, h as f32);
+            let (_, _, _, h_waste) =
+                best_triangular_params(TriDirection::Horizontal, target, wf, hf).expect("h");
+            let (_, _, _, v_waste) =
+                best_triangular_params(TriDirection::Vertical, target, wf, hf).expect("v");
+            let min_waste = h_waste.min(v_waste);
+
+            let choice = (TRIANGULAR_KIND.resolve_target)(target, w, h, 0).expect("triangular");
+            let topo =
+                TriangularTessellationTopology::read_payload(&choice.spec.payload).expect("read");
+            let chosen_waste = match topo.direction() {
+                TriDirection::Horizontal => h_waste,
+                TriDirection::Vertical => v_waste,
+            };
+            assert!(
+                chosen_waste <= min_waste + 0.01 + 1.0e-4,
+                "{w}x{h} target={target}: chose {:?} (waste {chosen_waste:.4}), \
+                 min available {min_waste:.4}",
+                topo.direction()
+            );
+        }
+    }
+
+    #[test]
+    fn triangular_rebuild_refits_layout_when_aspect_flips() {
+        // Switching art from landscape to portrait must re-fit the lattice to
+        // the new aspect (the bug: the old spec was carried over and covered
+        // the new image poorly). Resolve for landscape, then rebuild for
+        // portrait and confirm the refit covers the portrait image well —
+        // which the carried-over landscape spec would not.
+        let landscape = (TRIANGULAR_KIND.resolve_target)(120, 1600, 900, 0).expect("landscape");
+
+        let coverage = |spec: &TopologySpec, w: u32, h: u32| -> f32 {
+            let topo = TriangularTessellationTopology::read_payload(&spec.payload).expect("read");
+            let (ex, ey) = topo.pose_extent();
+            let scale = (w as f32 / ex).min(h as f32 / ey);
+            (ex * scale) * (ey * scale) / (w as f32 * h as f32)
+        };
+
+        let (pw, ph) = (900u32, 1600u32);
+        let carried_over = coverage(&landscape.spec, pw, ph);
+        let refit_spec = (TRIANGULAR_KIND.rebuild_for_image)(&landscape.spec, pw, ph);
+        let refit = coverage(&refit_spec, pw, ph);
+
+        assert!(
+            refit > 0.85,
+            "refit should hug the portrait image; covered {refit:.3}"
+        );
+        assert!(
+            refit > carried_over + 0.1,
+            "refit ({refit:.3}) should cover much better than the carried-over \
+             landscape spec ({carried_over:.3})"
+        );
+        // Piece count is preserved across the refit (within the discrete grid).
+        let before = build_topology_from_spec(&landscape.spec)
+            .unwrap()
+            .piece_count();
+        let after = build_topology_from_spec(&refit_spec).unwrap().piece_count();
+        assert!(
+            diff_abs(before, after) <= before / 5 + 2,
+            "piece count drifted too much on refit: {before} -> {after}"
+        );
     }
 
     #[test]
@@ -694,7 +802,7 @@ mod tests {
         let tri = TopologySpec::triangular_tessellation(3, 2);
         assert_eq!(
             (topology_kind_for_tag(&tri.tag).unwrap().spec_label)(&tri).as_deref(),
-            Some("3x2")
+            Some("H 3x2")
         );
         let vor = TopologySpec::voronoi(80, 1, 1.0);
         assert_eq!(
