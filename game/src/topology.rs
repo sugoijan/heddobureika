@@ -10,7 +10,7 @@ pub use crate::triangular_lattice::{TriDirection, TriLattice};
 use crate::ids::{EdgeId, PieceId};
 use crate::playable::{PlayableState, Pose2};
 use crate::rotation_step::SymmetryStrength;
-pub use crate::traits::topology::{FrameBounds, PieceOuterFeature, PuzzleTopology};
+pub use crate::traits::topology::{FrameBounds, ImagePlacement, PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
 
 /// Relative transform expectation for topology-defined neighbor relationships.
@@ -848,6 +848,31 @@ impl PuzzleTopology for TriangularTessellationTopology {
         self.extent
     }
 
+    /// Triangular keeps pieces exactly equilateral, so the lattice is scaled
+    /// UNIFORMLY (same factor on both axes) and centred — the image area
+    /// outside the frame is the letterbox crop. This is the single source of
+    /// truth the renderer and the worker both consume.
+    fn image_placement(&self, image_width: u32, image_height: u32) -> ImagePlacement {
+        let (ex, ey) = self.extent;
+        let w = image_width as f32;
+        let h = image_height as f32;
+        if ex <= 0.0 || ey <= 0.0 {
+            return ImagePlacement {
+                pose_unit_px: [1.0, 1.0],
+                origin_px: [0.0, 0.0],
+                frame_px: [w, h],
+            };
+        }
+        let scale = (w / ex).min(h / ey);
+        let frame_w = ex * scale;
+        let frame_h = ey * scale;
+        ImagePlacement {
+            pose_unit_px: [scale, scale],
+            origin_px: [(w - frame_w) * 0.5, (h - frame_h) * 0.5],
+            frame_px: [frame_w, frame_h],
+        }
+    }
+
     fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
         self.extent
     }
@@ -864,22 +889,15 @@ impl PuzzleTopology for TriangularTessellationTopology {
         _settings: &dyn std::any::Any,
     ) -> Option<crate::render_geometry::PuzzleRenderGeometry> {
         use crate::traits::shaping::TopologyShaper;
-        let img_w = image_width as f32;
-        let img_h = image_height as f32;
-        let (ex, ey) = self.extent;
-        if ex <= 0.0 || ey <= 0.0 {
+        if self.extent.0 <= 0.0 || self.extent.1 <= 0.0 {
             return None;
         }
-        // The lattice is exactly equilateral, so scale it UNIFORMLY (same
-        // factor on both axes) to fit inside the image, centred. The image
-        // area outside the centred rectangle is the (sub-triangle, by
-        // construction) crop/letterbox margin. Pose units are square, so
-        // `pose_unit_x == pose_unit_y == scale` and pieces never distort.
-        let scale = (img_w / ex).min(img_h / ey);
-        let frame_w = ex * scale;
-        let frame_h = ey * scale;
-        let origin_x = (img_w - frame_w) * 0.5;
-        let origin_y = (img_h - frame_h) * 0.5;
+        // Uniform scale + centred frame — the shared placement the worker also
+        // uses, so client and server never disagree on where pieces sit.
+        let placement = self.image_placement(image_width, image_height);
+        let scale = placement.pose_unit_px[0];
+        let [frame_w, frame_h] = placement.frame_px;
+        let [origin_x, origin_y] = placement.origin_px;
 
         let corner_radius_px = crate::render_geometry::PuzzleFrameShape::from_image_and_pieces(
             frame_w.max(1.0) as u32,
@@ -998,6 +1016,10 @@ impl<T: PuzzleTopology + ?Sized> PuzzleTopology for &T {
         (*self).image_extent_in_pose_units()
     }
 
+    fn image_placement(&self, image_width: u32, image_height: u32) -> ImagePlacement {
+        (*self).image_placement(image_width, image_height)
+    }
+
     fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
         (*self).snap_frame_extent_in_pose_units()
     }
@@ -1088,6 +1110,10 @@ impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Box<T> {
 
     fn image_extent_in_pose_units(&self) -> (f32, f32) {
         self.as_ref().image_extent_in_pose_units()
+    }
+
+    fn image_placement(&self, image_width: u32, image_height: u32) -> ImagePlacement {
+        self.as_ref().image_placement(image_width, image_height)
     }
 
     fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
@@ -1183,6 +1209,10 @@ impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Rc<T> {
         self.as_ref().image_extent_in_pose_units()
     }
 
+    fn image_placement(&self, image_width: u32, image_height: u32) -> ImagePlacement {
+        self.as_ref().image_placement(image_width, image_height)
+    }
+
     fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
         self.as_ref().snap_frame_extent_in_pose_units()
     }
@@ -1274,6 +1304,10 @@ impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Arc<T> {
 
     fn image_extent_in_pose_units(&self) -> (f32, f32) {
         self.as_ref().image_extent_in_pose_units()
+    }
+
+    fn image_placement(&self, image_width: u32, image_height: u32) -> ImagePlacement {
+        self.as_ref().image_placement(image_width, image_height)
     }
 
     fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {

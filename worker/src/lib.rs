@@ -1,10 +1,10 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
-    compute_workspace_layout, rotate_vec, safety_corrections_after_detach, scramble_flips,
-    scramble_layout_for_pieces, scramble_nonce_from_seed, scramble_rotations,
-    scramble_seed_from_topology, splitmix32, PieceBoundsPx, DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE,
-    MAX_LINE_BEND_RATIO, PUZZLE_SEED,
+    compute_workspace_layout, piece_bounds_px, rotate_vec, safety_corrections_after_detach,
+    scramble_flips, scramble_layout_for_pieces, scramble_nonce_from_seed, scramble_pose,
+    scramble_rotations, scramble_seed_from_topology, splitmix32, DEFAULT_TAB_DEPTH_CAP,
+    FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
 };
 use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
 use heddobureika_core::{
@@ -20,7 +20,7 @@ use heddobureika_core::{
     ASSET_CHUNK_BYTES, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
 };
 use heddobureika_game::{
-    AngleDeg, FlipState, GroupId, LogicalState, PlayableAction, PlayableState, Pose2, TopologySpec,
+    AngleDeg, FlipState, GroupId, LogicalState, PlayableAction, PlayableState, TopologySpec,
 };
 use image_pipeline::{AlphaMode, PipelineConfig};
 use imagesize::{Compression, ImageType};
@@ -608,21 +608,19 @@ fn apply_bridge_detach(
     // "unsafe" pose flash.
     let puzzle = live.snapshot.puzzle.clone();
     let rules = live.snapshot.rules;
-    let pose_unit_px = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
-        .map(|t| {
-            let (ex, ey) = t.image_extent_in_pose_units();
-            (
-                puzzle.image_width as f32 / ex.max(1.0),
-                puzzle.image_height as f32 / ey.max(1.0),
-            )
-        })
-        .unwrap_or((1.0, 1.0));
+    let placement = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
+        .map(|t| t.image_placement(puzzle.image_width, puzzle.image_height))
+        .unwrap_or(heddobureika_game::ImagePlacement {
+            pose_unit_px: [1.0, 1.0],
+            origin_px: [0.0, 0.0],
+            frame_px: [puzzle.image_width as f32, puzzle.image_height as f32],
+        });
     let corrections = safety_corrections_after_detach(
         &live.playable,
         &original_members,
         &puzzle,
         &rules,
-        pose_unit_px,
+        placement,
     );
     for (corr_group, drop_pos) in corrections {
         let correction_batch = live.playable.apply_action_only(
@@ -1178,17 +1176,21 @@ impl DurableObject for Room {
 
 /// Topology-agnostic pixel geometry for the authoritative bounds clamp.
 ///
-/// `pose_unit_x/y` convert pose-mm to puzzle pixels (`image_dim / extent`);
-/// for a grid this equals the per-cell pixel size, so grid behaviour is
-/// unchanged. `piece_half_*` hold each piece's half bounding-box in pixels
-/// (`piece_extent_mm * pose_unit / 2`), so the clamp is exact per piece for
-/// any topology. `view_*` is the workspace rect in puzzle pixels.
+/// Derived from the topology's [`ImagePlacement`] — the SAME mapping the client
+/// renderer uses — so the server and client never disagree on where pieces sit.
+/// A pose-mm point `p` maps to the pixel `origin + p * pose_unit`. `pose_unit`
+/// is per-cell pixel size for stretch-to-fill topologies (grid/hex/voronoi) and
+/// a uniform scale for cropping ones (triangular); `origin` is the frame's
+/// top-left (non-zero only when letterboxed). `piece_half_*` hold each piece's
+/// half bounding-box in pixels, and `view_*` is the workspace rect in pixels.
 ///
 /// Built once per puzzle (cached on `RoomLivePuzzle`) — actions only move
 /// pieces, never change the topology, image size, or rules it derives from.
 struct RoomGeometry {
     pose_unit_x: f32,
     pose_unit_y: f32,
+    origin_x: f32,
+    origin_y: f32,
     view_min_x: f32,
     view_max_x: f32,
     view_min_y: f32,
@@ -1204,22 +1206,27 @@ impl RoomGeometry {
         image_height: u32,
         workspace_padding_ratio: f32,
     ) -> Option<Self> {
-        let image_width = image_width as f32;
-        let image_height = image_height as f32;
-        if image_width <= 0.0 || image_height <= 0.0 {
-            return None;
-        }
-        let (extent_x, extent_y) = topology.image_extent_in_pose_units();
-        if extent_x <= 0.0 || extent_y <= 0.0 {
+        if image_width == 0 || image_height == 0 {
             return None;
         }
         let total = topology.piece_count() as usize;
         if total == 0 {
             return None;
         }
-        let pose_unit_x = image_width / extent_x;
-        let pose_unit_y = image_height / extent_y;
-        let layout = compute_workspace_layout(image_width, image_height, workspace_padding_ratio);
+        let placement = topology.image_placement(image_width, image_height);
+        let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
+        let [origin_x, origin_y] = placement.origin_px;
+        let [frame_w, frame_h] = placement.frame_px;
+        if pose_unit_x <= 0.0 || pose_unit_y <= 0.0 || frame_w <= 0.0 || frame_h <= 0.0 {
+            return None;
+        }
+        let layout = compute_workspace_layout(
+            origin_x,
+            origin_y,
+            frame_w,
+            frame_h,
+            workspace_padding_ratio,
+        );
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
         let view_min_x = layout.view_min_x / puzzle_scale;
         let view_min_y = layout.view_min_y / puzzle_scale;
@@ -1235,6 +1242,8 @@ impl RoomGeometry {
         Some(Self {
             pose_unit_x,
             pose_unit_y,
+            origin_x,
+            origin_y,
             view_min_x,
             view_max_x,
             view_min_y,
@@ -2816,28 +2825,32 @@ impl Room {
         rules: GameRules,
         scramble_override: Option<u32>,
     ) -> Option<PlayableGameSnapshot> {
-        let image_width = puzzle.image_width as f32;
-        let image_height = puzzle.image_height as f32;
-        if image_width <= 0.0 || image_height <= 0.0 {
+        if puzzle.image_width == 0 || puzzle.image_height == 0 {
             return None;
         }
-        // Topology-agnostic snapshot construction: the topology itself
-        // tells us how many pose-units span the image, which gives us
-        // per-axis pose units to convert pixel positions into pose-mm.
-        // Works for grid, triangular, and any future topology.
+        // Topology-agnostic snapshot construction. `image_placement` is the
+        // SAME pose→pixel mapping the client renderer uses (stretch-to-fill for
+        // grid/hex/voronoi, uniform-scale + centred frame for triangular), so
+        // scattered poses render in exactly the spot the worker intends.
         let topology = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())?;
-        let (extent_x, extent_y) = topology.image_extent_in_pose_units();
-        if extent_x <= 0.0 || extent_y <= 0.0 {
-            return None;
-        }
-        let pose_unit_x = image_width / extent_x;
-        let pose_unit_y = image_height / extent_y;
         let total = topology.piece_count() as usize;
         if total == 0 {
             return None;
         }
-        let layout =
-            compute_workspace_layout(image_width, image_height, rules.workspace_padding_ratio);
+        let placement = topology.image_placement(puzzle.image_width, puzzle.image_height);
+        let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
+        let [origin_x, origin_y] = placement.origin_px;
+        let [frame_w, frame_h] = placement.frame_px;
+        if pose_unit_x <= 0.0 || pose_unit_y <= 0.0 || frame_w <= 0.0 || frame_h <= 0.0 {
+            return None;
+        }
+        let layout = compute_workspace_layout(
+            origin_x,
+            origin_y,
+            frame_w,
+            frame_h,
+            rules.workspace_padding_ratio,
+        );
         let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
         let puzzle_view_min_x = layout.view_min_x / puzzle_scale;
         let puzzle_view_min_y = layout.view_min_y / puzzle_scale;
@@ -2855,16 +2868,11 @@ impl Room {
         let seed = scramble_seed_from_topology(PUZZLE_SEED, scramble_nonce, &puzzle.to_spec());
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-        // Per-piece bounding boxes: assume a uniform piece extent (one
-        // pose unit per axis) for now. The worker doesn't currently have
-        // render geometry, so this is approximate — fine for grid and
-        // triangular where pieces fit within a pose-unit-square cell.
-        let piece_bounds: Vec<PieceBoundsPx> = (0..total)
-            .map(|_| PieceBoundsPx {
-                width: pose_unit_x,
-                height: pose_unit_y,
-            })
-            .collect();
+        // Per-piece bounding boxes from the topology's pose-unit extents (same
+        // source as the authoritative bounds clamp). The worker has no shaped
+        // render geometry, so the anchor is approximated at the bbox centre —
+        // a sub-piece offset that keeps scattered pieces inside the padded view.
+        let piece_bounds = piece_bounds_px(&topology, placement);
         let (positions, order) = scramble_layout_for_pieces(
             seed,
             &piece_bounds,
@@ -2878,12 +2886,19 @@ impl Room {
         let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
         let play_rules = rules.to_play_rules().ok()?;
         let mut playable = PlayableState::new(LogicalState::new(topology), play_rules);
+        // Non-square pose units (stretch-to-fill topologies) feed rotation math.
+        if pose_unit_x > 0.0 && pose_unit_y > 0.0 {
+            playable.set_piece_aspect_ratio(pose_unit_y / pose_unit_x);
+        }
         for idx in 0..total {
             let (x, y) = *positions.get(idx)?;
             let rotation = *rotations.get(idx)?;
-            let pose = Pose2::try_from_mm_degrees(
-                (x + pose_unit_x * 0.5) / pose_unit_x,
-                (y + pose_unit_y * 0.5) / pose_unit_y,
+            // Shared topology-driven mapping — identical to the client's scramble.
+            let pose = scramble_pose(
+                &playable.logical.topology,
+                placement,
+                heddobureika_game::PieceId(idx as u32),
+                (x, y),
                 rotation,
             )?;
             if let Some(group_pose) = playable.group_pose.get_mut(idx) {
@@ -4853,8 +4868,8 @@ fn group_in_bounds(
         .unwrap_or(false);
     let multi = members.len() > 1;
     let anchor_px = (
-        anchor_center_mm.0 * geometry.pose_unit_x,
-        anchor_center_mm.1 * geometry.pose_unit_y,
+        geometry.origin_x + anchor_center_mm.0 * geometry.pose_unit_x,
+        geometry.origin_y + anchor_center_mm.1 * geometry.pose_unit_y,
     );
     for &id in members {
         let Some(piece_local) = snapshot.state.piece_local_pose.get(id).copied() else {
@@ -4908,6 +4923,54 @@ mod tests {
         EdgeId, FlipState, GenericPlayableState, GridTopology, LogicalState, PieceId, PlayRules,
         PlayableState, Pose2, PuzzleTopology,
     };
+
+    /// The server's geometry must use the SAME pose→pixel placement the client
+    /// renders with, or scattered/clamped pieces would land in different spots
+    /// in multiplayer than in single-player. For triangular (uniform scale +
+    /// letterboxed centred frame) this used to diverge from the worker's old
+    /// stretch-to-fill model.
+    #[test]
+    fn room_geometry_matches_client_placement_for_triangular() {
+        let spec = heddobureika_core::TopologySpec::triangular_tessellation(4, 5);
+        let topology = heddobureika_core::build_topology_from_spec(&spec).expect("topology");
+        let (w, h) = (1200u32, 700u32);
+        let ratio = GameRules::default().workspace_padding_ratio;
+        let geom = RoomGeometry::from_topology(&topology, w, h, ratio).expect("room geometry");
+        let render = topology
+            .build_render_geometry(
+                w,
+                h,
+                0,
+                &heddobureika_core::TriangularTessellationShapeSettings::default(),
+            )
+            .expect("render geometry");
+
+        let approx = |a: f32, b: f32| (a - b).abs() < 1.0e-3;
+        assert!(
+            approx(geom.pose_unit_x, render.pose_unit_px[0])
+                && approx(geom.pose_unit_y, render.pose_unit_px[1]),
+            "pose units diverge: worker {:?} vs client {:?}",
+            (geom.pose_unit_x, geom.pose_unit_y),
+            render.pose_unit_px,
+        );
+        assert!(
+            approx(geom.origin_x, render.pose_origin_px[0])
+                && approx(geom.origin_y, render.pose_origin_px[1]),
+            "frame origin diverges: worker {:?} vs client {:?}",
+            (geom.origin_x, geom.origin_y),
+            render.pose_origin_px,
+        );
+        // Triangular: square pose units (uniform scale) and a letterboxed,
+        // non-zero centred origin — the exact properties the old worker lacked.
+        assert!(
+            approx(geom.pose_unit_x, geom.pose_unit_y),
+            "triangular pose units should be square"
+        );
+        assert!(
+            geom.origin_x > 0.0 || geom.origin_y > 0.0,
+            "triangular frame should be letterboxed (centred origin)"
+        );
+    }
 
     /// Per-piece fixture data used by the 2x1 test builder.
     struct LegacyFixture {

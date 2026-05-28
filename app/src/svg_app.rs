@@ -324,6 +324,11 @@ struct SvgView {
     ui_group: Element,
     puzzle_group: Element,
     puzzle_bounds: Element,
+    /// Debug-only reference outlines (shown when `show_debug`): the puzzle-ART
+    /// frame (full image) and the workspace it would produce — so the
+    /// difference vs the cropped final puzzle is visible.
+    debug_art_frame: Element,
+    debug_art_workspace: Element,
     pieces: RefCell<Vec<SvgPieceNodes>>,
     ui_credit_hitbox: RefCell<Option<UiHitbox>>,
     ui_credit_hovered: Cell<bool>,
@@ -401,10 +406,24 @@ pub(crate) fn run(core: Rc<AppCore>) {
         let puzzle_group = create_svg_element(&document, "g");
         let puzzle_bounds = create_svg_element(&document, "rect");
         let _ = puzzle_bounds.set_attribute("class", "puzzle-bounds");
+        let debug_art_frame = create_svg_element(&document, "rect");
+        let _ = debug_art_frame.set_attribute(
+            "style",
+            "fill:none; stroke:#f438dc; stroke-width:2; stroke-dasharray:8 5; \
+             pointer-events:none; display:none;",
+        );
+        let debug_art_workspace = create_svg_element(&document, "rect");
+        let _ = debug_art_workspace.set_attribute(
+            "style",
+            "fill:none; stroke:#f438dc; stroke-width:2; stroke-dasharray:2 4; \
+             opacity:0.7; pointer-events:none; display:none;",
+        );
         let _ = svg.append_child(&defs);
         let _ = svg.append_child(&workspace_rect);
         let _ = svg.append_child(&ui_group);
         let _ = puzzle_group.append_child(&puzzle_bounds);
+        let _ = puzzle_group.append_child(&debug_art_frame);
+        let _ = puzzle_group.append_child(&debug_art_workspace);
         let _ = svg.append_child(&puzzle_group);
         let _ = root.append_child(&svg);
 
@@ -425,6 +444,8 @@ pub(crate) fn run(core: Rc<AppCore>) {
             ui_group,
             puzzle_group,
             puzzle_bounds,
+            debug_art_frame,
+            debug_art_workspace,
             render_settings.svg.clone(),
         ));
         let preview = PreviewOverlay::new(&document);
@@ -506,6 +527,8 @@ impl SvgView {
         ui_group: Element,
         puzzle_group: Element,
         puzzle_bounds: Element,
+        debug_art_frame: Element,
+        debug_art_workspace: Element,
         svg_settings: SvgRenderSettings,
     ) -> Self {
         Self {
@@ -518,6 +541,8 @@ impl SvgView {
             ui_group,
             puzzle_group,
             puzzle_bounds,
+            debug_art_frame,
+            debug_art_workspace,
             pieces: RefCell::new(Vec::new()),
             ui_credit_hitbox: RefCell::new(None),
             ui_credit_hovered: Cell::new(false),
@@ -2710,6 +2735,8 @@ impl SvgView {
         clear_children(&self.defs);
         clear_children(&self.puzzle_group);
         let _ = self.puzzle_group.append_child(&self.puzzle_bounds);
+        let _ = self.puzzle_group.append_child(&self.debug_art_frame);
+        let _ = self.puzzle_group.append_child(&self.debug_art_workspace);
     }
 
     fn ensure_scene(self: &Rc<Self>, snapshot: &AppSnapshot, assets: Rc<PuzzleAssets>) {
@@ -2845,6 +2872,8 @@ impl SvgView {
     fn rebuild_pieces(&self, snapshot: &AppSnapshot, assets: &PuzzleAssets, image_src: &str) {
         clear_children(&self.puzzle_group);
         let _ = self.puzzle_group.append_child(&self.puzzle_bounds);
+        let _ = self.puzzle_group.append_child(&self.debug_art_frame);
+        let _ = self.puzzle_group.append_child(&self.debug_art_workspace);
         self.pieces.borrow_mut().clear();
         for piece in &assets.render_geometry.pieces {
             let node = self.build_piece_node(snapshot, assets, piece.id.as_usize(), image_src);
@@ -3019,6 +3048,48 @@ impl SvgView {
         let radius = fmt_f32(assets.render_geometry.frame_shape.corner_radius_px);
         let _ = self.puzzle_bounds.set_attribute("rx", &radius);
         let _ = self.puzzle_bounds.set_attribute("ry", &radius);
+
+        // Debug-only reference outlines: the puzzle-ART frame (full image) and
+        // the workspace it WOULD produce, so the difference vs the cropped
+        // final puzzle (drawn above) is visible. Hidden unless debug is on.
+        const FRAME_STYLE: &str =
+            "fill:none; stroke:#f438dc; stroke-width:2; stroke-dasharray:8 5; pointer-events:none;";
+        const WORKSPACE_STYLE: &str = "fill:none; stroke:#f438dc; stroke-width:2; \
+             stroke-dasharray:2 4; opacity:0.7; pointer-events:none;";
+        if snapshot.app_settings.show_debug {
+            let iw = assets.render_geometry.image_width as f32;
+            let ih = assets.render_geometry.image_height as f32;
+            let _ = self.debug_art_frame.set_attribute("x", "0");
+            let _ = self.debug_art_frame.set_attribute("y", "0");
+            let _ = self.debug_art_frame.set_attribute("width", &fmt_f32(iw));
+            let _ = self.debug_art_frame.set_attribute("height", &fmt_f32(ih));
+            let _ = self.debug_art_frame.set_attribute("style", FRAME_STYLE);
+
+            let art =
+                compute_workspace_layout(0.0, 0.0, iw, ih, snapshot.rules.workspace_padding_ratio);
+            let _ = self
+                .debug_art_workspace
+                .set_attribute("x", &fmt_f32(art.view_min_x));
+            let _ = self
+                .debug_art_workspace
+                .set_attribute("y", &fmt_f32(art.view_min_y));
+            let _ = self
+                .debug_art_workspace
+                .set_attribute("width", &fmt_f32(art.view_width));
+            let _ = self
+                .debug_art_workspace
+                .set_attribute("height", &fmt_f32(art.view_height));
+            let _ = self
+                .debug_art_workspace
+                .set_attribute("style", WORKSPACE_STYLE);
+        } else {
+            let _ = self
+                .debug_art_frame
+                .set_attribute("style", "display:none; pointer-events:none;");
+            let _ = self
+                .debug_art_workspace
+                .set_attribute("style", "display:none; pointer-events:none;");
+        }
     }
 
     fn render_ui(&self, snapshot: &AppSnapshot) {

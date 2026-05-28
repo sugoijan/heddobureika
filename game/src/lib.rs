@@ -93,7 +93,7 @@ pub use topology::{
 };
 pub use traits::edge_profile::EdgeProfileStrategy;
 pub use traits::shaping::{PieceGeometryProvider, TopologyShaper};
-pub use traits::topology::{FrameBounds, PieceOuterFeature, PuzzleTopology};
+pub use traits::topology::{FrameBounds, ImagePlacement, PieceOuterFeature, PuzzleTopology};
 pub use triangular_lattice::{TriDirection, TriLattice};
 pub use triangular_shape::{
     TriangularTessellationShapeBuildError, TriangularTessellationShapeCache,

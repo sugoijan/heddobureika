@@ -15,9 +15,10 @@ use crate::runtime::{AssetEvent, SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use heddobureika_core::{
     angle_matches, safety_corrections_after_detach, AngleDeg, ClientId, ClientMsg, FlipState,
-    GameRules, MergePolicy, PieceId, PlayableAction, PlayableGameSnapshot, PlayableRoomUpdate,
-    PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo, PuzzleTopology,
-    RestrictedPlayableAction, RoomControlUpdate, RoomPersistence, PRIVATE_ASSET_MAX_BYTES,
+    GameRules, ImagePlacement, MergePolicy, PieceId, PlayableAction, PlayableGameSnapshot,
+    PlayableRoomUpdate, PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo,
+    PuzzleTopology, RestrictedPlayableAction, RoomControlUpdate, RoomPersistence,
+    PRIVATE_ASSET_MAX_BYTES,
 };
 
 const PENDING_POS_EPS: f32 = 0.02;
@@ -510,25 +511,14 @@ impl MultiplayerBridgeState {
 
     fn prune_pending_against_state(&self, game: &AppGameState) {
         let active_drag_anchor = self.active_drag_anchor();
-        // Topology-agnostic pose-unit derivation: ask the topology how
-        // many pose-mm units it spans and divide image pixels into that.
-        // Falls back to `(1.0, 1.0)` so the comparison still runs (with a
-        // looser tolerance) for puzzles whose topology can't be built.
-        let (piece_width, piece_height) =
-            heddobureika_core::build_topology_from_spec(&game.puzzle.to_spec())
-                .map(|topology| {
-                    let (ex, ey) = topology.image_extent_in_pose_units();
-                    (
-                        game.puzzle.image_width as f32 / ex.max(1.0),
-                        game.puzzle.image_height as f32 / ey.max(1.0),
-                    )
-                })
-                .unwrap_or((1.0, 1.0));
+        // Topology-driven placement (matches the wire converter), so the px↔mm
+        // comparison correctly accounts for the frame origin on letterboxed
+        // topologies.
+        let placement = current_placement(&game.puzzle);
         self.pending_snaps
             .borrow_mut()
             .retain(|(anchor_id, entry)| {
-                !pending_transform_matches_state(game, *anchor_id, entry, piece_width, piece_height)
-                    .unwrap_or(true)
+                !pending_transform_matches_state(game, *anchor_id, entry, placement).unwrap_or(true)
             });
         let mut pending = self.pending_by_anchor.borrow_mut();
         if !pending.is_empty() {
@@ -537,14 +527,8 @@ impl MultiplayerBridgeState {
                 if Some(*anchor_id) == active_drag_anchor {
                     continue;
                 }
-                if pending_transform_matches_state(
-                    game,
-                    *anchor_id,
-                    entry,
-                    piece_width,
-                    piece_height,
-                )
-                .unwrap_or(true)
+                if pending_transform_matches_state(game, *anchor_id, entry, placement)
+                    .unwrap_or(true)
                 {
                     to_remove.push(*anchor_id);
                 }
@@ -824,23 +808,12 @@ impl MultiplayerBridgeState {
             console::warn!("multiplayer prediction skipped (state not ready)");
             return false;
         };
-        // Pose unit comes from the rendered geometry; if that's not yet
-        // populated, fall back to deriving it from the topology's
-        // declared image span (topology-agnostic — works for grid,
-        // triangular, future Voronoi).
-        let unit_x = snapshot.pose_unit_px[0];
-        let unit_y = snapshot.pose_unit_px[1];
-        let (fallback_x, fallback_y) = heddobureika_core::build_topology_from_spec(&info.to_spec())
-            .map(|topology| {
-                let (ex, ey) = topology.image_extent_in_pose_units();
-                (
-                    info.image_width as f32 / ex.max(1.0),
-                    info.image_height as f32 / ey.max(1.0),
-                )
-            })
-            .unwrap_or((1.0, 1.0));
-        let piece_width = if unit_x > 0.0 { unit_x } else { fallback_x };
-        let piece_height = if unit_y > 0.0 { unit_y } else { fallback_y };
+        // Topology-driven pixel placement (matches the wire converter exactly)
+        // so the prediction's pose conversion produces the same pose-mm the
+        // server computes — without this, the predicted pose for a flip or
+        // pending transform would land far off-screen (px treated as mm) until
+        // the echo arrives one RTT later.
+        let placement = current_placement(&info);
         let pending_detaches_snapshot = self.pending_detaches.borrow().clone();
         if !pending_detaches_snapshot.is_empty() {
             let mut invalid = Vec::new();
@@ -886,8 +859,7 @@ impl MultiplayerBridgeState {
                     *anchor_id,
                     pending.pos,
                     pending.rot_deg,
-                    piece_width,
-                    piece_height,
+                    placement,
                     pending.snap,
                 )
                 .is_err()
@@ -918,6 +890,7 @@ impl MultiplayerBridgeState {
                     pending.flipped,
                     pending.pos,
                     pending.rot_deg,
+                    placement,
                 )
                 .is_err()
                 {
@@ -1006,8 +979,7 @@ fn predict_pending_transform<T: PuzzleTopology>(
     anchor_id: u32,
     pos: (f32, f32),
     rot_deg: Option<f32>,
-    piece_width: f32,
-    piece_height: f32,
+    placement: ImagePlacement,
     snap: bool,
 ) -> Result<(), ()> {
     let piece = PieceId(anchor_id);
@@ -1015,11 +987,18 @@ fn predict_pending_transform<T: PuzzleTopology>(
         return Err(());
     }
     let group = playable.logical.group_of(piece).ok_or(())?;
-    if piece_width <= 0.0 || piece_height <= 0.0 {
+    let unit_x = placement.pose_unit_px[0];
+    let unit_y = placement.pose_unit_px[1];
+    let origin_x = placement.origin_px[0];
+    let origin_y = placement.origin_px[1];
+    if unit_x <= 0.0 || unit_y <= 0.0 {
         return Err(());
     }
-    let target_x_mm = (pos.0 + piece_width * 0.5) / piece_width;
-    let target_y_mm = (pos.1 + piece_height * 0.5) / piece_height;
+    // Convert `pos` (pixels, wire convention) to pose-mm via the topology's
+    // placement — including the frame origin offset, so letterboxed topologies
+    // (triangular) predict the same pose the server computes.
+    let target_x_mm = (pos.0 + unit_x * 0.5 - origin_x) / unit_x;
+    let target_y_mm = (pos.1 + unit_y * 0.5 - origin_y) / unit_y;
     let current_piece_pose = playable.piece_world_pose(piece).ok_or(())?;
     let group_rotation = match rot_deg {
         Some(rot) => {
@@ -1054,12 +1033,27 @@ fn predict_pending_transform<T: PuzzleTopology>(
     Ok(())
 }
 
+/// Topology-driven pixel placement used by the bridge's prediction +
+/// pending-match logic. Falls back to a unit placement when the spec can't be
+/// built so callers can still test a coarse match (used for grid-default
+/// behaviour in tests and degenerate puzzles).
+fn current_placement(info: &PuzzleInfo) -> ImagePlacement {
+    heddobureika_core::build_topology_from_spec(&info.to_spec())
+        .map(|t| t.image_placement(info.image_width, info.image_height))
+        .unwrap_or(ImagePlacement {
+            pose_unit_px: [1.0, 1.0],
+            origin_px: [0.0, 0.0],
+            frame_px: [info.image_width as f32, info.image_height as f32],
+        })
+}
+
 fn predict_pending_flip<T: PuzzleTopology>(
     playable: &mut PlayableState<T>,
     piece_id: u32,
     flipped: bool,
     pos: (f32, f32),
     rot_deg: f32,
+    placement: ImagePlacement,
 ) -> Result<(), ()> {
     let piece = PieceId(piece_id);
     if piece.as_usize() >= playable.piece_count() {
@@ -1073,11 +1067,25 @@ fn predict_pending_flip<T: PuzzleTopology>(
     }
     // Use the click-pivoted post-flip pose carried with the action so the
     // prediction matches the authoritative echo (server applies the same
-    // target pose). Falls back to the current world pose if it can't be
-    // built.
-    let target_pose = Pose2::try_from_mm_degrees(pos.0, pos.1, rot_deg)
-        .or_else(|| playable.piece_world_pose(piece))
-        .ok_or(())?;
+    // target pose). The carried `pos` is in PIXELS (the wire's legacy
+    // top-left convention from `piece_grid_pose`); convert to pose-mm here
+    // using the SAME formula the wire converter uses
+    // (`playable_position_from_core_pos`) so the predicted pose matches the
+    // server's authoritative pose exactly — otherwise the predicted piece
+    // jumps far off-screen until the echo arrives (one RTT later).
+    let unit_x = placement.pose_unit_px[0];
+    let unit_y = placement.pose_unit_px[1];
+    let origin_x = placement.origin_px[0];
+    let origin_y = placement.origin_px[1];
+    let target_pose = if unit_x > 0.0 && unit_y > 0.0 {
+        let x_mm = (pos.0 + unit_x * 0.5 - origin_x) / unit_x;
+        let y_mm = (pos.1 + unit_y * 0.5 - origin_y) / unit_y;
+        Pose2::try_from_mm_degrees(x_mm, y_mm, rot_deg)
+    } else {
+        None
+    }
+    .or_else(|| playable.piece_world_pose(piece))
+    .ok_or(())?;
     let target_flip = if flipped {
         FlipState::Flipped
     } else {
@@ -1119,17 +1127,15 @@ fn predict_pending_detach<T: PuzzleTopology>(
     let _ = playable.apply_restricted_action_batch(action, None);
     // Mirror the server's post-detach safety force-move so the predicted
     // state matches the wire echo and we don't snap poses when it arrives.
-    let pose_unit_px = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
-        .map(|t| {
-            let (ex, ey) = t.image_extent_in_pose_units();
-            (
-                puzzle.image_width as f32 / ex.max(1.0),
-                puzzle.image_height as f32 / ey.max(1.0),
-            )
-        })
-        .unwrap_or((1.0, 1.0));
+    let placement = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
+        .map(|t| t.image_placement(puzzle.image_width, puzzle.image_height))
+        .unwrap_or(heddobureika_core::ImagePlacement {
+            pose_unit_px: [1.0, 1.0],
+            origin_px: [0.0, 0.0],
+            frame_px: [puzzle.image_width as f32, puzzle.image_height as f32],
+        });
     let corrections =
-        safety_corrections_after_detach(playable, &original_members, puzzle, rules, pose_unit_px);
+        safety_corrections_after_detach(playable, &original_members, puzzle, rules, placement);
     for (group, drop_pos) in corrections {
         let _ =
             playable.apply_action_only(PlayableAction::TranslateGroup { group, drop_pos }, None);
@@ -1150,14 +1156,19 @@ fn pending_transform_matches_state(
     game: &AppGameState,
     anchor_id: u32,
     entry: &PendingTransform,
-    piece_width: f32,
-    piece_height: f32,
+    placement: ImagePlacement,
 ) -> Option<bool> {
     let piece = PieceId(anchor_id);
     game.playable.logical.group_of(piece)?;
     let pose = game.playable.piece_world_pose(piece)?;
-    let px = pose.x_mm() * piece_width - piece_width * 0.5;
-    let py = pose.y_mm() * piece_height - piece_height * 0.5;
+    let unit_x = placement.pose_unit_px[0];
+    let unit_y = placement.pose_unit_px[1];
+    let origin_x = placement.origin_px[0];
+    let origin_y = placement.origin_px[1];
+    // Mirror the wire's px↔mm with the frame-origin offset so the comparison
+    // matches what the server thinks the pose is for letterboxed topologies.
+    let px = origin_x + pose.x_mm() * unit_x - unit_x * 0.5;
+    let py = origin_y + pose.y_mm() * unit_y - unit_y * 0.5;
     let rot = pose.rotation_degrees();
     let pos_match =
         (px - entry.pos.0).abs() <= PENDING_POS_EPS && (py - entry.pos.1).abs() <= PENDING_POS_EPS;
@@ -1180,8 +1191,8 @@ mod tests {
     use super::*;
     use crate::core::GridChoice;
     use heddobureika_core::{
-        build_topology_from_spec, EdgeId, GameRules, GridShapeSettings, GridTopology, LogicalState,
-        PlayRules, PlayableRoomUpdateKind, ProposalApplyStatusSnapshot, TopologySpec,
+        build_topology_from_spec, EdgeId, GameRules, GridTopology, LogicalState, PlayRules,
+        PlayableRoomUpdateKind, ProposalApplyStatusSnapshot, TopologySpec,
     };
 
     fn two_piece_puzzle() -> PuzzleInfo {
@@ -1206,19 +1217,12 @@ mod tests {
             actual_count: 2,
         };
         let topology = build_topology_from_spec(&TopologySpec::grid(2, 1)).expect("topology");
-        let geometry = topology
-            .build_render_geometry(
-                puzzle.image_width,
-                puzzle.image_height,
-                puzzle.shape_seed,
-                &GridShapeSettings::default(),
-            )
-            .expect("render geometry");
+        let placement = topology.image_placement(puzzle.image_width, puzzle.image_height);
         AppGameState::scrambled(
             puzzle,
             GameRules::default(),
             TopologySpec::grid(2, 1),
-            &geometry,
+            placement,
             0,
             &[(0.0, 0.0), (250.0, 0.0)],
             &[0.0, 0.0],
@@ -1241,8 +1245,11 @@ mod tests {
             1,
             (250.0, 0.0),
             Some(90.0),
-            100.0,
-            100.0,
+            ImagePlacement {
+                pose_unit_px: [100.0, 100.0],
+                origin_px: [0.0, 0.0],
+                frame_px: [200.0, 100.0],
+            },
             false,
         )
         .expect("prediction should place a non-anchor piece");
@@ -1383,8 +1390,76 @@ mod tests {
         let topology = GridTopology::try_new(2, 1).expect("valid grid");
         let mut playable = PlayableState::solved(topology, PlayRules::default());
 
-        assert!(predict_pending_flip(&mut playable, 0, true, (0.0, 0.0), 0.0).is_err());
+        assert!(predict_pending_flip(
+            &mut playable,
+            0,
+            true,
+            (0.0, 0.0),
+            0.0,
+            ImagePlacement {
+                pose_unit_px: [100.0, 100.0],
+                origin_px: [0.0, 0.0],
+                frame_px: [200.0, 100.0],
+            }
+        )
+        .is_err());
         assert!(playable.is_solved());
+    }
+
+    /// Regression for the RTT-tied unflip flicker: the carried `pos` in
+    /// `SyncAction::Flip` is in PIXELS (the wire's legacy top-left convention),
+    /// so the prediction must convert it to pose-mm using the SAME formula the
+    /// wire converter (`playable_position_from_core_pos`) uses — including the
+    /// frame-origin offset for letterboxed topologies. Without this fix,
+    /// `Pose2::try_from_mm_degrees(pos.0, pos.1, …)` treated pixels as mm and
+    /// the predicted unflip landed far off-screen until the echo arrived one
+    /// round-trip later.
+    #[test]
+    fn pending_flip_prediction_converts_pixels_to_pose_mm() {
+        use heddobureika_core::TriangularTessellationTopology;
+        let topology = TriangularTessellationTopology::try_new(4, 5).expect("topology");
+        let placement = topology.image_placement(1200, 700);
+        // Triangular at this size is letterboxed → non-zero origin (that is
+        // exactly what the pre-fix prediction ignored).
+        assert!(
+            placement.origin_px[0] > 0.0 || placement.origin_px[1] > 0.0,
+            "test setup expects a letterboxed placement"
+        );
+        let mut playable = PlayableState::new(LogicalState::new(topology), PlayRules::default());
+        // Each piece is its own singleton group on a fresh `PlayableState`;
+        // mark piece 0's group as flipped so the unflip prediction is allowed.
+        playable.group_flip[0] = FlipState::Flipped;
+
+        let pos_px = (400.0_f32, 350.0_f32);
+        predict_pending_flip(&mut playable, 0, false, pos_px, 0.0, placement)
+            .expect("singleton unflip should be predictable");
+
+        // Expected pose-mm via the wire converter's formula.
+        let unit = placement.pose_unit_px;
+        let origin = placement.origin_px;
+        let expected_x_mm = (pos_px.0 + unit[0] * 0.5 - origin[0]) / unit[0];
+        let expected_y_mm = (pos_px.1 + unit[1] * 0.5 - origin[1]) / unit[1];
+        let pose = playable
+            .piece_world_pose(PieceId(0))
+            .expect("predicted pose");
+        assert!(
+            (pose.x_mm() - expected_x_mm).abs() < 1.0e-3
+                && (pose.y_mm() - expected_y_mm).abs() < 1.0e-3,
+            "predicted pose ({:.3}, {:.3}) should match wire mm ({:.3}, {:.3})",
+            pose.x_mm(),
+            pose.y_mm(),
+            expected_x_mm,
+            expected_y_mm,
+        );
+        // Load-bearing sanity: a triangular pose-mm coord is small (<= a few
+        // pose units), while the pre-fix bug placed the piece at pose ≈ `pos.0`
+        // (hundreds of pose-mm) — far off-screen.
+        assert!(
+            pose.x_mm().abs() < 50.0 && pose.y_mm().abs() < 50.0,
+            "pose ({:.3}, {:.3}) suggests pixels were treated as mm (the bug)",
+            pose.x_mm(),
+            pose.y_mm()
+        );
     }
 
     #[test]

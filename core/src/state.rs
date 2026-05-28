@@ -24,7 +24,7 @@ pub struct CoreState {
 impl CoreState {
     pub fn new() -> Self {
         let rules = GameRules::default();
-        let layout = compute_workspace_layout(1.0, 1.0, rules.workspace_padding_ratio);
+        let layout = compute_workspace_layout(0.0, 0.0, 1.0, 1.0, rules.workspace_padding_ratio);
         Self {
             puzzle_info: None,
             grid: FALLBACK_GRID,

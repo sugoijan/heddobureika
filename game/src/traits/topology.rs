@@ -18,6 +18,23 @@ pub struct FrameBounds {
     pub max_y: f32,
 }
 
+/// How a topology's pose-unit lattice is laid out in image pixels — the single
+/// source of truth shared by the client renderer and the server (worker) so
+/// both agree on where pieces sit. A pose-mm point `p` maps to the pixel
+/// `origin_px + p * pose_unit_px`, and back via `(pixel - origin_px) /
+/// pose_unit_px`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImagePlacement {
+    /// Pose-unit → pixel scale per axis.
+    pub pose_unit_px: [f32; 2],
+    /// Top-left pixel of the puzzle frame within the image.
+    pub origin_px: [f32; 2],
+    /// Puzzle frame size in pixels (`pose_extent * pose_unit_px`). For
+    /// stretch-to-fill topologies this equals the image; for cropping ones
+    /// (triangular) it is a centred, letterboxed sub-rect.
+    pub frame_px: [f32; 2],
+}
+
 /// An outer feature of a piece, used by the universal frame-snap
 /// solver. All coordinates are piece-local pose units (relative to the
 /// piece anchor, BEFORE rotation), and the solver lifts them to world
@@ -203,6 +220,26 @@ pub trait PuzzleTopology {
         let extent_x = if extent_x > 0.0 { extent_x } else { 1.0 };
         let extent_y = if extent_y > 0.0 { extent_y } else { 1.0 };
         (extent_x, extent_y)
+    }
+
+    /// Pixel placement of the pose-unit lattice within the image (see
+    /// [`ImagePlacement`]). The default STRETCHES the pose extent to fill the
+    /// whole image (origin `[0, 0]`, frame = image), matching grid/hex/voronoi.
+    /// Topologies that keep pieces undistorted by cropping/letterboxing
+    /// (triangular, which uses a uniform scale and a centred frame) override
+    /// this. Both the renderer and the worker call it, so they never disagree.
+    fn image_placement(&self, image_width: u32, image_height: u32) -> ImagePlacement {
+        let (ex, ey) = self.image_extent_in_pose_units();
+        let w = image_width as f32;
+        let h = image_height as f32;
+        ImagePlacement {
+            pose_unit_px: [
+                if ex > 0.0 { w / ex } else { 1.0 },
+                if ey > 0.0 { h / ey } else { 1.0 },
+            ],
+            origin_px: [0.0, 0.0],
+            frame_px: [w, h],
+        }
     }
 
     /// Approximate piece extent in pose-mm units, used by consumers that

@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use heddobureika_game::{GroupId, PieceId, PlayableState, Position2, PuzzleTopology};
+use heddobureika_game::{
+    GroupId, ImagePlacement, PieceId, PlayableState, Position2, PuzzleTopology,
+};
 
 use crate::snapshot::{GameRules, PuzzleInfo};
 
@@ -50,9 +52,21 @@ pub struct WorkspaceLayout {
     pub puzzle_scale: f32,
 }
 
-pub fn compute_workspace_layout(width: f32, height: f32, padding_ratio: f32) -> WorkspaceLayout {
-    let safe_width = width.max(1.0);
-    let safe_height = height.max(1.0);
+/// Builds the workspace (play area) around the puzzle's actual frame rect, in
+/// the same pixel space the pieces live in. The frame may be a letterboxed
+/// sub-rect of the image (e.g. triangular's centred equilateral frame), so the
+/// padded play area hugs the cropped puzzle rather than the full image. Callers
+/// that have no distinct frame pass `frame_x = frame_y = 0` with the image
+/// dimensions, which reproduces the historical image-sized workspace exactly.
+pub fn compute_workspace_layout(
+    frame_x: f32,
+    frame_y: f32,
+    frame_width: f32,
+    frame_height: f32,
+    padding_ratio: f32,
+) -> WorkspaceLayout {
+    let safe_width = frame_width.max(1.0);
+    let safe_height = frame_height.max(1.0);
     let min_dim = safe_width.min(safe_height).max(1.0);
     let padding_ratio =
         padding_ratio.clamp(WORKSPACE_PADDING_RATIO_MIN, WORKSPACE_PADDING_RATIO_MAX);
@@ -62,11 +76,12 @@ pub fn compute_workspace_layout(width: f32, height: f32, padding_ratio: f32) -> 
     let puzzle_scale = (workspace_width / safe_width)
         .min(workspace_height / safe_height)
         .min(1.0);
+    // Centre the padding around the frame's actual position.
     let puzzle_offset_x = (workspace_width - safe_width) * 0.5;
     let puzzle_offset_y = (workspace_height - safe_height) * 0.5;
     WorkspaceLayout {
-        view_min_x: -puzzle_offset_x,
-        view_min_y: -puzzle_offset_y,
+        view_min_x: frame_x - puzzle_offset_x,
+        view_min_y: frame_y - puzzle_offset_y,
         view_width: workspace_width,
         view_height: workspace_height,
         puzzle_scale,
@@ -669,6 +684,52 @@ pub fn scramble_layout_for_pieces(
     (positions, order)
 }
 
+/// Per-piece scatter bounding boxes derived purely from the topology — the
+/// piece's pose-unit extent scaled into pixels by the shared [`ImagePlacement`].
+/// No shaped render geometry involved, so the client and server agree exactly.
+pub fn piece_bounds_px<T: PuzzleTopology>(
+    topology: &T,
+    placement: ImagePlacement,
+) -> Vec<PieceBoundsPx> {
+    let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
+    (0..topology.piece_count())
+        .map(|idx| {
+            let (ex, ey) = topology.piece_extent_mm(PieceId(idx));
+            PieceBoundsPx {
+                width: ex.as_mm_f32() * pose_unit_x,
+                height: ey.as_mm_f32() * pose_unit_y,
+            }
+        })
+        .collect()
+}
+
+/// Converts a scattered top-left pixel position into a piece pose, shared by the
+/// client and server so both place pieces identically. The piece's geometric
+/// centre (its bounding-box centre, derived from the topology's pose-unit
+/// extent — NOT shaped render geometry) is mapped back through the shared
+/// [`ImagePlacement`]: `pose = (centre_px - origin) / pose_unit`.
+pub fn scramble_pose<T: PuzzleTopology>(
+    topology: &T,
+    placement: ImagePlacement,
+    piece: PieceId,
+    top_left_px: (f32, f32),
+    rotation_deg: f32,
+) -> Option<heddobureika_game::Pose2> {
+    let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
+    let [origin_x, origin_y] = placement.origin_px;
+    if pose_unit_x <= 0.0 || pose_unit_y <= 0.0 {
+        return None;
+    }
+    let (ex, ey) = topology.piece_extent_mm(piece);
+    let center_x = top_left_px.0 + ex.as_mm_f32() * pose_unit_x * 0.5;
+    let center_y = top_left_px.1 + ey.as_mm_f32() * pose_unit_y * 0.5;
+    heddobureika_game::Pose2::try_from_mm_degrees(
+        (center_x - origin_x) / pose_unit_x,
+        (center_y - origin_y) / pose_unit_y,
+        rotation_deg,
+    )
+}
+
 pub fn scramble_layout(
     seed: u32,
     cols: usize,
@@ -753,35 +814,28 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
     affected_pieces: &[PieceId],
     puzzle: &PuzzleInfo,
     rules: &GameRules,
-    pose_unit_px: (f32, f32),
+    placement: ImagePlacement,
 ) -> Vec<(GroupId, Position2)> {
     if puzzle.image_width == 0 || puzzle.image_height == 0 {
         return Vec::new();
     }
-    // Derive the piece's pixel extent for the workspace-clamp inset from
-    // the topology's pose-unit declaration. `pose_unit_px` is the per-axis
-    // scale for converting pose-mm → pixels; the caller is responsible for
-    // providing values that match the render geometry. For the inset we
-    // assume a typical piece spans one pose unit per axis, which matches
-    // grid pieces exactly and is a safe over-approximation for triangular.
-    let piece_width = pose_unit_px.0.max(0.0);
-    let piece_height = pose_unit_px.1.max(0.0);
+    // `placement` is the shared pose→pixel mapping (`pixel = origin + pose *
+    // pose_unit`) used by the renderer AND the worker, so the clamp matches
+    // exactly on both sides. For the inset we assume a typical piece spans one
+    // pose unit per axis — exact for grid, a safe over-approximation otherwise.
+    let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
+    let [origin_x, origin_y] = placement.origin_px;
+    let [frame_w, frame_h] = placement.frame_px;
+    let piece_width = pose_unit_x.max(0.0);
+    let piece_height = pose_unit_y.max(0.0);
     if piece_width <= 0.0 || piece_height <= 0.0 {
         return Vec::new();
     }
-    let pose_unit_x = if pose_unit_px.0 > 0.0 {
-        pose_unit_px.0
-    } else {
-        piece_width
-    };
-    let pose_unit_y = if pose_unit_px.1 > 0.0 {
-        pose_unit_px.1
-    } else {
-        piece_height
-    };
     let layout = compute_workspace_layout(
-        puzzle.image_width as f32,
-        puzzle.image_height as f32,
+        origin_x,
+        origin_y,
+        frame_w,
+        frame_h,
         rules.workspace_padding_ratio,
     );
     let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
@@ -836,16 +890,16 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
             (tight_min_x, tight_max_x, tight_min_y, tight_max_y)
         };
 
-        let cx = pose.x_mm() * pose_unit_x;
-        let cy = pose.y_mm() * pose_unit_y;
+        let cx = origin_x + pose.x_mm() * pose_unit_x;
+        let cy = origin_y + pose.y_mm() * pose_unit_y;
         let new_cx = cx.clamp(min_x, max_x);
         let new_cy = cy.clamp(min_y, max_y);
         if (new_cx - cx).abs() < 1.0e-3 && (new_cy - cy).abs() < 1.0e-3 {
             continue;
         }
 
-        let new_x_mm = new_cx / pose_unit_x;
-        let new_y_mm = new_cy / pose_unit_y;
+        let new_x_mm = (new_cx - origin_x) / pose_unit_x;
+        let new_y_mm = (new_cy - origin_y) / pose_unit_y;
         let Some(new_pos) = Position2::try_from_mm(new_x_mm, new_y_mm) else {
             continue;
         };
@@ -859,8 +913,43 @@ mod safety_tests {
     use super::*;
     use crate::snapshot::PuzzleImageRef;
     use heddobureika_game::{
-        GridTopology, LogicalState, PieceId, PlayRules, Pose2, RestrictedPlayableAction,
+        build_topology_from_spec, GridTopology, LogicalState, PieceId, PlayRules, Pose2,
+        RestrictedPlayableAction, TopologySpec,
     };
+
+    /// The shared scatter contract: a scattered top-left maps to a pose whose
+    /// bounding-box CENTRE, mapped back through the placement, lands at the
+    /// intended pixel centre. This is the single mapping the client and worker
+    /// both use, so verifying it locks their scatter behaviour together. Uses a
+    /// letterboxed triangular placement so the non-zero origin is exercised.
+    #[test]
+    fn scramble_pose_round_trips_bbox_center_through_placement() {
+        let topology =
+            build_topology_from_spec(&TopologySpec::triangular_tessellation(4, 5)).expect("topo");
+        let placement = topology.image_placement(1200, 700);
+        let [ux, uy] = placement.pose_unit_px;
+        let [ox, oy] = placement.origin_px;
+        assert!(
+            ox > 0.0 || oy > 0.0,
+            "expected a letterboxed (offset) frame"
+        );
+
+        let piece = PieceId(7);
+        let (ex, ey) = topology.piece_extent_mm(piece);
+        let top_left = (250.0_f32, 130.0_f32);
+        let pose = scramble_pose(&topology, placement, piece, top_left, 0.0).expect("pose");
+
+        let center_back_x = ox + pose.x_mm() * ux;
+        let center_back_y = oy + pose.y_mm() * uy;
+        assert!(
+            (center_back_x - (top_left.0 + ex.as_mm_f32() * ux * 0.5)).abs() < 1.0e-3,
+            "x centre did not round-trip"
+        );
+        assert!(
+            (center_back_y - (top_left.1 + ey.as_mm_f32() * uy * 0.5)).abs() < 1.0e-3,
+            "y centre did not round-trip"
+        );
+    }
 
     fn puzzle_3x1() -> PuzzleInfo {
         PuzzleInfo {
@@ -923,14 +1012,12 @@ mod safety_tests {
             &puzzle,
             &rules,
             heddobureika_game::build_topology_from_spec(&puzzle.to_spec())
-                .map(|t| {
-                    let (ex, ey) = t.image_extent_in_pose_units();
-                    (
-                        puzzle.image_width as f32 / ex.max(1.0),
-                        puzzle.image_height as f32 / ey.max(1.0),
-                    )
-                })
-                .unwrap_or((1.0, 1.0)),
+                .map(|t| t.image_placement(puzzle.image_width, puzzle.image_height))
+                .unwrap_or(ImagePlacement {
+                    pose_unit_px: [1.0, 1.0],
+                    origin_px: [0.0, 0.0],
+                    frame_px: [puzzle.image_width as f32, puzzle.image_height as f32],
+                }),
         );
 
         // The remaining {0, 1} group should be force-moved. The singleton {2}
@@ -1009,14 +1096,12 @@ mod safety_tests {
             &puzzle,
             &rules,
             heddobureika_game::build_topology_from_spec(&puzzle.to_spec())
-                .map(|t| {
-                    let (ex, ey) = t.image_extent_in_pose_units();
-                    (
-                        puzzle.image_width as f32 / ex.max(1.0),
-                        puzzle.image_height as f32 / ey.max(1.0),
-                    )
-                })
-                .unwrap_or((1.0, 1.0)),
+                .map(|t| t.image_placement(puzzle.image_width, puzzle.image_height))
+                .unwrap_or(ImagePlacement {
+                    pose_unit_px: [1.0, 1.0],
+                    origin_px: [0.0, 0.0],
+                    frame_px: [puzzle.image_width as f32, puzzle.image_height as f32],
+                }),
         );
 
         assert!(

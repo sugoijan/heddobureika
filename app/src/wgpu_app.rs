@@ -3074,6 +3074,7 @@ impl WgpuView {
             let settings = self.wgpu_settings.borrow().clone();
             renderer.set_edge_aa(settings.edge_aa);
             renderer.set_show_fps(settings.show_fps);
+            renderer.set_show_debug(snapshot.app_settings.show_debug);
             renderer.set_solved(snapshot.solved);
             renderer.update_instances(instances);
             renderer.set_ui_texts(&ui_specs);
@@ -3099,6 +3100,13 @@ impl WgpuView {
         // possibly letterboxed sub-rect), not the full image rectangle.
         let frame = assets.render_geometry.frame_shape.bounds;
         let frame_rect_px = [frame.x, frame.y, frame.width, frame.height];
+        // Full puzzle-art rectangle + padding ratio, for the debug-only
+        // reference outlines (art size vs. final cropped size).
+        let image_size_px = [
+            assets.render_geometry.image_width as f32,
+            assets.render_geometry.image_height as f32,
+        ];
+        let workspace_padding_ratio = snapshot.rules.workspace_padding_ratio;
         let typical_piece_extent_px = assets.render_geometry.typical_piece_extent_px;
         let view_min_x = view_rect.min_x;
         let view_min_y = view_rect.min_y;
@@ -3133,6 +3141,8 @@ impl WgpuView {
                 image,
                 puzzle_bounds_px,
                 frame_rect_px,
+                image_size_px,
+                workspace_padding_ratio,
                 typical_piece_extent_px,
                 view_min_x,
                 view_min_y,
@@ -3168,6 +3178,7 @@ impl WgpuView {
                     renderer.set_ui_font_bytes(FPS_FONT_BYTES.to_vec());
                     renderer.set_edge_aa(edge_aa);
                     renderer.set_show_fps(show_fps);
+                    renderer.set_show_debug(refresh_debug);
                     renderer.set_solved(solved);
                     if let Some(instances) = view.pending_instances.borrow_mut().take() {
                         renderer.update_instances(instances);

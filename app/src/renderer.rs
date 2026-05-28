@@ -651,6 +651,15 @@ pub(crate) struct WgpuRenderer {
     frame_bg_instance_count: u32,
     frame_stroke_instance_buffer: wgpu::Buffer,
     frame_stroke_instance_count: u32,
+    // Debug-only outlines tracing the puzzle-ART rectangle (frame + workspace
+    // sized to the full image) so the difference vs the cropped final puzzle is
+    // visible. Drawn in a distinct colour when `show_debug` is set.
+    debug_bind_group: wgpu::BindGroup,
+    _debug_globals_buffer: wgpu::Buffer,
+    debug_instance_buffer: wgpu::Buffer,
+    debug_instance_count: u32,
+    debug_outline_color: [f32; 4],
+    show_debug: bool,
     ui_pipeline: wgpu::RenderPipeline,
     _ui_globals_buffer: wgpu::Buffer,
     ui_globals_bind_group: wgpu::BindGroup,
@@ -685,6 +694,8 @@ impl WgpuRenderer {
         image: HtmlImageElement,
         puzzle_bounds_px: [f32; 2],
         frame_rect_px: [f32; 4],
+        image_size_px: [f32; 2],
+        workspace_padding_ratio: f32,
         typical_piece_extent_px: [f32; 2],
         view_min_x: f32,
         view_min_y: f32,
@@ -1085,6 +1096,30 @@ impl WgpuRenderer {
                 resource: frame_stroke_globals_buffer.as_entire_binding(),
             }],
         });
+        // Debug outline colour: a bright, theme-independent magenta so the
+        // puzzle-art reference rectangles stand out against frame/workspace.
+        let debug_outline_color = [0.96, 0.22, 0.86, 0.95];
+        let debug_globals = FrameGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            color: debug_outline_color,
+            output_gamma,
+            puzzle_scale: 1.0,
+            _pad: [0.0; 2],
+        };
+        let debug_globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("debug-globals-buffer"),
+            contents: bytemuck::bytes_of(&debug_globals),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let debug_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("debug-bind-group"),
+            layout: &frame_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: debug_globals_buffer.as_entire_binding(),
+            }],
+        });
         let frame_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("frame-pipeline-layout"),
@@ -1379,6 +1414,50 @@ impl WgpuRenderer {
                 contents: bytemuck::cast_slice(&frame_stroke_instances),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
+        // Debug reference outlines, built in image-pixel space (puzzle_scale =
+        // 1, matching the workspace stroke): the puzzle-ART rectangle (full
+        // image) and the workspace it WOULD produce. Drawn only in debug mode,
+        // they let the difference vs the cropped final puzzle be seen directly.
+        let outline_rects = |min_x: f32, min_y: f32, width: f32, height: f32| {
+            let cx = min_x + width * 0.5;
+            let cy = min_y + height * 0.5;
+            let s = workspace_stroke_width;
+            let hs = s * 0.5;
+            [
+                ([cx, min_y + hs], [width, s]),
+                ([cx, min_y + height - hs], [width, s]),
+                ([min_x + hs, cy], [s, height]),
+                ([min_x + width - hs, cy], [s, height]),
+            ]
+            .map(|(pos, size)| FrameInstance {
+                pos,
+                size,
+                rotation: 0.0,
+                _pad: 0.0,
+            })
+        };
+        let art_w = image_size_px[0].max(1.0);
+        let art_h = image_size_px[1].max(1.0);
+        let art_layout = heddobureika_core::compute_workspace_layout(
+            0.0,
+            0.0,
+            art_w,
+            art_h,
+            workspace_padding_ratio,
+        );
+        let mut debug_instances = outline_rects(0.0, 0.0, art_w, art_h).to_vec();
+        debug_instances.extend(outline_rects(
+            art_layout.view_min_x,
+            art_layout.view_min_y,
+            art_layout.view_width,
+            art_layout.view_height,
+        ));
+        let debug_instance_count = debug_instances.len() as u32;
+        let debug_instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("debug-instance-buffer"),
+            contents: bytemuck::cast_slice(&debug_instances),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
         // The dashed outline traces the puzzle's actual frame, which for
         // letterboxed topologies (e.g. triangular) is a centred sub-rect of
         // the image — not the full image. `image_size` (texture UV) still uses
@@ -1447,6 +1526,12 @@ impl WgpuRenderer {
             frame_bg_instance_count: frame_bg_instances.len() as u32,
             frame_stroke_instance_buffer,
             frame_stroke_instance_count: frame_stroke_instances.len() as u32,
+            debug_bind_group,
+            _debug_globals_buffer: debug_globals_buffer,
+            debug_instance_buffer,
+            debug_instance_count,
+            debug_outline_color,
+            show_debug: false,
             ui_pipeline,
             _ui_globals_buffer: ui_globals_buffer,
             ui_globals_bind_group,
@@ -1603,6 +1688,14 @@ impl WgpuRenderer {
                 render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
                 render_pass.set_vertex_buffer(1, self.frame_instance_buffer.slice(..));
                 render_pass.draw_indexed(0..self.index_count, 0, 0..self.frame_instance_count);
+            }
+            // Debug reference outlines (puzzle-art frame + workspace), in a
+            // distinct colour, so the difference vs the cropped final puzzle is
+            // visible while debugging.
+            if self.show_debug && self.debug_instance_count > 0 {
+                render_pass.set_bind_group(0, &self.debug_bind_group, &[]);
+                render_pass.set_vertex_buffer(1, self.debug_instance_buffer.slice(..));
+                render_pass.draw_indexed(0..self.index_count, 0, 0..self.debug_instance_count);
             }
         }
 
@@ -2313,6 +2406,19 @@ impl WgpuRenderer {
             0,
             bytemuck::bytes_of(&frame_stroke_globals),
         );
+        let debug_globals = FrameGlobals {
+            view_min: [view_min_x, view_min_y],
+            view_size: [view_width, view_height],
+            color: self.debug_outline_color,
+            output_gamma: self.globals.output_gamma,
+            puzzle_scale: 1.0,
+            _pad: [0.0; 2],
+        };
+        self.queue.write_buffer(
+            &self._debug_globals_buffer,
+            0,
+            bytemuck::bytes_of(&debug_globals),
+        );
         let ui_globals = UiGlobals {
             view_min: [view_min_x, view_min_y],
             view_size: [view_width, view_height],
@@ -2402,6 +2508,10 @@ impl WgpuRenderer {
         if self.globals.outline_color != target {
             self.globals.outline_color = target;
         }
+    }
+
+    pub(crate) fn set_show_debug(&mut self, enabled: bool) {
+        self.show_debug = enabled;
     }
 
     pub(crate) fn set_show_fps(&mut self, enabled: bool) {

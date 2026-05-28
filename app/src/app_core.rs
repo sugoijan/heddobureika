@@ -11,11 +11,11 @@ use crate::game_state::AppGameState;
 use crate::input::ClickGesture;
 use crate::runtime::CoreAction;
 use heddobureika_core::{
-    angle_delta, build_topology_from_spec, rand_range, safety_corrections_after_detach,
-    scramble_flips, validate_image_ref, AngleDeg, CoreState, FlipState, GameRules, MergePolicy,
-    PieceId, PlayableAction, Pose2, Position2, PuzzleImageRef, PuzzleInfo, PuzzleTopology,
-    RestrictedPlayableAction, TopologySpec, DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE,
-    MAX_LINE_BEND_RATIO,
+    angle_delta, build_topology_from_spec, piece_bounds_px, safety_corrections_after_detach,
+    scramble_flips, scramble_layout_for_pieces, validate_image_ref, AngleDeg, CoreState, FlipState,
+    GameRules, ImagePlacement, MergePolicy, PieceId, PlayableAction, Pose2, Position2,
+    PuzzleImageRef, PuzzleInfo, PuzzleTopology, RestrictedPlayableAction, TopologySpec,
+    DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, MAX_LINE_BEND_RATIO,
 };
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
@@ -260,6 +260,23 @@ struct AppState {
     renderer_kind: RendererKind,
 }
 
+/// The puzzle's frame rect `(x, y, w, h)` in image-pixel space, for sizing the
+/// workspace. Uses the built render geometry's `frame_shape` (a letterboxed
+/// sub-rect for cropping topologies like triangular); falls back to the full
+/// image when assets aren't built yet, then to a unit rect.
+fn workspace_frame_rect(state: &AppState) -> (f32, f32, f32, f32) {
+    if let Some(assets) = state.assets.as_ref() {
+        let b = assets.render_geometry.frame_shape.bounds;
+        return (b.x, b.y, b.width, b.height);
+    }
+    state
+        .core
+        .puzzle_info
+        .as_ref()
+        .map(|info| (0.0, 0.0, info.image_width as f32, info.image_height as f32))
+        .unwrap_or((0.0, 0.0, 1.0, 1.0))
+}
+
 impl AppCore {
     pub(crate) fn new() -> Rc<Self> {
         let state = AppState::new();
@@ -446,14 +463,19 @@ impl AppCore {
             piece_height,
             mask_pad,
         });
+        // Size the workspace around the puzzle's actual frame (a letterboxed
+        // sub-rect for cropping topologies like triangular), not the full image.
+        let frame = assets.render_geometry.frame_shape.bounds;
         state.core.puzzle_info = Some(info);
         state.assets = Some(assets);
         state.core.grid = grid;
         state.core.piece_width = piece_width;
         state.core.piece_height = piece_height;
         state.core.layout = compute_workspace_layout(
-            width as f32,
-            height as f32,
+            frame.x,
+            frame.y,
+            frame.width,
+            frame.height,
             state.core.rules.workspace_padding_ratio,
         );
         let layout = state.core.layout;
@@ -475,13 +497,14 @@ impl AppCore {
         let seed = scramble_seed_from_topology(PUZZLE_SEED, nonce, &descriptor);
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-        let (positions, order) = scramble_layout_for_geometry(
+        // Topology-driven scatter: piece bounds and the pose mapping come from
+        // the topology's `image_placement` + pose-unit extents, NOT the shaped
+        // render geometry — so the client matches the worker exactly.
+        let placement = topology.image_placement(width, height);
+        let piece_bounds = piece_bounds_px(&topology, placement);
+        let (positions, order) = scramble_layout_for_pieces(
             seed,
-            state
-                .assets
-                .as_ref()
-                .map(|assets| &assets.render_geometry)
-                .expect("assets installed before scramble"),
+            &piece_bounds,
             puzzle_view_min_x,
             puzzle_view_min_y,
             puzzle_view_width,
@@ -496,11 +519,7 @@ impl AppCore {
                 info,
                 state.core.rules,
                 descriptor.clone(),
-                &state
-                    .assets
-                    .as_ref()
-                    .expect("assets installed before game")
-                    .render_geometry,
+                placement,
                 nonce,
                 &positions,
                 &rotations,
@@ -552,12 +571,6 @@ impl AppCore {
         // confirm the same corrected poses.
         if shift_key {
             let rules = state.core.rules;
-            let pose_unit_px = state.assets.as_ref().map(|assets| {
-                (
-                    assets.render_geometry.pose_unit_px[0],
-                    assets.render_geometry.pose_unit_px[1],
-                )
-            });
             if let Some(game) = state.game.as_mut() {
                 let piece = PieceId(piece_id as u32);
                 let pose = game
@@ -587,27 +600,25 @@ impl AppCore {
                     None,
                 );
                 let puzzle_info = game.puzzle.clone();
-                // Pose units default to topology-derived scale when no
-                // render geometry is loaded yet. Works for grid,
-                // triangular, and any future topology because it goes
-                // through `image_extent_in_pose_units`.
-                let pose_unit_px = pose_unit_px.unwrap_or_else(|| {
-                    build_topology_from_spec(&puzzle_info.to_spec())
-                        .map(|t| {
-                            let (ex, ey) = t.image_extent_in_pose_units();
-                            (
-                                puzzle_info.image_width as f32 / ex.max(1.0),
-                                puzzle_info.image_height as f32 / ey.max(1.0),
-                            )
-                        })
-                        .unwrap_or((1.0, 1.0))
-                });
+                // Placement comes straight from the topology — the same mapping
+                // the worker uses — so the local clamp matches the server's
+                // without depending on shaped render geometry.
+                let placement = build_topology_from_spec(&puzzle_info.to_spec())
+                    .map(|t| t.image_placement(puzzle_info.image_width, puzzle_info.image_height))
+                    .unwrap_or(ImagePlacement {
+                        pose_unit_px: [1.0, 1.0],
+                        origin_px: [0.0, 0.0],
+                        frame_px: [
+                            puzzle_info.image_width as f32,
+                            puzzle_info.image_height as f32,
+                        ],
+                    });
                 let corrections = safety_corrections_after_detach(
                     &game.playable,
                     &original_members,
                     &puzzle_info,
                     &rules,
-                    pose_unit_px,
+                    placement,
                 );
                 for (group, drop_pos) in corrections {
                     let _ = game.playable.apply_action_only(
@@ -1138,13 +1149,8 @@ impl AppCore {
             return;
         }
         state.core.rules.workspace_padding_ratio = value;
-        let (width, height) = state
-            .core
-            .puzzle_info
-            .as_ref()
-            .map(|info| (info.image_width as f32, info.image_height as f32))
-            .unwrap_or((1.0, 1.0));
-        state.core.layout = compute_workspace_layout(width, height, value);
+        let (fx, fy, fw, fh) = workspace_frame_rect(&state);
+        state.core.layout = compute_workspace_layout(fx, fy, fw, fh, value);
         let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         drop(state);
@@ -1158,14 +1164,9 @@ impl AppCore {
             return;
         }
         state.core.rules.image_max_dimension = value;
-        let (width, height) = state
-            .core
-            .puzzle_info
-            .as_ref()
-            .map(|info| (info.image_width as f32, info.image_height as f32))
-            .unwrap_or((1.0, 1.0));
+        let (fx, fy, fw, fh) = workspace_frame_rect(&state);
         state.core.layout =
-            compute_workspace_layout(width, height, state.core.rules.workspace_padding_ratio);
+            compute_workspace_layout(fx, fy, fw, fh, state.core.rules.workspace_padding_ratio);
         let layout = state.core.layout;
         state.view.reset_to_fit(layout);
         drop(state);
@@ -1388,17 +1389,7 @@ impl AppCore {
     /// positions/rotations/flips with a new nonce and installs the result.
     /// Dev-panel "scramble" button.
     pub(crate) fn rescramble(&self) {
-        let (
-            info,
-            rules,
-            layout,
-            current_nonce,
-            piece_width,
-            piece_height,
-            mask_pad,
-            descriptor,
-            geometry,
-        ) = {
+        let (info, rules, layout, current_nonce, piece_width, piece_height, mask_pad, descriptor) = {
             let state = self.state.borrow();
             let Some(info) = state.core.puzzle_info.clone() else {
                 return;
@@ -1420,10 +1411,12 @@ impl AppCore {
                 piece_height,
                 assets.mask_pad,
                 assets.topology.clone(),
-                assets.render_geometry.clone(),
             )
         };
-        let total = geometry.pieces.len();
+        let Some(topology) = build_topology_from_spec(&descriptor) else {
+            return;
+        };
+        let total = topology.piece_count() as usize;
         if total == 0 {
             return;
         }
@@ -1439,9 +1432,12 @@ impl AppCore {
         let seed = scramble_seed_from_topology(PUZZLE_SEED, nonce, &info.to_spec());
         let rotation_seed = splitmix32(seed ^ 0xC0DE_F00D);
         let flip_seed = splitmix32(seed ^ 0xF11F_5EED);
-        let (positions, order) = scramble_layout_for_geometry(
+        // Topology-driven scatter (matches the worker; no render geometry).
+        let placement = topology.image_placement(info.image_width, info.image_height);
+        let piece_bounds = piece_bounds_px(&topology, placement);
+        let (positions, order) = scramble_layout_for_pieces(
             seed,
-            &geometry,
+            &piece_bounds,
             puzzle_view_min_x,
             puzzle_view_min_y,
             puzzle_view_width,
@@ -1451,7 +1447,7 @@ impl AppCore {
         let rotations = scramble_rotations(rotation_seed, total, rules.rotation_enabled);
         let flips = scramble_flips(flip_seed, total, FLIP_CHANCE);
         let Ok(game) = AppGameState::scrambled(
-            info, rules, descriptor, &geometry, nonce, &positions, &rotations, &flips, &order,
+            info, rules, descriptor, placement, nonce, &positions, &rotations, &flips, &order,
         ) else {
             return;
         };
@@ -1936,43 +1932,6 @@ fn build_assets_for_topology(
     Some((render_geometry, pose_unit[0], pose_unit[1], mask_pad))
 }
 
-fn scramble_layout_for_geometry(
-    seed: u32,
-    geometry: &PuzzleRenderGeometry,
-    view_min_x: f32,
-    view_min_y: f32,
-    view_width: f32,
-    view_height: f32,
-    margin: f32,
-) -> (Vec<(f32, f32)>, Vec<usize>) {
-    let mut positions = Vec::with_capacity(geometry.pieces.len());
-    for piece in &geometry.pieces {
-        let min_x = view_min_x + margin;
-        let mut max_x = view_min_x + view_width - piece.bounds_px.width - margin;
-        let min_y = view_min_y + margin;
-        let mut max_y = view_min_y + view_height - piece.bounds_px.height - margin;
-        if max_x < min_x {
-            max_x = min_x;
-        }
-        if max_y < min_y {
-            max_y = min_y;
-        }
-        let salt = piece.id.as_u32() << 1;
-        positions.push((
-            rand_range(seed, salt, min_x, max_x),
-            rand_range(seed, salt + 1, min_y, max_y),
-        ));
-    }
-
-    let mut order: Vec<usize> = (0..geometry.pieces.len()).collect();
-    for i in (1..order.len()).rev() {
-        let salt = 0xC0DE_u32 + i as u32;
-        let j = (heddobureika_core::rand_unit(seed, salt) * (i as f32 + 1.0)) as usize;
-        order.swap(i, j);
-    }
-    (positions, order)
-}
-
 /// Generates a fresh, non-zero shape seed for a brand-new puzzle. Used
 /// when no saved snapshot pins a specific seed (first boot, picking a
 /// new catalog puzzle, etc.) — every fresh puzzle gets a unique tab/
@@ -2050,7 +2009,15 @@ mod tests {
         );
         let snapshot_before = core.snapshot();
         let game = snapshot_before.game.as_ref().expect("game");
-        let pose_unit_px = core.assets().expect("assets").render_geometry.pose_unit_px;
+        let geom = core.assets().expect("assets").render_geometry.clone();
+        let placement = ImagePlacement {
+            pose_unit_px: geom.pose_unit_px,
+            origin_px: geom.pose_origin_px,
+            frame_px: [
+                geom.frame_shape.bounds.width,
+                geom.frame_shape.bounds.height,
+            ],
+        };
         // Pick the piece nearest the lattice centre — solidly in-bounds, so a
         // correct safety helper produces no correction. (The old y-unit bug
         // would still drag such an interior piece.)
@@ -2081,7 +2048,7 @@ mod tests {
             &[heddobureika_core::PieceId(piece_id as u32)],
             &puzzle_info,
             &rules,
-            (pose_unit_px[0], pose_unit_px[1]),
+            placement,
         );
         // The piece's canonical position sits inside the workspace, so the
         // safety helper should produce no correction.
@@ -2342,6 +2309,118 @@ mod tests {
         assert!(
             (ux - uy).abs() / ux.max(uy) < 1.0e-3,
             "pose units not square"
+        );
+    }
+
+    #[test]
+    fn triangular_workspace_hugs_cropped_frame_not_image() {
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "triangular".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "triangular".to_string(),
+            },
+            (300, 200),
+            TopologySpec::triangular_tessellation(3, 3),
+            Some(1),
+        );
+        let assets = core.assets().expect("assets");
+        let frame = assets.render_geometry.frame_shape.bounds;
+        // The equilateral frame is a centred, letterboxed sub-rect of the image.
+        assert!(
+            frame.width < 300.0 && frame.x > 0.0,
+            "frame should be a centred sub-rect: x={} w={}",
+            frame.x,
+            frame.width
+        );
+
+        let layout = core.snapshot().layout;
+        // Padding is applied to the FRAME, not the image, so it is uniform on
+        // both axes. If the workspace were sized to the 300x200 image (the bug),
+        // pad_x would exceed pad_y by the letterbox margin.
+        let pad_x = layout.view_width - frame.width;
+        let pad_y = layout.view_height - frame.height;
+        assert!(pad_x > 0.0, "workspace should pad around the frame");
+        assert!(
+            (pad_x - pad_y).abs() < 1.0e-2,
+            "padding should be uniform around the cropped frame: {pad_x} vs {pad_y}"
+        );
+        // The workspace is centred on the frame's actual position (offset by the
+        // letterbox origin), so view_min_x tracks frame.x — not 0.
+        assert!(
+            (layout.view_min_x - (frame.x - pad_x * 0.5)).abs() < 1.0e-2,
+            "view_min_x {} should hug frame.x {} (pad {})",
+            layout.view_min_x,
+            frame.x,
+            pad_x
+        );
+    }
+
+    #[test]
+    fn changing_piece_count_aspect_updates_workspace_layout() {
+        // The multiplayer client re-fits its workspace by calling
+        // `set_puzzle_with_topology` whenever the puzzle spec changes (the
+        // `should_update_core` gate in the bridge fires on any topology-payload
+        // difference). This verifies the underlying mechanism: two triangular
+        // specs whose FINAL puzzle aspect differs must produce different
+        // workspaces on the SAME image — so a piece-count change that reshapes
+        // the puzzle does update the play area.
+        let core = AppCore::new();
+        let img = (1000u32, 1000u32);
+        let image_ref = || PuzzleImageRef::BuiltIn {
+            slug: "tri".to_string(),
+        };
+
+        // Wide layout: few rows, many points per row → wide letterboxed frame.
+        core.set_puzzle_with_topology(
+            "tri".to_string(),
+            image_ref(),
+            img,
+            TopologySpec::triangular_tessellation(2, 8),
+            Some(1),
+        );
+        let wide = core.snapshot().layout;
+        let wide_frame = core
+            .assets()
+            .expect("assets")
+            .render_geometry
+            .frame_shape
+            .bounds;
+
+        // Tall layout: many rows, few points → tall letterboxed frame.
+        core.set_puzzle_with_topology(
+            "tri".to_string(),
+            image_ref(),
+            img,
+            TopologySpec::triangular_tessellation(8, 2),
+            Some(1),
+        );
+        let tall = core.snapshot().layout;
+        let tall_frame = core
+            .assets()
+            .expect("assets")
+            .render_geometry
+            .frame_shape
+            .bounds;
+
+        // The frames have opposite aspect (wide vs tall)...
+        assert!(
+            wide_frame.width > wide_frame.height && tall_frame.height > tall_frame.width,
+            "expected opposite frame aspects: wide {}x{}, tall {}x{}",
+            wide_frame.width,
+            wide_frame.height,
+            tall_frame.width,
+            tall_frame.height
+        );
+        // ...so the workspace must have been re-fitted, not carried over.
+        assert!(
+            (wide.view_width - tall.view_width).abs() > 1.0
+                || (wide.view_height - tall.view_height).abs() > 1.0,
+            "workspace did not update with the puzzle aspect: wide {}x{}, tall {}x{}",
+            wide.view_width,
+            wide.view_height,
+            tall.view_width,
+            tall.view_height
         );
     }
 }

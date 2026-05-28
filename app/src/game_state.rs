@@ -11,12 +11,11 @@
 
 use std::fmt;
 
-use crate::core::PuzzleRenderGeometry;
 use heddobureika_core::{
-    build_topology_from_spec, EdgeId, FlipState, GameRules, GenericPlayableState, GroupId,
-    LogicalState, PieceId, PlayableDelta, PlayableGameSnapshot, PlayableGameSnapshotError,
-    PlayableRoomUpdate, PlayableState, Pose2, ProjectionScratch, PuzzleInfo, PuzzleTopology,
-    TopologySpec, VisualState,
+    build_topology_from_spec, scramble_pose, EdgeId, FlipState, GameRules, GenericPlayableState,
+    GroupId, ImagePlacement, LogicalState, PieceId, PlayableDelta, PlayableGameSnapshot,
+    PlayableGameSnapshotError, PlayableRoomUpdate, PlayableState, Pose2, ProjectionScratch,
+    PuzzleInfo, PuzzleTopology, TopologySpec, VisualState,
 };
 
 /// Live app-side game state. Wraps the canonical generic `PlayableState`
@@ -113,7 +112,7 @@ impl AppGameState {
         puzzle: PuzzleInfo,
         rules: GameRules,
         descriptor: TopologySpec,
-        geometry: &PuzzleRenderGeometry,
+        placement: ImagePlacement,
         scramble_nonce: u32,
         positions: &[(f32, f32)],
         rotations: &[f32],
@@ -123,25 +122,31 @@ impl AppGameState {
         let topology =
             build_topology_from_spec(&descriptor).ok_or(AppGameStateError::UnsupportedTopology)?;
         let total = topology.piece_count() as usize;
-        if positions.len() != total
-            || rotations.len() != total
-            || flips.len() != total
-            || geometry.pieces.len() != total
-        {
+        if positions.len() != total || rotations.len() != total || flips.len() != total {
             return Err(AppGameStateError::UnsupportedTopology);
         }
         let play_rules = rules.to_play_rules()?;
         let logical = LogicalState::new(topology);
         let mut playable = PlayableState::new(logical, play_rules);
-        if geometry.pose_unit_px[0] > 0.0 && geometry.pose_unit_px[1] > 0.0 {
-            playable.set_piece_aspect_ratio(geometry.pose_unit_px[1] / geometry.pose_unit_px[0]);
+        // Pose units are square for cropping topologies (triangular) and
+        // stretched for fill ones; the aspect feeds rotation-with-aspect.
+        if placement.pose_unit_px[0] > 0.0 && placement.pose_unit_px[1] > 0.0 {
+            playable.set_piece_aspect_ratio(placement.pose_unit_px[1] / placement.pose_unit_px[0]);
         }
         for idx in 0..total {
             let piece = PieceId(idx as u32);
             let Some(group) = playable.logical.group_of(piece) else {
                 return Err(AppGameStateError::UnsupportedTopology);
             };
-            let Some(pose) = geometry.pixel_to_pose(piece, positions[idx], rotations[idx]) else {
+            // Topology-driven placement (geometric-centre scatter) — identical
+            // to the worker, with no dependence on shaped render geometry.
+            let Some(pose) = scramble_pose(
+                &playable.logical.topology,
+                placement,
+                piece,
+                positions[idx],
+                rotations[idx],
+            ) else {
                 return Err(AppGameStateError::UnsupportedTopology);
             };
             if let Some(slot) = playable.group_pose.get_mut(group.as_usize()) {
@@ -287,8 +292,7 @@ mod tests {
     use super::*;
     use crate::core::GridChoice;
     use heddobureika_core::{
-        build_topology_from_spec, GridShapeSettings, PlayableAction, PlayableRoomUpdateKind,
-        Position2, PuzzleImageRef,
+        build_topology_from_spec, PlayableAction, PlayableRoomUpdateKind, Position2, PuzzleImageRef,
     };
 
     #[test]
@@ -314,19 +318,12 @@ mod tests {
             actual_count: 2,
         };
         let topology = build_topology_from_spec(&TopologySpec::grid(2, 1)).expect("topology");
-        let geometry = topology
-            .build_render_geometry(
-                puzzle.image_width,
-                puzzle.image_height,
-                puzzle.shape_seed,
-                &GridShapeSettings::default(),
-            )
-            .expect("render geometry");
+        let placement = topology.image_placement(puzzle.image_width, puzzle.image_height);
         let mut game = AppGameState::scrambled(
             puzzle,
             GameRules::default(),
             TopologySpec::grid(2, 1),
-            &geometry,
+            placement,
             1,
             &positions,
             &rotations,
