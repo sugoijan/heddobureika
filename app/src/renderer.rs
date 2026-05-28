@@ -51,7 +51,11 @@ pub(crate) struct Instance {
     pub(crate) pos: [f32; 2],
     pub(crate) size: [f32; 2],
     pub(crate) rotation: f32,
-    pub(crate) flip: f32,
+    /// Flip animation progress in `[0,1]` (0 = front face, 1 = back face). The
+    /// vertex shader maps this to a 180°·progress rotation about the piece's
+    /// vertical anchor axis; at the endpoints it matches the instant front/back
+    /// rendering. May briefly exceed `[0,1]` with an underdamped flip spring.
+    pub(crate) flip_progress: f32,
     pub(crate) hover: f32,
     pub(crate) drag: f32,
     pub(crate) piece_origin: [f32; 2],
@@ -319,7 +323,9 @@ struct Globals {
     outline_width_px: f32,
     edge_aa: f32,
     puzzle_scale: f32,
-    _pad: [f32; 1],
+    /// Piece thickness in pixels for the pseudo-3D flip extrusion side pass
+    /// (≈2mm · pose_unit_px). 0 disables the extrusion.
+    flip_thickness_px: f32,
     outline_color: [f32; 4],
 }
 
@@ -624,6 +630,9 @@ pub(crate) struct WgpuRenderer {
     _config: wgpu::SurfaceConfiguration,
     pipeline_outline: wgpu::RenderPipeline,
     pipeline_fill: wgpu::RenderPipeline,
+    pipeline_flip_side: wgpu::RenderPipeline,
+    /// Whether any instance is mid-flip this frame; gates the extrusion pass.
+    flip_active: bool,
     frame_pipeline: wgpu::RenderPipeline,
     bind_group_outline: wgpu::BindGroup,
     bind_group_fill: wgpu::BindGroup,
@@ -837,7 +846,7 @@ impl WgpuRenderer {
             outline_width_px: 2.0,
             edge_aa: WGPU_EDGE_AA_DEFAULT,
             puzzle_scale,
-            _pad: [0.0; 1],
+            flip_thickness_px: 0.0,
             outline_color: OUTLINE_COLOR_DEFAULT,
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -975,43 +984,63 @@ impl WgpuRenderer {
             immediate_size: 0,
         });
 
-        let make_pipeline =
-            |label: &'static str, blend: wgpu::BlendState| -> wgpu::RenderPipeline {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[Vertex::layout(), Instance::layout()],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: config.format,
-                            blend: Some(blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let pipeline_outline =
-            make_pipeline("piece-outline-pipeline", wgpu::BlendState::ALPHA_BLENDING);
-        let pipeline_fill = make_pipeline("piece-fill-pipeline", wgpu::BlendState::ALPHA_BLENDING);
+        let make_pipeline = |label: &'static str,
+                             vs_entry: &'static str,
+                             fs_entry: &'static str,
+                             blend: wgpu::BlendState|
+         -> wgpu::RenderPipeline {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs_entry),
+                    buffers: &[Vertex::layout(), Instance::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline_outline = make_pipeline(
+            "piece-outline-pipeline",
+            "vs_main",
+            "fs_main",
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
+        let pipeline_fill = make_pipeline(
+            "piece-fill-pipeline",
+            "vs_main",
+            "fs_main",
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
+        // Pseudo-3D flip "extrusion" side: same masked piece geometry, offset by
+        // the projected thickness and flat-colored with the cardboard edge.
+        let pipeline_flip_side = make_pipeline(
+            "piece-flip-side-pipeline",
+            "vs_flip_side",
+            "fs_flip_side",
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         let frame_dash_globals = FrameGlobals {
             view_min: [view_min_x, view_min_y],
@@ -1342,7 +1371,7 @@ impl WgpuRenderer {
             pos: [0.0, 0.0],
             size: [0.0, 0.0],
             rotation: 0.0,
-            flip: 0.0,
+            flip_progress: 0.0,
             hover: 0.0,
             drag: 0.0,
             piece_origin: [0.0, 0.0],
@@ -1499,6 +1528,8 @@ impl WgpuRenderer {
             _config: config,
             pipeline_outline,
             pipeline_fill,
+            pipeline_flip_side,
+            flip_active: false,
             frame_pipeline,
             bind_group_outline,
             bind_group_fill,
@@ -1729,6 +1760,15 @@ impl WgpuRenderer {
                 if batch.draw_outline {
                     render_pass.set_pipeline(&self.pipeline_outline);
                     render_pass.set_bind_group(0, &self.bind_group_outline, &[]);
+                    render_pass.set_vertex_buffer(1, slice.clone());
+                    render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+                }
+                if self.flip_active {
+                    // Cardboard "extrusion" side, drawn behind the face so the
+                    // textured front/back leaves a thickness rim. The shader
+                    // degenerates the quad for pieces that aren't mid-flip.
+                    render_pass.set_pipeline(&self.pipeline_flip_side);
+                    render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
                     render_pass.set_vertex_buffer(1, slice.clone());
                     render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
                 }
@@ -2497,6 +2537,16 @@ impl WgpuRenderer {
 
     pub(crate) fn set_edge_aa(&mut self, edge_aa: f32) {
         self.globals.edge_aa = edge_aa.max(0.0);
+    }
+
+    /// Piece thickness (px) for the pseudo-3D flip extrusion. 0 disables it.
+    pub(crate) fn set_flip_thickness_px(&mut self, thickness_px: f32) {
+        self.globals.flip_thickness_px = thickness_px.max(0.0);
+    }
+
+    /// Whether any instance is mid-flip this frame; gates the extrusion pass.
+    pub(crate) fn set_flip_active(&mut self, active: bool) {
+        self.flip_active = active;
     }
 
     pub(crate) fn set_solved(&mut self, solved: bool) {

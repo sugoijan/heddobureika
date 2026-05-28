@@ -23,7 +23,7 @@ fn piece_shader_validates_and_targets_webgl2() {
     assert_shader(
         "piece",
         PIECE_SRC,
-        &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         &[
             ((0, 0), ResourceKind::Uniform),
             ((0, 1), ResourceKind::Texture2d),

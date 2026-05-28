@@ -123,6 +123,11 @@ pub(crate) struct AppSnapshot {
     pub(crate) drag_cursor: Option<(f32, f32)>,
     pub(crate) drag_pointer_id: Option<i32>,
     pub(crate) drag_rotate_mode: bool,
+    /// Direction hint for the most recent *local* click-to-rotate, as
+    /// `(group anchor, sign)` where sign is +1 clockwise / -1 counter-clockwise.
+    /// Lets the WGPU rotation animation follow the click direction even when the
+    /// target's shortest path is the other way. Not set for network rotations.
+    pub(crate) last_local_rotation: Option<(u32, f32)>,
     pub(crate) drag_right_click: bool,
     pub(crate) drag_primary_id: Option<usize>,
     pub(crate) solved: bool,
@@ -258,6 +263,9 @@ struct AppState {
     app_settings: AppSettings,
     view_settings: ViewSettings,
     renderer_kind: RendererKind,
+    /// Direction of the most recent local click-to-rotate, surfaced to the
+    /// renderer via `AppSnapshot::last_local_rotation`. See that field.
+    last_local_rotation: Option<(u32, f32)>,
 }
 
 /// The puzzle's frame rect `(x, y, w, h)` in image-pixel space, for sizing the
@@ -843,6 +851,9 @@ impl AppCore {
 
     pub(crate) fn drag_end(&self, pointer_id: Option<i32>) {
         let mut state = self.state.borrow_mut();
+        // Clear any stale click-to-rotate direction hint; only the rotate branch
+        // below re-sets it, so a plain drag/flip/unflip leaves no hint behind.
+        state.last_local_rotation = None;
         let Some(drag) = state.drag_state.take() else {
             return;
         };
@@ -1054,6 +1065,11 @@ impl AppCore {
                 MergePolicy::KeepFixedGroup,
             );
             game.rebuild_visual();
+            // Record the click direction so the renderer animates the rotation
+            // the way the user clicked, even when the target's shortest path is
+            // the other way. Local action only; network rotations set no hint.
+            state.last_local_rotation =
+                Some((primary_group.as_u32(), if clockwise { 1.0 } else { -1.0 }));
             self.finalize_drag(&mut state);
             drop(state);
             self.notify();
@@ -1656,6 +1672,7 @@ fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
         drag_cursor: None,
         drag_pointer_id: None,
         drag_rotate_mode: false,
+        last_local_rotation: None,
         drag_right_click: false,
         drag_primary_id: None,
         solved: false,
@@ -1700,6 +1717,7 @@ fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
     }
     snapshot.hovered_id = state.hovered_id;
     snapshot.active_id = state.active_id;
+    snapshot.last_local_rotation = state.last_local_rotation;
     snapshot
         .dragging_members
         .clone_from(&state.dragging_members);
@@ -1897,6 +1915,7 @@ impl AppState {
             app_settings: AppSettings::default(),
             view_settings: ViewSettings::default(),
             renderer_kind: RendererKind::Wgpu,
+            last_local_rotation: None,
         }
     }
 }

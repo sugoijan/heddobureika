@@ -27,6 +27,8 @@ use crate::input::{
 };
 use crate::persisted_store;
 use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
+use crate::flip_anim::FlipAnim;
+use crate::rotation_anim::{apply_group_transform, GroupAnim, SpringParams};
 use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
     UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
@@ -36,6 +38,19 @@ use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::{ClientId, PuzzleImageRef, PuzzleInfo};
 
+/// Piece thickness for the pseudo-3D flip extrusion (millimetres). Fixed, not
+/// dev-panel configurable.
+const FLIP_THICKNESS_MM: f32 = 2.0;
+/// Real-world size one pose unit represents (≈ a piece pitch). The puzzle's
+/// internal "mm" pose units are actually nominal (~1 unit per piece, see
+/// `topology::piece_extent_mm`), so to turn a physical millimetre count into
+/// pixels we go through this assumed pitch: `px_per_mm = pose_unit_px /
+/// POSE_UNIT_MM`. A standard jigsaw piece is ~2.5 cm, so 2 mm lands as a thin
+/// edge that scales with the piece (zoom/piece-count independent).
+const POSE_UNIT_MM: f32 = 25.0;
+/// A piece counts as "mid-flip" (needs the extrusion pass) when its flip
+/// progress is this far from both 0 and 1.
+const FLIP_ACTIVE_EPS: f32 = 0.001;
 const CREDIT_TEXT: &str = "coded by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
 const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
@@ -499,6 +514,16 @@ struct WgpuView {
     debug_overlay: RefCell<Option<DebugOverlay>>,
     wgpu_settings: RefCell<WgpuRenderSettings>,
     wheel_intent: RefCell<WheelIntentTracker>,
+    /// Per-group spring state for the optional rotation animation, keyed by the
+    /// canonical group anchor (`AppSnapshot::piece_group_anchor`). Empty when the
+    /// feature is off. See `animate_rotations` and `crate::rotation_anim`.
+    rotate_anim: RefCell<HashMap<u32, GroupAnim>>,
+    rotate_anim_last_ms: Cell<f32>,
+    /// Per-group flip spring state for the optional flip animation, keyed by
+    /// group anchor. Shares the `rotate_anim` toggle and spring params. Empty
+    /// when the feature is off. See `animate_flips` and `crate::flip_anim`.
+    flip_anim: RefCell<HashMap<u32, FlipAnim>>,
+    flip_anim_last_ms: Cell<f32>,
 }
 
 impl WgpuView {
@@ -561,6 +586,10 @@ impl WgpuView {
             debug_overlay: RefCell::new(None),
             wgpu_settings: RefCell::new(wgpu_settings),
             wheel_intent: RefCell::new(WheelIntentTracker::new()),
+            rotate_anim: RefCell::new(HashMap::new()),
+            rotate_anim_last_ms: Cell::new(0.0),
+            flip_anim: RefCell::new(HashMap::new()),
+            flip_anim_last_ms: Cell::new(0.0),
         }
     }
 
@@ -584,6 +613,14 @@ impl WgpuView {
         if render_scale_changed {
             self.last_puzzle.borrow_mut().take();
         }
+        if !settings.rotate_anim {
+            // Drop spring state so the next frame snaps straight to the
+            // authoritative poses/flip (identical to the un-animated path).
+            self.rotate_anim.borrow_mut().clear();
+            self.rotate_anim_last_ms.set(0.0);
+            self.flip_anim.borrow_mut().clear();
+            self.flip_anim_last_ms.set(0.0);
+        }
         self.request_render();
     }
 
@@ -606,6 +643,10 @@ impl WgpuView {
         self.preview_seeded.set(false);
         self.preview_velocity.set([0.0, 0.0]);
         self.preview_motion_last_ms.set(0.0);
+        self.rotate_anim.borrow_mut().clear();
+        self.rotate_anim_last_ms.set(0.0);
+        self.flip_anim.borrow_mut().clear();
+        self.flip_anim_last_ms.set(0.0);
         *self.image.borrow_mut() = None;
     }
 
@@ -1753,6 +1794,223 @@ impl WgpuView {
         }
         self.preview_blur.set(blur);
         (blur - target_blur).abs() > 0.01
+    }
+
+    /// Optional rotation animation (WGPU only). Returns `(positions, rotations,
+    /// animating)` where the arrays are the snapshot's per-piece pixel positions
+    /// and degrees with each group's rigid pose spring-smoothed toward its
+    /// authoritative target. When the feature is off, settled, or a group is
+    /// being dragged, the output is identical to the inputs (`animating` false).
+    ///
+    /// Each group is treated as one solid. A click-to-rotate is a rigid motion
+    /// about a fixed pole (the clicked point); we recover that pole, spring the
+    /// angle, and derive the displayed centroid from it so the pole stays put for
+    /// the whole transition — see [`crate::rotation_anim`]. The displayed pose is
+    /// turned into a per-member render transform `D(p) = R(φ)·(p − c_t) + c_d`
+    /// applied to each piece's anchor point via [`apply_group_transform`]; at
+    /// settle `φ = 0` and `c_d = c_t`, so `D` is the identity. Spring state
+    /// persists per group across frames, so re-rotating mid-flight carries the
+    /// current velocity into the new target/pole without a jump.
+    fn animate_rotations(
+        &self,
+        now_ms: f32,
+        snapshot: &AppSnapshot,
+        geometry: &PuzzleRenderGeometry,
+        positions: &[(f32, f32)],
+        rotations: &[f32],
+    ) -> (Vec<(f32, f32)>, Vec<f32>, bool) {
+        let params = {
+            let settings = self.wgpu_settings.borrow();
+            if !settings.rotate_anim || snapshot.game.is_none() {
+                drop(settings);
+                self.rotate_anim.borrow_mut().clear();
+                self.rotate_anim_last_ms.set(now_ms);
+                return (positions.to_vec(), rotations.to_vec(), false);
+            }
+            SpringParams {
+                response: settings
+                    .rotate_anim_response
+                    .clamp(WGPU_ROTATE_ANIM_RESPONSE_MIN, WGPU_ROTATE_ANIM_RESPONSE_MAX),
+                damping: settings
+                    .rotate_anim_damping
+                    .clamp(WGPU_ROTATE_ANIM_DAMPING_MIN, WGPU_ROTATE_ANIM_DAMPING_MAX),
+            }
+        };
+
+        let total = positions.len();
+        let anchors = &snapshot.piece_group_anchor;
+        // Group member ids by canonical anchor.
+        let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+        for id in 0..total {
+            let anchor = anchors.get(id).copied().unwrap_or(id as u32);
+            groups.entry(anchor).or_default().push(id);
+        }
+        // Anchors of groups currently being dragged: keep them live (snap to
+        // target) so the existing drag transform in `build_wgpu_instances`
+        // applies cleanly without a competing spring.
+        let mut dragged: Vec<u32> = Vec::new();
+        for &m in &snapshot.dragging_members {
+            if let Some(a) = anchors.get(m).copied() {
+                if !dragged.contains(&a) {
+                    dragged.push(a);
+                }
+            }
+        }
+
+        let last = self.rotate_anim_last_ms.get();
+        let dt = if last > 0.0 {
+            ((now_ms - last).max(0.0).min(50.0)) / 1000.0
+        } else {
+            0.0
+        };
+        self.rotate_anim_last_ms.set(now_ms);
+
+        let mut new_positions = positions.to_vec();
+        let mut new_rotations = rotations.to_vec();
+        let mut animating = false;
+        let mut map = self.rotate_anim.borrow_mut();
+
+        for (anchor, members) in &groups {
+            let Some(center) = drag_group_center(positions, members, geometry) else {
+                continue;
+            };
+            let (c_t_x, c_t_y) = center;
+            // Shared rigid angle: every member's world rotation changes by the
+            // same amount, so the anchor member (== canonical id) is a valid
+            // reference.
+            let ref_id = members
+                .iter()
+                .copied()
+                .find(|&m| m as u32 == *anchor)
+                .unwrap_or_else(|| members.iter().copied().min().unwrap_or(0));
+            let target_angle = rotations.get(ref_id).copied().unwrap_or(0.0);
+
+            let entry = map
+                .entry(*anchor)
+                .or_insert_with(|| GroupAnim::settled(c_t_x, c_t_y, target_angle));
+
+            if dragged.contains(anchor) {
+                entry.snap_to(c_t_x, c_t_y, target_angle);
+                continue; // identity transform; leave snapshot values as-is
+            }
+            // Force the animation to follow the click direction for a local
+            // rotate (so a clockwise click never animates counter-clockwise,
+            // even when the target's shortest path is the other way). Network
+            // rotations carry no hint and use the shortest path.
+            let dir_hint = match snapshot.last_local_rotation {
+                Some((hint_anchor, sign)) if hint_anchor == *anchor => sign,
+                _ => 0.0,
+            };
+            if !entry.step(c_t_x, c_t_y, target_angle, params, dt, dir_hint) {
+                continue; // settled => identity transform
+            }
+            animating = true;
+
+            let (phi, c_d) = entry.offset(target_angle);
+            for &id in members {
+                let Some(piece) = geometry.pieces.get(id) else {
+                    continue;
+                };
+                let pos = positions
+                    .get(id)
+                    .copied()
+                    .unwrap_or((piece.bounds_px.x, piece.bounds_px.y));
+                let anchor_px = piece.pose_anchor_px;
+                // Transform the piece's anchor point, then convert back to a
+                // top-left position for the instance.
+                let pt = (pos.0 + anchor_px[0], pos.1 + anchor_px[1]);
+                let moved = apply_group_transform(pt, center, c_d, phi);
+                new_positions[id] = (moved.0 - anchor_px[0], moved.1 - anchor_px[1]);
+                new_rotations[id] = rotations.get(id).copied().unwrap_or(0.0) + phi;
+            }
+        }
+
+        // Drop spring state for groups that no longer exist (e.g. after a merge
+        // or membership change) so stale anchors don't linger.
+        if map.len() != groups.len() {
+            map.retain(|anchor, _| groups.contains_key(anchor));
+        }
+
+        (new_positions, new_rotations, animating)
+    }
+
+    /// Optional flip animation (WGPU only, same gate/params as the rotation
+    /// animation). Returns `(flip_progress, animating)` where `flip_progress[i]`
+    /// is the per-piece flip progress in `[0,1]` fed to the renderer (0 = front,
+    /// 1 = back). When the feature is off or a group's flip is settled the value
+    /// is the binary target (== today's instant behavior).
+    fn animate_flips(&self, now_ms: f32, snapshot: &AppSnapshot) -> (Vec<f32>, bool) {
+        let total = snapshot.piece_flipped.len();
+        let targets: Vec<f32> = snapshot
+            .piece_flipped
+            .iter()
+            .map(|&f| if f { 1.0 } else { 0.0 })
+            .collect();
+
+        let params = {
+            let settings = self.wgpu_settings.borrow();
+            if !settings.rotate_anim || snapshot.game.is_none() {
+                drop(settings);
+                self.flip_anim.borrow_mut().clear();
+                self.flip_anim_last_ms.set(now_ms);
+                return (targets, false);
+            }
+            SpringParams {
+                response: settings
+                    .rotate_anim_response
+                    .clamp(WGPU_ROTATE_ANIM_RESPONSE_MIN, WGPU_ROTATE_ANIM_RESPONSE_MAX),
+                damping: settings
+                    .rotate_anim_damping
+                    .clamp(WGPU_ROTATE_ANIM_DAMPING_MIN, WGPU_ROTATE_ANIM_DAMPING_MAX),
+            }
+        };
+
+        let anchors = &snapshot.piece_group_anchor;
+        // One representative target per group (flip is uniform across a group,
+        // and only single-piece groups can be flipped anyway).
+        let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+        for id in 0..total {
+            let anchor = anchors.get(id).copied().unwrap_or(id as u32);
+            groups.entry(anchor).or_default().push(id);
+        }
+
+        let last = self.flip_anim_last_ms.get();
+        let dt = if last > 0.0 {
+            ((now_ms - last).max(0.0).min(50.0)) / 1000.0
+        } else {
+            0.0
+        };
+        self.flip_anim_last_ms.set(now_ms);
+
+        let mut progress = targets.clone();
+        let mut animating = false;
+        let mut map = self.flip_anim.borrow_mut();
+
+        for (anchor, members) in &groups {
+            let target = members
+                .first()
+                .and_then(|&id| targets.get(id).copied())
+                .unwrap_or(0.0);
+            let entry = map
+                .entry(*anchor)
+                .or_insert_with(|| FlipAnim::settled(target));
+            let still = entry.step(target, params, dt);
+            if still {
+                animating = true;
+            }
+            let p = entry.progress();
+            for &id in members {
+                if let Some(out) = progress.get_mut(id) {
+                    *out = p;
+                }
+            }
+        }
+
+        if map.len() != groups.len() {
+            map.retain(|anchor, _| groups.contains_key(anchor));
+        }
+
+        (progress, animating)
     }
 
     fn set_preview_hover(&self, target: PreviewHoverTarget) -> bool {
@@ -3038,10 +3296,32 @@ impl WgpuView {
         let ownership_by_anchor = sync_view.ownership_by_anchor();
         let positions = snapshot.piece_positions_px();
         let rotations = snapshot.piece_rotations_deg();
+        let (positions, rotations, animating_rotation) = self.animate_rotations(
+            now_ms(),
+            snapshot,
+            &assets.render_geometry,
+            &positions,
+            &rotations,
+        );
+        if animating_rotation {
+            self.request_render();
+        }
+        let (flip_progress, animating_flip) = self.animate_flips(now_ms(), snapshot);
+        if animating_flip {
+            self.request_render();
+        }
+        let flip_active = flip_progress
+            .iter()
+            .any(|&p| p > FLIP_ACTIVE_EPS && p < 1.0 - FLIP_ACTIVE_EPS);
+        // In pose-unit (pre-`puzzle_scale`) pixels, like the instance positions;
+        // the shader applies `puzzle_scale` afterward. `pose_unit_px / POSE_UNIT_MM`
+        // is px-per-mm, so this is the physical 2mm thickness on screen.
+        let flip_thickness_px =
+            FLIP_THICKNESS_MM * snapshot.pose_unit_px[0].max(0.0) / POSE_UNIT_MM;
         let instances = build_wgpu_instances(
             &positions,
             &rotations,
-            &snapshot.piece_flipped,
+            &flip_progress,
             &snapshot.z_order,
             snapshot.hovered_id,
             snapshot.app_settings.show_debug,
@@ -3076,6 +3356,8 @@ impl WgpuView {
             renderer.set_show_fps(settings.show_fps);
             renderer.set_show_debug(snapshot.app_settings.show_debug);
             renderer.set_solved(snapshot.solved);
+            renderer.set_flip_thickness_px(flip_thickness_px);
+            renderer.set_flip_active(flip_active);
             renderer.update_instances(instances);
             renderer.set_ui_texts(&ui_specs);
             renderer.set_ui_overlay_sprites(&preview_specs);
@@ -3350,7 +3632,7 @@ fn drag_group_position(
 fn build_wgpu_instances(
     positions: &[(f32, f32)],
     rotations: &[f32],
-    flips: &[bool],
+    flip_progress: &[f32],
     z_order: &[usize],
     hovered_id: Option<usize>,
     show_debug: bool,
@@ -3509,7 +3791,7 @@ fn build_wgpu_instances(
                 pos
             };
             let rotation = rotations.get(id).copied().unwrap_or(0.0);
-            let flipped = flips.get(id).copied().unwrap_or(false);
+            let flip = flip_progress.get(id).copied().unwrap_or(0.0);
             let hovered = hovered_mask.get(id).copied().unwrap_or(false);
             let owned = owned_mask.get(id).copied().unwrap_or(false);
             let mask_origin = mask_atlas.origins.get(id).copied().unwrap_or([0.0, 0.0]);
@@ -3517,7 +3799,7 @@ fn build_wgpu_instances(
                 pos: [render_pos.0, render_pos.1],
                 size: [piece.bounds_px.width, piece.bounds_px.height],
                 rotation,
-                flip: if flipped { 1.0 } else { 0.0 },
+                flip_progress: flip,
                 hover: if show_debug {
                     OUTLINE_KIND_DEBUG
                 } else if owned {

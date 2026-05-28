@@ -12,7 +12,7 @@ struct Globals {
     outline_width_px: f32,
     edge_aa: f32,
     puzzle_scale: f32,
-    _pad: f32,
+    flip_thickness_px: f32,
     outline_color: vec4<f32>,
 };
 
@@ -62,28 +62,32 @@ fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
     let full_size = input.inst_size + globals.mask_pad * 2.0;
     let local = (input.pos + vec2<f32>(0.5, 0.5)) * full_size;
-    var local_geom = local;
-    let is_flipped = input.inst_flip > 0.5;
-    // Flip pivot is the topology-defined canonical anchor (centroid for
-    // triangles, geometric center for grid pieces). Mirroring around the
-    // same point we rotate around keeps the canonical position fixed when a
-    // piece is flipped — pose.xy stays put visually, which is also what the
-    // SVG renderer does. For grid pieces this is equivalent to mirroring
-    // around the bounding-box center, so behavior is preserved.
     let anchor_padded = globals.mask_pad + input.inst_pose_anchor;
-    if (is_flipped) {
-        local_geom.x = 2.0 * anchor_padded.x - local_geom.x;
-    }
+    let is_back = input.inst_flip > 0.5;
     let center = anchor_padded;
     let drag = input.inst_drag;
     let drag_active = abs(drag) > 1e-4;
     let drag_scale = select(1.0, 1.02, drag_active);
     let drag_rot = drag * 0.017453292;
-    let angle = (select(input.inst_rot, -input.inst_rot, is_flipped)) * 0.017453292 + drag_rot;
-    let rotated = rotate_point(local_geom - center, angle) + center;
+    let angle = input.inst_rot * 0.017453292 + drag_rot;
+    let rotated = rotate_point(local - center, angle) + center;
     let scaled = (rotated - center) * drag_scale + center;
     let world = (input.inst_pos - globals.mask_pad) + scaled;
-    let world_scaled = world * globals.puzzle_scale;
+    // Flip: rotate the thin slab about a WORKSPACE-vertical axis through the
+    // piece anchor (applied here in world space, after the piece's own
+    // rotation). Orthographically that foreshortens X about the axis by
+    // cos(beta); the front/back faces sit +/- half the thickness in depth,
+    // which projects to a +/- (thickness/2)*sin(beta) horizontal shift, so the
+    // two faces stay a true ~2mm apart. beta = progress*180deg. cos(180)=-1
+    // reproduces the mirrored back pose exactly (== the static flip), so no
+    // rotation negate is needed.
+    let axis_x = (input.inst_pos.x - globals.mask_pad.x) + anchor_padded.x;
+    let flip_beta = input.inst_flip * 3.14159265;
+    let z_sign = select(1.0, -1.0, is_back);
+    let flipped_x = axis_x
+        + (world.x - axis_x) * cos(flip_beta)
+        + z_sign * globals.flip_thickness_px * 0.5 * sin(flip_beta);
+    let world_scaled = vec2<f32>(flipped_x, world.y) * globals.puzzle_scale;
     let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
     let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
     out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
@@ -219,4 +223,74 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4<f32>(apply_output_gamma(rgb), alpha);
+}
+
+// Pseudo-3D flip "extrusion" side: a solid cardboard band on the workspace-
+// vertical flip axis. Its width is the projected thickness (thickness*sin(beta))
+// so it is zero at the endpoints and fully visible at the half-way (edge-on)
+// point; its height matches the piece's workspace vertical extent. Drawn behind
+// the face so the (foreshortening) face covers it until edge-on, then the rim
+// shows as the solid 2mm edge between the front and back faces. Degenerates
+// off-screen when the piece is not mid-flip, so it costs nothing when settled.
+@vertex
+fn vs_flip_side(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.art_uv = vec2<f32>(0.0, 0.0);
+    out.mask_uv = vec2<f32>(0.0, 0.0);
+    out.local_pos = vec2<f32>(0.0, 0.0);
+    out.flip = input.inst_flip;
+    out.hover = 0.0;
+    out.rot = 0.0;
+    let flip_beta = input.inst_flip * 3.14159265;
+    let band_w = globals.flip_thickness_px * abs(sin(flip_beta));
+    if (band_w < 0.001) {
+        out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0); // off-screen / clipped
+        return out;
+    }
+    let anchor_padded = globals.mask_pad + input.inst_pose_anchor;
+    let drag = input.inst_drag;
+    let drag_rot = drag * 0.017453292;
+    let angle = input.inst_rot * 0.017453292 + drag_rot;
+    // Workspace vertical extent of the (rotated) piece bounding box.
+    let height_ws = abs(input.inst_size.x * sin(angle)) + abs(input.inst_size.y * cos(angle));
+    let axis_x = (input.inst_pos.x - globals.mask_pad.x) + anchor_padded.x;
+    let axis_y = (input.inst_pos.y - globals.mask_pad.y) + anchor_padded.y;
+    let wx = axis_x + input.pos.x * band_w;
+    let wy = axis_y + input.pos.y * height_ws;
+    let world_scaled = vec2<f32>(wx, wy) * globals.puzzle_scale;
+    let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
+    out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    // Invert the (un-flipped) piece transform to find which piece texel this
+    // band point covers, so the rim is trimmed to the piece silhouette rather
+    // than its bounding box. Clamp to this piece's atlas cell so out-of-piece
+    // points sample transparent padding, never a neighbour.
+    let world_pt = vec2<f32>(wx, wy);
+    let rotated = world_pt - (input.inst_pos - globals.mask_pad);
+    let local = rotate_point(rotated - anchor_padded, -angle) + anchor_padded;
+    let piece_local = local - globals.mask_pad;
+    let cell_min = (input.inst_mask_origin - globals.mask_pad) / globals.atlas_size;
+    let cell_max = (input.inst_mask_origin + input.inst_size + globals.mask_pad) / globals.atlas_size;
+    out.mask_uv = clamp(
+        (input.inst_mask_origin + piece_local) / globals.atlas_size,
+        cell_min,
+        cell_max,
+    );
+    return out;
+}
+
+@fragment
+fn fs_flip_side(input: VertexOut) -> @location(0) vec4<f32> {
+    // Trim the rim to the piece silhouette (so it doesn't overrun the bounding
+    // box) via the piece mask, then fill with the solid cardboard edge color.
+    let mask = textureSample(mask_tex, tex_sampler, input.mask_uv).r;
+    let outline_threshold = 0.05;
+    let mask_fwidth = abs(dpdx(mask)) + abs(dpdy(mask));
+    let edge_aa = max(mask_fwidth * globals.edge_aa, 1e-4);
+    let edge_alpha = smoothstep(outline_threshold, outline_threshold + edge_aa, mask);
+    if (mask < outline_threshold) {
+        discard;
+    }
+    let edge_rgb = srgb_to_linear(vec3<f32>(0.56, 0.36, 0.20));
+    return vec4<f32>(apply_output_gamma(edge_rgb), edge_alpha);
 }

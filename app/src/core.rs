@@ -20,6 +20,16 @@ pub(crate) const WGPU_EDGE_AA_DEFAULT: f32 = 1.0;
 pub(crate) const WGPU_RENDER_SCALE_MIN: f32 = 0.5;
 pub(crate) const WGPU_RENDER_SCALE_MAX: f32 = 2.0;
 pub(crate) const WGPU_RENDER_SCALE_DEFAULT: f32 = 1.0;
+// Spring-based rotation animation (WGPU renderer only). `response` is the
+// approximate time (seconds) for the spring to reach its target; `damping` is
+// the damping ratio (1.0 = critically damped, <1.0 overshoots/bounces, >1.0 is
+// sluggish). See `WgpuRenderSettings`.
+pub(crate) const WGPU_ROTATE_ANIM_RESPONSE_MIN: f32 = 0.05;
+pub(crate) const WGPU_ROTATE_ANIM_RESPONSE_MAX: f32 = 1.0;
+pub(crate) const WGPU_ROTATE_ANIM_RESPONSE_DEFAULT: f32 = 0.18;
+pub(crate) const WGPU_ROTATE_ANIM_DAMPING_MIN: f32 = 0.3;
+pub(crate) const WGPU_ROTATE_ANIM_DAMPING_MAX: f32 = 2.0;
+pub(crate) const WGPU_ROTATE_ANIM_DAMPING_DEFAULT: f32 = 1.0;
 pub(crate) const WGPU_CANVAS_MAX_PX: u32 = 8192;
 pub(crate) const AUTO_PAN_OUTER_RATIO_MIN: f32 = 0.0;
 pub(crate) const AUTO_PAN_OUTER_RATIO_MAX: f32 = 0.2;
@@ -149,6 +159,16 @@ pub(crate) struct WgpuRenderSettings {
     pub(crate) edge_aa: f32,
     #[serde(default = "default_wgpu_render_scale")]
     pub(crate) render_scale: f32,
+    /// Animate "click to rotate" and flip movements with a spring instead of
+    /// snapping instantly. WGPU renderer only; on by default.
+    #[serde(default = "default_wgpu_rotate_anim")]
+    pub(crate) rotate_anim: bool,
+    /// Spring response time in seconds (lower = snappier).
+    #[serde(default = "default_wgpu_rotate_anim_response")]
+    pub(crate) rotate_anim_response: f32,
+    /// Spring damping ratio (1.0 = critical, <1.0 bouncy, >1.0 sluggish).
+    #[serde(default = "default_wgpu_rotate_anim_damping")]
+    pub(crate) rotate_anim_damping: f32,
 }
 
 impl Default for WgpuRenderSettings {
@@ -157,6 +177,9 @@ impl Default for WgpuRenderSettings {
             show_fps: false,
             edge_aa: WGPU_EDGE_AA_DEFAULT,
             render_scale: WGPU_RENDER_SCALE_DEFAULT,
+            rotate_anim: true,
+            rotate_anim_response: WGPU_ROTATE_ANIM_RESPONSE_DEFAULT,
+            rotate_anim_damping: WGPU_ROTATE_ANIM_DAMPING_DEFAULT,
         }
     }
 }
@@ -167,6 +190,18 @@ fn default_wgpu_edge_aa() -> f32 {
 
 fn default_wgpu_render_scale() -> f32 {
     WGPU_RENDER_SCALE_DEFAULT
+}
+
+fn default_wgpu_rotate_anim() -> bool {
+    true
+}
+
+fn default_wgpu_rotate_anim_response() -> f32 {
+    WGPU_ROTATE_ANIM_RESPONSE_DEFAULT
+}
+
+fn default_wgpu_rotate_anim_damping() -> f32 {
+    WGPU_ROTATE_ANIM_DAMPING_DEFAULT
 }
 
 #[derive(

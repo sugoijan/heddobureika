@@ -1214,6 +1214,9 @@ fn app(props: &AppProps) -> Html {
     let wgpu_show_fps = wgpu_settings_value.show_fps;
     let wgpu_edge_aa = wgpu_settings_value.edge_aa;
     let wgpu_render_scale = wgpu_settings_value.render_scale;
+    let wgpu_rotate_anim = wgpu_settings_value.rotate_anim;
+    let wgpu_rotate_anim_response = wgpu_settings_value.rotate_anim_response;
+    let wgpu_rotate_anim_damping = wgpu_settings_value.rotate_anim_damping;
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
     let rotation_snap_tolerance = use_state(|| ROTATION_SNAP_TOLERANCE_DEFAULT_DEG);
@@ -3139,6 +3142,53 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
+    let on_wgpu_rotate_anim_toggle = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let enabled = input.checked();
+            let mut next = (*render_settings).clone();
+            next.wgpu.rotate_anim = enabled;
+            render_settings.set(next);
+        })
+    };
+    let on_wgpu_rotate_anim_response = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value =
+                    value.clamp(WGPU_ROTATE_ANIM_RESPONSE_MIN, WGPU_ROTATE_ANIM_RESPONSE_MAX);
+                let mut next = (*render_settings).clone();
+                next.wgpu.rotate_anim_response = value;
+                render_settings.set(next);
+            }
+        })
+    };
+    let on_wgpu_rotate_anim_damping = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value = value.clamp(WGPU_ROTATE_ANIM_DAMPING_MIN, WGPU_ROTATE_ANIM_DAMPING_MAX);
+                let mut next = (*render_settings).clone();
+                next.wgpu.rotate_anim_damping = value;
+                render_settings.set(next);
+            }
+        })
+    };
+    let on_reset_render_settings = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |_: MouseEvent| {
+            // Reset every render setting to its default, but stay on the
+            // currently-active renderer so the reset doesn't switch/reload it.
+            // The render_settings effect re-persists, re-applies, and syncs
+            // image_max_dim to the core automatically.
+            let mut next = RenderSettings::default();
+            next.renderer = (*render_settings).renderer;
+            render_settings.set(next);
+        })
+    };
     let on_theme_toggle = {
         let theme_mode = theme_mode.clone();
         let theme_toggle_ref = theme_toggle_ref.clone();
@@ -3509,6 +3559,7 @@ fn app(props: &AppProps) -> Html {
                         <button
                             type="button"
                             id="grid-regenerate"
+                            class="control-button"
                             onclick={on_regenerate_click.clone()}
                             disabled={lock_puzzle_controls}
                         >
@@ -4065,9 +4116,68 @@ fn app(props: &AppProps) -> Html {
                                 oninput={on_wgpu_render_scale}
                             />
                         </div>
+                        <div class="control">
+                            <label for="wgpu-rotate-anim">
+                                { "Move animations: " }
+                                { if wgpu_rotate_anim { "On" } else { "Off" } }
+                                <input
+                                    id="wgpu-rotate-anim"
+                                    type="checkbox"
+                                    checked={wgpu_rotate_anim}
+                                    onchange={on_wgpu_rotate_anim_toggle}
+                                />
+                            </label>
+                        </div>
+                        { if wgpu_rotate_anim {
+                            html! {
+                                <>
+                                    <div class="control">
+                                        <label for="wgpu-rotate-anim-response">
+                                            { "Rotate response" }
+                                            <span class="control-value">{ fmt_f32(wgpu_rotate_anim_response) }</span>
+                                        </label>
+                                        <input
+                                            id="wgpu-rotate-anim-response"
+                                            type="range"
+                                            min={WGPU_ROTATE_ANIM_RESPONSE_MIN.to_string()}
+                                            max={WGPU_ROTATE_ANIM_RESPONSE_MAX.to_string()}
+                                            step="0.01"
+                                            value={wgpu_rotate_anim_response.to_string()}
+                                            oninput={on_wgpu_rotate_anim_response}
+                                        />
+                                    </div>
+                                    <div class="control">
+                                        <label for="wgpu-rotate-anim-damping">
+                                            { "Rotate damping" }
+                                            <span class="control-value">{ fmt_f32(wgpu_rotate_anim_damping) }</span>
+                                        </label>
+                                        <input
+                                            id="wgpu-rotate-anim-damping"
+                                            type="range"
+                                            min={WGPU_ROTATE_ANIM_DAMPING_MIN.to_string()}
+                                            max={WGPU_ROTATE_ANIM_DAMPING_MAX.to_string()}
+                                            step="0.05"
+                                            value={wgpu_rotate_anim_damping.to_string()}
+                                            oninput={on_wgpu_rotate_anim_damping}
+                                        />
+                                    </div>
+                                </>
+                            }
+                        } else {
+                            html! {}
+                        } }
                     </>
                 }
             } }
+            <div class="control">
+                <button
+                    type="button"
+                    class="control-button"
+                    onclick={on_reset_render_settings}
+                >
+                    { "Reset render settings" }
+                </button>
+            </div>
             <div class="control">
                 <label for="theme-mode">
                     { "Theme: " }

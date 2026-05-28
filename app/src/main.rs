@@ -7,6 +7,7 @@ mod app_runtime;
 mod boot;
 mod boot_runtime;
 mod core;
+mod flip_anim;
 mod game_state;
 mod idb;
 mod input;
@@ -25,6 +26,7 @@ mod renderer;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "renderer_stub.rs"]
 mod renderer;
+mod rotation_anim;
 mod runtime;
 mod sync_runtime;
 mod view_runtime;
