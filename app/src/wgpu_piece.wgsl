@@ -14,6 +14,13 @@ struct Globals {
     puzzle_scale: f32,
     flip_thickness_px: f32,
     outline_color: vec4<f32>,
+    // Drop-shadow params (read only by the shadow pass). `shadow_offset` is the
+    // bottom-right offset in puzzle px (negative of the emboss `light_dir`);
+    // `shadow_radius` is the blur radius in atlas texels; `shadow_darkness` is
+    // the opacity.
+    shadow_offset: vec2<f32>,
+    shadow_darkness: f32,
+    shadow_radius: f32,
 };
 
 @group(0) @binding(0)
@@ -293,4 +300,75 @@ fn fs_flip_side(input: VertexOut) -> @location(0) vec4<f32> {
     }
     let edge_rgb = srgb_to_linear(vec3<f32>(0.56, 0.36, 0.20));
     return vec4<f32>(apply_output_gamma(edge_rgb), edge_alpha);
+}
+
+// Drop shadow. Places the piece exactly like `vs_main` (rotation about the
+// anchor, position) but shifts the whole quad by `globals.shadow_offset`
+// (bottom-right, opposite the emboss light) and ignores the flip foreshorten
+// and drag scale. Drawn directly into the scene right before each group's
+// pieces (in z-order), so a group's shadow falls on lower pieces and the
+// group's own pieces (drawn after) hide the shadow under them — no intra-group
+// self-shadow. Members of one group have disjoint masks, so their shadows don't
+// overlap (no double-darkening). `art_uv`/`local_pos` carry the piece's atlas
+// cell bounds so the blur taps stay inside the cell (no neighbour bleed).
+@vertex
+fn vs_shadow(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    let full_size = input.inst_size + globals.mask_pad * 2.0;
+    let local = (input.pos + vec2<f32>(0.5, 0.5)) * full_size;
+    let anchor_padded = globals.mask_pad + input.inst_pose_anchor;
+    let center = anchor_padded;
+    let angle = input.inst_rot * 0.017453292;
+    let rotated = rotate_point(local - center, angle) + center;
+    let world = (input.inst_pos - globals.mask_pad) + rotated;
+    // Apply the same flip transform as `vs_main` so a flipped/mid-flip piece's
+    // shadow matches its mirrored/foreshortened silhouette (otherwise the shadow
+    // looks mirrored). Then shift by the shadow offset.
+    let axis_x = (input.inst_pos.x - globals.mask_pad.x) + anchor_padded.x;
+    let flip_beta = input.inst_flip * 3.14159265;
+    let z_sign = select(1.0, -1.0, input.inst_flip > 0.5);
+    let flipped_x = axis_x
+        + (world.x - axis_x) * cos(flip_beta)
+        + z_sign * globals.flip_thickness_px * 0.5 * sin(flip_beta);
+    let world_scaled = (vec2<f32>(flipped_x, world.y) + globals.shadow_offset) * globals.puzzle_scale;
+    let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
+    out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    let piece_local = local - globals.mask_pad;
+    out.mask_uv = (input.inst_mask_origin + piece_local) / globals.atlas_size;
+    // Atlas cell bounds (including padding) for clamping blur taps.
+    out.art_uv = (input.inst_mask_origin - globals.mask_pad) / globals.atlas_size;
+    out.local_pos = (input.inst_mask_origin + input.inst_size + globals.mask_pad)
+        / globals.atlas_size;
+    out.flip = 0.0;
+    out.hover = 0.0;
+    out.rot = angle;
+    return out;
+}
+
+@fragment
+fn fs_shadow(input: VertexOut) -> @location(0) vec4<f32> {
+    // 5x5 Gaussian blur of the piece mask coverage; tap spacing scales with the
+    // radius. Taps are clamped to the piece's atlas cell so they fade into the
+    // transparent padding rather than bleeding into a neighbouring piece.
+    let cell_min = input.art_uv;
+    let cell_max = input.local_pos;
+    var weights = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
+    let texel = (globals.shadow_radius * 0.5) / globals.atlas_size;
+    var coverage = 0.0;
+    var weight_sum = 0.0;
+    for (var j = 0; j < 5; j = j + 1) {
+        for (var i = 0; i < 5; i = i + 1) {
+            let w = weights[i] * weights[j];
+            let offset = vec2<f32>(f32(i) - 2.0, f32(j) - 2.0) * texel;
+            let uv = clamp(input.mask_uv + offset, cell_min, cell_max);
+            coverage = coverage + w * textureSampleLevel(mask_tex, tex_sampler, uv, 0.0).r;
+            weight_sum = weight_sum + w;
+        }
+    }
+    coverage = coverage / weight_sum;
+    if (coverage <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, coverage * globals.shadow_darkness);
 }

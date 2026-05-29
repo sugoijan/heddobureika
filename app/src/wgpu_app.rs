@@ -3358,6 +3358,18 @@ impl WgpuView {
             renderer.set_solved(snapshot.solved);
             renderer.set_flip_thickness_px(flip_thickness_px);
             renderer.set_flip_active(flip_active);
+            renderer.set_shadow(
+                settings.shadow,
+                settings
+                    .shadow_distance
+                    .clamp(WGPU_SHADOW_DISTANCE_MIN, WGPU_SHADOW_DISTANCE_MAX),
+                settings
+                    .shadow_radius
+                    .clamp(WGPU_SHADOW_RADIUS_MIN, WGPU_SHADOW_RADIUS_MAX),
+                settings
+                    .shadow_darkness
+                    .clamp(WGPU_SHADOW_DARKNESS_MIN, WGPU_SHADOW_DARKNESS_MAX),
+            );
             renderer.update_instances(instances);
             renderer.set_ui_texts(&ui_specs);
             renderer.set_ui_overlay_sprites(&preview_specs);
@@ -3650,6 +3662,7 @@ fn build_wgpu_instances(
         return InstanceSet {
             instances: Vec::new(),
             batches: Vec::new(),
+            groups: Vec::new(),
         };
     }
     let fallback_order = if z_order.len() == total {
@@ -3762,6 +3775,7 @@ fn build_wgpu_instances(
     }
     let mut instances = Vec::with_capacity(order.len());
     let mut batches: Vec<InstanceBatch> = Vec::new();
+    let mut groups: Vec<InstanceBatch> = Vec::new();
     for gid in group_order {
         let members = &group_members[gid];
         if members.is_empty() {
@@ -3824,6 +3838,12 @@ fn build_wgpu_instances(
             continue;
         }
         let draw_outline = show_debug || group_has_hover[gid] || group_has_owned[gid];
+        // Per-group span (never merged) for the interleaved shadow pass.
+        groups.push(InstanceBatch {
+            start,
+            count,
+            draw_outline,
+        });
         if !show_debug && !draw_outline {
             if let Some(last) = batches.last_mut() {
                 if !last.draw_outline {
@@ -3838,7 +3858,11 @@ fn build_wgpu_instances(
             draw_outline,
         });
     }
-    InstanceSet { instances, batches }
+    InstanceSet {
+        instances,
+        batches,
+        groups,
+    }
 }
 
 fn piece_owned_by_other(

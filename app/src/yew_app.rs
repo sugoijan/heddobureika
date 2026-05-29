@@ -1217,6 +1217,10 @@ fn app(props: &AppProps) -> Html {
     let wgpu_rotate_anim = wgpu_settings_value.rotate_anim;
     let wgpu_rotate_anim_response = wgpu_settings_value.rotate_anim_response;
     let wgpu_rotate_anim_damping = wgpu_settings_value.rotate_anim_damping;
+    let wgpu_shadow = wgpu_settings_value.shadow;
+    let wgpu_shadow_distance = wgpu_settings_value.shadow_distance;
+    let wgpu_shadow_radius = wgpu_settings_value.shadow_radius;
+    let wgpu_shadow_darkness = wgpu_settings_value.shadow_darkness;
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
     let rotation_snap_tolerance = use_state(|| ROTATION_SNAP_TOLERANCE_DEFAULT_DEG);
@@ -3177,6 +3181,52 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
+    let on_wgpu_shadow_toggle = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let enabled = input.checked();
+            let mut next = (*render_settings).clone();
+            next.wgpu.shadow = enabled;
+            render_settings.set(next);
+        })
+    };
+    let on_wgpu_shadow_distance = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value = value.clamp(WGPU_SHADOW_DISTANCE_MIN, WGPU_SHADOW_DISTANCE_MAX);
+                let mut next = (*render_settings).clone();
+                next.wgpu.shadow_distance = value;
+                render_settings.set(next);
+            }
+        })
+    };
+    let on_wgpu_shadow_radius = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value = value.clamp(WGPU_SHADOW_RADIUS_MIN, WGPU_SHADOW_RADIUS_MAX);
+                let mut next = (*render_settings).clone();
+                next.wgpu.shadow_radius = value;
+                render_settings.set(next);
+            }
+        })
+    };
+    let on_wgpu_shadow_darkness = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value = value.clamp(WGPU_SHADOW_DARKNESS_MIN, WGPU_SHADOW_DARKNESS_MAX);
+                let mut next = (*render_settings).clone();
+                next.wgpu.shadow_darkness = value;
+                render_settings.set(next);
+            }
+        })
+    };
     let on_reset_render_settings = {
         let render_settings = render_settings.clone();
         Callback::from(move |_: MouseEvent| {
@@ -4159,6 +4209,71 @@ fn app(props: &AppProps) -> Html {
                                             step="0.05"
                                             value={wgpu_rotate_anim_damping.to_string()}
                                             oninput={on_wgpu_rotate_anim_damping}
+                                        />
+                                    </div>
+                                </>
+                            }
+                        } else {
+                            html! {}
+                        } }
+                        <div class="control">
+                            <label for="wgpu-shadow">
+                                { "Shadow: " }
+                                { if wgpu_shadow { "On" } else { "Off" } }
+                                <input
+                                    id="wgpu-shadow"
+                                    type="checkbox"
+                                    checked={wgpu_shadow}
+                                    onchange={on_wgpu_shadow_toggle}
+                                />
+                            </label>
+                        </div>
+                        { if wgpu_shadow {
+                            html! {
+                                <>
+                                    <div class="control">
+                                        <label for="wgpu-shadow-distance">
+                                            { "Shadow distance" }
+                                            <span class="control-value">{ fmt_f32(wgpu_shadow_distance) }</span>
+                                        </label>
+                                        <input
+                                            id="wgpu-shadow-distance"
+                                            type="range"
+                                            min={WGPU_SHADOW_DISTANCE_MIN.to_string()}
+                                            max={WGPU_SHADOW_DISTANCE_MAX.to_string()}
+                                            step="0.5"
+                                            value={wgpu_shadow_distance.to_string()}
+                                            oninput={on_wgpu_shadow_distance}
+                                        />
+                                    </div>
+                                    <div class="control">
+                                        <label for="wgpu-shadow-radius">
+                                            { "Shadow radius" }
+                                            <span class="control-value">{ fmt_f32(wgpu_shadow_radius) }</span>
+                                        </label>
+                                        <input
+                                            id="wgpu-shadow-radius"
+                                            type="range"
+                                            min={WGPU_SHADOW_RADIUS_MIN.to_string()}
+                                            max={WGPU_SHADOW_RADIUS_MAX.to_string()}
+                                            step="0.5"
+                                            value={wgpu_shadow_radius.to_string()}
+                                            oninput={on_wgpu_shadow_radius}
+                                        />
+                                    </div>
+                                    <div class="control">
+                                        <label for="wgpu-shadow-darkness">
+                                            { "Shadow darkness" }
+                                            <span class="control-value">{ fmt_f32(wgpu_shadow_darkness) }</span>
+                                        </label>
+                                        <input
+                                            id="wgpu-shadow-darkness"
+                                            type="range"
+                                            min={WGPU_SHADOW_DARKNESS_MIN.to_string()}
+                                            max={WGPU_SHADOW_DARKNESS_MAX.to_string()}
+                                            step="0.05"
+                                            value={wgpu_shadow_darkness.to_string()}
+                                            oninput={on_wgpu_shadow_darkness}
                                         />
                                     </div>
                                 </>

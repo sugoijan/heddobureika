@@ -79,6 +79,9 @@ pub(crate) struct InstanceBatch {
 pub(crate) struct InstanceSet {
     pub(crate) instances: Vec<Instance>,
     pub(crate) batches: Vec<InstanceBatch>,
+    /// Per-group spans in z-order, never merged. Used to interleave each group's
+    /// shadow with its pieces when the drop shadow is enabled.
+    pub(crate) groups: Vec<InstanceBatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -327,6 +330,12 @@ struct Globals {
     /// (≈2mm · pose_unit_px). 0 disables the extrusion.
     flip_thickness_px: f32,
     outline_color: [f32; 4],
+    /// Drop-shadow params (read only by the shadow pass). `shadow_offset` is the
+    /// bottom-right offset in puzzle px; `shadow_darkness` the opacity;
+    /// `shadow_radius` the blur radius in atlas texels.
+    shadow_offset: [f32; 2],
+    shadow_darkness: f32,
+    shadow_radius: f32,
 }
 
 #[repr(C, align(16))]
@@ -633,6 +642,15 @@ pub(crate) struct WgpuRenderer {
     pipeline_flip_side: wgpu::RenderPipeline,
     /// Whether any instance is mid-flip this frame; gates the extrusion pass.
     flip_active: bool,
+    // Drop-shadow effect.
+    pipeline_shadow: wgpu::RenderPipeline,
+    /// Per-group instance spans (z-order), never merged — used to interleave
+    /// each group's shadow with its pieces when the shadow is enabled.
+    instance_groups: Vec<InstanceBatch>,
+    shadow_enabled: bool,
+    shadow_distance: f32,
+    shadow_radius: f32,
+    shadow_darkness: f32,
     frame_pipeline: wgpu::RenderPipeline,
     bind_group_outline: wgpu::BindGroup,
     bind_group_fill: wgpu::BindGroup,
@@ -848,6 +866,9 @@ impl WgpuRenderer {
             puzzle_scale,
             flip_thickness_px: 0.0,
             outline_color: OUTLINE_COLOR_DEFAULT,
+            shadow_offset: [0.0, 0.0],
+            shadow_darkness: 0.0,
+            shadow_radius: 0.0,
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals-buffer-fill"),
@@ -1041,6 +1062,41 @@ impl WgpuRenderer {
             "fs_flip_side",
             wgpu::BlendState::ALPHA_BLENDING,
         );
+
+        // Drop shadow: same piece bind group + instance buffer, the quad shifted
+        // bottom-right and the mask blurred, drawn directly into the scene
+        // interleaved per group (see `render`). Targets the surface.
+        let pipeline_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("piece-shadow-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow"),
+                buffers: &[Vertex::layout(), Instance::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_shadow"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let frame_dash_globals = FrameGlobals {
             view_min: [view_min_x, view_min_y],
@@ -1530,6 +1586,12 @@ impl WgpuRenderer {
             pipeline_fill,
             pipeline_flip_side,
             flip_active: false,
+            pipeline_shadow,
+            instance_groups: Vec::new(),
+            shadow_enabled: false,
+            shadow_distance: 0.0,
+            shadow_radius: 0.0,
+            shadow_darkness: 0.0,
             frame_pipeline,
             bind_group_outline,
             bind_group_fill,
@@ -1641,6 +1703,20 @@ impl WgpuRenderer {
             }
         }
 
+        // Shadow params folded into `globals` so the shared piece bind group
+        // carries them to the shadow pass. Offset (world px) is bottom-right —
+        // the negative of the emboss light direction `normalize(-1,-1)`.
+        const INV_SQRT2: f32 = 0.70710677;
+        if self.shadow_enabled {
+            self.globals.shadow_offset =
+                [self.shadow_distance * INV_SQRT2, self.shadow_distance * INV_SQRT2];
+            self.globals.shadow_darkness = self.shadow_darkness;
+            self.globals.shadow_radius = self.shadow_radius;
+        } else {
+            self.globals.shadow_offset = [0.0, 0.0];
+            self.globals.shadow_darkness = 0.0;
+            self.globals.shadow_radius = 0.0;
+        }
         let mut globals_outline = self.globals;
         globals_outline.render_mode = 1.0;
         self.queue.write_buffer(
@@ -1750,18 +1826,36 @@ impl WgpuRenderer {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             let stride = std::mem::size_of::<Instance>() as wgpu::BufferAddress;
-            for batch in &self.instance_batches {
-                if batch.count == 0 {
+            // With the shadow on we must walk groups individually (never merged)
+            // so each group's shadow is drawn right before its own pieces and
+            // after lower groups' pieces — that's what reveals z-order. Off, we
+            // use the merged batches for fewer draw calls.
+            let spans: &[InstanceBatch] = if self.shadow_enabled {
+                &self.instance_groups
+            } else {
+                &self.instance_batches
+            };
+            for span in spans {
+                if span.count == 0 {
                     continue;
                 }
-                let start = batch.start as wgpu::BufferAddress * stride;
-                let end = (batch.start + batch.count) as wgpu::BufferAddress * stride;
+                let start = span.start as wgpu::BufferAddress * stride;
+                let end = (span.start + span.count) as wgpu::BufferAddress * stride;
                 let slice = self.instance_buffer.slice(start..end);
-                if batch.draw_outline {
+                if self.shadow_enabled {
+                    // The group's shadow lands on everything already drawn
+                    // (lower groups + background); its own pieces below cover the
+                    // shadow under them, so a group never shadows itself.
+                    render_pass.set_pipeline(&self.pipeline_shadow);
+                    render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
+                    render_pass.set_vertex_buffer(1, slice.clone());
+                    render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
+                }
+                if span.draw_outline {
                     render_pass.set_pipeline(&self.pipeline_outline);
                     render_pass.set_bind_group(0, &self.bind_group_outline, &[]);
                     render_pass.set_vertex_buffer(1, slice.clone());
-                    render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+                    render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
                 }
                 if self.flip_active {
                     // Cardboard "extrusion" side, drawn behind the face so the
@@ -1770,12 +1864,12 @@ impl WgpuRenderer {
                     render_pass.set_pipeline(&self.pipeline_flip_side);
                     render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
                     render_pass.set_vertex_buffer(1, slice.clone());
-                    render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+                    render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
                 }
                 render_pass.set_pipeline(&self.pipeline_fill);
                 render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
                 render_pass.set_vertex_buffer(1, slice);
-                render_pass.draw_indexed(0..self.index_count, 0, 0..batch.count);
+                render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
             }
         }
 
@@ -2549,6 +2643,15 @@ impl WgpuRenderer {
         self.flip_active = active;
     }
 
+    /// Configures the optional drop shadow. `distance`/`radius` are in puzzle
+    /// (world) px; `darkness` is the shadow opacity (0..1).
+    pub(crate) fn set_shadow(&mut self, enabled: bool, distance: f32, radius: f32, darkness: f32) {
+        self.shadow_enabled = enabled;
+        self.shadow_distance = distance.max(0.0);
+        self.shadow_radius = radius.max(0.0);
+        self.shadow_darkness = darkness.clamp(0.0, 1.0);
+    }
+
     pub(crate) fn set_solved(&mut self, solved: bool) {
         let target = if solved {
             OUTLINE_COLOR_SOLVED
@@ -2621,6 +2724,7 @@ impl WgpuRenderer {
             );
         }
         self.instance_batches = set.batches;
+        self.instance_groups = set.groups;
     }
 
     pub(crate) fn set_emboss_enabled(&mut self, enabled: bool) {

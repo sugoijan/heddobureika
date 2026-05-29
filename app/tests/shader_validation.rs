@@ -57,6 +57,21 @@ fn ui_shader_validates_and_targets_webgl2() {
     );
 }
 
+#[test]
+fn piece_shadow_entries_target_webgl2() {
+    // The shadow coverage pass reuses the piece shader; make sure its entry
+    // points also lower to WebGL2 GLSL.
+    let (module, info) = parse_and_validate(PIECE_SRC, "piece-shadow");
+    assert_webgl2_glsl(&module, &info, ShaderStage::Vertex, "vs_shadow", "piece-shadow");
+    assert_webgl2_glsl(
+        &module,
+        &info,
+        ShaderStage::Fragment,
+        "fs_shadow",
+        "piece-shadow",
+    );
+}
+
 fn assert_shader(
     label: &str,
     source: &str,

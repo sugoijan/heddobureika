@@ -30,6 +30,18 @@ pub(crate) const WGPU_ROTATE_ANIM_RESPONSE_DEFAULT: f32 = 0.18;
 pub(crate) const WGPU_ROTATE_ANIM_DAMPING_MIN: f32 = 0.3;
 pub(crate) const WGPU_ROTATE_ANIM_DAMPING_MAX: f32 = 2.0;
 pub(crate) const WGPU_ROTATE_ANIM_DAMPING_DEFAULT: f32 = 1.0;
+// Optional drop-shadow effect (WGPU renderer only). Distance/radius are in
+// puzzle (world) pixels so the shadow scales with zoom; darkness is the shadow
+// opacity (0..1). The shadow falls bottom-right, opposite the emboss light.
+pub(crate) const WGPU_SHADOW_DISTANCE_MIN: f32 = 0.0;
+pub(crate) const WGPU_SHADOW_DISTANCE_MAX: f32 = 30.0;
+pub(crate) const WGPU_SHADOW_DISTANCE_DEFAULT: f32 = 1.0;
+pub(crate) const WGPU_SHADOW_RADIUS_MIN: f32 = 0.0;
+pub(crate) const WGPU_SHADOW_RADIUS_MAX: f32 = 30.0;
+pub(crate) const WGPU_SHADOW_RADIUS_DEFAULT: f32 = 4.0;
+pub(crate) const WGPU_SHADOW_DARKNESS_MIN: f32 = 0.0;
+pub(crate) const WGPU_SHADOW_DARKNESS_MAX: f32 = 1.0;
+pub(crate) const WGPU_SHADOW_DARKNESS_DEFAULT: f32 = 0.5;
 pub(crate) const WGPU_CANVAS_MAX_PX: u32 = 8192;
 pub(crate) const AUTO_PAN_OUTER_RATIO_MIN: f32 = 0.0;
 pub(crate) const AUTO_PAN_OUTER_RATIO_MAX: f32 = 0.2;
@@ -169,6 +181,19 @@ pub(crate) struct WgpuRenderSettings {
     /// Spring damping ratio (1.0 = critical, <1.0 bouncy, >1.0 sluggish).
     #[serde(default = "default_wgpu_rotate_anim_damping")]
     pub(crate) rotate_anim_damping: f32,
+    /// Subtle drop shadow under all pieces/groups. WGPU renderer only; on by
+    /// default.
+    #[serde(default = "default_wgpu_shadow")]
+    pub(crate) shadow: bool,
+    /// Shadow offset distance toward the bottom-right, in puzzle (world) px.
+    #[serde(default = "default_wgpu_shadow_distance")]
+    pub(crate) shadow_distance: f32,
+    /// Shadow blur radius, in puzzle (world) px.
+    #[serde(default = "default_wgpu_shadow_radius")]
+    pub(crate) shadow_radius: f32,
+    /// Shadow opacity (0..1).
+    #[serde(default = "default_wgpu_shadow_darkness")]
+    pub(crate) shadow_darkness: f32,
 }
 
 impl Default for WgpuRenderSettings {
@@ -180,6 +205,10 @@ impl Default for WgpuRenderSettings {
             rotate_anim: true,
             rotate_anim_response: WGPU_ROTATE_ANIM_RESPONSE_DEFAULT,
             rotate_anim_damping: WGPU_ROTATE_ANIM_DAMPING_DEFAULT,
+            shadow: true,
+            shadow_distance: WGPU_SHADOW_DISTANCE_DEFAULT,
+            shadow_radius: WGPU_SHADOW_RADIUS_DEFAULT,
+            shadow_darkness: WGPU_SHADOW_DARKNESS_DEFAULT,
         }
     }
 }
@@ -194,6 +223,22 @@ fn default_wgpu_render_scale() -> f32 {
 
 fn default_wgpu_rotate_anim() -> bool {
     true
+}
+
+fn default_wgpu_shadow() -> bool {
+    true
+}
+
+fn default_wgpu_shadow_distance() -> f32 {
+    WGPU_SHADOW_DISTANCE_DEFAULT
+}
+
+fn default_wgpu_shadow_radius() -> f32 {
+    WGPU_SHADOW_RADIUS_DEFAULT
+}
+
+fn default_wgpu_shadow_darkness() -> f32 {
+    WGPU_SHADOW_DARKNESS_DEFAULT
 }
 
 fn default_wgpu_rotate_anim_response() -> f32 {
