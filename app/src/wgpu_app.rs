@@ -28,7 +28,9 @@ use crate::input::{
 use crate::persisted_store;
 use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
 use crate::flip_anim::FlipAnim;
-use crate::rotation_anim::{apply_group_transform, GroupAnim, SpringParams};
+use crate::rotation_anim::{
+    apply_group_transform, rotate_group_succession, GroupAnim, SpringParams,
+};
 use crate::renderer::{
     build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
     UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
@@ -519,6 +521,11 @@ struct WgpuView {
     /// feature is off. See `animate_rotations` and `crate::rotation_anim`.
     rotate_anim: RefCell<HashMap<u32, GroupAnim>>,
     rotate_anim_last_ms: Cell<f32>,
+    /// Previous frame's `AppSnapshot::piece_group_anchor`, so `animate_rotations`
+    /// can detect a merge that re-keyed a group onto a new anchor and carry its
+    /// spring state across (instead of reseeding `settled`, which would jump a
+    /// mid-flight group). Empty when the feature is off.
+    rotate_anim_prev_anchors: RefCell<Vec<u32>>,
     /// Per-group flip spring state for the optional flip animation, keyed by
     /// group anchor. Shares the `rotate_anim` toggle and spring params. Empty
     /// when the feature is off. See `animate_flips` and `crate::flip_anim`.
@@ -588,6 +595,7 @@ impl WgpuView {
             wheel_intent: RefCell::new(WheelIntentTracker::new()),
             rotate_anim: RefCell::new(HashMap::new()),
             rotate_anim_last_ms: Cell::new(0.0),
+            rotate_anim_prev_anchors: RefCell::new(Vec::new()),
             flip_anim: RefCell::new(HashMap::new()),
             flip_anim_last_ms: Cell::new(0.0),
         }
@@ -1824,6 +1832,7 @@ impl WgpuView {
             if !settings.rotate_anim || snapshot.game.is_none() {
                 drop(settings);
                 self.rotate_anim.borrow_mut().clear();
+                self.rotate_anim_prev_anchors.borrow_mut().clear();
                 self.rotate_anim_last_ms.set(now_ms);
                 return (positions.to_vec(), rotations.to_vec(), false);
             }
@@ -1870,8 +1879,47 @@ impl WgpuView {
         let mut animating = false;
         let mut map = self.rotate_anim.borrow_mut();
 
+        // Re-key spring state across merges and splits by membership overlap, so
+        // a group's animation follows its *identity* rather than its volatile
+        // canonical-anchor id. `map` is still keyed by the PREVIOUS frame's
+        // anchors here. Match each previous entry to the current group sharing
+        // the most of its former members (its primary successor), move the entry
+        // there (rebased to the successor's reference), and drop entries with no
+        // winning successor. This handles a merge (the entry follows the bulk of
+        // its members into the combined group) and a split (the entry follows the
+        // largest fragment; smaller fragments seed fresh `settled` state) without
+        // depending on `HashMap` iteration order — see `rotate_group_succession`.
+        if !map.is_empty() {
+            let prev = self.rotate_anim_prev_anchors.borrow();
+            let dest = rotate_group_succession(total, &prev, anchors, |a| map.contains_key(&a));
+            drop(prev);
+            // Relocate winners (rebasing when the key actually moves); drop the
+            // rest (they were absorbed into another group's entry).
+            let old = std::mem::take(&mut *map);
+            for (prev_a, mut anim) in old {
+                let Some(&cur_a) = dest.get(&prev_a) else {
+                    continue;
+                };
+                if prev_a != cur_a {
+                    if let Some(members) = groups.get(&cur_a) {
+                        if let Some(new_ref) =
+                            group_reference_point(positions, cur_a, members, geometry)
+                        {
+                            let old_ref = anim.tracked_reference();
+                            anim.rebase_reference(old_ref, new_ref);
+                        }
+                    }
+                }
+                map.insert(cur_a, anim);
+            }
+        }
+
         for (anchor, members) in &groups {
-            let Some(center) = drag_group_center(positions, members, geometry) else {
+            // Use a *stable* reference point (the canonical-anchor piece's anchor)
+            // rather than the membership mean: adding pieces on a merge must not
+            // shift the reference, or the group jumps by the centroid delta.
+            let Some(center) = group_reference_point(positions, *anchor, members, geometry)
+            else {
                 continue;
             };
             let (c_t_x, c_t_y) = center;
@@ -1894,14 +1942,16 @@ impl WgpuView {
                 continue; // identity transform; leave snapshot values as-is
             }
             // Force the animation to follow the click direction for a local
-            // rotate (so a clockwise click never animates counter-clockwise,
-            // even when the target's shortest path is the other way). Network
-            // rotations carry no hint and use the shortest path.
-            let dir_hint = match snapshot.last_local_rotation {
-                Some((hint_anchor, sign)) if hint_anchor == *anchor => sign,
-                _ => 0.0,
+            // rotate (so a clockwise click never animates counter-clockwise, even
+            // when the target's shortest path is the other way), and pivot about
+            // the exact click point rather than a pole inferred from a possibly
+            // still-settling displayed pose. Network rotations carry no hint and
+            // use the shortest path with a recovered pole.
+            let (dir_hint, pivot) = match snapshot.last_local_rotation {
+                Some(hint) if hint.anchor == *anchor => (hint.sign, Some(hint.pivot)),
+                _ => (0.0, None),
             };
-            if !entry.step(c_t_x, c_t_y, target_angle, params, dt, dir_hint) {
+            if !entry.step(c_t_x, c_t_y, target_angle, params, dt, dir_hint, pivot) {
                 continue; // settled => identity transform
             }
             animating = true;
@@ -1930,6 +1980,13 @@ impl WgpuView {
         if map.len() != groups.len() {
             map.retain(|anchor, _| groups.contains_key(anchor));
         }
+        drop(map);
+
+        // Remember this frame's grouping so the next frame can detect a re-keyed
+        // group and carry its spring state across (see the carry-over above).
+        *self.rotate_anim_prev_anchors.borrow_mut() = (0..total)
+            .map(|id| anchors.get(id).copied().unwrap_or(id as u32))
+            .collect();
 
         (new_positions, new_rotations, animating)
     }
@@ -3619,6 +3676,27 @@ fn drag_group_center(
     } else {
         None
     }
+}
+
+/// World position of a group's *stable* reference point: the canonical-anchor
+/// piece's pose-anchor point. Unlike [`drag_group_center`] (the membership mean)
+/// this does not move when other pieces join the group, so a merge produces no
+/// spurious centroid jump in the rotation animation. Falls back to the
+/// lowest-id member when the anchor piece is missing from geometry.
+fn group_reference_point(
+    positions: &[(f32, f32)],
+    anchor: u32,
+    members: &[usize],
+    geometry: &PuzzleRenderGeometry,
+) -> Option<(f32, f32)> {
+    let ref_id = members
+        .iter()
+        .copied()
+        .find(|&m| m as u32 == anchor)
+        .or_else(|| members.iter().copied().min())?;
+    let pos = positions.get(ref_id)?;
+    let piece = geometry.pieces.get(ref_id)?;
+    Some((pos.0 + piece.pose_anchor_px[0], pos.1 + piece.pose_anchor_px[1]))
 }
 
 fn drag_group_position(

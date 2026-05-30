@@ -17,6 +17,7 @@
 //! target (and the new pole) without a jump. Pure translations (e.g. drop snaps
 //! with no rotation) fall back to springing the centroid directly.
 
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 /// Tunable spring feel. `response` is roughly the time (seconds) to reach the
@@ -94,10 +95,25 @@ impl GroupAnim {
     /// velocity. `dir_hint` forces the rotation direction (`> 0` clockwise /
     /// increasing angle, `< 0` counter-clockwise, `0` = shortest path); it lets a
     /// local click-to-rotate animate the way the user clicked even when that is
-    /// the long way round. A rotation re-derives the fixed pole from the *current
-    /// displayed pose* so re-targeting mid-flight never jumps; a pure translation
-    /// clears the rotation mode.
-    fn retarget_if_changed(&mut self, cx: f32, cy: f32, angle: f32, dir_hint: f32) {
+    /// the long way round.
+    ///
+    /// `pivot` is the rotation's true fixed point (the click point) when known.
+    /// When supplied it is used verbatim, so the animation pivots about exactly
+    /// that point regardless of where the displayed pose currently sits — this
+    /// matters when a just-committed move is still settling, since the displayed
+    /// centroid then lags the authoritative pose and a *recovered* pole would be
+    /// wrong (the group would swing in from its pre-move position). When `None`
+    /// (e.g. a network rotation) the pole is recovered from the current displayed
+    /// pose, which also keeps a mid-flight re-target from jumping. A pure
+    /// translation (negligible rotation) clears the rotation mode either way.
+    fn retarget_if_changed(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        angle: f32,
+        dir_hint: f32,
+        pivot: Option<(f32, f32)>,
+    ) {
         let changed = shortest_angle_delta(self.tgt_angle, angle).abs() > TARGET_ANG_EPS
             || (self.tgt_cx - cx).abs() > TARGET_POS_EPS
             || (self.tgt_cy - cy).abs() > TARGET_POS_EPS;
@@ -106,9 +122,17 @@ impl GroupAnim {
         }
         let delta = directed_delta(self.disp_angle, angle, dir_hint);
         self.goal_angle = self.disp_angle + delta;
-        // The pole is direction-independent (`R(delta) == R(delta - 360)`), so a
-        // forced long-way-round rotation keeps the same fixed point.
-        match rotation_pole((self.disp_cx, self.disp_cy), delta, (cx, cy)) {
+        // A negligible rotation has no usable pole — treat it as a translation.
+        // Otherwise pivot about the supplied click point when known, else recover
+        // the pole from the displayed pose. The pole is direction-independent
+        // (`R(delta) == R(delta - 360)`), so a forced long-way-round rotation
+        // keeps the same fixed point.
+        let pole = if delta.abs() < ROT_MODE_EPS_DEG {
+            None
+        } else {
+            pivot.or_else(|| rotation_pole((self.disp_cx, self.disp_cy), delta, (cx, cy)))
+        };
+        match pole {
             Some((px, py)) => {
                 self.pivot_x = px;
                 self.pivot_y = py;
@@ -127,7 +151,8 @@ impl GroupAnim {
 
     /// Advances one frame toward the (possibly new) target. Returns `true` while
     /// still animating, `false` once settled (identity transform). `dir_hint`
-    /// forces the rotation direction on a re-target (see `retarget_if_changed`).
+    /// forces the rotation direction and `pivot` supplies the exact fixed point
+    /// on a re-target (see `retarget_if_changed`).
     pub(crate) fn step(
         &mut self,
         cx: f32,
@@ -136,8 +161,9 @@ impl GroupAnim {
         params: SpringParams,
         dt: f32,
         dir_hint: f32,
+        pivot: Option<(f32, f32)>,
     ) -> bool {
-        self.retarget_if_changed(cx, cy, angle, dir_hint);
+        self.retarget_if_changed(cx, cy, angle, dir_hint, pivot);
         if dt > 0.0 {
             // Spring the *continuous* angle toward the continuous goal (linear,
             // not shortest-path) so a forced direction is honored.
@@ -192,6 +218,104 @@ impl GroupAnim {
     pub(crate) fn offset(&self, angle: f32) -> (f32, (f32, f32)) {
         (self.disp_angle - angle, (self.disp_cx, self.disp_cy))
     }
+
+    /// The target (authoritative) reference position this state is tracking —
+    /// the reference point against which `disp`/`tgt` are expressed. Used as
+    /// `old_ref` when carrying this state to a new anchor (see
+    /// [`Self::rebase_reference`]).
+    pub(crate) fn tracked_reference(&self) -> (f32, f32) {
+        (self.tgt_cx, self.tgt_cy)
+    }
+
+    /// Re-express the displayed pose against a new reference point *without*
+    /// changing the rendered transform. Used when a merge moves a group's spring
+    /// state to a new canonical-anchor key: `old_ref`/`new_ref` are the old and
+    /// new anchor pieces' target (authoritative) reference positions.
+    ///
+    /// `c_d` is the displayed position of the reference point, so the new
+    /// reference's displayed position under the current transform is
+    /// `c_d' = R(phi)·(new_ref − old_ref) + c_d`. The pivot is an absolute world
+    /// point (and the angle/velocity state is reference-independent), so they
+    /// carry over untouched; only the reference-relative translation moves.
+    pub(crate) fn rebase_reference(&mut self, old_ref: (f32, f32), new_ref: (f32, f32)) {
+        let phi = self.disp_angle - self.tgt_angle;
+        let (s, c) = phi.to_radians().sin_cos();
+        let ex = new_ref.0 - old_ref.0;
+        let ey = new_ref.1 - old_ref.1;
+        self.disp_cx += c * ex - s * ey;
+        self.disp_cy += s * ex + c * ey;
+        self.tgt_cx = new_ref.0;
+        self.tgt_cy = new_ref.1;
+    }
+}
+
+/// Match each previous frame's spring-state group to its primary successor in
+/// the current frame by membership overlap, returning `previous_anchor ->
+/// current_anchor` for the entries that should be relocated or kept (others are
+/// dropped because they were absorbed into another group's entry). Each previous
+/// entry proposes to the current group sharing the most of its former members;
+/// each current group accepts the proposer with the largest overlap. This tracks
+/// group identity across both merges (an entry follows the bulk of its members)
+/// and splits (an entry follows the largest fragment) without depending on
+/// `HashMap` iteration order. `has_entry(a)` reports whether previous anchor `a`
+/// actually has spring state worth relocating. Ties break toward the lower
+/// anchor so the result is deterministic.
+///
+/// `prev[i]`/`cur[i]` are piece `i`'s canonical group anchor in the previous and
+/// current frame; out-of-range indices fall back to the piece's own id (its
+/// singleton-group anchor).
+pub(crate) fn rotate_group_succession(
+    total: usize,
+    prev: &[u32],
+    cur: &[u32],
+    has_entry: impl Fn(u32) -> bool,
+) -> HashMap<u32, u32> {
+    use std::collections::hash_map::Entry;
+    // Shared member count between each previous entry and each current group.
+    let mut overlap: HashMap<(u32, u32), usize> = HashMap::new();
+    for id in 0..total {
+        let prev_a = prev.get(id).copied().unwrap_or(id as u32);
+        if !has_entry(prev_a) {
+            continue;
+        }
+        let cur_a = cur.get(id).copied().unwrap_or(id as u32);
+        *overlap.entry((prev_a, cur_a)).or_default() += 1;
+    }
+    // Each previous entry proposes to its best (max-overlap) successor.
+    let mut best_for_prev: HashMap<u32, (u32, usize)> = HashMap::new();
+    for (&(prev_a, cur_a), &n) in &overlap {
+        match best_for_prev.entry(prev_a) {
+            Entry::Occupied(mut o) => {
+                let (b_cur, b_n) = *o.get();
+                if n > b_n || (n == b_n && cur_a < b_cur) {
+                    o.insert((cur_a, n));
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert((cur_a, n));
+            }
+        }
+    }
+    // Each current group accepts the proposer with the largest overlap.
+    let mut accepted: HashMap<u32, (u32, usize)> = HashMap::new();
+    for (&prev_a, &(cur_a, n)) in &best_for_prev {
+        match accepted.entry(cur_a) {
+            Entry::Occupied(mut o) => {
+                let (b_prev, b_n) = *o.get();
+                if n > b_n || (n == b_n && prev_a < b_prev) {
+                    o.insert((prev_a, n));
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert((prev_a, n));
+            }
+        }
+    }
+    let mut dest = HashMap::with_capacity(accepted.len());
+    for (cur_a, (prev_a, _)) in accepted {
+        dest.insert(prev_a, cur_a);
+    }
+    dest
 }
 
 /// Signed shortest angular difference `to - from`, wrapped to `[-180, 180]` deg.
@@ -358,6 +482,7 @@ mod tests {
                 params,
                 dt,
                 0.0,
+                None,
             );
             let (phi, c_d) = anim.offset(target_angle);
             // The pole, expressed in the target config, must map back onto
@@ -421,7 +546,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         // Animate partway toward the first target (still mid-flight).
         for _ in 0..6 {
-            anim.step(target_a.0, target_a.1, angle_a, params, dt, 0.0);
+            anim.step(target_a.0, target_a.1, angle_a, params, dt, 0.0, None);
         }
 
         // Second rotation: the game rotates the authoritative pose (target_a)
@@ -431,13 +556,13 @@ mod tests {
         let target_b = rotate_about(target_a, pivot_b, 60.0);
 
         // First frame of the new leg establishes the pole we should hold.
-        anim.step(target_b.0, target_b.1, angle_b, params, dt, 0.0);
+        anim.step(target_b.0, target_b.1, angle_b, params, dt, 0.0, None);
         let (phi0, c_d0) = anim.offset(angle_b);
         let pole = transform_fixed_point(target_b, c_d0, phi0);
 
         let mut max_err = 0.0_f32;
         for _ in 0..600 {
-            let still = anim.step(target_b.0, target_b.1, angle_b, params, dt, 0.0);
+            let still = anim.step(target_b.0, target_b.1, angle_b, params, dt, 0.0, None);
             let (phi, c_d) = anim.offset(angle_b);
             let mapped = apply_group_transform(pole, target_b, c_d, phi);
             let err = ((mapped.0 - pole.0).powi(2) + (mapped.1 - pole.1).powi(2)).sqrt();
@@ -450,6 +575,147 @@ mod tests {
             max_err <= 0.05,
             "pole drifted after mid-flight retarget: max_err={max_err}"
         );
+    }
+
+    /// Carrying a group's spring state to a new canonical-anchor key (on a
+    /// merge) must not move anything on screen: rendering any probe point under
+    /// the rebased state against the *new* reference must match the rendering
+    /// under the old state against the *old* reference. Uses a mid-flight
+    /// rotation so the reference change is exercised with a non-zero `phi`.
+    #[test]
+    fn rebase_reference_preserves_rendered_transform() {
+        let params = SpringParams {
+            response: 0.2,
+            damping: 1.0,
+        };
+        let pivot = (300.0, 120.0);
+        let start = (60.0, 80.0);
+        let target_angle = 90.0;
+        let target = rotate_about(start, pivot, target_angle);
+
+        let mut anim = GroupAnim::settled(start.0, start.1, 0.0);
+        let dt = 1.0 / 60.0;
+        // Mid-flight: displayed angle strictly between 0 and 90 => non-zero phi.
+        for _ in 0..5 {
+            anim.step(target.0, target.1, target_angle, params, dt, 0.0, None);
+        }
+
+        // Render a probe point under the current (old-reference) transform.
+        let probe = (220.0, 160.0);
+        let old_ref = anim.tracked_reference();
+        let (phi0, c_d0) = anim.offset(target_angle);
+        let before = apply_group_transform(probe, old_ref, c_d0, phi0);
+
+        // The merge re-keys this group onto a different anchor piece whose
+        // target reference is `new_ref`. Carry the state across.
+        let new_ref = (140.0, 200.0);
+        anim.rebase_reference(old_ref, new_ref);
+
+        // The same probe, rendered against the new reference, must not move.
+        let (phi1, c_d1) = anim.offset(target_angle);
+        let after = apply_group_transform(probe, new_ref, c_d1, phi1);
+
+        assert!(
+            approx(before, after, 1e-3),
+            "rebase moved the rendered transform: {before:?} != {after:?}"
+        );
+        // And the state now tracks the new reference.
+        assert!(
+            approx(anim.tracked_reference(), new_ref, 1e-3),
+            "rebase did not adopt the new reference"
+        );
+    }
+
+    /// All previous anchors have spring state (the common case in the renderer,
+    /// where every group gets an entry).
+    fn all_live(_: u32) -> bool {
+        true
+    }
+
+    /// An unchanged grouping maps every entry to itself — nothing is relocated
+    /// or dropped.
+    #[test]
+    fn succession_keeps_unchanged_groups() {
+        // Two groups: {0,1} anchor 0, {2,3} anchor 2.
+        let prev = [0u32, 0, 2, 2];
+        let cur = [0u32, 0, 2, 2];
+        let dest = rotate_group_succession(4, &prev, &cur, all_live);
+        assert_eq!(dest.get(&0), Some(&0));
+        assert_eq!(dest.get(&2), Some(&2));
+        assert_eq!(dest.len(), 2);
+    }
+
+    /// Merge of two groups into one (anchor = the lower id): the entry follows
+    /// the bulk of its members; the absorbed group's entry is dropped.
+    #[test]
+    fn succession_merge_follows_majority() {
+        // Prev: {0,1} anchor 0, {2,3} anchor 2. Now all one group, anchor 0.
+        let prev = [0u32, 0, 2, 2];
+        let cur = [0u32, 0, 0, 0];
+        let dest = rotate_group_succession(4, &prev, &cur, all_live);
+        // Both previous entries' best successor is current anchor 0; the one with
+        // the larger overlap wins. They tie here (2 each), so the lower previous
+        // anchor (0) wins and 2 is dropped.
+        assert_eq!(dest.get(&0), Some(&0));
+        assert_eq!(dest.get(&2), None);
+        assert_eq!(dest.len(), 1);
+    }
+
+    /// Merge where a *larger* group attaches to a *lower-id* loose piece: the
+    /// big group's animation must move onto the new (lower) anchor key rather
+    /// than be lost to the loose piece's settled entry.
+    #[test]
+    fn succession_merge_into_lower_loose_piece() {
+        // Prev: lone piece 1 (anchor 1), group {5,6,7} anchor 5.
+        // Now merged into one group whose anchor is the min => 1.
+        let prev = [0u32, 1, 2, 3, 4, 5, 5, 5];
+        let cur = [0u32, 1, 2, 3, 4, 1, 1, 1];
+        let dest = rotate_group_succession(8, &prev, &cur, all_live);
+        // The big group (prev anchor 5, overlap 3) wins key 1 over the loose
+        // piece (prev anchor 1, overlap 1).
+        assert_eq!(dest.get(&5), Some(&1));
+        assert_eq!(dest.get(&1), None);
+    }
+
+    /// Detach of a non-anchor piece: the remnant keeps its key in place and the
+    /// detached singleton gets no carried entry (it will seed `settled`).
+    #[test]
+    fn succession_detach_non_anchor_keeps_remnant() {
+        // Prev: {0,1,2} anchor 0. Detach piece 2 => {0,1} anchor 0, {2} anchor 2.
+        let prev = [0u32, 0, 0];
+        let cur = [0u32, 0, 2];
+        let dest = rotate_group_succession(3, &prev, &cur, all_live);
+        assert_eq!(dest.get(&0), Some(&0)); // remnant keeps its state in place
+        assert!(!dest.values().any(|&c| c == 2)); // nothing carried to the lone piece
+        assert_eq!(dest.len(), 1);
+    }
+
+    /// Detach of the anchor (min) piece: the entry follows the larger remnant
+    /// (re-keyed to its new anchor); the detached former-anchor piece gets none.
+    #[test]
+    fn succession_detach_anchor_follows_larger_remnant() {
+        // Prev: {0,1,2} anchor 0. Detach piece 0 => {0} anchor 0, {1,2} anchor 1.
+        let prev = [0u32, 0, 0];
+        let cur = [0u32, 1, 1];
+        let dest = rotate_group_succession(3, &prev, &cur, all_live);
+        // Entry 0's best successor is current anchor 1 (overlap 2 > 1).
+        assert_eq!(dest.get(&0), Some(&1));
+        // Current group {0} (the detached former anchor) receives no entry.
+        assert!(!dest.values().any(|&c| c == 0));
+        assert_eq!(dest.len(), 1);
+    }
+
+    /// Only previous anchors that actually have spring state are considered;
+    /// groups without an entry never produce a relocation.
+    #[test]
+    fn succession_ignores_anchors_without_entries() {
+        let prev = [0u32, 0, 2, 2];
+        let cur = [0u32, 0, 0, 0];
+        // Pretend only anchor 2 has an entry.
+        let dest = rotate_group_succession(4, &prev, &cur, |a| a == 2);
+        assert_eq!(dest.get(&2), Some(&0));
+        assert_eq!(dest.get(&0), None);
+        assert_eq!(dest.len(), 1);
     }
 
     /// A clockwise click whose target's *shortest* path is counter-clockwise
@@ -472,7 +738,7 @@ mod tests {
         let mut min_disp = f32::INFINITY;
         let mut max_disp = f32::NEG_INFINITY;
         for _ in 0..600 {
-            let still = cw.step(target.0, target.1, target_angle, params, 1.0 / 60.0, 1.0);
+            let still = cw.step(target.0, target.1, target_angle, params, 1.0 / 60.0, 1.0, None);
             min_disp = min_disp.min(cw.disp_angle);
             max_disp = max_disp.max(cw.disp_angle);
             if !still {
@@ -493,7 +759,8 @@ mod tests {
         let mut shortest = GroupAnim::settled(start.0, start.1, 0.0);
         let mut min_short = f32::INFINITY;
         for _ in 0..600 {
-            let still = shortest.step(target.0, target.1, target_angle, params, 1.0 / 60.0, 0.0);
+            let still =
+                shortest.step(target.0, target.1, target_angle, params, 1.0 / 60.0, 0.0, None);
             min_short = min_short.min(shortest.disp_angle);
             if !still {
                 break;
@@ -502,6 +769,76 @@ mod tests {
         assert!(
             min_short < -100.0,
             "without a hint the shortest path is counter-clockwise (min_short={min_short})"
+        );
+    }
+
+    /// Starting a rotation while a just-committed move is still settling: the
+    /// displayed centroid lags the authoritative (post-move) pose. With the true
+    /// click pivot supplied, the animation rotates about that exact point — it
+    /// never swings in from the stale pre-move position — so the click point
+    /// stays fixed for the whole transition. (Without the pivot the recovered
+    /// pole would latch onto the lagging centroid and the click would drift.)
+    #[test]
+    fn supplied_pivot_holds_through_lagging_move() {
+        let params = SpringParams {
+            response: 0.18,
+            damping: 1.0,
+        };
+        let pre_move = (50.0, 60.0);
+        let post_move = (400.0, 120.0); // a large move, only partly animated
+        let click = (260.0, 300.0);
+        let rot_delta = -90.0; // counter-clockwise (the reported direction)
+        let dt = 1.0 / 60.0;
+
+        // Settle at the pre-move pose, then start the move and step only a few
+        // frames so the displayed centroid is still far from `post_move`.
+        let mut anim = GroupAnim::settled(pre_move.0, pre_move.1, 0.0);
+        for _ in 0..3 {
+            anim.step(post_move.0, post_move.1, 0.0, params, dt, 0.0, None);
+        }
+        let (_, lagging) = anim.offset(0.0);
+        let lag = ((lagging.0 - post_move.0).powi(2) + (lagging.1 - post_move.1).powi(2)).sqrt();
+        assert!(
+            lag > 100.0,
+            "precondition: the move should still be lagging (disp={lagging:?})"
+        );
+
+        // Now rotate the *post-move* group about the click point by `rot_delta`,
+        // supplying the exact pivot the way a local click-to-rotate does.
+        let target_angle = rot_delta;
+        let target_centroid = rotate_about(post_move, click, rot_delta);
+        let mut max_err = 0.0_f32;
+        let mut animated = false;
+        for _ in 0..600 {
+            let still = anim.step(
+                target_centroid.0,
+                target_centroid.1,
+                target_angle,
+                params,
+                dt,
+                -1.0,
+                Some(click),
+            );
+            let (phi, c_d) = anim.offset(target_angle);
+            let mapped = apply_group_transform(click, target_centroid, c_d, phi);
+            let err = ((mapped.0 - click.0).powi(2) + (mapped.1 - click.1).powi(2)).sqrt();
+            max_err = max_err.max(err);
+            if !still {
+                break;
+            }
+            animated = true;
+        }
+        assert!(animated, "expected the group to animate the rotation");
+        assert!(
+            max_err <= 0.05,
+            "click pivot drifted (animation latched onto the lagging pose): max_err={max_err}"
+        );
+        // And it must arrive exactly: settled => identity at the target.
+        let (phi, c_d) = anim.offset(target_angle);
+        assert!(phi.abs() <= ANG_EPS, "did not settle in angle: phi={phi}");
+        assert!(
+            approx(c_d, target_centroid, POS_EPS),
+            "did not settle in position: {c_d:?} != {target_centroid:?}"
         );
     }
 }

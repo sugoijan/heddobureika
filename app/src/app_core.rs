@@ -83,6 +83,21 @@ struct ViewState {
     mode: ViewMode,
 }
 
+/// The most recent *local* click-to-rotate, surfaced to the WGPU rotation
+/// animation. `anchor` is the rotated group's canonical anchor; `sign` is +1
+/// clockwise / -1 counter-clockwise (so the animation follows the click
+/// direction even when the target's shortest path is the other way); `pivot` is
+/// the click point in scene-pixel space (the rotation's true fixed point). With
+/// the pivot known exactly the animation never has to recover it from the
+/// displayed pose, which would be wrong while a just-committed move is still
+/// settling. Not set for network rotations.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalRotationHint {
+    pub(crate) anchor: u32,
+    pub(crate) sign: f32,
+    pub(crate) pivot: (f32, f32),
+}
+
 #[derive(Clone)]
 pub(crate) struct AppSnapshot {
     pub(crate) puzzle_info: Option<PuzzleInfo>,
@@ -123,11 +138,9 @@ pub(crate) struct AppSnapshot {
     pub(crate) drag_cursor: Option<(f32, f32)>,
     pub(crate) drag_pointer_id: Option<i32>,
     pub(crate) drag_rotate_mode: bool,
-    /// Direction hint for the most recent *local* click-to-rotate, as
-    /// `(group anchor, sign)` where sign is +1 clockwise / -1 counter-clockwise.
-    /// Lets the WGPU rotation animation follow the click direction even when the
-    /// target's shortest path is the other way. Not set for network rotations.
-    pub(crate) last_local_rotation: Option<(u32, f32)>,
+    /// The most recent *local* click-to-rotate (anchor, direction, and click
+    /// pivot); see [`LocalRotationHint`]. Not set for network rotations.
+    pub(crate) last_local_rotation: Option<LocalRotationHint>,
     pub(crate) drag_right_click: bool,
     pub(crate) drag_primary_id: Option<usize>,
     pub(crate) solved: bool,
@@ -263,9 +276,9 @@ struct AppState {
     app_settings: AppSettings,
     view_settings: ViewSettings,
     renderer_kind: RendererKind,
-    /// Direction of the most recent local click-to-rotate, surfaced to the
-    /// renderer via `AppSnapshot::last_local_rotation`. See that field.
-    last_local_rotation: Option<(u32, f32)>,
+    /// The most recent local click-to-rotate, surfaced to the renderer via
+    /// `AppSnapshot::last_local_rotation`. See [`LocalRotationHint`].
+    last_local_rotation: Option<LocalRotationHint>,
 }
 
 /// The puzzle's frame rect `(x, y, w, h)` in image-pixel space, for sizing the
@@ -1065,11 +1078,16 @@ impl AppCore {
                 MergePolicy::KeepFixedGroup,
             );
             game.rebuild_visual();
-            // Record the click direction so the renderer animates the rotation
-            // the way the user clicked, even when the target's shortest path is
-            // the other way. Local action only; network rotations set no hint.
-            state.last_local_rotation =
-                Some((primary_group.as_u32(), if clockwise { 1.0 } else { -1.0 }));
+            // Record the click direction *and* pivot so the renderer animates the
+            // rotation the way the user clicked (even when the target's shortest
+            // path is the other way) and about the exact click point — never a
+            // pivot inferred from a still-settling displayed pose. Local action
+            // only; network rotations set no hint.
+            state.last_local_rotation = Some(LocalRotationHint {
+                anchor: primary_group.as_u32(),
+                sign: if clockwise { 1.0 } else { -1.0 },
+                pivot: (drag.start_x, drag.start_y),
+            });
             self.finalize_drag(&mut state);
             drop(state);
             self.notify();
