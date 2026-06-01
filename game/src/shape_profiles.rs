@@ -529,7 +529,7 @@ impl BoundaryArcClassifier {
                 FrameCorner::BottomLeft | FrameCorner::BottomRight => self.height,
             };
             let d = (p.x - cx).hypot(p.y - cy);
-            if best.map_or(true, |(_, b)| d < b) {
+            if best.is_none_or(|(_, b)| d < b) {
                 best = Some((i, d));
             }
         }

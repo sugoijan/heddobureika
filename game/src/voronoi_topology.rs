@@ -1166,8 +1166,8 @@ fn nearest_neighbor_for_edge(
     end: Point,
 ) -> Option<PieceId> {
     let midpoint = Point {
-        x: (start.x + end.x) * 0.5,
-        y: (start.y + end.y) * 0.5,
+        x: f32::midpoint(start.x, end.x),
+        y: f32::midpoint(start.y, end.y),
     };
     let owner = *sites.get(owner_idx)?;
     let owner_start_d2 = distance_sq(start, owner);
@@ -1787,8 +1787,8 @@ fn set_path_end_point(path: &mut PathMm, target: PointMm) {
 fn path_midpoint(path: &PathMm) -> PointMm {
     let end = path_end_point(path);
     point_mm(
-        (path.start.x_mm() + end.x_mm()) * 0.5,
-        (path.start.y_mm() + end.y_mm()) * 0.5,
+        f32::midpoint(path.start.x_mm(), end.x_mm()),
+        f32::midpoint(path.start.y_mm(), end.y_mm()),
     )
 }
 

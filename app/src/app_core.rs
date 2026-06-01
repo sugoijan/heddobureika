@@ -2000,18 +2000,14 @@ fn time_nonce(previous: u32) -> u32 {
 fn now_ms_f32() -> f32 {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
-            if let Ok(perf) = Reflect::get(&window, &"performance".into()) {
-                if let Ok(now_fn) = Reflect::get(&perf, &"now".into())
-                    .and_then(|value| value.dyn_into::<Function>())
-                {
-                    if let Ok(value) = now_fn.call0(&perf) {
-                        if let Some(ms) = value.as_f64() {
-                            return ms as f32;
-                        }
-                    }
-                }
-            }
+        if let Some(window) = web_sys::window()
+            && let Ok(perf) = Reflect::get(&window, &"performance".into())
+            && let Ok(now_fn) = Reflect::get(&perf, &"now".into())
+                .and_then(|value| value.dyn_into::<Function>())
+            && let Ok(value) = now_fn.call0(&perf)
+            && let Some(ms) = value.as_f64()
+        {
+            return ms as f32;
         }
         return (Date::now() % 1_000_000.0) as f32;
     }

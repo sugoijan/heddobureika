@@ -1669,7 +1669,7 @@ impl<T: PuzzleTopology> PlayableState<T> {
                     let mut best: Option<((f32, f32), f32)> = None;
                     for c in corners.iter() {
                         let d = (wx - c.0).hypot(wy - c.1);
-                        if best.map_or(true, |(_, bd)| d < bd) {
+                        if best.is_none_or(|(_, bd)| d < bd) {
                             best = Some((*c, d));
                         }
                     }
