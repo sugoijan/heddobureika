@@ -106,6 +106,10 @@ impl MultiplayerBridgeState {
             state.record_pending_detach(piece_id);
         })));
         let state = Rc::clone(self);
+        sync_runtime::set_multiplayer_local_send_to_back_observer(Some(Rc::new(move |piece_id| {
+            state.apply_local_send_to_back(piece_id);
+        })));
+        let state = Rc::clone(self);
         let subscription = self.core.subscribe(Rc::new(move || {
             state.try_send_init();
         }));
@@ -506,6 +510,21 @@ impl MultiplayerBridgeState {
         self.pending_detaches.borrow_mut().insert(piece_id);
         if self.core.snapshot().dragging_members.is_empty() {
             let _ = self.apply_predicted_state(false);
+        }
+    }
+
+    /// Mirror a local shake "send to fitting depth" into the predicted base
+    /// state. The core's game already shows the reorder (applied optimistically
+    /// in `drag_move`); updating `local_state` here keeps it from being reverted
+    /// to front the next time the predicted state is rebuilt from an echo, until
+    /// the server's authoritative `GroupOrder` broadcast arrives. Uses the same
+    /// deterministic geometry reorder, so it matches the server.
+    fn apply_local_send_to_back(&self, piece_id: u32) {
+        let mut local = self.local_state.borrow_mut();
+        if let Some(state) = local.as_mut() {
+            if state.playable.send_backward_to_fitting_depth(&[piece_id]) {
+                state.rebuild_visual();
+            }
         }
     }
 

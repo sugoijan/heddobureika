@@ -26,6 +26,10 @@ pub enum SyncAction {
     Release {
         anchor_id: usize,
     },
+    /// Demote a group to the bottom of the z-stack (shake-to-back gesture).
+    SendToBack {
+        anchor_id: usize,
+    },
 }
 
 #[derive(Clone, Debug)]

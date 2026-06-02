@@ -38,6 +38,7 @@ pub(crate) struct MultiplayerGameSync {
         Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>>>,
     local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>>>,
     local_detach_observer: Rc<RefCell<Option<Rc<dyn Fn(u32)>>>>,
+    local_send_to_back_observer: Rc<RefCell<Option<Rc<dyn Fn(u32)>>>>,
 }
 
 impl MultiplayerGameSync {
@@ -61,6 +62,7 @@ impl MultiplayerGameSync {
             local_transform_observer: Rc::new(RefCell::new(None)),
             local_flip_observer: Rc::new(RefCell::new(None)),
             local_detach_observer: Rc::new(RefCell::new(None)),
+            local_send_to_back_observer: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -132,6 +134,10 @@ impl MultiplayerGameSync {
 
     pub(crate) fn set_local_detach_observer(&self, observer: Option<Rc<dyn Fn(u32)>>) {
         *self.local_detach_observer.borrow_mut() = observer;
+    }
+
+    pub(crate) fn set_local_send_to_back_observer(&self, observer: Option<Rc<dyn Fn(u32)>>) {
+        *self.local_send_to_back_observer.borrow_mut() = observer;
     }
 
     fn next_client_seq_for(&self, anchor_id: u32) -> u64 {
@@ -528,6 +534,17 @@ impl GameSync for MultiplayerGameSync {
                     self.send(ClientMsg::Release {
                         piece_id: *anchor_id as u32,
                     });
+                }
+                SyncAction::SendToBack { anchor_id } => {
+                    self.send(ClientMsg::SendToBack {
+                        piece_id: *anchor_id as u32,
+                    });
+                    // Mirror the demotion into the predicted local state so a
+                    // server pose-echo doesn't snap z-order back to front before
+                    // the authoritative GroupOrder broadcast arrives.
+                    if let Some(observer) = self.local_send_to_back_observer.borrow().as_ref() {
+                        observer(*anchor_id as u32);
+                    }
                 }
             },
             _ => {}

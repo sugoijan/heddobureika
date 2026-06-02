@@ -38,6 +38,7 @@ struct SyncRuntimeState {
     mp_local_transform_observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
     mp_local_flip_observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
     mp_local_detach_observer: Option<Rc<dyn Fn(u32)>>,
+    mp_local_send_to_back_observer: Option<Rc<dyn Fn(u32)>>,
 }
 
 impl SyncRuntimeState {
@@ -62,6 +63,7 @@ impl SyncRuntimeState {
             mp_local_transform_observer: None,
             mp_local_flip_observer: None,
             mp_local_detach_observer: None,
+            mp_local_send_to_back_observer: None,
         }
     }
 
@@ -95,6 +97,13 @@ impl SyncRuntimeState {
             ) {
                 sync.borrow()
                     .set_local_detach_observer(Some(observer.clone()));
+            }
+            if let (Some(sync), Some(observer)) = (
+                self.multiplayer.as_ref(),
+                self.mp_local_send_to_back_observer.as_ref(),
+            ) {
+                sync.borrow()
+                    .set_local_send_to_back_observer(Some(observer.clone()));
             }
             if let Some(mut local_sync) = self.local_sync.take() {
                 local_sync.shutdown();
@@ -457,6 +466,16 @@ pub(crate) fn set_multiplayer_local_detach_observer(observer: Option<Rc<dyn Fn(u
     });
 }
 
+pub(crate) fn set_multiplayer_local_send_to_back_observer(observer: Option<Rc<dyn Fn(u32)>>) {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.mp_local_send_to_back_observer = observer.clone();
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow().set_local_send_to_back_observer(observer);
+        }
+    });
+}
+
 pub(crate) fn clear_sync_hooks() {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
@@ -598,6 +617,13 @@ pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_cor
     }
     match action {
         CoreAction::DragMove { .. } => {
+            // A shake-to-back gesture may have fired during this move; the
+            // z-order change was applied locally, so just propagate it.
+            if let Some(anchor) = core.take_pending_shake_to_back() {
+                handle_local_action(&CoreAction::Sync(SyncAction::SendToBack {
+                    anchor_id: anchor,
+                }));
+            }
             let snapshot = core.snapshot();
             let Some(anchor_id) = snapshot.dragging_members.first().copied() else {
                 return;

@@ -8,6 +8,7 @@ use crate::rules::PlayRules;
 use crate::snap::{angle_matches, ActionId, MergePolicy, SnapProposal};
 use crate::topology::{PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
+use crate::z_depth::{reorder_for_fitting_depth, Aabb, Gesture};
 use crate::update::{
     AppliedProposal, GroupMergeUpdate, GroupPoseUpdate, PlayableUpdateBatch,
     ProposalApplyRejection, ProposalApplyStatus,
@@ -955,6 +956,111 @@ impl<T: PuzzleTopology> PlayableState<T> {
             return false;
         }
         self.z_order = next;
+        self.rebuild_z_indices_from_snapshot();
+        true
+    }
+
+    /// Reorders `z_order` so that the groups containing the given anchor pieces
+    /// come first (i.e. on the bottom). Anchors that don't resolve to alive
+    /// groups are silently skipped. The demoted groups keep their relative
+    /// order. Returns `true` when the order changed, `false` otherwise. Mirror
+    /// of [`set_z_order_by_anchors`](Self::set_z_order_by_anchors).
+    pub fn send_to_back_by_anchors(&mut self, anchors: &[u32]) -> bool {
+        if anchors.is_empty() {
+            return false;
+        }
+        let before = self.z_order.clone();
+        let mut demoted = Vec::with_capacity(anchors.len());
+        for anchor in anchors {
+            let Some(group) = self.logical.group_of(PieceId(*anchor)) else {
+                continue;
+            };
+            if !before.contains(&group) || demoted.contains(&group) {
+                continue;
+            }
+            demoted.push(group);
+        }
+        let mut next = Vec::with_capacity(before.len());
+        next.extend(demoted.iter().copied());
+        for group in &before {
+            if !demoted.contains(group) {
+                next.push(*group);
+            }
+        }
+        if next == before {
+            return false;
+        }
+        self.z_order = next;
+        self.rebuild_z_indices_from_snapshot();
+        true
+    }
+
+    /// World-space axis-aligned bounding box (pose-mm) of a group: the union of
+    /// its members' rotated bounding rectangles. `None` if the group has no
+    /// placeable members. Deterministic from topology + poses only, so client
+    /// and server agree. See [`crate::z_depth`].
+    pub fn group_world_aabb(&self, group: GroupId) -> Option<Aabb> {
+        let mut aabb = Aabb::empty();
+        let mut any = false;
+        for piece in self.logical.members_of(group) {
+            let Some(pose) = self.piece_world_pose(piece) else {
+                continue;
+            };
+            let (ex, ey) = self.logical.topology.piece_extent_mm(piece);
+            let hx = ex.as_mm_f32() * 0.5;
+            let hy = ey.as_mm_f32() * 0.5;
+            // Rotated-rectangle AABB half-extents.
+            let (sin, cos) = pose.rotation_degrees().to_radians().sin_cos();
+            let ax = hx * cos.abs() + hy * sin.abs();
+            let ay = hx * sin.abs() + hy * cos.abs();
+            aabb = aabb.union(Aabb::from_center_half(pose.x_mm(), pose.y_mm(), ax, ay));
+            any = true;
+        }
+        if any {
+            Some(aabb)
+        } else {
+            None
+        }
+    }
+
+    /// Drag-start gesture: bring the group containing `anchors[0]` as far toward
+    /// the front as possible without (near-)completely hiding any overlapping
+    /// piece (those it would mostly cover are lifted above it). Geometry-aware
+    /// replacement for [`set_z_order_by_anchors`](Self::set_z_order_by_anchors)
+    /// at the drag-start call site. Returns `true` when the order changed.
+    pub fn bring_forward_to_fitting_depth(&mut self, anchors: &[u32]) -> bool {
+        self.apply_fitting_depth(anchors, Gesture::BringForward)
+    }
+
+    /// Shake gesture: send the group containing `anchors[0]` to its "fitting
+    /// depth" — as far back as possible to reveal pieces under it, but never so
+    /// far that it becomes (near-)completely hidden — and re-sort overlapping
+    /// pieces so none is left hidden behind a larger one. Geometry-aware
+    /// replacement for [`send_to_back_by_anchors`](Self::send_to_back_by_anchors)
+    /// at the shake call site. Returns `true` when the order changed.
+    pub fn send_backward_to_fitting_depth(&mut self, anchors: &[u32]) -> bool {
+        self.apply_fitting_depth(anchors, Gesture::SendBackward)
+    }
+
+    fn apply_fitting_depth(&mut self, anchors: &[u32], gesture: Gesture) -> bool {
+        let Some(&anchor) = anchors.first() else {
+            return false;
+        };
+        let Some(group) = self.logical.group_of(PieceId(anchor)) else {
+            return false;
+        };
+        let order = self.z_order.clone();
+        let Some(g_pos) = order.iter().position(|&gid| gid == group) else {
+            return false;
+        };
+        let aabbs: Vec<Aabb> = order
+            .iter()
+            .map(|&gid| self.group_world_aabb(gid).unwrap_or_else(Aabb::empty))
+            .collect();
+        let Some(new_order) = reorder_for_fitting_depth(&order, &aabbs, g_pos, gesture) else {
+            return false;
+        };
+        self.z_order = new_order;
         self.rebuild_z_indices_from_snapshot();
         true
     }

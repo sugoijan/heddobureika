@@ -373,12 +373,21 @@ impl RoomLivePuzzle {
         self.playable.revision = seq;
     }
 
-    /// Reorders `playable.z_order` so that the given anchor piece ids' groups
-    /// come last (i.e. on top). Anchor ids that don't resolve to alive groups
-    /// are ignored. Returns true when the order changed; re-syncs the snapshot
-    /// shadow on change. Delegates to `PlayableState::set_z_order_by_anchors`.
-    fn apply_group_order_by_anchors(&mut self, anchors: &[u32]) -> bool {
-        let changed = self.playable.set_z_order_by_anchors(anchors);
+    /// Drag-start reorder: bring the group containing `anchor` toward the front
+    /// to its geometry-aware "fitting depth" (see [`heddobureika_game::z_depth`]).
+    /// Deterministic, so it matches the originating client's optimistic result.
+    fn bring_forward(&mut self, anchor: u32) -> bool {
+        let changed = self.playable.bring_forward_to_fitting_depth(&[anchor]);
+        if changed {
+            self.sync_snapshot_from_playable();
+        }
+        changed
+    }
+
+    /// Shake reorder: send the group containing `anchor` to its geometry-aware
+    /// "fitting depth" (as far back as possible without hiding it). Deterministic.
+    fn send_backward(&mut self, anchor: u32) -> bool {
+        let changed = self.playable.send_backward_to_fitting_depth(&[anchor]);
         if changed {
             self.sync_snapshot_from_playable();
         }
@@ -1078,6 +1087,9 @@ impl DurableObject for Room {
                 base_revision: _,
             } => self.handle_detach(client_id, piece_id).await,
             ClientMsg::Release { piece_id } => self.handle_release(client_id, piece_id).await,
+            ClientMsg::SendToBack { piece_id } => {
+                self.handle_send_to_back(client_id, piece_id).await
+            }
             ClientMsg::Ping { nonce } => {
                 let response = ServerMsg::Pong { nonce };
                 let _ = self.send_server_msg(&ws, &response);
@@ -1658,6 +1670,14 @@ impl Room {
                 rot_deg: None,
                 client_seq: None,
             },
+            ClientMsg::SendToBack { piece_id } => ClientCommandRecord {
+                kind: RecordedCommandKind::SendToBack,
+                piece_id: Some(*piece_id),
+                anchor_id: None,
+                pos: None,
+                rot_deg: None,
+                client_seq: None,
+            },
             ClientMsg::Ping { .. } => ClientCommandRecord {
                 kind: RecordedCommandKind::Ping,
                 piece_id: None,
@@ -1695,7 +1715,8 @@ impl Room {
             | ClientMsg::Place { .. }
             | ClientMsg::Flip { .. }
             | ClientMsg::Detach { .. }
-            | ClientMsg::Release { .. } => {
+            | ClientMsg::Release { .. }
+            | ClientMsg::SendToBack { .. } => {
                 CommandHandlingResult::ignored("ignored_or_conflict", seq)
             }
         }
@@ -3004,10 +3025,11 @@ impl Room {
             );
             inner.owner_by_client.insert(client_id, anchor_id);
 
-            let mut group_order = playable_group_order_anchors(&runtime_snapshot.snapshot);
-            group_order.retain(|id| *id != anchor_id);
-            group_order.push(anchor_id);
-            let _ = runtime_snapshot.apply_group_order_by_anchors(&group_order);
+            // Bring the selected group toward the front to its geometry-aware
+            // fitting depth (matches the client's optimistic reorder), then
+            // broadcast the resulting full order.
+            let _ = runtime_snapshot.bring_forward(anchor_id);
+            let group_order = playable_group_order_anchors(&runtime_snapshot.snapshot);
 
             let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
             runtime_snapshot.set_seq(seq);
@@ -3038,6 +3060,72 @@ impl Room {
             let _ = self.broadcast(&msg);
         }
         let _ = self.broadcast(&update_msg);
+        let _ = self.broadcast(&group_order_update);
+        self.schedule_alarm().await?;
+
+        Ok(())
+    }
+
+    /// Shake-to-back: demote the owner's group to the bottom of the z-stack and
+    /// broadcast the resulting order. Only the group's current owner may
+    /// reorder it; a no-op order change is silently ignored.
+    async fn handle_send_to_back(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
+        let now = now_ms();
+        let group_order_update = {
+            let mut inner = self.inner.borrow_mut();
+            let mut runtime_snapshot = match inner.live.take() {
+                Some(snapshot) => snapshot,
+                None => return Ok(()),
+            };
+            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
+            if piece_id as usize >= total {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            }
+            let mut members =
+                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
+                    Some(members) => members,
+                    None => {
+                        inner.live = Some(runtime_snapshot);
+                        return Ok(());
+                    }
+                };
+            members.sort_unstable();
+            let anchor_id = members[0] as u32;
+
+            let owns_anchor = inner
+                .owners_by_anchor
+                .get(&anchor_id)
+                .map(|owner| owner.owner_id == client_id)
+                .unwrap_or(false);
+            if !owns_anchor {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            }
+
+            // Send the group to its geometry-aware fitting depth (matches the
+            // client's optimistic reorder); skip the broadcast if nothing moved.
+            if !runtime_snapshot.send_backward(anchor_id) {
+                inner.live = Some(runtime_snapshot);
+                return Ok(());
+            }
+            let group_order = playable_group_order_anchors(&runtime_snapshot.snapshot);
+
+            let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
+            runtime_snapshot.set_seq(seq);
+            let group_order_update = control_update_msg(
+                seq,
+                RoomControlUpdate::GroupOrder { order: group_order },
+                Some(client_id),
+                None,
+            );
+
+            inner.live = Some(runtime_snapshot);
+            group_order_update
+        };
+
+        self.touch_command(now, false).await?;
+        self.persist_snapshot_if_needed().await?;
         let _ = self.broadcast(&group_order_update);
         self.schedule_alarm().await?;
 
@@ -4664,6 +4752,9 @@ impl CommandStore {
             x if x == RecordedCommandKind::Release as u32 => Ok(RecordedCommandKind::Release),
             x if x == RecordedCommandKind::Ping as u32 => Ok(RecordedCommandKind::Ping),
             x if x == RecordedCommandKind::Detach as u32 => Ok(RecordedCommandKind::Detach),
+            x if x == RecordedCommandKind::SendToBack as u32 => {
+                Ok(RecordedCommandKind::SendToBack)
+            }
             _ => Err("invalid command kind".to_string()),
         }
     }

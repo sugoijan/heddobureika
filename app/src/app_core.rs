@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 
 use crate::core::*;
 use crate::game_state::AppGameState;
-use crate::input::ClickGesture;
+use crate::input::{ClickGesture, ShakeDetector};
 use crate::runtime::CoreAction;
 use heddobureika_core::{
     angle_delta, build_topology_from_spec, piece_bounds_px, safety_corrections_after_detach,
@@ -271,6 +271,9 @@ struct DragState {
     pivot_y: f32,
     start_angle: f32,
     pointer_id: Option<i32>,
+    /// Detects the shake-to-back gesture from this drag's pointer motion. Fed
+    /// each `drag_move`; fires at most once per drag.
+    shake: ShakeDetector,
     /// Whether a click on this group would actually rotate it (rotation enabled,
     /// not a big/locked group at rest, and a non-trivial symmetry step exists).
     /// Captured at press time (membership/angle are fixed for the hold) and used
@@ -296,6 +299,10 @@ struct AppState {
     /// The most recent local click-to-rotate, surfaced to the renderer via
     /// `AppSnapshot::last_local_rotation`. See [`LocalRotationHint`].
     last_local_rotation: Option<LocalRotationHint>,
+    /// One-shot anchor piece id queued when a shake-to-back gesture fires during
+    /// a drag. Consumed by the sync layer (via
+    /// [`AppCore::take_pending_shake_to_back`]) to emit the network message.
+    pending_shake_to_back: Option<usize>,
 }
 
 /// The puzzle's frame rect `(x, y, w, h)` in image-pixel space, for sizing the
@@ -794,19 +801,21 @@ impl AppCore {
             pivot_y,
             start_angle,
             pointer_id,
+            shake: ShakeDetector::new(),
             rotation_eligible,
         });
         state.dragging_members = members.clone();
         state.active_id = Some(piece_id);
         state.hovered_id = None;
-        // Bring the dragged group to the top of the z-stack. The anchor
-        // piece id is `members[0]` (members is sorted ascending). On
-        // PlayableState that's a `SetGroupOrder` restricted action which
-        // promotes the named anchors to the back of `z_order` (= top of
-        // the render stack).
+        // Bring the dragged group toward the front to its "fitting depth": as
+        // far up as possible without (near-)completely hiding any piece it
+        // overlaps (smaller pieces it would cover are lifted above it). The
+        // anchor piece id is `members[0]` (members is sorted ascending). The
+        // geometry-based reorder is deterministic, so the server's authoritative
+        // recompute (handle_select) matches this optimistic result.
         if let Some(game) = state.game.as_mut() {
             let anchors = vec![members[0] as u32];
-            game.playable.set_z_order_by_anchors(&anchors);
+            game.playable.bring_forward_to_fitting_depth(&anchors);
             game.rebuild_visual();
         }
         drop(state);
@@ -930,9 +939,39 @@ impl AppCore {
                 Self::set_piece_pixel_pose(&mut state, *id, new_px, rot);
             }
         }
+        // Shake-to-back: feed the gesture detector with the live cursor and,
+        // when it fires, demote the dragged group to the bottom of the z-stack.
+        // Amplitude is judged against the smallest piece's extent so the gesture
+        // scales with the puzzle. Fires at most once per drag; a fresh drag
+        // starts a new detector (and re-promotes to front on drag-start).
+        let reference_len = state
+            .assets
+            .as_ref()
+            .map(|assets| {
+                let [w, h] = assets.render_geometry.min_piece_extent_px;
+                w.min(h)
+            })
+            .unwrap_or_else(|| state.core.piece_width.min(state.core.piece_height));
+        if drag.shake.update(x, y, now_ms_f32(), reference_len) {
+            if let Some(anchor) = drag.members.first().copied() {
+                if let Some(game) = state.game.as_mut() {
+                    if game.playable.send_backward_to_fitting_depth(&[anchor as u32]) {
+                        game.rebuild_visual();
+                        state.pending_shake_to_back = Some(anchor);
+                    }
+                }
+            }
+        }
         state.drag_state = Some(drag);
         drop(state);
         self.notify();
+    }
+
+    /// Takes the one-shot anchor queued by a shake-to-back gesture, if any. The
+    /// sync layer calls this after a drag-move to emit the network message; the
+    /// local z-order change has already been applied optimistically.
+    pub(crate) fn take_pending_shake_to_back(&self) -> Option<usize> {
+        self.state.borrow_mut().pending_shake_to_back.take()
     }
 
     pub(crate) fn drag_end(&self, pointer_id: Option<i32>) {
@@ -2024,6 +2063,7 @@ impl AppState {
             view_settings: ViewSettings::default(),
             renderer_kind: RendererKind::Wgpu,
             last_local_rotation: None,
+            pending_shake_to_back: None,
         }
     }
 }

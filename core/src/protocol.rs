@@ -106,6 +106,7 @@ pub enum RecordedCommandKind {
     Release,
     Ping,
     Detach,
+    SendToBack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -672,6 +673,12 @@ pub enum ClientMsg {
         base_revision: u64,
     },
     Release {
+        piece_id: u32,
+    },
+    /// Demote the owned group containing `piece_id` to the bottom of the
+    /// z-stack (shake-to-back gesture). The server reorders authoritatively and
+    /// broadcasts the resulting [`RoomControlUpdate::GroupOrder`].
+    SendToBack {
         piece_id: u32,
     },
     Ping {

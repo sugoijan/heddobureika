@@ -2086,6 +2086,7 @@ fn recorded_kind_name(kind: RecordedCommandKind) -> &'static str {
         RecordedCommandKind::Release => "Release",
         RecordedCommandKind::Ping => "Ping",
         RecordedCommandKind::Detach => "Detach",
+        RecordedCommandKind::SendToBack => "SendToBack",
     }
 }
 

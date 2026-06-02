@@ -36,6 +36,7 @@ pub mod triangular_shape;
 pub mod units;
 pub mod update;
 pub mod voronoi_topology;
+pub mod z_depth;
 
 pub use delta::{IdList, PlayableDelta};
 pub use edge_compose::ConnectorSeg;
