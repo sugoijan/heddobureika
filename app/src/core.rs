@@ -43,6 +43,26 @@ pub(crate) const WGPU_SHADOW_DARKNESS_MIN: f32 = 0.0;
 pub(crate) const WGPU_SHADOW_DARKNESS_MAX: f32 = 1.0;
 pub(crate) const WGPU_SHADOW_DARKNESS_DEFAULT: f32 = 0.5;
 pub(crate) const WGPU_CANVAS_MAX_PX: u32 = 8192;
+// Transient "hold" emphasis applied to the piece/group being dragged: a slight
+// uniform scale-up and a small rotation (signed by mouse button). These are the
+// single source of truth shared by every renderer (and, for WGPU, plumbed into
+// the shader uniform) so the CPU-side anchor spread and the GPU-side per-piece
+// growth can never drift apart and misalign group members. `DRAG_ROTATION_DEG`
+// is the base angle, divided by sqrt(group size) so larger groups tilt less.
+pub(crate) const DRAG_SCALE: f32 = 1.01;
+pub(crate) const DRAG_ROTATION_DEG: f32 = 3.2;
+// Time-based animation of the hold rotation: it rises quickly to full tilt over
+// `DRAG_EMPHASIS_ATTACK_MS`, then eases back to zero by the click cutoff
+// (`CLICK_MAX_DURATION_MS`), telegraphing how long the press still counts as a
+// click. The attack stays well inside the always-click window
+// (`CLICK_QUICK_TAP_MS = 120ms`). The scale-up is unaffected and persists for the
+// whole hold. See `drag_hold_emphasis` in `wgpu_app.rs`.
+pub(crate) const DRAG_EMPHASIS_ATTACK_MS: f32 = 70.0;
+// Minimum predicted click-rotation (degrees) for the hold emphasis to show its
+// rotation tilt. Below this the click would not meaningfully rotate the group
+// (big/locked groups at rest, pieces whose only symmetry angle is the current
+// one), so only the scale part of the hold effect plays.
+pub(crate) const DRAG_ROTATION_ELIGIBLE_MIN_DEG: f32 = 0.5;
 pub(crate) const AUTO_PAN_OUTER_RATIO_MIN: f32 = 0.0;
 pub(crate) const AUTO_PAN_OUTER_RATIO_MAX: f32 = 0.2;
 pub(crate) const AUTO_PAN_OUTER_RATIO_DEFAULT: f32 = 0.03;

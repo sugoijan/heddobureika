@@ -258,6 +258,16 @@ impl ClickGesture {
         self.active = false;
         self.moved = false;
     }
+
+    /// Press timestamp (same clock as the `now_ms` passed to [`arm`]).
+    pub(crate) fn start_ms(&self) -> f32 {
+        self.start_ms
+    }
+
+    /// Whether the pointer has moved beyond the click slop (no longer a click).
+    pub(crate) fn moved(&self) -> bool {
+        self.moved
+    }
 }
 
 #[allow(dead_code)]

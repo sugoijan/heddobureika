@@ -1,6 +1,6 @@
 use crate::core::{
-    PuzzleRenderGeometry, CORNER_RADIUS_RATIO, EMBOSS_OPACITY, EMBOSS_RIM, WGPU_EDGE_AA_DEFAULT,
-    WGPU_RENDER_SCALE_MIN,
+    PuzzleRenderGeometry, CORNER_RADIUS_RATIO, DRAG_SCALE, EMBOSS_OPACITY, EMBOSS_RIM,
+    WGPU_EDGE_AA_DEFAULT, WGPU_RENDER_SCALE_MIN,
 };
 use bytemuck::{Pod, Zeroable};
 use glyphon::cosmic_text::Align;
@@ -67,6 +67,11 @@ pub(crate) struct Instance {
     /// vertex shader rotates the quad around this point so the visual
     /// rotation matches the hit-test rotation.
     pub(crate) pose_anchor: [f32; 2],
+    /// 1.0 while this piece is being held/dragged, else 0.0. Gates the hold
+    /// scale-up in the shader independently of `drag` (the rotation), so the
+    /// scale persists even as the rotation animates back to zero. See
+    /// `drag_hold_emphasis`.
+    pub(crate) held: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +204,11 @@ impl Instance {
                     format: wgpu::VertexFormat::Float32x2,
                     offset: 48,
                     shader_location: 9,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 56,
+                    shader_location: 10,
                 },
             ],
         }
@@ -336,6 +346,11 @@ struct Globals {
     shadow_offset: [f32; 2],
     shadow_darkness: f32,
     shadow_radius: f32,
+    /// Uniform scale-up applied to the held/dragged piece or group (gated
+    /// per-instance by a non-zero `inst_drag`). Sourced from `DRAG_SCALE` so it
+    /// matches the CPU-side anchor spread in `drag_group_position`.
+    drag_scale: f32,
+    _pad_drag: [f32; 3],
 }
 
 #[repr(C, align(16))]
@@ -869,6 +884,8 @@ impl WgpuRenderer {
             shadow_offset: [0.0, 0.0],
             shadow_darkness: 0.0,
             shadow_radius: 0.0,
+            drag_scale: DRAG_SCALE,
+            _pad_drag: [0.0; 3],
         };
         let globals_buffer_fill = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals-buffer-fill"),
@@ -1433,6 +1450,7 @@ impl WgpuRenderer {
             piece_origin: [0.0, 0.0],
             mask_origin: [0.0, 0.0],
             pose_anchor: [0.0, 0.0],
+            held: 0.0,
         }];
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("piece-instance-buffer"),

@@ -21,6 +21,10 @@ struct Globals {
     shadow_offset: vec2<f32>,
     shadow_darkness: f32,
     shadow_radius: f32,
+    // Uniform scale-up for the held/dragged piece or group, gated per-instance
+    // by a non-zero `inst_drag`. Matches the CPU-side anchor spread so group
+    // members stay aligned.
+    drag_scale: f32,
 };
 
 @group(0) @binding(0)
@@ -46,6 +50,7 @@ struct VertexIn {
     @location(7) inst_piece_origin: vec2<f32>,
     @location(8) inst_mask_origin: vec2<f32>,
     @location(9) inst_pose_anchor: vec2<f32>,
+    @location(10) inst_held: f32,
 };
 
 struct VertexOut {
@@ -73,8 +78,11 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let is_back = input.inst_flip > 0.5;
     let center = anchor_padded;
     let drag = input.inst_drag;
-    let drag_active = abs(drag) > 1e-4;
-    let drag_scale = select(1.0, 1.02, drag_active);
+    // Scale-up is gated by the held flag (persists for the whole hold), while the
+    // rotation comes from `inst_drag` (animated, may pass through zero). Keeping
+    // these independent avoids the group-misalignment glitch that arises if the
+    // per-piece scale and the CPU-side anchor spread disagree.
+    let drag_scale = select(1.0, globals.drag_scale, input.inst_held > 0.5);
     let drag_rot = drag * 0.017453292;
     let angle = input.inst_rot * 0.017453292 + drag_rot;
     let rotated = rotate_point(local - center, angle) + center;

@@ -16,14 +16,14 @@ use web_sys::{
     PointerEvent, WheelEvent,
 };
 
-use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect};
+use crate::app_core::{now_ms_f32, AppCore, AppSnapshot, PuzzleAssets, ViewRect};
 use crate::app_router;
 use crate::boot;
 use crate::core::*;
 use crate::input::{
     screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
     workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
-    WheelIntentTracker,
+    WheelIntentTracker, CLICK_MAX_DURATION_MS,
 };
 use crate::persisted_store;
 use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
@@ -76,8 +76,6 @@ const UI_TEXT_LAYOUT_PAD: f32 = 6.0;
 const UI_TEXT_HITBOX_PAD: f32 = 8.0;
 const UI_TITLE_ROTATION_DEG: f32 = 0.5;
 const UI_TITLE_FONT_RATIO: f32 = 0.058;
-const DRAG_SCALE: f32 = 1.01;
-const DRAG_ROTATION_DEG: f32 = 1.0;
 const OUTLINE_KIND_HOVER: f32 = 1.0;
 const OUTLINE_KIND_OWNED: f32 = 2.0;
 const OUTLINE_KIND_DEBUG: f32 = 3.0;
@@ -3350,6 +3348,21 @@ impl WgpuView {
         } else {
             0.0
         };
+        // Hold rotation emphasis: animate the tilt over the press to telegraph the
+        // click window. Driven by the press timestamp (performance.now epoch) so it
+        // stays in lock-step with the real click decision. Suppressed entirely when
+        // a click wouldn't rotate the group (big/locked groups, no-op symmetry) so
+        // only the scale part of the hold effect plays for those.
+        let drag_emphasis = match snapshot.drag_press_ms {
+            Some(press_ms) if highlight_members.is_some() && snapshot.drag_rotation_eligible => {
+                let elapsed = now_ms_f32() - press_ms;
+                if drag_hold_active(elapsed, snapshot.drag_click_moved) {
+                    self.request_render();
+                }
+                drag_hold_emphasis(elapsed, snapshot.drag_click_moved)
+            }
+            _ => 0.0,
+        };
         let ownership_by_anchor = sync_view.ownership_by_anchor();
         let positions = snapshot.piece_positions_px();
         let rotations = snapshot.piece_rotations_deg();
@@ -3388,6 +3401,7 @@ impl WgpuView {
             highlight_members,
             drag_origin,
             drag_dir,
+            drag_emphasis,
             ownership_by_anchor.as_ref(),
             sync_view.client_id(),
         );
@@ -3653,6 +3667,34 @@ fn drag_angle_for_group(count: usize) -> f32 {
     DRAG_ROTATION_DEG / denom
 }
 
+/// Time envelope (0..1) for the hold rotation emphasis, telegraphing the click
+/// window. Quick ease-out attack to full tilt by `DRAG_EMPHASIS_ATTACK_MS`, then
+/// a cosine ease back to 0 exactly at `CLICK_MAX_DURATION_MS` (the click cutoff);
+/// 0 once the cutoff passes or the gesture has moved past the click slop (it's a
+/// drag, not a click). Multiply by the full per-group angle to get the applied
+/// rotation. See [`drag_hold_active`] for the matching keep-animating predicate.
+fn drag_hold_emphasis(elapsed_ms: f32, moved: bool) -> f32 {
+    if moved || elapsed_ms < 0.0 || elapsed_ms >= CLICK_MAX_DURATION_MS {
+        return 0.0;
+    }
+    if elapsed_ms <= DRAG_EMPHASIS_ATTACK_MS {
+        // Ease-out quad: fast start, settling at the peak.
+        let t = elapsed_ms / DRAG_EMPHASIS_ATTACK_MS;
+        1.0 - (1.0 - t) * (1.0 - t)
+    } else {
+        // Cosine ease from 1 -> 0 across the rest of the click window.
+        let u = (elapsed_ms - DRAG_EMPHASIS_ATTACK_MS)
+            / (CLICK_MAX_DURATION_MS - DRAG_EMPHASIS_ATTACK_MS);
+        0.5 * (1.0 + (std::f32::consts::PI * u).cos())
+    }
+}
+
+/// Whether the hold emphasis is still changing and frames should keep being
+/// requested (the pointer may be held perfectly still, producing no events).
+fn drag_hold_active(elapsed_ms: f32, moved: bool) -> bool {
+    !moved && elapsed_ms >= 0.0 && elapsed_ms < CLICK_MAX_DURATION_MS
+}
+
 fn drag_group_center(
     positions: &[(f32, f32)],
     members: &[usize],
@@ -3732,6 +3774,7 @@ fn build_wgpu_instances(
     highlighted_members: Option<&[usize]>,
     drag_origin: Option<(f32, f32)>,
     drag_dir: f32,
+    drag_emphasis: f32,
     ownership_by_anchor: &HashMap<u32, ClientId>,
     own_client_id: Option<ClientId>,
 ) -> InstanceSet {
@@ -3782,12 +3825,15 @@ fn build_wgpu_instances(
             }
         }
     }
+    // "Held" gates the persistent scale-up and the anchor spread; the rotation
+    // magnitude is further modulated over time by `drag_emphasis` (0..1) so it can
+    // animate to zero while the piece stays held and scaled.
     let drag_active = drag_dir.abs() > f32::EPSILON && drag_mask.iter().any(|val| *val);
     let drag_count = highlighted_members
         .map(|members| members.len())
         .unwrap_or(0);
     let drag_rotation = if drag_active {
-        drag_angle_for_group(drag_count) * drag_dir.signum()
+        drag_angle_for_group(drag_count) * drag_dir.signum() * drag_emphasis
     } else {
         0.0
     };
@@ -3903,6 +3949,11 @@ fn build_wgpu_instances(
                 },
                 drag: if drag_mask.get(id).copied().unwrap_or(false) {
                     drag_rotation
+                } else {
+                    0.0
+                },
+                held: if drag_active && drag_mask.get(id).copied().unwrap_or(false) {
+                    1.0
                 } else {
                     0.0
                 },

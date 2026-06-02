@@ -143,6 +143,17 @@ pub(crate) struct AppSnapshot {
     pub(crate) last_local_rotation: Option<LocalRotationHint>,
     pub(crate) drag_right_click: bool,
     pub(crate) drag_primary_id: Option<usize>,
+    /// Press timestamp of the active drag/hold (performance.now epoch, matching
+    /// [`now_ms_f32`]), used by the renderer to animate the click-window hold
+    /// emphasis. `None` when nothing is being held.
+    pub(crate) drag_press_ms: Option<f32>,
+    /// Whether the active drag's gesture has moved beyond the click slop, i.e.
+    /// releasing would no longer register as a click.
+    pub(crate) drag_click_moved: bool,
+    /// Whether a click on the held group would actually rotate it. When false
+    /// (big/locked groups, no-op symmetry), the hold emphasis shows only its
+    /// scale part, not the rotation.
+    pub(crate) drag_rotation_eligible: bool,
     pub(crate) solved: bool,
     pub(crate) layout: WorkspaceLayout,
     pub(crate) view: ViewRect,
@@ -260,6 +271,12 @@ struct DragState {
     pivot_y: f32,
     start_angle: f32,
     pointer_id: Option<i32>,
+    /// Whether a click on this group would actually rotate it (rotation enabled,
+    /// not a big/locked group at rest, and a non-trivial symmetry step exists).
+    /// Captured at press time (membership/angle are fixed for the hold) and used
+    /// to gate the rotation part of the hold emphasis. The scale part always
+    /// applies regardless.
+    rotation_eligible: bool,
 }
 
 struct AppState {
@@ -705,6 +722,61 @@ impl AppCore {
         let pivot_x = base_pos.0 + anchor[0];
         let pivot_y = base_pos.1 + anchor[1];
         let start_angle = (y - pivot_y).atan2(x - pivot_x);
+        // Predict whether a click on this group would actually rotate it, mirroring
+        // the rotate branch in `drag_end`. Membership and angle are fixed for the
+        // whole hold, so it's safe to capture this once here. Gates the rotation
+        // part of the hold emphasis (the scale part always applies).
+        let rotation_eligible = {
+            let rotation_enabled = state.core.rules.rotation_enabled;
+            let rotation_snap_tolerance = state.core.rules.rotation_snap_tolerance_deg;
+            if !rotation_enabled || rotate_mode {
+                false
+            } else if let Some(game) = state.game.as_ref() {
+                match game.playable.logical.group_of(PieceId(piece_id as u32)) {
+                    Some(primary_group) => {
+                        let group_size = members.len();
+                        let rotation_locked = group_size == total
+                            || group_size > ROTATION_LOCK_THRESHOLD_DEFAULT;
+                        let current_angle = game
+                            .playable
+                            .pose_of(primary_group)
+                            .map(|pose| pose.rotation_degrees())
+                            .unwrap_or(0.0);
+                        if group_size > 1
+                            && rotation_locked
+                            && angle_matches(current_angle, 0.0, rotation_snap_tolerance)
+                        {
+                            false
+                        } else {
+                            let clockwise = !right_click;
+                            let delta = match game
+                                .playable
+                                .next_step_rotation(primary_group, clockwise)
+                                .map(|angle| angle.as_degrees_f32())
+                            {
+                                Some(target) => angle_delta(target, current_angle),
+                                None => {
+                                    let mut d = click_rotation_delta(
+                                        current_angle,
+                                        0.0,
+                                        0.0,
+                                        rotation_snap_tolerance,
+                                    );
+                                    if right_click {
+                                        d = -d;
+                                    }
+                                    d
+                                }
+                            };
+                            delta.abs() > DRAG_ROTATION_ELIGIBLE_MIN_DEG
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            }
+        };
         state.drag_state = Some(DragState {
             start_x: x,
             start_y: y,
@@ -722,6 +794,7 @@ impl AppCore {
             pivot_y,
             start_angle,
             pointer_id,
+            rotation_eligible,
         });
         state.dragging_members = members.clone();
         state.active_id = Some(piece_id);
@@ -1693,6 +1766,9 @@ fn build_snapshot_from_state(state: &AppState) -> AppSnapshot {
         last_local_rotation: None,
         drag_right_click: false,
         drag_primary_id: None,
+        drag_press_ms: None,
+        drag_click_moved: false,
+        drag_rotation_eligible: false,
         solved: false,
         layout: state.core.layout,
         view: state.view.view_rect(),
@@ -1755,6 +1831,20 @@ fn fill_snapshot_from_state(state: &AppState, snapshot: &mut AppSnapshot) {
         .map(|drag| drag.right_click)
         .unwrap_or(false);
     snapshot.drag_primary_id = state.drag_state.as_ref().map(|drag| drag.primary_id);
+    snapshot.drag_press_ms = state
+        .drag_state
+        .as_ref()
+        .map(|drag| drag.click_gesture.start_ms());
+    snapshot.drag_click_moved = state
+        .drag_state
+        .as_ref()
+        .map(|drag| drag.click_gesture.moved())
+        .unwrap_or(false);
+    snapshot.drag_rotation_eligible = state
+        .drag_state
+        .as_ref()
+        .map(|drag| drag.rotation_eligible)
+        .unwrap_or(false);
     snapshot.solved = state.core.solved;
     snapshot.layout = state.core.layout;
     snapshot.view = state.view.view_rect();
@@ -1997,7 +2087,7 @@ fn time_nonce(previous: u32) -> u32 {
     }
 }
 
-fn now_ms_f32() -> f32 {
+pub(crate) fn now_ms_f32() -> f32 {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window()
