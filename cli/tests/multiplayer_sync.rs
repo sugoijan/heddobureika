@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use heddobureika_core::catalog::DEFAULT_PUZZLE_SLUG;
+use heddobureika_core::catalog::PUZZLE_CATALOG;
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
@@ -212,7 +212,7 @@ fn build_init_payload() -> (PuzzleInfo, SingletonFixture) {
     let puzzle = PuzzleInfo {
         label: "Test".to_string(),
         image_ref: PuzzleImageRef::BuiltIn {
-            slug: DEFAULT_PUZZLE_SLUG.to_string(),
+            slug: PUZZLE_CATALOG[0].slug.to_string(),
         },
         topology: TopologySpec::grid(cols, rows).into(),
         shape_seed: 0,
@@ -306,7 +306,7 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
         persistence: RoomPersistence::Durable,
         puzzle: PuzzleSpec {
             image_ref: PuzzleImageRef::BuiltIn {
-                slug: DEFAULT_PUZZLE_SLUG.to_string(),
+                slug: PUZZLE_CATALOG[0].slug.to_string(),
             },
             pieces: None,
             seed: None,
@@ -469,7 +469,7 @@ async fn multiplayer_private_upload_reloads_and_serves_asset(
         persistence: RoomPersistence::Durable,
         puzzle: PuzzleSpec {
             image_ref: PuzzleImageRef::BuiltIn {
-                slug: DEFAULT_PUZZLE_SLUG.to_string(),
+                slug: PUZZLE_CATALOG[0].slug.to_string(),
             },
             pieces: None,
             seed: None,
@@ -635,7 +635,7 @@ async fn recording_caps_and_exports_rows() -> Result<(), Box<dyn std::error::Err
             persistence: RoomPersistence::Durable,
             puzzle: PuzzleSpec {
                 image_ref: PuzzleImageRef::BuiltIn {
-                    slug: DEFAULT_PUZZLE_SLUG.to_string(),
+                    slug: PUZZLE_CATALOG[0].slug.to_string(),
                 },
                 pieces: None,
                 seed: None,

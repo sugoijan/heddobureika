@@ -11,8 +11,7 @@ use heddobureika_core::codec::{decode_result, encode};
 use heddobureika_core::room_id::{RoomId, ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
     puzzle_by_slug, AdminMsg, PuzzleImageRef, PuzzleSpec, RecordedCommand, RecordedCommandKind,
-    RecordedCommandOutcome, ServerMsg, ASSET_CHUNK_BYTES, DEFAULT_PUZZLE_SLUG,
-    PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG,
+    RecordedCommandOutcome, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG,
 };
 use mime_guess::MimeGuess;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -57,7 +56,7 @@ enum RoomCommand {
         base_url: String,
         #[arg(long, env = "ROOM_ADMIN_TOKEN")]
         admin_token: String,
-        #[arg(long, default_value = DEFAULT_PUZZLE_SLUG)]
+        #[arg(long, default_value = PUZZLE_CATALOG[0].slug)]
         puzzle: String,
         #[arg(long)]
         puzzle_file: Option<PathBuf>,

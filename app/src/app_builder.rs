@@ -14,7 +14,7 @@ use crate::persisted::BootPuzzleSelection;
 use crate::persisted_store;
 use crate::sync_runtime;
 use heddobureika_core::catalog::{
-    logical_image_size, puzzle_by_slug, PuzzleCatalogEntry, DEFAULT_PUZZLE_SLUG, PUZZLE_CATALOG,
+    logical_image_size, puzzle_by_slug, PuzzleCatalogEntry, PUZZLE_CATALOG,
 };
 use heddobureika_core::{PuzzleImageRef, TopologySpec};
 use js_sys::decode_uri_component;
@@ -282,17 +282,29 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
             });
         }
     }
-    puzzle_by_slug(DEFAULT_PUZZLE_SLUG)
-        .or_else(|| PUZZLE_CATALOG.first())
-        .copied()
-        .map(|entry| BootSelection {
-            entry,
-            grid_override: None,
-            topology: None,
-            seed: None,
-            clear_hash,
-            force_new: false,
-        })
+    // First boot (no hash route, no saved snapshot, no saved selection):
+    // start on a random catalog puzzle rather than a fixed default, so a
+    // fresh visitor gets some variety. Blank test images live outside the
+    // catalog, so they're naturally excluded from this pool.
+    random_catalog_entry().map(|entry| BootSelection {
+        entry,
+        grid_override: None,
+        topology: None,
+        seed: None,
+        clear_hash,
+        force_new: false,
+    })
+}
+
+/// Picks a uniformly random entry from the catalog, or `None` if the catalog
+/// is empty. Reuses the same time-seeded nonce that mints shape seeds.
+fn random_catalog_entry() -> Option<PuzzleCatalogEntry> {
+    let len = PUZZLE_CATALOG.len();
+    if len == 0 {
+        return None;
+    }
+    let index = (random_shape_seed() as usize) % len;
+    PUZZLE_CATALOG.get(index).copied()
 }
 
 fn apply_selection(

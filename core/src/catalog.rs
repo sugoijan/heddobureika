@@ -9,10 +9,56 @@ pub struct PuzzleCatalogEntry {
 
 include!(concat!(env!("OUT_DIR"), "/puzzle_catalog.rs"));
 
+pub const BLANK_WHITE_SLUG: &str = "blank-white";
+pub const BLANK_BLACK_SLUG: &str = "blank-black";
+
+/// Synthetic, solid-color "puzzles" used to stress-test the visual effects
+/// (emboss / shadow / etc.) at the extremes. They are deliberately NOT part of
+/// [`PUZZLE_CATALOG`] — so they never appear in the catalog listing or the
+/// random first-boot pick — but can be selected explicitly and round-trip
+/// through snapshots and multiplayer like any other built-in slug. Their `src`
+/// is intentionally empty: the renderer synthesizes a flat image from the slug
+/// rather than fetching a file.
+pub const BLANK_PUZZLES: &[PuzzleCatalogEntry] = &[
+    PuzzleCatalogEntry {
+        label: "Blank (white)",
+        slug: BLANK_WHITE_SLUG,
+        src: "",
+        width: 1024,
+        height: 1024,
+    },
+    PuzzleCatalogEntry {
+        label: "Blank (black)",
+        slug: BLANK_BLACK_SLUG,
+        src: "",
+        width: 1024,
+        height: 1024,
+    },
+];
+
+/// Looks up a blank test puzzle by slug. Returns `None` for ordinary catalog
+/// slugs (use [`puzzle_by_slug`] for those).
+pub fn blank_puzzle_by_slug(slug: &str) -> Option<&'static PuzzleCatalogEntry> {
+    let trimmed = slug.trim();
+    BLANK_PUZZLES
+        .iter()
+        .find(|entry| entry.slug.eq_ignore_ascii_case(trimmed))
+}
+
+/// Whether `slug` names one of the synthetic blank test puzzles.
+pub fn is_blank_slug(slug: &str) -> bool {
+    blank_puzzle_by_slug(slug).is_some()
+}
+
+/// Resolves a built-in slug to its catalog or blank entry. Blanks are included
+/// so saved games / hash routes that pin a blank slug restore correctly; the
+/// catalog listing and random pick still iterate [`PUZZLE_CATALOG`] directly,
+/// so blanks stay out of those.
 pub fn puzzle_by_slug(slug: &str) -> Option<&'static PuzzleCatalogEntry> {
     let trimmed = slug.trim();
     PUZZLE_CATALOG
         .iter()
+        .chain(BLANK_PUZZLES.iter())
         .find(|entry| entry.slug.eq_ignore_ascii_case(trimmed))
 }
 

@@ -27,7 +27,9 @@ use crate::persisted_store;
 use crate::runtime::{SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
-use heddobureika_core::catalog::{PuzzleCatalogEntry, PUZZLE_CATALOG};
+use heddobureika_core::catalog::{
+    blank_puzzle_by_slug, PuzzleCatalogEntry, BLANK_PUZZLES, PUZZLE_CATALOG,
+};
 use heddobureika_core::{
     available_topologies, is_valid_room_id, logical_image_size, topology_kind_for_tag, AdminMsg,
     ClientId, PieceCountChoice, PlayableGameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec,
@@ -382,6 +384,21 @@ impl AdminSocket {
             hook(status, message);
         }
     }
+}
+
+/// Whether a keyboard event originated from an editable field, so global
+/// shortcuts can bow out while the user is typing.
+fn event_target_is_editable(event: &KeyboardEvent) -> bool {
+    event
+        .target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        .map(|element| {
+            let tag = element.tag_name();
+            tag.eq_ignore_ascii_case("input")
+                || tag.eq_ignore_ascii_case("textarea")
+                || tag.eq_ignore_ascii_case("select")
+        })
+        .unwrap_or(false)
 }
 
 fn puzzle_art_index_by_slug(slug: &str) -> Option<usize> {
@@ -951,6 +968,18 @@ fn app(props: &AppProps) -> Html {
     // with the live puzzle (a private image selects "Custom").
     let puzzle_art_custom = use_state(|| false);
     let puzzle_art_custom_value = *puzzle_art_custom;
+    // Which blank test puzzle (if any) is selected. Blanks live outside the
+    // catalog, so they can't be addressed by index; we track the slug instead.
+    let initial_blank_slug = app_core
+        .snapshot()
+        .puzzle_info
+        .as_ref()
+        .and_then(|info| match &info.image_ref {
+            PuzzleImageRef::BuiltIn { slug } => blank_puzzle_by_slug(slug).map(|entry| entry.slug),
+            _ => None,
+        });
+    let puzzle_art_blank = use_state(|| initial_blank_slug);
+    let puzzle_art_blank_value = *puzzle_art_blank;
     let puzzle_art = PUZZLE_ARTS
         .get(puzzle_art_index_value)
         .copied()
@@ -962,12 +991,21 @@ fn app(props: &AppProps) -> Html {
             html! {
                 <option
                     value={index.to_string()}
-                    selected={!puzzle_art_custom_value && index == puzzle_art_index_value}
+                    selected={puzzle_art_blank_value.is_none()
+                        && !puzzle_art_custom_value
+                        && index == puzzle_art_index_value}
                 >
                     {art.label}
                 </option>
             }
         })
+        .chain(BLANK_PUZZLES.iter().map(|art| {
+            html! {
+                <option value={art.slug} selected={puzzle_art_blank_value == Some(art.slug)}>
+                    {art.label}
+                </option>
+            }
+        }))
         .chain(std::iter::once(html! {
             <option value="custom" selected={puzzle_art_custom_value}>
                 { "Custom\u{2026}" }
@@ -1814,6 +1852,7 @@ fn app(props: &AppProps) -> Html {
         let puzzle_info = puzzle_info_store.clone();
         let puzzle_art_index = puzzle_art_index.clone();
         let puzzle_art_custom = puzzle_art_custom.clone();
+        let puzzle_art_blank = puzzle_art_blank.clone();
         let grid_index = grid_index.clone();
         let grid_custom_count = grid_custom_count.clone();
         let local_topology = local_topology.clone();
@@ -1912,16 +1951,33 @@ fn app(props: &AppProps) -> Html {
                     // controls stay visible.
                     match &info.image_ref {
                         PuzzleImageRef::BuiltIn { slug } => {
-                            if *puzzle_art_custom {
-                                puzzle_art_custom.set(false);
-                            }
-                            if let Some(index) = puzzle_art_index_by_slug(slug) {
-                                if *puzzle_art_index != index {
-                                    puzzle_art_index.set(index);
+                            if let Some(entry) = blank_puzzle_by_slug(slug) {
+                                // A blank test puzzle: select its slug option and
+                                // leave both custom and catalog-index modes.
+                                if *puzzle_art_custom {
+                                    puzzle_art_custom.set(false);
+                                }
+                                if *puzzle_art_blank != Some(entry.slug) {
+                                    puzzle_art_blank.set(Some(entry.slug));
+                                }
+                            } else {
+                                if puzzle_art_blank.is_some() {
+                                    puzzle_art_blank.set(None);
+                                }
+                                if *puzzle_art_custom {
+                                    puzzle_art_custom.set(false);
+                                }
+                                if let Some(index) = puzzle_art_index_by_slug(slug) {
+                                    if *puzzle_art_index != index {
+                                        puzzle_art_index.set(index);
+                                    }
                                 }
                             }
                         }
                         PuzzleImageRef::Private { .. } => {
+                            if puzzle_art_blank.is_some() {
+                                puzzle_art_blank.set(None);
+                            }
                             if !*puzzle_art_custom {
                                 puzzle_art_custom.set(true);
                             }
@@ -2543,6 +2599,7 @@ fn app(props: &AppProps) -> Html {
     let on_puzzle_art_change = {
         let puzzle_art_index = puzzle_art_index.clone();
         let puzzle_art_custom = puzzle_art_custom.clone();
+        let puzzle_art_blank = puzzle_art_blank.clone();
         let puzzle_art_len = PUZZLE_ARTS.len();
         let lock_puzzle_controls = lock_puzzle_controls;
         let apply_puzzle_change = apply_puzzle_change.clone();
@@ -2558,12 +2615,32 @@ fn app(props: &AppProps) -> Html {
             if raw == "custom" {
                 // Reveal the private-image upload controls. The puzzle only
                 // changes once a file is actually uploaded.
+                puzzle_art_blank.set(None);
                 puzzle_art_custom.set(true);
+                return;
+            }
+            // Blank test puzzles are addressed by slug, not catalog index.
+            if let Some(entry) = blank_puzzle_by_slug(&raw) {
+                puzzle_art_custom.set(false);
+                puzzle_art_blank.set(Some(entry.slug));
+                clear_saved_game();
+                let grid_override = if descriptor.tag == "grid" {
+                    Some(grid)
+                } else {
+                    None
+                };
+                apply_puzzle_change.emit(PuzzleChangeRequest {
+                    entry: *entry,
+                    grid_override,
+                    descriptor: descriptor.clone(),
+                    shape_seed: regenerate_seed_value,
+                });
                 return;
             }
             if let Ok(value) = raw.parse::<usize>() {
                 if value < puzzle_art_len {
                     puzzle_art_custom.set(false);
+                    puzzle_art_blank.set(None);
                     puzzle_art_index.set(value);
                     clear_saved_game();
                     let entry = PUZZLE_ARTS.get(value).copied().unwrap_or(PUZZLE_ARTS[0]);
@@ -3383,6 +3460,7 @@ fn app(props: &AppProps) -> Html {
 
     {
         let show_controls = show_controls.clone();
+        let app_core = app_core.clone();
         use_effect_with(show_controls_value, move |show_controls_value| {
             let current = *show_controls_value;
             let window = web_sys::window().expect("window available");
@@ -3399,6 +3477,11 @@ fn app(props: &AppProps) -> Html {
                         if event.repeat() {
                             return;
                         }
+                        // Don't hijack keystrokes while the user is typing in a
+                        // field (piece-count input, room id, etc.).
+                        if event_target_is_editable(event) {
+                            return;
+                        }
                         let key = event.key();
                         let code = event.code();
                         let toggle = matches!(key.as_str(), "?" | "d" | "D")
@@ -3412,6 +3495,33 @@ fn app(props: &AppProps) -> Html {
                                 code
                             );
                             show_controls.set(next);
+                            event.prevent_default();
+                            return;
+                        }
+                        // View shortcuts mirror the dev panel's Rules tab
+                        // buttons: 1 zoom in, 2 zoom out, 3 fit workspace,
+                        // 4 fit frame. Match the digit by `code` so the row
+                        // keys work regardless of Shift/keyboard layout.
+                        let handled = match code.as_str() {
+                            "Digit1" | "Numpad1" => {
+                                app_core.zoom_view_by(1.1);
+                                true
+                            }
+                            "Digit2" | "Numpad2" => {
+                                app_core.zoom_view_by(1.0 / 1.1);
+                                true
+                            }
+                            "Digit3" | "Numpad3" => {
+                                app_core.reset_view_to_fit();
+                                true
+                            }
+                            "Digit4" | "Numpad4" => {
+                                app_core.fit_view_to_frame();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
                             event.prevent_default();
                         }
                     }

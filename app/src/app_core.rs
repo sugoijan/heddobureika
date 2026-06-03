@@ -1381,6 +1381,17 @@ impl AppCore {
         self.notify();
     }
 
+    /// Zooms by `factor` around the current view center. Convenience wrapper
+    /// over [`zoom_view_at`] for callers (keyboard shortcuts, the dev panel)
+    /// that just want to zoom toward the middle of the viewport.
+    pub(crate) fn zoom_view_by(&self, factor: f32) {
+        let (center_x, center_y) = {
+            let state = self.state.borrow();
+            (state.view.center_x, state.view.center_y)
+        };
+        self.zoom_view_at(factor, center_x, center_y);
+    }
+
     pub(crate) fn reset_view_to_fit(&self) {
         let mut state = self.state.borrow_mut();
         let layout = state.core.layout;

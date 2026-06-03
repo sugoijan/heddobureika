@@ -778,26 +778,118 @@ impl WgpuRenderer {
         canvas.set_width(canvas_width);
         canvas.set_height(canvas_height);
 
-        let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        })
-        .await;
-        let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-            .map_err(|err| {
-                wasm_bindgen::JsValue::from_str(&format!("create_surface failed: {err:?}"))
-            })?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+        // Acquire a surface + adapter, preferring WebGPU and falling back to
+        // WebGL2.
+        //
+        // The two backends live in *separate* instances on purpose:
+        // `wgpu::Instance::new` returns a WebGPU-only instance whenever
+        // `navigator.gpu` exists, so a single instance can never host both
+        // backends on the web.
+        //
+        // We also avoid `wgpu::util::new_instance_with_webgpu_detection`, whose
+        // support probe issues a bare `navigator.gpu.requestAdapter()` (no power
+        // preference, no surface). That bare probe returns null on some dual-/
+        // hybrid-GPU browsers even though WebGPU works fine when an adapter is
+        // requested with proper options; when it fails, wgpu silently drops the
+        // WebGPU backend. We instead try WebGPU ourselves and only fall back to
+        // WebGL if it genuinely can't produce an adapter.
+        //
+        // Dual-/hybrid-GPU machines also frequently fail to return an adapter for
+        // `HighPerformance` + `compatible_surface` (the canvas is composited by
+        // the integrated GPU, so the discrete adapter can't present to it), so the
+        // helper tries progressively more permissive options rather than bailing
+        // on the first failure.
+        async fn request_adapter_with_fallback(
+            instance: &wgpu::Instance,
+            surface: &wgpu::Surface<'_>,
+        ) -> Result<wgpu::Adapter, String> {
+            let attempts = [
+                (wgpu::PowerPreference::HighPerformance, false),
+                (wgpu::PowerPreference::LowPower, false),
+                (wgpu::PowerPreference::None, false),
+                (wgpu::PowerPreference::None, true),
+            ];
+            let mut last_err = None;
+            for (power_preference, force_fallback_adapter) in attempts {
+                match instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference,
+                        compatible_surface: Some(surface),
+                        force_fallback_adapter,
+                    })
+                    .await
+                {
+                    Ok(adapter) => return Ok(adapter),
+                    Err(err) => last_err = Some(format!("{err:?}")),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| "no adapter".to_string()))
+        }
+
+        let has_webgpu = web_sys::window()
+            .and_then(|window| {
+                js_sys::Reflect::get(&window.navigator(), &wasm_bindgen::JsValue::from_str("gpu"))
+                    .ok()
             })
-            .await
-            .map_err(|err| {
-                wasm_bindgen::JsValue::from_str(&format!("request_adapter failed: {err:?}"))
-            })?;
+            .is_some_and(|gpu| !gpu.is_undefined() && !gpu.is_null());
+
+        // Try WebGPU first.
+        let mut acquired: Option<(wgpu::Surface<'static>, wgpu::Adapter)> = None;
+        if has_webgpu {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            match instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())) {
+                Ok(surface) => match request_adapter_with_fallback(&instance, &surface).await {
+                    Ok(adapter) => acquired = Some((surface, adapter)),
+                    Err(detail) => {
+                        console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                            "WebGPU adapter unavailable, falling back to WebGL: {detail}"
+                        )));
+                    }
+                },
+                Err(err) => {
+                    console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                        "WebGPU surface unavailable, falling back to WebGL: {err:?}"
+                    )));
+                }
+            }
+        }
+
+        // Fall back to WebGL2. The GLES backend can render to a canvas, but the
+        // safe `SurfaceTarget::Canvas` path passes no display handle, which
+        // wgpu-core rejects with `MissingDisplayHandle` before reaching the
+        // backend. The GLES web backend ignores the display handle anyway, so we
+        // supply a dummy `RawDisplayHandle::Web` via the unsafe raw-handle path.
+        let (surface, adapter) = match acquired {
+            Some(pair) => pair,
+            None => {
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::GL,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                });
+                let surface = unsafe {
+                    let value: &wasm_bindgen::JsValue = canvas.as_ref();
+                    let obj = core::ptr::NonNull::from(value).cast();
+                    instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: Some(wgpu::rwh::RawDisplayHandle::Web(
+                            wgpu::rwh::WebDisplayHandle::new(),
+                        )),
+                        raw_window_handle: wgpu::rwh::WebCanvasWindowHandle::new(obj).into(),
+                    })
+                }
+                .map_err(|err| {
+                    wasm_bindgen::JsValue::from_str(&format!("create_surface failed: {err:?}"))
+                })?;
+                let adapter = request_adapter_with_fallback(&instance, &surface)
+                    .await
+                    .map_err(|detail| {
+                        wasm_bindgen::JsValue::from_str(&format!("request_adapter failed: {detail}"))
+                    })?;
+                (surface, adapter)
+            }
+        };
         let backend = adapter.get_info().backend;
         let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
         let (device, queue) = adapter

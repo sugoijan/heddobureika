@@ -8,8 +8,6 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct CatalogFile {
-    default_slug: Option<String>,
-    default_src: Option<String>,
     puzzles: Vec<PuzzleEntry>,
 }
 
@@ -59,50 +57,7 @@ fn main() {
 
     validate_entries(&catalog.puzzles, &catalog_path);
 
-    let default_slug = catalog
-        .default_slug
-        .as_deref()
-        .unwrap_or(catalog.puzzles[0].slug.as_str());
-    let default_entry = catalog
-        .puzzles
-        .iter()
-        .find(|entry| entry.slug == default_slug)
-        .unwrap_or_else(|| {
-            panic!(
-                "default_slug '{}' not found in {}",
-                default_slug,
-                catalog_path.display()
-            )
-        });
-
-    let default_src = catalog
-        .default_src
-        .as_deref()
-        .unwrap_or(default_entry.src.as_str());
-    if default_src != default_entry.src {
-        panic!(
-            "default_src '{}' does not match src '{}' for default_slug '{}' in {}",
-            default_src,
-            default_entry.src,
-            default_slug,
-            catalog_path.display()
-        );
-    }
-
     let mut output = String::new();
-    writeln!(
-        &mut output,
-        "pub const DEFAULT_PUZZLE_SLUG: &str = {};",
-        rust_string(default_slug)
-    )
-    .unwrap();
-    writeln!(
-        &mut output,
-        "pub const DEFAULT_PUZZLE_SRC: &str = {};",
-        rust_string(default_src)
-    )
-    .unwrap();
-    writeln!(&mut output).unwrap();
     writeln!(
         &mut output,
         "pub const PUZZLE_CATALOG: &[PuzzleCatalogEntry] = &["
@@ -112,15 +67,10 @@ fn main() {
     for entry in &catalog.puzzles {
         let (width, height, src_path) = image_dimensions(entry, workspace_root);
         println!("cargo:rerun-if-changed={}", src_path.display());
-        let src_value = if entry.slug == default_slug {
-            "DEFAULT_PUZZLE_SRC".to_string()
-        } else {
-            rust_string(&entry.src)
-        };
         writeln!(&mut output, "    PuzzleCatalogEntry {{").unwrap();
         writeln!(&mut output, "        label: {},", rust_string(&entry.label)).unwrap();
         writeln!(&mut output, "        slug: {},", rust_string(&entry.slug)).unwrap();
-        writeln!(&mut output, "        src: {},", src_value).unwrap();
+        writeln!(&mut output, "        src: {},", rust_string(&entry.src)).unwrap();
         writeln!(&mut output, "        width: {},", width).unwrap();
         writeln!(&mut output, "        height: {},", height).unwrap();
         writeln!(&mut output, "    }},").unwrap();

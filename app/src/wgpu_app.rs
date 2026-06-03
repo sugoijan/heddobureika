@@ -3559,10 +3559,16 @@ impl WgpuView {
                     *view.renderer.borrow_mut() = Some(renderer);
                 }
                 Err(err) => {
-                    let (message, hint) = match err.as_string().as_deref() {
+                    let err_text = err.as_string();
+                    let (message, hint) = match err_text.as_deref() {
                         Some("image_read_failed") | Some("image_draw_failed") => (
                             "Failed to read the puzzle image.",
                             "Check the URL or CORS headers.",
+                        ),
+                        Some(text) if text.starts_with("request_adapter failed") => (
+                            "Failed to initialize the renderer.",
+                            "No compatible GPU was found. Check that hardware \
+                             acceleration is enabled, or try a different browser.",
                         ),
                         _ => (
                             "Failed to initialize the renderer.",

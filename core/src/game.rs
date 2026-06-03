@@ -794,16 +794,16 @@ pub fn scramble_flips(seed: u32, total: usize, chance: f32) -> Vec<bool> {
 }
 
 /// Computes any safety-bound corrections that need to be applied to groups
-/// resulting from a just-applied detach. For each affected group:
-///   * singletons must keep their anchor within the loose single-piece bound,
-///   * multi-piece groups must keep their anchor within the tight one-piece
-///     inset of that bound.
+/// resulting from a just-applied detach. A group is considered safe — and so
+/// reported with no correction — as long as at least one of its pieces' centers
+/// sits inside the loose workspace box, which is exactly the predicate
+/// `drag_move` enforces while dragging. A group that ends up entirely outside
+/// that box is translated by the smallest delta that brings its nearest piece
+/// back to the edge of the box, leaving it at the same limit a drag would stop
+/// at (rather than yanking the whole group deep inside the workspace).
 ///
-/// A group whose anchor is already inside its applicable bound is reported as
-/// no correction (omitted from the result). Otherwise the anchor center is
-/// clamped to the nearest in-bounds position and returned as `(group_id,
-/// new_anchor_pos)`. The helper is pure — it does not mutate `playable`. The
-/// caller applies each correction via
+/// Each reported correction is `(group_id, new_anchor_pos)`. The helper is pure
+/// — it does not mutate `playable`. The caller applies each correction via
 /// `apply_action_only(PlayableAction::TranslateGroup { group, drop_pos })`.
 ///
 /// `affected_pieces` should contain every piece that belonged to the original
@@ -821,7 +821,7 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
     }
     // `placement` is the shared pose→pixel mapping (`pixel = origin + pose *
     // pose_unit`) used by the renderer AND the worker, so the clamp matches
-    // exactly on both sides. For the inset we assume a typical piece spans one
+    // exactly on both sides. For the box we assume a typical piece spans one
     // pose unit per axis — exact for grid, a safe over-approximation otherwise.
     let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
     let [origin_x, origin_y] = placement.origin_px;
@@ -853,20 +853,6 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
     if center_max_y < center_min_y {
         center_max_y = center_min_y;
     }
-    let mut tight_min_x = center_min_x + piece_width;
-    let mut tight_max_x = center_max_x - piece_width;
-    let mut tight_min_y = center_min_y + piece_height;
-    let mut tight_max_y = center_max_y - piece_height;
-    if tight_max_x < tight_min_x {
-        let mid = (center_min_x + center_max_x) * 0.5;
-        tight_min_x = mid;
-        tight_max_x = mid;
-    }
-    if tight_max_y < tight_min_y {
-        let mid = (center_min_y + center_max_y) * 0.5;
-        tight_min_y = mid;
-        tight_max_y = mid;
-    }
 
     let mut corrections = Vec::new();
     let mut seen_groups: Vec<GroupId> = Vec::new();
@@ -883,23 +869,42 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
             continue;
         };
 
-        let is_singleton = playable.logical.members_of(group).nth(1).is_none();
-        let (min_x, max_x, min_y, max_y) = if is_singleton {
-            (center_min_x, center_max_x, center_min_y, center_max_y)
-        } else {
-            (tight_min_x, tight_max_x, tight_min_y, tight_max_y)
-        };
-
-        let cx = origin_x + pose.x_mm() * pose_unit_x;
-        let cy = origin_y + pose.y_mm() * pose_unit_y;
-        let new_cx = cx.clamp(min_x, max_x);
-        let new_cy = cy.clamp(min_y, max_y);
-        if (new_cx - cx).abs() < 1.0e-3 && (new_cy - cy).abs() < 1.0e-3 {
+        // A group is safe as long as ANY one of its pieces' centers lands in
+        // the loose box (the same per-piece predicate `drag_move` uses). Walk
+        // every member; if one is already inside, leave the group alone.
+        // Otherwise record the smallest pixel translation that pulls the
+        // nearest member back to the box edge — this is the minimal nudge that
+        // keeps the group draggable instead of burying it deep inside.
+        let mut in_bounds = false;
+        let mut best: Option<(f32, f32, f32)> = None; // (dist², dx_px, dy_px)
+        for member in playable.logical.members_of(group) {
+            let Some(member_pose) = playable.piece_world_pose(member) else {
+                continue;
+            };
+            let cx = origin_x + member_pose.x_mm() * pose_unit_x;
+            let cy = origin_y + member_pose.y_mm() * pose_unit_y;
+            let dx = cx.clamp(center_min_x, center_max_x) - cx;
+            let dy = cy.clamp(center_min_y, center_max_y) - cy;
+            if dx.abs() < 1.0e-3 && dy.abs() < 1.0e-3 {
+                in_bounds = true;
+                break;
+            }
+            let dist = dx * dx + dy * dy;
+            if best.map_or(true, |(best_dist, _, _)| dist < best_dist) {
+                best = Some((dist, dx, dy));
+            }
+        }
+        if in_bounds {
             continue;
         }
+        let Some((_, dx, dy)) = best else {
+            continue;
+        };
 
-        let new_x_mm = (new_cx - origin_x) / pose_unit_x;
-        let new_y_mm = (new_cy - origin_y) / pose_unit_y;
+        // The translation is the same for every member, so apply it to the
+        // group anchor pose and convert the pixel delta back to pose units.
+        let new_x_mm = pose.x_mm() + dx / pose_unit_x;
+        let new_y_mm = pose.y_mm() + dy / pose_unit_y;
         let Some(new_pos) = Position2::try_from_mm(new_x_mm, new_y_mm) else {
             continue;
         };
@@ -978,14 +983,16 @@ mod safety_tests {
     }
 
     #[test]
-    fn detach_endpiece_force_moves_remaining_multi_piece_group_to_tight_bound() {
+    fn detach_endpiece_nudges_out_of_bounds_group_to_the_drag_limit() {
         // 3x1 puzzle: workspace center bounds are roughly x in [10..290],
-        // y in [10..90]. Tight (multi-piece) bound for x is [110..190]; for
-        // y the inset collapses to the midpoint 50 (because the workspace is
-        // narrower than 3 piece-heights). Place the anchor at center (50,
-        // 50) — well outside the tight x bound. Detach the END piece (id 2)
-        // so the remaining group {0, 1} is still multi-piece.
-        let anchor_pose = Pose2::try_from_mm_degrees(0.5, 0.5, 0.0).expect("finite pose");
+        // y in [10..90]. Place the anchor (piece 0) at x = -1.0 so the three
+        // piece centers sit at -100, 0, 100 px. Detach the END piece (id 2)
+        // at 100 px — it stays a singleton inside the loose bound, so no
+        // correction. The remaining {0, 1} group has both centers (-100, 0)
+        // outside the loose x bound, so it must be nudged: the NEAREST member
+        // (piece 1 at 0 px) only needs +10 px to reach the left edge (10 px),
+        // not the full pull to bury the group inside.
+        let anchor_pose = Pose2::try_from_mm_degrees(-1.0, 0.5, 0.0).expect("finite pose");
         let mut playable = solved_3x1_at(anchor_pose);
 
         // Capture original members BEFORE the detach.
@@ -1020,8 +1027,8 @@ mod safety_tests {
                 }),
         );
 
-        // The remaining {0, 1} group should be force-moved. The singleton {2}
-        // sits at (250, 50) in pixel-center coords — inside the loose bound
+        // The remaining {0, 1} group should be nudged. The singleton {2}
+        // sits at (100, 50) in pixel-center coords — inside the loose bound
         // x in [10..290] — so no correction is reported for it.
         assert_eq!(
             corrections.len(),
@@ -1034,17 +1041,17 @@ mod safety_tests {
             Some(PieceId(0)),
             "correction should target the remaining group whose anchor is piece 0"
         );
-        // New anchor center x should be clamped to the tight-min x (110) —
-        // i.e. 110 / piece_width = 110/100 = 1.1.
+        // Minimal nudge: piece 1 (center 0 px) reaches the left edge (10 px)
+        // with +10 px == +0.1 pose units, so the anchor moves -1.0 -> -0.9.
         assert!(
-            (new_pos.x_mm() - 1.1).abs() < 1.0e-3,
-            "anchor x should clamp to tight_min_x: got {}",
+            (new_pos.x_mm() - (-0.9)).abs() < 1.0e-3,
+            "anchor x should nudge to the drag limit: got {}",
             new_pos.x_mm()
         );
-        // y stays at the tight midpoint (50px -> 0.5mm).
+        // y is already in bounds (50 px), so it stays put (0.5 mm).
         assert!(
             (new_pos.y_mm() - 0.5).abs() < 1.0e-3,
-            "anchor y should sit at tight midpoint: got {}",
+            "anchor y should be unchanged: got {}",
             new_pos.y_mm()
         );
     }
