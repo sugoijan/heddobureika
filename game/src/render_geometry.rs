@@ -81,6 +81,12 @@ pub struct PieceRenderGeometry {
     /// their endpoints). Lets callers point-test against the real piece
     /// shape rather than only its bounding box.
     pub outline_px: Box<[[f32; 2]]>,
+    /// Densely flattened closed outline polyline (cubic segments sampled
+    /// into short chords), in the same bounds-relative pixel frame as
+    /// `outline_px`/`pose_anchor_px`. Used to extrude the cardboard
+    /// thickness rim during the flip animation, where the coarse
+    /// `outline_px` would show facets along the tab/blank curves.
+    pub outline_dense_px: Box<[[f32; 2]]>,
     pub image_origin_px: [f32; 2],
     pub outline_svg: String,
     pub edge_svgs: Vec<String>,
@@ -271,6 +277,46 @@ fn path_on_curve_points(path: &PathMm) -> Box<[[f32; 2]]> {
     points.into_boxed_slice()
 }
 
+/// Densely flattened points of a path: line segments contribute their
+/// endpoint, cubic segments are sampled into `CUBIC_STEPS` short chords.
+/// In the path's own coordinate frame, matching `path_on_curve_points`.
+/// Used to extrude the flip thickness rim along the true (smooth) outline.
+fn path_dense_points(path: &PathMm) -> Box<[[f32; 2]]> {
+    const CUBIC_STEPS: usize = 12;
+    let mut points: Vec<[f32; 2]> = Vec::with_capacity(path.segs.len() * CUBIC_STEPS + 1);
+    let mut current = path.start;
+    points.push([current.x_mm(), current.y_mm()]);
+    for seg in path.segs.iter() {
+        match seg {
+            PathSegMm::LineTo { to } => {
+                points.push([to.x_mm(), to.y_mm()]);
+                current = *to;
+            }
+            PathSegMm::CubicTo { c1, c2, to } => {
+                for step in 1..=CUBIC_STEPS {
+                    let t = step as f32 / CUBIC_STEPS as f32;
+                    points.push(cubic_point(current, *c1, *c2, *to, t));
+                }
+                current = *to;
+            }
+        }
+    }
+    points.into_boxed_slice()
+}
+
+/// De Casteljau evaluation of a cubic Bézier at parameter `t`.
+fn cubic_point(p0: PointMm, c1: PointMm, c2: PointMm, p1: PointMm, t: f32) -> [f32; 2] {
+    let mt = 1.0 - t;
+    let a = mt * mt * mt;
+    let b = 3.0 * mt * mt * t;
+    let c = 3.0 * mt * t * t;
+    let d = t * t * t;
+    [
+        a * p0.x_mm() + b * c1.x_mm() + c * c2.x_mm() + d * p1.x_mm(),
+        a * p0.y_mm() + b * c1.y_mm() + c * c2.y_mm() + d * p1.y_mm(),
+    ]
+}
+
 /// Standard even-odd ray-cast point-in-polygon test.
 fn point_in_polygon(point: (f32, f32), polygon: &[[f32; 2]]) -> bool {
     if polygon.len() < 3 {
@@ -388,6 +434,7 @@ where
             bounds_px: bounds,
             pose_anchor_px: [anchor_x - bounds.x, anchor_y - bounds.y],
             outline_px: path_on_curve_points(&local_outline),
+            outline_dense_px: path_dense_points(&local_outline),
             image_origin_px: [bounds.x, bounds.y],
             outline_svg: path_to_svg_d(&local_outline),
             edge_svgs,

@@ -32,17 +32,15 @@ use crate::rotation_anim::{
     apply_group_transform, rotate_group_succession, GroupAnim, SpringParams,
 };
 use crate::renderer::{
-    build_mask_atlas, Instance, InstanceBatch, InstanceSet, MaskAtlasData, UiRotationOrigin,
-    UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
+    build_mask_atlas, EdgeVertex, FlipEdgeSpan, FlipEdges, Instance, InstanceBatch, InstanceSet,
+    MaskAtlasData, UiRotationOrigin, UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec,
+    WgpuRenderer,
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::{ClientId, PuzzleImageRef, PuzzleInfo};
 
-/// Piece thickness for the pseudo-3D flip extrusion (millimetres). Fixed, not
-/// dev-panel configurable.
-const FLIP_THICKNESS_MM: f32 = 2.0;
 /// Real-world size one pose unit represents (≈ a piece pitch). The puzzle's
 /// internal "mm" pose units are actually nominal (~1 unit per piece, see
 /// `topology::piece_extent_mm`), so to turn a physical millimetre count into
@@ -3380,15 +3378,17 @@ impl WgpuView {
         if animating_flip {
             self.request_render();
         }
-        let flip_active = flip_progress
-            .iter()
-            .any(|&p| p > FLIP_ACTIVE_EPS && p < 1.0 - FLIP_ACTIVE_EPS);
         // In pose-unit (pre-`puzzle_scale`) pixels, like the instance positions;
         // the shader applies `puzzle_scale` afterward. `pose_unit_px / POSE_UNIT_MM`
-        // is px-per-mm, so this is the physical 2mm thickness on screen.
+        // is px-per-mm, so this is the configured physical thickness on screen.
+        let flip_thickness_mm = self
+            .wgpu_settings
+            .borrow()
+            .flip_thickness_mm
+            .clamp(WGPU_FLIP_THICKNESS_MM_MIN, WGPU_FLIP_THICKNESS_MM_MAX);
         let flip_thickness_px =
-            FLIP_THICKNESS_MM * snapshot.pose_unit_px[0].max(0.0) / POSE_UNIT_MM;
-        let instances = build_wgpu_instances(
+            flip_thickness_mm * snapshot.pose_unit_px[0].max(0.0) / POSE_UNIT_MM;
+        let mut instances = build_wgpu_instances(
             &positions,
             &rotations,
             &flip_progress,
@@ -3428,7 +3428,7 @@ impl WgpuView {
             renderer.set_show_debug(snapshot.app_settings.show_debug);
             renderer.set_solved(snapshot.solved);
             renderer.set_flip_thickness_px(flip_thickness_px);
-            renderer.set_flip_active(flip_active);
+            renderer.set_flip_edges(std::mem::take(&mut instances.flip_edges));
             renderer.set_shadow(
                 settings.shadow,
                 settings
@@ -3790,6 +3790,7 @@ fn build_wgpu_instances(
             instances: Vec::new(),
             batches: Vec::new(),
             groups: Vec::new(),
+            flip_edges: FlipEdges::default(),
         };
     }
     let fallback_order = if z_order.len() == total {
@@ -3906,6 +3907,9 @@ fn build_wgpu_instances(
     let mut instances = Vec::with_capacity(order.len());
     let mut batches: Vec<InstanceBatch> = Vec::new();
     let mut groups: Vec<InstanceBatch> = Vec::new();
+    // Thickness rims for any pieces mid-flip, indexed by their instance position.
+    let mut flip_edge_verts: Vec<EdgeVertex> = Vec::new();
+    let mut flip_edge_spans: Vec<FlipEdgeSpan> = Vec::new();
     for gid in group_order {
         let members = &group_members[gid];
         if members.is_empty() {
@@ -3967,6 +3971,19 @@ fn build_wgpu_instances(
                 mask_origin,
                 pose_anchor: piece.pose_anchor_px,
             });
+            // While mid-flip, extrude this piece's outline for the thickness rim.
+            if flip > FLIP_ACTIVE_EPS && flip < 1.0 - FLIP_ACTIVE_EPS {
+                let v_start = flip_edge_verts.len() as u32;
+                push_flip_edge_verts(&piece.outline_dense_px, &mut flip_edge_verts);
+                let v_count = flip_edge_verts.len() as u32 - v_start;
+                if v_count > 0 {
+                    flip_edge_spans.push(FlipEdgeSpan {
+                        v_start,
+                        v_count,
+                        instance_index: instances.len() as u32 - 1,
+                    });
+                }
+            }
         }
         let count = (instances.len() as u32) - start;
         if count == 0 {
@@ -3997,6 +4014,35 @@ fn build_wgpu_instances(
         instances,
         batches,
         groups,
+        flip_edges: FlipEdges {
+            verts: flip_edge_verts,
+            spans: flip_edge_spans,
+        },
+    }
+}
+
+/// Extrudes a closed outline polyline (piece-local px) into thickness-rim
+/// geometry: for each segment, two triangles spanning the slab depth from
+/// `z_sign = -1` (back face) to `+1` (front face). The vertex shader projects
+/// these with the flip rotation. Appends 6 verts per segment to `out`.
+fn push_flip_edge_verts(outline: &[[f32; 2]], out: &mut Vec<EdgeVertex>) {
+    let n = outline.len();
+    if n < 2 {
+        return;
+    }
+    for i in 0..n {
+        let a = outline[i];
+        let b = outline[(i + 1) % n];
+        let a_back = EdgeVertex { pos: a, z_sign: -1.0 };
+        let a_front = EdgeVertex { pos: a, z_sign: 1.0 };
+        let b_back = EdgeVertex { pos: b, z_sign: -1.0 };
+        let b_front = EdgeVertex { pos: b, z_sign: 1.0 };
+        out.push(a_back);
+        out.push(a_front);
+        out.push(b_back);
+        out.push(b_back);
+        out.push(a_front);
+        out.push(b_front);
     }
 }
 

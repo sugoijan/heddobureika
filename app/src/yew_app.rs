@@ -1259,6 +1259,7 @@ fn app(props: &AppProps) -> Html {
     let wgpu_shadow_distance = wgpu_settings_value.shadow_distance;
     let wgpu_shadow_radius = wgpu_settings_value.shadow_radius;
     let wgpu_shadow_darkness = wgpu_settings_value.shadow_darkness;
+    let wgpu_flip_thickness_mm = wgpu_settings_value.flip_thickness_mm;
     let rotation_noise = use_state(|| ROTATION_NOISE_DEFAULT);
     let rotation_noise_value = *rotation_noise;
     let rotation_snap_tolerance = use_state(|| ROTATION_SNAP_TOLERANCE_DEFAULT_DEG);
@@ -3258,6 +3259,19 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
+    let on_wgpu_flip_thickness = {
+        let render_settings = render_settings.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Ok(value) = input.value().parse::<f32>() {
+                let value =
+                    value.clamp(WGPU_FLIP_THICKNESS_MM_MIN, WGPU_FLIP_THICKNESS_MM_MAX);
+                let mut next = (*render_settings).clone();
+                next.wgpu.flip_thickness_mm = value;
+                render_settings.set(next);
+            }
+        })
+    };
     let on_wgpu_shadow_toggle = {
         let render_settings = render_settings.clone();
         Callback::from(move |event: Event| {
@@ -4326,6 +4340,21 @@ fn app(props: &AppProps) -> Html {
                         } else {
                             html! {}
                         } }
+                        <div class="control">
+                            <label for="wgpu-flip-thickness">
+                                { "Piece thickness (mm)" }
+                                <span class="control-value">{ fmt_f32(wgpu_flip_thickness_mm) }</span>
+                            </label>
+                            <input
+                                id="wgpu-flip-thickness"
+                                type="range"
+                                min={WGPU_FLIP_THICKNESS_MM_MIN.to_string()}
+                                max={WGPU_FLIP_THICKNESS_MM_MAX.to_string()}
+                                step="0.5"
+                                value={wgpu_flip_thickness_mm.to_string()}
+                                oninput={on_wgpu_flip_thickness}
+                            />
+                        </div>
                         <div class="control">
                             <label for="wgpu-shadow">
                                 { "Shadow: " }

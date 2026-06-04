@@ -34,6 +34,37 @@ impl Vertex {
     }
 }
 
+/// A vertex of the flip thickness rim (`vs_flip_edge`). `pos` is an outline
+/// point in piece-local px; `z_sign` is the extrusion depth sign (±1) for the
+/// front/back wall of the cardboard slab.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub(crate) struct EdgeVertex {
+    pub(crate) pos: [f32; 2],
+    pub(crate) z_sign: f32,
+}
+
+impl EdgeVertex {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<EdgeVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 8,
+                    shader_location: 11,
+                },
+            ],
+        }
+    }
+}
+
 const QUAD_VERTICES: [Vertex; 4] = [
     Vertex { pos: [-0.5, -0.5] },
     Vertex { pos: [0.5, -0.5] },
@@ -87,6 +118,27 @@ pub(crate) struct InstanceSet {
     /// Per-group spans in z-order, never merged. Used to interleave each group's
     /// shadow with its pieces when the drop shadow is enabled.
     pub(crate) groups: Vec<InstanceBatch>,
+    /// Extruded-outline thickness rims for the pieces mid-flip this frame.
+    pub(crate) flip_edges: FlipEdges,
+}
+
+/// Thickness-rim geometry for the pieces that are mid-flip this frame. The
+/// extruded outlines of all such pieces are concatenated into `verts` (two
+/// triangles per outline segment, see `vs_flip_edge`); each `spans` entry says
+/// where one piece's vertices live and which instance (by index in the instance
+/// buffer) supplies its transform — so the rim reuses the already-uploaded
+/// instance data and is drawn at the same z-position as the face.
+#[derive(Default)]
+pub(crate) struct FlipEdges {
+    pub(crate) verts: Vec<EdgeVertex>,
+    pub(crate) spans: Vec<FlipEdgeSpan>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FlipEdgeSpan {
+    pub(crate) v_start: u32,
+    pub(crate) v_count: u32,
+    pub(crate) instance_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -654,9 +706,11 @@ pub(crate) struct WgpuRenderer {
     _config: wgpu::SurfaceConfiguration,
     pipeline_outline: wgpu::RenderPipeline,
     pipeline_fill: wgpu::RenderPipeline,
-    pipeline_flip_side: wgpu::RenderPipeline,
-    /// Whether any instance is mid-flip this frame; gates the extrusion pass.
-    flip_active: bool,
+    pipeline_flip_edge: wgpu::RenderPipeline,
+    /// Concatenated extruded-outline vertices for the pieces mid-flip this
+    /// frame, with one draw span per piece. Empty `spans` means nothing flips.
+    flip_edge_buffer: Option<wgpu::Buffer>,
+    flip_edge_spans: Vec<FlipEdgeSpan>,
     // Drop-shadow effect.
     pipeline_shadow: wgpu::RenderPipeline,
     /// Per-group instance spans (z-order), never merged — used to interleave
@@ -1163,14 +1217,40 @@ impl WgpuRenderer {
             "fs_main",
             wgpu::BlendState::ALPHA_BLENDING,
         );
-        // Pseudo-3D flip "extrusion" side: same masked piece geometry, offset by
-        // the projected thickness and flat-colored with the cardboard edge.
-        let pipeline_flip_side = make_pipeline(
-            "piece-flip-side-pipeline",
-            "vs_flip_side",
-            "fs_flip_side",
-            wgpu::BlendState::ALPHA_BLENDING,
-        );
+        // Pseudo-3D flip thickness rim: the piece outline extruded in depth and
+        // rotated with the face, flat-colored with the cardboard edge. Uses its
+        // own outline vertex layout (slot 0) + the shared instance layout.
+        let pipeline_flip_edge = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("piece-flip-edge-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_flip_edge"),
+                buffers: &[EdgeVertex::layout(), Instance::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_flip_edge"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // Drop shadow: same piece bind group + instance buffer, the quad shifted
         // bottom-right and the mask blurred, drawn directly into the scene
@@ -1694,8 +1774,9 @@ impl WgpuRenderer {
             _config: config,
             pipeline_outline,
             pipeline_fill,
-            pipeline_flip_side,
-            flip_active: false,
+            pipeline_flip_edge,
+            flip_edge_buffer: None,
+            flip_edge_spans: Vec::new(),
             pipeline_shadow,
             instance_groups: Vec::new(),
             shadow_enabled: false,
@@ -1967,14 +2048,37 @@ impl WgpuRenderer {
                     render_pass.set_vertex_buffer(1, slice.clone());
                     render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
                 }
-                if self.flip_active {
-                    // Cardboard "extrusion" side, drawn behind the face so the
-                    // textured front/back leaves a thickness rim. The shader
-                    // degenerates the quad for pieces that aren't mid-flip.
-                    render_pass.set_pipeline(&self.pipeline_flip_side);
-                    render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
-                    render_pass.set_vertex_buffer(1, slice.clone());
-                    render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
+                if let Some(edge_vbuf) = &self.flip_edge_buffer {
+                    // Cardboard thickness rim for each mid-flip piece owned by
+                    // this span, drawn behind its own face (so the face hides the
+                    // advancing wall and the receding wall shows) — emitted in the
+                    // span that owns the piece, matching the face's z-order. The
+                    // rim reuses this span's instance slice for the transform, so
+                    // the instance is addressed relative to `span.start`.
+                    let mut bound = false;
+                    for edge in &self.flip_edge_spans {
+                        if edge.instance_index < span.start
+                            || edge.instance_index >= span.start + span.count
+                        {
+                            continue;
+                        }
+                        if !bound {
+                            render_pass.set_pipeline(&self.pipeline_flip_edge);
+                            render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
+                            render_pass.set_vertex_buffer(0, edge_vbuf.slice(..));
+                            render_pass.set_vertex_buffer(1, slice.clone());
+                            bound = true;
+                        }
+                        let inst = edge.instance_index - span.start;
+                        render_pass.draw(
+                            edge.v_start..edge.v_start + edge.v_count,
+                            inst..inst + 1,
+                        );
+                    }
+                    if bound {
+                        // Restore the shared quad vertex buffer for the fill pass.
+                        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    }
                 }
                 render_pass.set_pipeline(&self.pipeline_fill);
                 render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
@@ -2748,9 +2852,24 @@ impl WgpuRenderer {
         self.globals.flip_thickness_px = thickness_px.max(0.0);
     }
 
-    /// Whether any instance is mid-flip this frame; gates the extrusion pass.
-    pub(crate) fn set_flip_active(&mut self, active: bool) {
-        self.flip_active = active;
+    /// Sets (or clears) the thickness-rim geometry for the pieces mid-flip this
+    /// frame. The rim reuses the instance data uploaded by `update_instances`
+    /// (referenced by `instance_index`), so call this alongside it. Cheap to
+    /// rebuild every frame — only a handful of pieces ever flip at once.
+    pub(crate) fn set_flip_edges(&mut self, edges: FlipEdges) {
+        if edges.verts.is_empty() || edges.spans.is_empty() {
+            self.flip_edge_buffer = None;
+            self.flip_edge_spans.clear();
+            return;
+        }
+        self.flip_edge_buffer = Some(self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("flip-edge-vertex-buffer"),
+                contents: bytemuck::cast_slice(&edges.verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+        self.flip_edge_spans = edges.spans;
     }
 
     /// Configures the optional drop shadow. `distance`/`radius` are in puzzle

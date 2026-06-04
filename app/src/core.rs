@@ -30,6 +30,13 @@ pub(crate) const WGPU_ROTATE_ANIM_RESPONSE_DEFAULT: f32 = 0.18;
 pub(crate) const WGPU_ROTATE_ANIM_DAMPING_MIN: f32 = 0.3;
 pub(crate) const WGPU_ROTATE_ANIM_DAMPING_MAX: f32 = 2.0;
 pub(crate) const WGPU_ROTATE_ANIM_DAMPING_DEFAULT: f32 = 1.0;
+// Physical piece thickness in millimetres, used to draw the cardboard edge rim
+// during the flip animation (WGPU renderer only). A standard jigsaw piece is
+// ~2mm; the slider lets us preview thicker/thinner stock before modelling
+// per-material thickness.
+pub(crate) const WGPU_FLIP_THICKNESS_MM_MIN: f32 = 0.0;
+pub(crate) const WGPU_FLIP_THICKNESS_MM_MAX: f32 = 12.0;
+pub(crate) const WGPU_FLIP_THICKNESS_MM_DEFAULT: f32 = 2.0;
 // Optional drop-shadow effect (WGPU renderer only). Distance/radius are in
 // puzzle (world) pixels so the shadow scales with zoom; darkness is the shadow
 // opacity (0..1). The shadow falls bottom-right, opposite the emboss light.
@@ -214,6 +221,9 @@ pub(crate) struct WgpuRenderSettings {
     /// Shadow opacity (0..1).
     #[serde(default = "default_wgpu_shadow_darkness")]
     pub(crate) shadow_darkness: f32,
+    /// Piece thickness in millimetres for the flip-animation edge rim.
+    #[serde(default = "default_wgpu_flip_thickness_mm")]
+    pub(crate) flip_thickness_mm: f32,
 }
 
 impl Default for WgpuRenderSettings {
@@ -229,6 +239,7 @@ impl Default for WgpuRenderSettings {
             shadow_distance: WGPU_SHADOW_DISTANCE_DEFAULT,
             shadow_radius: WGPU_SHADOW_RADIUS_DEFAULT,
             shadow_darkness: WGPU_SHADOW_DARKNESS_DEFAULT,
+            flip_thickness_mm: WGPU_FLIP_THICKNESS_MM_DEFAULT,
         }
     }
 }
@@ -267,6 +278,10 @@ fn default_wgpu_rotate_anim_response() -> f32 {
 
 fn default_wgpu_rotate_anim_damping() -> f32 {
     WGPU_ROTATE_ANIM_DAMPING_DEFAULT
+}
+
+fn default_wgpu_flip_thickness_mm() -> f32 {
+    WGPU_FLIP_THICKNESS_MM_DEFAULT
 }
 
 #[derive(

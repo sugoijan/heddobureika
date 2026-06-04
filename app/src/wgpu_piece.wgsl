@@ -240,15 +240,31 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(apply_output_gamma(rgb), alpha);
 }
 
-// Pseudo-3D flip "extrusion" side: a solid cardboard band on the workspace-
-// vertical flip axis. Its width is the projected thickness (thickness*sin(beta))
-// so it is zero at the endpoints and fully visible at the half-way (edge-on)
-// point; its height matches the piece's workspace vertical extent. Drawn behind
-// the face so the (foreshortening) face covers it until edge-on, then the rim
-// shows as the solid 2mm edge between the front and back faces. Degenerates
-// off-screen when the piece is not mid-flip, so it costs nothing when settled.
+// Pseudo-3D flip thickness rim: the piece outline extruded in depth from -t/2
+// to +t/2 and rotated about the workspace-vertical flip axis, exactly like the
+// face (`vs_main`) but with a per-vertex depth sign rather than one per face.
+// Drawn behind the face so the foreshortened/shifted face covers the advancing
+// wall, leaving the receding wall visible as the true ~2mm cardboard edge. The
+// geometry IS the silhouette, so the rim follows tabs/blanks and never spills
+// outside the piece. Fed only for the one piece that is mid-flip; degenerates
+// off-screen at the settled endpoints (sin(beta)==0).
+struct EdgeIn {
+    @location(0) pos: vec2<f32>,
+    @location(11) z_sign: f32,
+    @location(1) inst_pos: vec2<f32>,
+    @location(2) inst_size: vec2<f32>,
+    @location(3) inst_rot: f32,
+    @location(4) inst_flip: f32,
+    @location(5) inst_hover: f32,
+    @location(6) inst_drag: f32,
+    @location(7) inst_piece_origin: vec2<f32>,
+    @location(8) inst_mask_origin: vec2<f32>,
+    @location(9) inst_pose_anchor: vec2<f32>,
+    @location(10) inst_held: f32,
+};
+
 @vertex
-fn vs_flip_side(input: VertexIn) -> VertexOut {
+fn vs_flip_edge(input: EdgeIn) -> VertexOut {
     var out: VertexOut;
     out.art_uv = vec2<f32>(0.0, 0.0);
     out.mask_uv = vec2<f32>(0.0, 0.0);
@@ -257,57 +273,40 @@ fn vs_flip_side(input: VertexIn) -> VertexOut {
     out.hover = 0.0;
     out.rot = 0.0;
     let flip_beta = input.inst_flip * 3.14159265;
-    let band_w = globals.flip_thickness_px * abs(sin(flip_beta));
-    if (band_w < 0.001) {
-        out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0); // off-screen / clipped
+    if (abs(sin(flip_beta)) < 0.0005) {
+        out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0); // off-screen when settled
         return out;
     }
+    // `input.pos` is the outline vertex in piece-local px (relative to the
+    // bounds top-left), the same frame as `inst_pose_anchor`. Lift it into the
+    // padded-quad frame so the rest matches `vs_main` exactly.
+    let local = input.pos + globals.mask_pad;
     let anchor_padded = globals.mask_pad + input.inst_pose_anchor;
+    let center = anchor_padded;
     let drag = input.inst_drag;
+    let drag_scale = select(1.0, globals.drag_scale, input.inst_held > 0.5);
     let drag_rot = drag * 0.017453292;
     let angle = input.inst_rot * 0.017453292 + drag_rot;
-    // Workspace vertical extent of the (rotated) piece bounding box.
-    let height_ws = abs(input.inst_size.x * sin(angle)) + abs(input.inst_size.y * cos(angle));
+    let rotated = rotate_point(local - center, angle) + center;
+    let scaled = (rotated - center) * drag_scale + center;
+    let world = (input.inst_pos - globals.mask_pad) + scaled;
     let axis_x = (input.inst_pos.x - globals.mask_pad.x) + anchor_padded.x;
-    let axis_y = (input.inst_pos.y - globals.mask_pad.y) + anchor_padded.y;
-    let wx = axis_x + input.pos.x * band_w;
-    let wy = axis_y + input.pos.y * height_ws;
-    let world_scaled = vec2<f32>(wx, wy) * globals.puzzle_scale;
+    let flipped_x = axis_x
+        + (world.x - axis_x) * cos(flip_beta)
+        + input.z_sign * globals.flip_thickness_px * 0.5 * sin(flip_beta);
+    let world_scaled = vec2<f32>(flipped_x, world.y) * globals.puzzle_scale;
     let ndc_x = (world_scaled.x - globals.view_min.x) / globals.view_size.x * 2.0 - 1.0;
     let ndc_y = 1.0 - (world_scaled.y - globals.view_min.y) / globals.view_size.y * 2.0;
     out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
-    // Invert the (un-flipped) piece transform to find which piece texel this
-    // band point covers, so the rim is trimmed to the piece silhouette rather
-    // than its bounding box. Clamp to this piece's atlas cell so out-of-piece
-    // points sample transparent padding, never a neighbour.
-    let world_pt = vec2<f32>(wx, wy);
-    let rotated = world_pt - (input.inst_pos - globals.mask_pad);
-    let local = rotate_point(rotated - anchor_padded, -angle) + anchor_padded;
-    let piece_local = local - globals.mask_pad;
-    let cell_min = (input.inst_mask_origin - globals.mask_pad) / globals.atlas_size;
-    let cell_max = (input.inst_mask_origin + input.inst_size + globals.mask_pad) / globals.atlas_size;
-    out.mask_uv = clamp(
-        (input.inst_mask_origin + piece_local) / globals.atlas_size,
-        cell_min,
-        cell_max,
-    );
     return out;
 }
 
 @fragment
-fn fs_flip_side(input: VertexOut) -> @location(0) vec4<f32> {
-    // Trim the rim to the piece silhouette (so it doesn't overrun the bounding
-    // box) via the piece mask, then fill with the solid cardboard edge color.
-    let mask = textureSample(mask_tex, tex_sampler, input.mask_uv).r;
-    let outline_threshold = 0.05;
-    let mask_fwidth = abs(dpdx(mask)) + abs(dpdy(mask));
-    let edge_aa = max(mask_fwidth * globals.edge_aa, 1e-4);
-    let edge_alpha = smoothstep(outline_threshold, outline_threshold + edge_aa, mask);
-    if (mask < outline_threshold) {
-        discard;
-    }
+fn fs_flip_edge(input: VertexOut) -> @location(0) vec4<f32> {
+    // Solid cardboard edge color. Opaque so overlapping wall quads (and the
+    // closed-loop seam) don't double-blend.
     let edge_rgb = srgb_to_linear(vec3<f32>(0.56, 0.36, 0.20));
-    return vec4<f32>(apply_output_gamma(edge_rgb), edge_alpha);
+    return vec4<f32>(apply_output_gamma(edge_rgb), 1.0);
 }
 
 // Drop shadow. Places the piece exactly like `vs_main` (rotation about the

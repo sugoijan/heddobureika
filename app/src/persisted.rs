@@ -1,7 +1,8 @@
 use crate::core::{InitMode, RenderSettings, RendererKind, ThemeMode};
 
 pub(crate) const BOOT_RECORD_VERSION: u32 = 2;
-pub(crate) const SETTINGS_VERSION: u32 = 1;
+// v2: added `WgpuRenderSettings::flip_thickness_mm` (changes the rkyv layout).
+pub(crate) const SETTINGS_VERSION: u32 = 2;
 
 pub(crate) const BOOT_RECORD_KEY: &str = "boot.v2";
 pub(crate) const SETTINGS_KEY: &str = "settings.v1";
