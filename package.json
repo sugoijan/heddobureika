@@ -8,12 +8,12 @@
     "html-minifier-terser": "^7.2.0",
     "lightningcss-cli": "^1.32.0",
     "terser": "^5.48.0",
-    "vitest": "^4.1.8",
+    "vitest": "^4.1.9",
     "wait-on": "^9.0.10",
-    "wrangler": "^4.96.0"
+    "wrangler": "^4.105.0"
   },
   "packageManager": "pnpm@10.33.2",
   "dependencies": {
-    "lucide-static": "^1.17.0"
+    "lucide-static": "^1.22.0"
   }
 }
