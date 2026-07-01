@@ -623,6 +623,10 @@ pub enum AdminMsg {
         limit: u32,
     },
     RecordingClear,
+    /// Force the room to expire immediately: reset it to unactivated, drop its
+    /// live state/snapshot, and disconnect everyone — the same effect as the
+    /// inactivity timeout. Mainly a testing/ops hook for tearing a room down.
+    Expire,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]

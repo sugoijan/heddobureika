@@ -49,6 +49,11 @@ const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
 const AUTH_WINDOW_MS: i64 = 5 * 60 * 1000;
 const DISCONNECT_GRACE_MS: i64 = 1000;
 
+/// Body returned by the plain-HTTP room status probe when the room is not
+/// activated (never created, or expired). The client keys off the 403 status;
+/// the payload is a stable machine-readable reason for logging/diagnostics.
+const ROOM_STATUS_GONE_BODY: &str = "{\"code\":\"room_not_activated\"}";
+
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
@@ -872,15 +877,25 @@ impl DurableObject for Room {
             .get("Upgrade")?
             .map(|h| h.to_ascii_lowercase() == "websocket")
             .unwrap_or(false);
-        if !is_websocket {
-            return Response::error("expected websocket", 400);
-        }
 
         let path = req.path();
         let prefix = room_path_prefix(&self.env);
         let room_id = extract_room_id(&path, &prefix).unwrap_or("unknown");
 
         self.ensure_loaded().await?;
+
+        if !is_websocket {
+            // Plain-HTTP room status probe. A failed WebSocket upgrade hides
+            // its HTTP status from the browser, so the client asks over regular
+            // HTTP to tell a gone/expired room (not activated -> 403) from a
+            // transient network error, and avoid pointless reconnect attempts.
+            let activated = { self.inner.borrow().meta.activated };
+            if activated {
+                return Response::ok("active");
+            }
+            return Response::error(ROOM_STATUS_GONE_BODY, 403);
+        }
+
         self.persist_room_id(room_id).await?;
         let auth = match self.authenticate_request(&req, room_id).await {
             Ok(auth) => auth,
@@ -1016,6 +1031,9 @@ impl DurableObject for Room {
                     }
                     AdminMsg::RecordingClear => {
                         return self.handle_admin_recording_clear(ws).await;
+                    }
+                    AdminMsg::Expire => {
+                        return self.handle_admin_expire().await;
                     }
                 }
             }
@@ -1859,6 +1877,12 @@ impl Room {
             }
         }
         Ok(())
+    }
+
+    async fn handle_admin_expire(&self) -> Result<()> {
+        // `expire_room` broadcasts `room_expired` and closes every socket
+        // (including this admin one), so there is no separate ack to send.
+        self.expire_room().await
     }
 
     fn command_store_stub(&self) -> std::result::Result<Stub, String> {

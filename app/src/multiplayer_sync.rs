@@ -10,6 +10,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
 use crate::persisted_store;
+use crate::runtime::FailReason;
 use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
 
 pub(crate) struct WsHandlers {
@@ -119,7 +120,7 @@ impl MultiplayerSyncAdapter {
         &mut self,
         url: &str,
         on_server_msg: Rc<dyn Fn(ServerMsg)>,
-        on_fail: Rc<dyn Fn()>,
+        on_fail: Rc<dyn Fn(FailReason)>,
         on_open: Option<Rc<dyn Fn()>>,
         protocols: Option<Vec<String>>,
     ) {
@@ -146,7 +147,7 @@ impl MultiplayerSyncAdapter {
             Ok(ws) => ws,
             Err(_) => {
                 gloo::console::warn!("failed to open websocket", url);
-                on_fail();
+                on_fail(FailReason::Terminal);
                 return;
             }
         };
@@ -215,7 +216,7 @@ impl MultiplayerSyncAdapter {
                         "websocket failed to connect (room may be invalid)",
                         url.clone()
                     );
-                    on_fail();
+                    on_fail(FailReason::NeverOpened);
                     return;
                 }
                 if let Some(close) = event.dyn_ref::<CloseEvent>() {
@@ -228,7 +229,7 @@ impl MultiplayerSyncAdapter {
                 } else {
                     gloo::console::log!("websocket closed", url.clone());
                 }
-                on_fail();
+                on_fail(FailReason::Dropped);
             }) as Box<dyn FnMut(Event)>)
         };
 

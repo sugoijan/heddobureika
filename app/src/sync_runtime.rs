@@ -3,6 +3,8 @@ use std::rc::Rc;
 
 use gloo::timers::callback::Timeout;
 use gloo::timers::future::TimeoutFuture;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app_core::{AppCore, AppSnapshot, AppSubscription};
 use crate::app_router::{self, MultiplayerConfig};
@@ -10,7 +12,9 @@ use crate::boot_runtime::{self, BootState};
 use crate::core::InitMode;
 use crate::local_snapshot::{apply_playable_snapshot_to_core, ApplySnapshotResult};
 use crate::multiplayer_game_sync::MultiplayerGameSync;
-use crate::runtime::{CoreAction, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView};
+use crate::runtime::{
+    CoreAction, FailReason, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveSync {
@@ -182,12 +186,50 @@ const RETRY_DELAYS_MS: &[u32] = &[200, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 
 const BOOT_WAIT_POLL_MS: u32 = 25;
 const BOOT_WAIT_TIMEOUT_MS: u32 = 10_000;
 
-fn schedule_multiplayer_retry() {
+fn schedule_multiplayer_retry(reason: FailReason) {
+    match reason {
+        // The room was reachable (the socket had opened) — a drop is most
+        // likely a transient network issue, so keep the resilient backoff.
+        FailReason::Dropped => multiplayer_backoff_retry(),
+        // Nothing to retry against: fall back to the local game immediately.
+        FailReason::Terminal => multiplayer_fail_to_local(),
+        // Ambiguous: a gone/expired room rejects the WebSocket upgrade with a
+        // 403 that the browser cannot see, so it looks identical to a network
+        // blip here. Ask the server over plain HTTP which one it is before
+        // deciding whether to keep retrying or give up.
+        FailReason::NeverOpened => {
+            let probe = STATE.with(|slot| {
+                let state = slot.borrow();
+                if state.active != ActiveSync::Multiplayer {
+                    return None;
+                }
+                let config = state.config.as_ref()?;
+                let url = app_router::build_room_probe_url(&config.room_id)?;
+                Some((url, config.resumed))
+            });
+            let Some((url, resumed)) = probe else {
+                // No probe target (not multiplayer any more, or no ws base):
+                // preserve the previous behaviour and just back off.
+                multiplayer_backoff_retry();
+                return;
+            };
+            spawn_local(async move {
+                if probe_room_gone(&url, resumed).await {
+                    multiplayer_fail_to_local();
+                } else {
+                    multiplayer_backoff_retry();
+                }
+            });
+        }
+    }
+}
+
+fn multiplayer_backoff_retry() {
     let mut should_notify = false;
-    let (on_fail, delay_ms) = STATE.with(|slot| {
+    let on_fail = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         if state.active != ActiveSync::Multiplayer || state.config.is_none() {
-            return (None, None);
+            return None;
         }
         if let Some(sync) = state.multiplayer.as_ref() {
             sync.borrow_mut().disconnect();
@@ -197,7 +239,7 @@ fn schedule_multiplayer_retry() {
         let Some(delay) = RETRY_DELAYS_MS.get(state.retry_attempts as usize).copied() else {
             state.retry_attempts = 0;
             state.retry_timer.take();
-            return (Some(state.on_fail.clone()), None);
+            return Some(state.on_fail.clone());
         };
         state.retry_attempts = state.retry_attempts.saturating_add(1);
         let timer = Timeout::new(delay, || {
@@ -210,14 +252,64 @@ fn schedule_multiplayer_retry() {
             });
         });
         state.retry_timer = Some(timer);
-        (None, Some(delay))
+        None
     });
-    let _ = delay_ms;
     if should_notify {
         notify_sync_view_changed();
     }
     if let Some(on_fail) = on_fail {
         on_fail();
+    }
+}
+
+fn multiplayer_fail_to_local() {
+    let mut should_notify = false;
+    let on_fail = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if state.active != ActiveSync::Multiplayer || state.config.is_none() {
+            return None;
+        }
+        if let Some(sync) = state.multiplayer.as_ref() {
+            sync.borrow_mut().disconnect();
+        }
+        state.active_room = None;
+        state.retry_attempts = 0;
+        state.retry_timer.take();
+        should_notify = true;
+        Some(state.on_fail.clone())
+    });
+    if should_notify {
+        notify_sync_view_changed();
+    }
+    if let Some(on_fail) = on_fail {
+        on_fail();
+    }
+}
+
+/// Asks the server whether a room is gone. Returns `true` only when the room is
+/// definitively unavailable so retrying is pointless; any ambiguous outcome
+/// (200, 5xx, or a network error) returns `false` so we keep the resilient
+/// backoff rather than nuking a still-valid session on a transient blip.
+async fn probe_room_gone(url: &str, resumed: bool) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let response = match JsFuture::from(window.fetch_with_str(url)).await {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let Ok(response) = response.dyn_into::<web_sys::Response>() else {
+        return false;
+    };
+    match response.status() {
+        // "Room not activated": for a resumed session the room was live when we
+        // saved it, so this means it expired — terminal. For an explicit join
+        // the room may just be activating, so keep retrying.
+        403 => resumed,
+        // Unknown/invalid room id: gone regardless of how we got here.
+        404 => true,
+        // Reachable (200), server hiccup (5xx), or anything else: transient.
+        _ => false,
     }
 }
 
@@ -315,8 +407,8 @@ fn connect_if_ready(state: &mut SyncRuntimeState) {
     sync.borrow_mut().disconnect();
     sync.borrow_mut().connect(
         &config.room_id,
-        Rc::new(move || {
-            schedule_multiplayer_retry();
+        Rc::new(move |reason| {
+            schedule_multiplayer_retry(reason);
         }),
     );
     state.active_room = Some(config.room_id);

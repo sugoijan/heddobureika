@@ -254,6 +254,28 @@ recording-status room_id *args:
     base_url="${ROOM_WS_BASE_URL:-ws://127.0.0.1:{{WRANGLER_PORT}}/ws}"; \
     cargo run -p heddobureika-cli -- rooms recording status --room-id "{{room_id}}" --admin-token "$token" --base-url "$base_url" "$@"
 
+# Run the admin CLI with the token/base-url from .dev.vars auto-filled.
+# Meant for room admin commands, e.g. `just cli rooms delete --room-id <ID>`.
+# `--admin-token` and `--base-url` are only injected when you didn't pass them.
+cli *args:
+    @if [ -f .dev.vars ]; then \
+      set -a; source .dev.vars; set +a; \
+    fi; \
+    token="${ADMIN_TOKEN:-${ROOM_ADMIN_TOKEN:-}}"; \
+    if [ -z "$token" ]; then \
+      echo "Missing admin token. Set ADMIN_TOKEN (or ROOM_ADMIN_TOKEN) or use .dev.vars."; \
+      exit 1; \
+    fi; \
+    base_url="${ROOM_WS_BASE_URL:-ws://127.0.0.1:{{WRANGLER_PORT}}/ws}"; \
+    set -- {{args}}; \
+    if ! printf ' %s ' "$@" | grep -q -- ' --admin-token '; then \
+      set -- "$@" --admin-token "$token"; \
+    fi; \
+    if ! printf ' %s ' "$@" | grep -q -- ' --base-url '; then \
+      set -- "$@" --base-url "$base_url"; \
+    fi; \
+    cargo run -p heddobureika-cli -- "$@"
+
 deploy-app:
     @if [ -f .env.local ]; then \
       set -a; source .env.local; set +a; \

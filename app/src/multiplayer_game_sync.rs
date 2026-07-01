@@ -10,7 +10,7 @@ use crate::core::InitMode;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
 use crate::runtime::{
-    AssetEvent, CoreAction, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView,
+    AssetEvent, CoreAction, FailReason, GameSync, SyncAction, SyncEvent, SyncHooks, SyncView,
 };
 use crate::sync_runtime;
 use heddobureika_core::{
@@ -66,17 +66,17 @@ impl MultiplayerGameSync {
         }
     }
 
-    pub(crate) fn connect(&mut self, room_id: &str, on_fail: Rc<dyn Fn()>) {
+    pub(crate) fn connect(&mut self, room_id: &str, on_fail: Rc<dyn Fn(FailReason)>) {
         self.reset_state();
         let room_id = room_id.trim();
         if room_id.is_empty() {
             console::warn!("missing room id for multiplayer connect");
-            on_fail();
+            on_fail(FailReason::Terminal);
             return;
         }
         let Some(ws_base) = app_router::default_ws_base() else {
             console::warn!("missing websocket base for multiplayer connect");
-            on_fail();
+            on_fail(FailReason::Terminal);
             return;
         };
         *self.room_id.borrow_mut() = Some(room_id.to_string());
@@ -95,7 +95,7 @@ impl MultiplayerGameSync {
                 Ok(protocol) => protocol,
                 Err(err) => {
                     console::warn!("multiplayer auth failed", err);
-                    on_fail();
+                    on_fail(FailReason::Terminal);
                     return;
                 }
             };

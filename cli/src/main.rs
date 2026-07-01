@@ -71,6 +71,13 @@ enum RoomCommand {
         #[arg(long)]
         no_connect: bool,
     },
+    /// Force a room to expire now (reset to unactivated and disconnect all
+    /// clients), the same effect as the inactivity timeout. Useful for testing
+    /// the client's fall-back-to-local behaviour on a gone room.
+    Delete {
+        #[command(flatten)]
+        room: AdminRoomArgs,
+    },
     Recording {
         #[command(subcommand)]
         command: RecordingCommand,
@@ -327,6 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     no_connect,
                 )
                 .await?;
+            }
+            RoomCommand::Delete { room } => {
+                room_delete(room).await?;
+                println!("room_deleted: true");
             }
             RoomCommand::Recording { command } => match command {
                 RecordingCommand::Enable { room, max_events } => {
@@ -648,6 +659,39 @@ async fn recording_clear(room: AdminRoomArgs) -> Result<(), Box<dyn std::error::
     match result {
         Ok(inner) => inner,
         Err(_) => Err(err_msg("timed out waiting for recording clear ack")),
+    }
+}
+
+async fn room_delete(room: AdminRoomArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut write, mut read) = connect_ws(
+        &room.room.base_url,
+        &room.room.room_id,
+        Some(room.admin_token.as_str()),
+    )
+    .await?;
+
+    send_admin_msg(&mut write, AdminMsg::Expire).await?;
+
+    // Expiry broadcasts `room_expired` and then closes every socket (ours
+    // included), so either signal — the error broadcast or the socket close —
+    // confirms the room is gone.
+    let result = timeout(Duration::from_secs(10), async {
+        loop {
+            match recv_server_msg(&mut read).await? {
+                None => return Ok(()),
+                Some(ServerMsg::Error { code, .. }) if code == "room_expired" => return Ok(()),
+                Some(ServerMsg::Error { code, message }) => {
+                    return Err(err_msg(format!("server error {code}: {message}")));
+                }
+                Some(_) => {}
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(err_msg("timed out waiting for room expiry")),
     }
 }
 

@@ -24,7 +24,7 @@ use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
 use crate::persisted::{PrivateImageEntry, PrivateImageRefs, LOCAL_PRIVATE_SCOPE};
 use crate::persisted_store;
-use crate::runtime::{SyncEvent, SyncHooks};
+use crate::runtime::{FailReason, SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::catalog::{
@@ -256,7 +256,7 @@ impl AdminSocket {
         let upload_pending_on_fail = self.upload_pending.clone();
         let upload_status_hook_on_fail = self.upload_status_hook.clone();
         let event_hook_on_fail = event_hook.clone();
-        let on_fail = Rc::new(move || {
+        let on_fail = Rc::new(move |_reason: FailReason| {
             connected_on_fail.set(false);
             status_on_fail.set(AdminStatus::Failed);
             if let Some(hook) = status_hook.as_ref() {
@@ -342,7 +342,7 @@ impl AdminSocket {
                     Ok(protocol) => protocol,
                     Err(err) => {
                         gloo::console::warn!("admin auth failed", err);
-                        on_fail();
+                        on_fail(FailReason::Terminal);
                         return;
                     }
                 };
@@ -1440,12 +1440,14 @@ fn app(props: &AppProps) -> Html {
             multiplayer_config.set(Some(app_router::MultiplayerConfig {
                 room_id: room_id.clone(),
                 clear_hash: false,
+                resumed: false,
             }));
             app_router::save_room_session(&room_id);
             app_router::save_mode_preference(InitMode::Online);
             sync_runtime::init_from_config(Some(app_router::MultiplayerConfig {
                 room_id: room_id.clone(),
                 clear_hash: false,
+                resumed: false,
             }));
             let room_transition_seq = room_transition_seq.clone();
             let room_setup_status = room_setup_status.clone();

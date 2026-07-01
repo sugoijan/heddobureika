@@ -10,6 +10,12 @@ use heddobureika_core::is_valid_room_id;
 pub(crate) struct MultiplayerConfig {
     pub(crate) room_id: String,
     pub(crate) clear_hash: bool,
+    /// True when this config was restored from a previously saved session
+    /// rather than an explicit join (hash/query link or UI action). A resumed
+    /// room that the server now reports as "not activated" must have expired,
+    /// so the scheduler treats that as terminal; an explicit join to a
+    /// not-yet-activated room is instead retried (it may be activating).
+    pub(crate) resumed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +130,22 @@ pub(crate) fn build_room_ws_url(ws_base: &str, room_id: &str) -> String {
     format!("{base}/{room_id}")
 }
 
+/// HTTP(S) URL for a plain (non-upgrade) GET against a room. The server answers
+/// this with the room's liveness status, which the retry scheduler uses to tell
+/// a gone/expired room from a transient failure — the WebSocket handshake hides
+/// its HTTP status from the browser, so we ask over regular HTTP instead.
+pub(crate) fn build_room_probe_url(room_id: &str) -> Option<String> {
+    let ws_base = default_ws_base()?;
+    let http_base = if let Some(rest) = ws_base.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = ws_base.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        ws_base
+    };
+    Some(build_room_ws_url(&http_base, room_id))
+}
+
 pub(crate) fn save_render_settings(settings: &RenderSettings) {
     let settings = settings.clone();
     persisted_store::update_settings_blob(|blob| {
@@ -197,6 +219,7 @@ fn load_multiplayer_config() -> Option<MultiplayerConfig> {
         Some(MultiplayerConfig {
             room_id,
             clear_hash: false,
+            resumed: true,
         })
     })
 }
@@ -232,6 +255,7 @@ fn parse_multiplayer_config_from_hash(hash: &str) -> Option<MultiplayerConfig> {
     Some(MultiplayerConfig {
         room_id,
         clear_hash: true,
+        resumed: false,
     })
 }
 
@@ -249,5 +273,6 @@ fn parse_multiplayer_config_from_query(search: &str) -> Option<MultiplayerConfig
     Some(MultiplayerConfig {
         room_id,
         clear_hash: false,
+        resumed: false,
     })
 }

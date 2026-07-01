@@ -20,6 +20,27 @@ pub struct ViewHooks {
     pub on_action: Rc<dyn Fn(CoreAction)>,
 }
 
+/// Why a multiplayer connection attempt failed. The retry scheduler uses this
+/// to decide whether to back off and retry or give up and fall back to the
+/// local game.
+///
+/// A browser WebSocket cannot observe the HTTP status of a failed *upgrade*
+/// handshake (a 403 room-gone rejection surfaces as an opaque code-1006 close,
+/// indistinguishable from a network blip), so `NeverOpened` is deliberately
+/// ambiguous — the scheduler resolves it with an explicit HTTP status probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailReason {
+    /// The attempt could not even start (misconfiguration, unusable identity).
+    /// Retrying will not help; fall back to local immediately.
+    Terminal,
+    /// The socket opened at least once and then closed. The room was reachable,
+    /// so this is most likely a transient network drop worth the full backoff.
+    Dropped,
+    /// The socket never opened. Could be a gone/expired room (403 on the
+    /// upgrade) or a transient failure; the scheduler probes to decide.
+    NeverOpened,
+}
+
 #[derive(Clone)]
 pub struct SyncHooks {
     pub on_remote_action: Rc<dyn Fn(CoreAction)>,
