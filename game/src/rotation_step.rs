@@ -192,11 +192,7 @@ fn next_cw_directional(allowed: &[f32], base: f32) -> f32 {
             best = candidate;
         }
     }
-    if best.is_finite() {
-        best
-    } else {
-        base + 360.0
-    }
+    if best.is_finite() { best } else { base + 360.0 }
 }
 
 fn next_ccw_directional(allowed: &[f32], base: f32) -> f32 {
@@ -208,11 +204,7 @@ fn next_ccw_directional(allowed: &[f32], base: f32) -> f32 {
             best = candidate;
         }
     }
-    if best.is_finite() {
-        best
-    } else {
-        base - 360.0
-    }
+    if best.is_finite() { best } else { base - 360.0 }
 }
 
 fn normalize_for_symmetry(value: f32) -> f32 {

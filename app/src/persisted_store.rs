@@ -4,10 +4,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::idb;
 use crate::persisted::{
-    BootRecord, PrivateImageEntry, PrivateImageRefs, SettingsBlob, BOOT_RECORD_KEY,
-    BOOT_RECORD_VERSION, SETTINGS_KEY, SETTINGS_VERSION, SNAPSHOT_KEY,
+    BOOT_RECORD_KEY, BOOT_RECORD_VERSION, BootRecord, PrivateImageEntry, PrivateImageRefs,
+    SETTINGS_KEY, SETTINGS_VERSION, SNAPSHOT_KEY, SettingsBlob,
 };
-use heddobureika_core::{decode, encode, PlayableGameSnapshot, PLAYABLE_GAME_SNAPSHOT_VERSION};
+use heddobureika_core::{PLAYABLE_GAME_SNAPSHOT_VERSION, PlayableGameSnapshot, decode, encode};
 
 thread_local! {
     static BOOT_RECORD_CACHE: RefCell<Option<BootRecord>> = RefCell::new(None);

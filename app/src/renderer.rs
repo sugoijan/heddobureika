@@ -1,5 +1,5 @@
 use crate::core::{
-    PuzzleRenderGeometry, CORNER_RADIUS_RATIO, DRAG_SCALE, EMBOSS_OPACITY, EMBOSS_RIM,
+    CORNER_RADIUS_RATIO, DRAG_SCALE, EMBOSS_OPACITY, EMBOSS_RIM, PuzzleRenderGeometry,
     WGPU_EDGE_AA_DEFAULT, WGPU_RENDER_SCALE_MIN,
 };
 use bytemuck::{Pod, Zeroable};
@@ -11,7 +11,7 @@ use glyphon::{
 use js_sys::Date;
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{console, CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Path2d};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Path2d, console};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -1000,7 +1000,9 @@ impl WgpuRenderer {
                 let adapter = request_adapter_with_fallback(&instance, &surface, false)
                     .await
                     .map_err(|detail| {
-                        wasm_bindgen::JsValue::from_str(&format!("request_adapter failed: {detail}"))
+                        wasm_bindgen::JsValue::from_str(&format!(
+                            "request_adapter failed: {detail}"
+                        ))
                     })?;
                 (surface, adapter)
             }
@@ -1960,8 +1962,10 @@ impl WgpuRenderer {
         // the negative of the emboss light direction `normalize(-1,-1)`.
         const INV_SQRT2: f32 = 0.70710677;
         if self.shadow_enabled {
-            self.globals.shadow_offset =
-                [self.shadow_distance * INV_SQRT2, self.shadow_distance * INV_SQRT2];
+            self.globals.shadow_offset = [
+                self.shadow_distance * INV_SQRT2,
+                self.shadow_distance * INV_SQRT2,
+            ];
             self.globals.shadow_darkness = self.shadow_darkness;
             self.globals.shadow_radius = self.shadow_radius;
         } else {
@@ -2131,10 +2135,7 @@ impl WgpuRenderer {
                             bound = true;
                         }
                         let inst = edge.instance_index - span.start;
-                        render_pass.draw(
-                            edge.v_start..edge.v_start + edge.v_count,
-                            inst..inst + 1,
-                        );
+                        render_pass.draw(edge.v_start..edge.v_start + edge.v_count, inst..inst + 1);
                     }
                     if bound {
                         // Restore the shared quad vertex buffer for the fill pass.

@@ -3,16 +3,16 @@
 use crate::delta::PlayableDelta;
 use crate::ids::{EdgeId, GroupId, PieceId};
 use crate::logical::{LogicalInvariantError, LogicalState, LogicalStateSummary};
-use crate::rotation_step::{group_symmetry_angles, next_step_canonical, StepDirection};
+use crate::rotation_step::{StepDirection, group_symmetry_angles, next_step_canonical};
 use crate::rules::PlayRules;
-use crate::snap::{angle_matches, ActionId, MergePolicy, SnapProposal};
+use crate::snap::{ActionId, MergePolicy, SnapProposal, angle_matches};
 use crate::topology::{PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
-use crate::z_depth::{reorder_for_fitting_depth, Aabb, Gesture};
 use crate::update::{
     AppliedProposal, GroupMergeUpdate, GroupPoseUpdate, PlayableUpdateBatch,
     ProposalApplyRejection, ProposalApplyStatus,
 };
+use crate::z_depth::{Aabb, Gesture, reorder_for_fitting_depth};
 
 /// World-space XY position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1016,11 +1016,7 @@ impl<T: PuzzleTopology> PlayableState<T> {
             aabb = aabb.union(Aabb::from_center_half(pose.x_mm(), pose.y_mm(), ax, ay));
             any = true;
         }
-        if any {
-            Some(aabb)
-        } else {
-            None
-        }
+        if any { Some(aabb) } else { None }
     }
 
     /// Drag-start gesture: bring the group containing `anchors[0]` as far toward
@@ -2003,11 +1999,7 @@ enum LocalSnapFeature {
 /// 90°. Returned in degrees, in (-45, 45].
 fn rotation_correction_to_axis(angle: f32) -> f32 {
     let m = angle.rem_euclid(90.0);
-    if m > 45.0 {
-        90.0 - m
-    } else {
-        -m
-    }
+    if m > 45.0 { 90.0 - m } else { -m }
 }
 
 fn mark_group_dirty<T: PuzzleTopology>(

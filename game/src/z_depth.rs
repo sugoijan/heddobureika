@@ -368,7 +368,10 @@ mod tests {
         let far = out.iter().position(|g| g.as_u32() == 1).unwrap();
         let small = out.iter().position(|g| g.as_u32() == 2).unwrap();
         assert!(big > far, "big moves in front of the non-covered group");
-        assert!(small > big, "but stops behind the small piece it would cover");
+        assert!(
+            small > big,
+            "but stops behind the small piece it would cover"
+        );
     }
 
     #[test]
@@ -380,7 +383,10 @@ mod tests {
         let out = reorder_for_fitting_depth(&z, &aabbs, 0, Gesture::SendBackward).unwrap();
         let small = out.iter().position(|g| g.as_u32() == 1).unwrap();
         let big = out.iter().position(|g| g.as_u32() == 0).unwrap();
-        assert!(small > big, "shaken small group must not be hidden by its container");
+        assert!(
+            small > big,
+            "shaken small group must not be hidden by its container"
+        );
     }
 
     #[test]
@@ -393,9 +399,17 @@ mod tests {
             b(1.0, 1.0, 4.0, 4.0),
         ];
         let fwd = reorder_for_fitting_depth(&z, &aabbs, 1, Gesture::BringForward).unwrap();
-        assert_eq!(fwd.last().unwrap().as_u32(), 1, "isolated bring-forward → front");
+        assert_eq!(
+            fwd.last().unwrap().as_u32(),
+            1,
+            "isolated bring-forward → front"
+        );
         let back = reorder_for_fitting_depth(&z, &aabbs, 1, Gesture::SendBackward).unwrap();
-        assert_eq!(back.first().unwrap().as_u32(), 1, "isolated send-backward → back");
+        assert_eq!(
+            back.first().unwrap().as_u32(),
+            1,
+            "isolated send-backward → back"
+        );
     }
 
     #[test]
@@ -433,7 +447,10 @@ mod tests {
         assert_eq!(pos1, 1, "non-overlapping group keeps its slot");
         let big = out.iter().position(|g| g.as_u32() == 0).unwrap();
         let small = out.iter().position(|g| g.as_u32() == 2).unwrap();
-        assert!(small > big, "shaken big group drops below the small one it covered");
+        assert!(
+            small > big,
+            "shaken big group drops below the small one it covered"
+        );
     }
 
     #[test]
@@ -448,6 +465,10 @@ mod tests {
             b(2.0, 2.0, 4.0, 4.0),
         ];
         let out = reorder_for_fitting_depth(&z, &aabbs, 1, Gesture::BringForward).unwrap();
-        assert_eq!(out.last().unwrap().as_u32(), 1, "picked piece goes to absolute front");
+        assert_eq!(
+            out.last().unwrap().as_u32(),
+            1,
+            "picked piece goes to absolute front"
+        );
     }
 }

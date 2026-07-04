@@ -10,11 +10,11 @@ use std::f32::consts::PI;
 use std::num::NonZeroU32;
 
 use crate::edge_compose::ConnectorSeg;
-use crate::edge_profile::{build_edge_profile_segments, ConnectorShape, EdgeProfileInput};
+use crate::edge_profile::{ConnectorShape, EdgeProfileInput, build_edge_profile_segments};
 use crate::grid_shape::GridShapeSettings;
 use crate::ids::{EdgeId, PieceId};
 use crate::playable::Pose2;
-use crate::render_geometry::{build_render_geometry_from_atlas, PuzzleRenderGeometry};
+use crate::render_geometry::{PuzzleRenderGeometry, build_render_geometry_from_atlas};
 use crate::rotation_step::SymmetryStrength;
 use crate::shape::{EdgeSideGeometryMm, PathMm, PathSegMm, PointMm, ShapeAtlasMm};
 use crate::shape_atlas_builder::{PieceEdgeBuilderSpec, ShapeAtlasBuilder};

@@ -14,11 +14,11 @@ use crate::persisted_store;
 use crate::runtime::{AssetEvent, SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use heddobureika_core::{
-    angle_matches, safety_corrections_after_detach, AngleDeg, ClientId, ClientMsg, FlipState,
-    GameRules, ImagePlacement, MergePolicy, PieceId, PlayableAction, PlayableGameSnapshot,
-    PlayableRoomUpdate, PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo,
-    PuzzleTopology, RestrictedPlayableAction, RoomControlUpdate, RoomPersistence,
-    PRIVATE_ASSET_MAX_BYTES,
+    AngleDeg, ClientId, ClientMsg, FlipState, GameRules, ImagePlacement, MergePolicy,
+    PRIVATE_ASSET_MAX_BYTES, PieceId, PlayableAction, PlayableGameSnapshot, PlayableRoomUpdate,
+    PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo, PuzzleTopology,
+    RestrictedPlayableAction, RoomControlUpdate, RoomPersistence, angle_matches,
+    safety_corrections_after_detach,
 };
 
 const PENDING_POS_EPS: f32 = 0.02;
@@ -1223,8 +1223,8 @@ mod tests {
     use super::*;
     use crate::core::GridChoice;
     use heddobureika_core::{
-        build_topology_from_spec, EdgeId, GameRules, GridTopology, LogicalState, PlayRules,
-        PlayableRoomUpdateKind, ProposalApplyStatusSnapshot, TopologySpec,
+        EdgeId, GameRules, GridTopology, LogicalState, PlayRules, PlayableRoomUpdateKind,
+        ProposalApplyStatusSnapshot, TopologySpec, build_topology_from_spec,
     };
 
     fn two_piece_puzzle() -> PuzzleInfo {
@@ -1454,19 +1454,21 @@ mod tests {
         let topology = GridTopology::try_new(2, 1).expect("valid grid");
         let mut playable = PlayableState::solved(topology, PlayRules::default());
 
-        assert!(predict_pending_flip(
-            &mut playable,
-            0,
-            true,
-            (0.0, 0.0),
-            0.0,
-            ImagePlacement {
-                pose_unit_px: [100.0, 100.0],
-                origin_px: [0.0, 0.0],
-                frame_px: [200.0, 100.0],
-            }
-        )
-        .is_err());
+        assert!(
+            predict_pending_flip(
+                &mut playable,
+                0,
+                true,
+                (0.0, 0.0),
+                0.0,
+                ImagePlacement {
+                    pose_unit_px: [100.0, 100.0],
+                    origin_px: [0.0, 0.0],
+                    frame_px: [200.0, 100.0],
+                }
+            )
+            .is_err()
+        );
         assert!(playable.is_solved());
     }
 

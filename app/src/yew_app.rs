@@ -22,19 +22,19 @@ use crate::model::*;
 use crate::multiplayer_bridge;
 use crate::multiplayer_identity;
 use crate::multiplayer_sync::MultiplayerSyncAdapter;
-use crate::persisted::{PrivateImageEntry, PrivateImageRefs, LOCAL_PRIVATE_SCOPE};
+use crate::persisted::{LOCAL_PRIVATE_SCOPE, PrivateImageEntry, PrivateImageRefs};
 use crate::persisted_store;
 use crate::runtime::{FailReason, SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::catalog::{
-    blank_puzzle_by_slug, PuzzleCatalogEntry, BLANK_PUZZLES, PUZZLE_CATALOG,
+    BLANK_PUZZLES, PUZZLE_CATALOG, PuzzleCatalogEntry, blank_puzzle_by_slug,
 };
 use heddobureika_core::{
-    available_topologies, is_valid_room_id, logical_image_size, topology_kind_for_tag, AdminMsg,
-    ClientId, PieceCountChoice, PlayableGameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec,
-    PuzzleTopology, RoomControlUpdate, ServerMsg, TopologySpec, ASSET_CHUNK_BYTES,
-    PRIVATE_UPLOAD_MAX_BYTES, ROOM_ID_ALPHABET, ROOM_ID_LEN,
+    ASSET_CHUNK_BYTES, AdminMsg, ClientId, PRIVATE_UPLOAD_MAX_BYTES, PieceCountChoice,
+    PlayableGameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleTopology, ROOM_ID_ALPHABET,
+    ROOM_ID_LEN, RoomControlUpdate, ServerMsg, TopologySpec, available_topologies,
+    is_valid_room_id, logical_image_size, topology_kind_for_tag,
 };
 use image_pipeline::{AlphaMode, PipelineConfig};
 use sha2::{Digest, Sha256};
@@ -3266,8 +3266,7 @@ fn app(props: &AppProps) -> Html {
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if let Ok(value) = input.value().parse::<f32>() {
-                let value =
-                    value.clamp(WGPU_FLIP_THICKNESS_MM_MIN, WGPU_FLIP_THICKNESS_MM_MAX);
+                let value = value.clamp(WGPU_FLIP_THICKNESS_MM_MIN, WGPU_FLIP_THICKNESS_MM_MAX);
                 let mut next = (*render_settings).clone();
                 next.wgpu.flip_thickness_mm = value;
                 render_settings.set(next);

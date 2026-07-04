@@ -15,8 +15,8 @@ use heddobureika_game::{
 };
 
 use crate::grid::{
-    build_grid_choices, clamp_custom_piece_count, grid_choice_label, nearest_valid_grid,
-    DEFAULT_TARGET_COUNT, FALLBACK_GRID, TARGET_PIECE_COUNTS,
+    DEFAULT_TARGET_COUNT, FALLBACK_GRID, TARGET_PIECE_COUNTS, build_grid_choices,
+    clamp_custom_piece_count, grid_choice_label, nearest_valid_grid,
 };
 
 /// One discrete piece-count option the UI can offer the user. Wraps a
@@ -318,11 +318,7 @@ fn best_triangular_params(
 }
 
 fn diff_abs(a: u32, b: u32) -> u32 {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
+    if a >= b { a - b } else { b - a }
 }
 
 fn triangular_spec_label(spec: &TopologySpec) -> Option<String> {
@@ -575,7 +571,7 @@ fn voronoi_spec_label(spec: &TopologySpec) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heddobureika_game::{build_topology_from_spec, PuzzleTopology};
+    use heddobureika_game::{PuzzleTopology, build_topology_from_spec};
 
     #[test]
     fn registry_contains_all_kinds() {

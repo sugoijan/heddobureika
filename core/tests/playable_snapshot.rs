@@ -1,6 +1,6 @@
 use heddobureika_core::{
-    decode, encode, GameRules, PlayableGameSnapshot, PlayableGameSnapshotError,
-    PlayableGameStateSnapshot, PuzzleImageRef, PuzzleInfo, PLAYABLE_GAME_SNAPSHOT_VERSION,
+    GameRules, PLAYABLE_GAME_SNAPSHOT_VERSION, PlayableGameSnapshot, PlayableGameSnapshotError,
+    PlayableGameStateSnapshot, PuzzleImageRef, PuzzleInfo, decode, encode,
 };
 use heddobureika_game::{
     ActionId, GridTopology, LogicalState, MergePolicy, PlayRules, PlayableAction, PlayableState,

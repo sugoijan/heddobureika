@@ -13,7 +13,7 @@
 
 use crate::edge_compose::ConnectorSeg;
 use crate::edge_profile::{
-    build_edge_profile_segments, ConnectorShape, EdgeProfileInput, EdgeShapeStyle,
+    ConnectorShape, EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments,
 };
 use crate::ids::EdgeId;
 use crate::shape::{PathMm, PathSegMm, PointMm};

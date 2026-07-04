@@ -14,8 +14,8 @@
 //!    near (0,0) for every piece.
 
 use heddobureika_game::{
-    build_topology_from_spec, GridShapeSettings, PuzzleTopology, TopologySpec,
-    TriangularTessellationShapeSettings,
+    GridShapeSettings, PuzzleTopology, TopologySpec, TriangularTessellationShapeSettings,
+    build_topology_from_spec,
 };
 
 const IMAGE_W: u32 = 600;

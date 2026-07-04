@@ -5,7 +5,7 @@ use std::any::Any;
 use crate::ids::{EdgeId, PieceId};
 use crate::playable::Pose2;
 use crate::render_geometry::PuzzleRenderGeometry;
-use crate::rotation_step::{next_step_canonical, StepDirection, SymmetryStrength};
+use crate::rotation_step::{StepDirection, SymmetryStrength, next_step_canonical};
 use crate::topology::{RelativePose, TopologySpec};
 use crate::units::{AngleDeg, LengthMm};
 

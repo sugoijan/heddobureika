@@ -3,15 +3,15 @@ use std::rc::Rc;
 
 use gloo::timers::future::TimeoutFuture;
 use js_sys::{Array, Date, Math, Uint8Array};
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
 use crate::persisted_store;
 use crate::runtime::FailReason;
-use heddobureika_core::{decode, encode, AdminMsg, ClientMsg, ServerMsg};
+use heddobureika_core::{AdminMsg, ClientMsg, ServerMsg, decode, encode};
 
 pub(crate) struct WsHandlers {
     onopen: Closure<dyn FnMut(Event)>,

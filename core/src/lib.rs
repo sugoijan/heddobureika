@@ -17,9 +17,9 @@ pub use game::*;
 pub use game_bridge::*;
 pub use grid::*;
 pub use protocol::*;
-pub use room_id::{is_valid_room_id, RoomId, RoomIdError, ROOM_ID_ALPHABET, ROOM_ID_LEN};
+pub use room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId, RoomIdError, is_valid_room_id};
 pub use snapshot::*;
 pub use state::CoreState;
 pub use topology_kinds::{
-    available_topologies, topology_kind_for_tag, PieceCountChoice, TopologyKind,
+    PieceCountChoice, TopologyKind, available_topologies, topology_kind_for_tag,
 };

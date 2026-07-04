@@ -3,16 +3,16 @@
 use std::f32::consts::PI;
 
 use crate::edge_compose::{
-    append_mapped_local_line_points as compose_append_mapped_local_line_points,
+    ConnectorSeg, append_mapped_local_line_points as compose_append_mapped_local_line_points,
     connection_point_for_side as compose_connection_point_for_side,
-    map_segments_to_path as compose_map_segments_to_path, reverse_connector_segments, ConnectorSeg,
+    map_segments_to_path as compose_map_segments_to_path, reverse_connector_segments,
 };
 use crate::edge_host::{
-    corner_arc_points, frame_outline_points, warp_point, warp_points, BorderFrameShape,
-    EdgeOrientation, HostEdgeFrame, LineWave, WarpField,
+    BorderFrameShape, EdgeOrientation, HostEdgeFrame, LineWave, WarpField, corner_arc_points,
+    frame_outline_points, warp_point, warp_points,
 };
 use crate::edge_profile::{
-    build_edge_profile_segments, ConnectorShape, EdgeProfileInput, EdgeShapeStyle,
+    ConnectorShape, EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments,
 };
 use crate::ids::{BorderEdgeId, EdgeId, FrameEdgeId, PieceId};
 use crate::shape::{

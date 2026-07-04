@@ -5,8 +5,8 @@ use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgb, Rgba};
 use img_parts::{Bytes, ImageEXIF, ImageICC};
 use moxcms::{
-    curve_from_gamma, CicpColorPrimaries, CicpProfile, ColorProfile, Layout, MatrixCoefficients,
-    TransferCharacteristics, TransformOptions,
+    CicpColorPrimaries, CicpProfile, ColorProfile, Layout, MatrixCoefficients,
+    TransferCharacteristics, TransformOptions, curve_from_gamma,
 };
 
 #[derive(Debug, thiserror::Error)]

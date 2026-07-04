@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use heddobureika_core::ClientId;
 use js_sys::Date;
-use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use p256::SecretKey;
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;

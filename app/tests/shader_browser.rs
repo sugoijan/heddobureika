@@ -1,12 +1,12 @@
 #![cfg(all(target_arch = "wasm32", not(feature = "dev-panel-yew")))]
 
+use naga::ShaderStage;
 use naga::back::glsl;
 use naga::front::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
-use naga::ShaderStage;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
-use web_sys::{window, HtmlCanvasElement, WebGl2RenderingContext, WebGlProgram, WebGlShader};
+use web_sys::{HtmlCanvasElement, WebGl2RenderingContext, WebGlProgram, WebGlShader, window};
 
 const PIECE_SRC: &str = include_str!("../src/wgpu_piece.wgsl");
 const FRAME_SRC: &str = include_str!("../src/wgpu_frame.wgsl");

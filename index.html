@@ -1,9 +1,9 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Heddobureika</title>
+    <link data-trunk rel="inline" href="target/seo/seo-head.html" type="html" />
     <script id="boot-inline">
       (() => {
         const STORAGE_RENDERER_KEY = "hb.renderer_preference";
@@ -489,10 +489,16 @@
     <link data-trunk rel="rust" href="app/Cargo.toml" data-initializer="boot-init.js" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int"/>
     <link data-trunk rel="css" href="styles.css" />
     <link data-trunk rel="copy-file" href="boot-init.js" />
+    <link data-trunk rel="copy-file" href="seo/favicon.svg" />
+    <link data-trunk rel="copy-file" href="seo/favicon.ico" />
+    <link data-trunk rel="copy-file" href="seo/og-image.jpg" />
+    <link data-trunk rel="copy-file" href="seo/apple-touch-icon.png" />
+    <link data-trunk rel="copy-file" href="target/seo/sitemap.xml" />
     <link data-trunk rel="copy-dir" href="puzzles" />
     <link data-trunk rel="copy-dir" href="fonts" />
   </head>
   <body>
+    <link data-trunk rel="inline" href="target/seo/seo-body.html" type="html" />
     <div id="boot-shell" class="boot-shell is-loading" data-phase="checking">
       <div class="boot-bar" aria-hidden="true">
         <div class="boot-bar-track">
@@ -505,12 +511,6 @@
         <div class="boot-blocked-hint" id="boot-blocked-hint"></div>
       </div>
     </div>
-    <noscript>
-      <div class="boot-noscript" role="alert">
-        <div class="boot-noscript-title">JavaScript is required.</div>
-        <div class="boot-noscript-message">Enable JavaScript to run the app.</div>
-      </div>
-    </noscript>
     <div id="wgpu-root"></div>
     <div id="svg-root"></div>
     <div id="dev-panel-root"></div>

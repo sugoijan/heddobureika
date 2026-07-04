@@ -1,5 +1,5 @@
 use crate::{
-    compute_workspace_layout, GameRules, GridChoice, PuzzleInfo, WorkspaceLayout, FALLBACK_GRID,
+    FALLBACK_GRID, GameRules, GridChoice, PuzzleInfo, WorkspaceLayout, compute_workspace_layout,
 };
 
 /// In-memory puzzle metadata.

@@ -66,12 +66,12 @@ pub use projection::{
     IdentityPhysicalState, InteractableState, PhysicalProjection, ProjectionScratch, VisualState,
 };
 pub use render_geometry::{
-    PiecePaths, PieceRenderGeometry, PuzzleFrameShape, PuzzleRenderGeometry, RectPx,
-    PUZZLE_FRAME_CORNER_RADIUS_RATIO,
+    PUZZLE_FRAME_CORNER_RADIUS_RATIO, PiecePaths, PieceRenderGeometry, PuzzleFrameShape,
+    PuzzleRenderGeometry, RectPx,
 };
 pub use rotation_step::{
-    canonicalize_symmetry_angles, group_symmetry_angles, intersect_symmetry_angles,
-    next_step_canonical, next_step_target, StepDirection, StepRotationTarget, SymmetryStrength,
+    StepDirection, StepRotationTarget, SymmetryStrength, canonicalize_symmetry_angles,
+    group_symmetry_angles, intersect_symmetry_angles, next_step_canonical, next_step_target,
 };
 pub use rules::PlayRules;
 pub use shape::{
@@ -81,16 +81,16 @@ pub use shape::{
 };
 pub use shape_atlas_builder::{PieceEdgeBuilderSpec, ShapeAtlasBuildError, ShapeAtlasBuilder};
 pub use shape_svg::{
-    cache_to_svg_paths, frame_to_svg_paths, path_to_svg_d, piece_to_svg_paths, SvgPiecePaths,
+    SvgPiecePaths, cache_to_svg_paths, frame_to_svg_paths, path_to_svg_d, piece_to_svg_paths,
 };
 pub use snap::{ActionId, JoinSite, MergePolicy, SnapCandidate, SnapProposal, SnapRejectionReason};
 pub use snapshot::{
-    PlayableSnapshot, PlayableSnapshotError, RestoredPlayableState, SnapshotEnvelope,
-    PLAYABLE_SNAPSHOT_VERSION,
+    PLAYABLE_SNAPSHOT_VERSION, PlayableSnapshot, PlayableSnapshotError, RestoredPlayableState,
+    SnapshotEnvelope,
 };
 pub use topology::{
-    build_topology_from_spec, GenericPlayableState, GenericTopology, GridTopology, RelativePose,
-    SerializableTopology, TopologySpec, TrianglePieceKind, TriangularTessellationTopology,
+    GenericPlayableState, GenericTopology, GridTopology, RelativePose, SerializableTopology,
+    TopologySpec, TrianglePieceKind, TriangularTessellationTopology, build_topology_from_spec,
 };
 pub use traits::edge_profile::EdgeProfileStrategy;
 pub use traits::shaping::{PieceGeometryProvider, TopologyShaper};

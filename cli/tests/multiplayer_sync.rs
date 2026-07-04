@@ -1,13 +1,12 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::catalog::PUZZLE_CATALOG;
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
-    AdminMsg, ClientMsg, GameRules, GridTopology, LogicalState, PieceId, PlayRules,
-    PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableState, Pose2,
-    PuzzleImageRef, PuzzleInfo, PuzzleSpec, RoomPersistence, ServerMsg, TopologySpec,
-    ASSET_CHUNK_BYTES,
+    ASSET_CHUNK_BYTES, AdminMsg, ClientMsg, GameRules, GridTopology, LogicalState, PieceId,
+    PlayRules, PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableState,
+    Pose2, PuzzleImageRef, PuzzleInfo, PuzzleSpec, RoomPersistence, ServerMsg, TopologySpec,
 };
 
 /// Test fixture: each piece is its own singleton group with the given pose.
@@ -17,17 +16,17 @@ struct SingletonFixture {
     rotations: Vec<f32>,
     scramble_nonce: u32,
 }
-use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rand::RngExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use url::Url;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -453,8 +452,8 @@ async fn multiplayer_move_is_observed_by_second_client() -> Result<(), Box<dyn s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multiplayer_private_upload_reloads_and_serves_asset(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn multiplayer_private_upload_reloads_and_serves_asset()
+-> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_token) = admin_token_from_env() else {
         eprintln!("Skipping test: ADMIN_TOKEN/ROOM_ADMIN_TOKEN not set.");
         return Ok(());

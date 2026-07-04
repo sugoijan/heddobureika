@@ -10,7 +10,7 @@
 //! progress rotation about the piece's anchor; at the endpoints (0 or 1) it
 //! reduces to the existing instant front/back rendering.
 
-use crate::rotation_anim::{damped_spring, SpringParams};
+use crate::rotation_anim::{SpringParams, damped_spring};
 
 /// Settle thresholds: once `progress` and its velocity are this close to the
 /// target the flip is considered finished and snaps to the exact endpoint.

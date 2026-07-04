@@ -1,7 +1,7 @@
 //! Non-mutating snap probing and proposal contracts.
 
 use crate::ids::{EdgeId, GroupId, PieceId};
-use crate::playable::{rotate_offset_with_aspect, FlipState, PlayableState, Pose2};
+use crate::playable::{FlipState, PlayableState, Pose2, rotate_offset_with_aspect};
 use crate::topology::PuzzleTopology;
 
 /// Transport-agnostic action identifier carried by proposals.

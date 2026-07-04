@@ -1,23 +1,23 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
-    compute_workspace_layout, piece_bounds_px, rotate_vec, safety_corrections_after_detach,
-    scramble_flips, scramble_layout_for_pieces, scramble_nonce_from_seed, scramble_pose,
-    scramble_rotations, scramble_seed_from_topology, splitmix32, DEFAULT_TAB_DEPTH_CAP,
-    FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED,
+    DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED, compute_workspace_layout,
+    piece_bounds_px, rotate_vec, safety_corrections_after_detach, scramble_flips,
+    scramble_layout_for_pieces, scramble_nonce_from_seed, scramble_pose, scramble_rotations,
+    scramble_seed_from_topology, splitmix32,
 };
-use heddobureika_core::room_id::{is_valid_room_id, ROOM_ID_LEN};
+use heddobureika_core::room_id::{ROOM_ID_LEN, is_valid_room_id};
 use heddobureika_core::{
-    logical_image_size, nearest_valid_grid, puzzle_by_slug, topology_kind_for_tag,
-    DEFAULT_TARGET_COUNT, FALLBACK_GRID,
+    ASSET_CHUNK_BYTES, ActionId, AdminMsg, ClientId, ClientMsg, GameBridgeError, GameRules,
+    MergePolicy, OwnershipReason, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
+    PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableRoomUpdate,
+    PlayableRoomUpdateKind, PlayableTopologySnapshot, PlayableUpdateBatch, PuzzleImageRef,
+    PuzzleInfo, PuzzleSpec, RecordedCommand, RecordedCommandKind, RecordedCommandOutcome,
+    RoomControlUpdate, RoomPersistence, ServerMsg, validate_image_ref,
 };
 use heddobureika_core::{
-    validate_image_ref, ActionId, AdminMsg, ClientId, ClientMsg, GameBridgeError, GameRules,
-    MergePolicy, OwnershipReason, PlayableGameSnapshot, PlayablePoseSnapshot,
-    PlayablePositionSnapshot, PlayableRoomUpdate, PlayableRoomUpdateKind, PlayableTopologySnapshot,
-    PlayableUpdateBatch, PuzzleImageRef, PuzzleInfo, PuzzleSpec, RecordedCommand,
-    RecordedCommandKind, RecordedCommandOutcome, RoomControlUpdate, RoomPersistence, ServerMsg,
-    ASSET_CHUNK_BYTES, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
+    DEFAULT_TARGET_COUNT, FALLBACK_GRID, logical_image_size, nearest_valid_grid, puzzle_by_slug,
+    topology_kind_for_tag,
 };
 use heddobureika_game::{
     AngleDeg, FlipState, GroupId, LogicalState, PlayableAction, PlayableState, TopologySpec,
@@ -25,7 +25,7 @@ use heddobureika_game::{
 use image_pipeline::{AlphaMode, PipelineConfig};
 use imagesize::{Compression, ImageType};
 use js_sys::Date;
-use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::Deserialize as SerdeDeserialize;
 use sha2::{Digest, Sha256};
@@ -4776,9 +4776,7 @@ impl CommandStore {
             x if x == RecordedCommandKind::Release as u32 => Ok(RecordedCommandKind::Release),
             x if x == RecordedCommandKind::Ping as u32 => Ok(RecordedCommandKind::Ping),
             x if x == RecordedCommandKind::Detach as u32 => Ok(RecordedCommandKind::Detach),
-            x if x == RecordedCommandKind::SendToBack as u32 => {
-                Ok(RecordedCommandKind::SendToBack)
-            }
+            x if x == RecordedCommandKind::SendToBack as u32 => Ok(RecordedCommandKind::SendToBack),
             _ => Err("invalid command kind".to_string()),
         }
     }

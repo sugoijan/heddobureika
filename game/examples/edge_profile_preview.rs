@@ -2,8 +2,8 @@ use std::fmt::Write;
 use std::num::NonZeroU32;
 
 use heddobureika_game::{
-    path_to_svg_d, GridEdgeProfileSample, GridJigsawShaper, GridShapeSettings, GridTopology,
-    LengthMm, PathMm, PathSegMm,
+    GridEdgeProfileSample, GridJigsawShaper, GridShapeSettings, GridTopology, LengthMm, PathMm,
+    PathSegMm, path_to_svg_d,
 };
 
 fn main() {

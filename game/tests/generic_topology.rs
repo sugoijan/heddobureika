@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use heddobureika_game::{
-    build_topology_from_spec, GenericTopology, GridTopology, LogicalState, PlayRules,
-    PlayableState, PuzzleTopology, TopologySpec, TriangularTessellationTopology,
+    GenericTopology, GridTopology, LogicalState, PlayRules, PlayableState, PuzzleTopology,
+    TopologySpec, TriangularTessellationTopology, build_topology_from_spec,
 };
 
 #[test]

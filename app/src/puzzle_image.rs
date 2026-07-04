@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use heddobureika_core::{
-    catalog::{puzzle_by_slug, BLANK_BLACK_SLUG, BLANK_WHITE_SLUG},
     PuzzleImageRef,
+    catalog::{BLANK_BLACK_SLUG, BLANK_WHITE_SLUG, puzzle_by_slug},
 };
 
 pub(crate) fn resolve_puzzle_image_src(image_ref: &PuzzleImageRef) -> Option<String> {

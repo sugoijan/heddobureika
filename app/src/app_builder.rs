@@ -1,12 +1,12 @@
-use crate::app_core::{random_shape_seed, AppCore};
+use crate::app_core::{AppCore, random_shape_seed};
 use crate::app_router;
 use crate::app_runtime;
 use crate::boot;
 use crate::boot_runtime::{self, BootState};
 use crate::core::{
-    build_grid_choices, grid_choice_index, nearest_valid_grid, scramble_nonce_from_seed,
     DEFAULT_TARGET_COUNT, FALLBACK_GRID, IMAGE_MAX_DIMENSION_MAX, IMAGE_MAX_DIMENSION_MIN,
-    PUZZLE_SEED,
+    PUZZLE_SEED, build_grid_choices, grid_choice_index, nearest_valid_grid,
+    scramble_nonce_from_seed,
 };
 use crate::core::{GridChoice, InitMode, RenderSettings, RendererKind};
 use crate::local_snapshot::load_local_snapshot;
@@ -14,7 +14,7 @@ use crate::persisted::BootPuzzleSelection;
 use crate::persisted_store;
 use crate::sync_runtime;
 use heddobureika_core::catalog::{
-    logical_image_size, puzzle_by_slug, PuzzleCatalogEntry, PUZZLE_CATALOG,
+    PUZZLE_CATALOG, PuzzleCatalogEntry, logical_image_size, puzzle_by_slug,
 };
 use heddobureika_core::{PuzzleImageRef, TopologySpec};
 use js_sys::decode_uri_component;
@@ -432,6 +432,10 @@ impl BootCoordinator {
         boot::set_phase("Initializing", "Loading saved data.");
         boot_runtime::set_boot_state(BootState::LoadingStorage);
         let _ = persisted_store::bootstrap().await;
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::favicon::init(&self.core);
+        }
         boot::set_phase("Initializing", "Preparing session.");
         let init = app_router::load_init_config();
         let _ = init.mode_preference;

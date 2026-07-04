@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["app", "core", "game", "worker", "cli", "image_pipeline"]
+members = ["app", "core", "game", "worker", "cli", "image_pipeline", "xtask"]
 default-members = ["app"]
 
 [workspace.package]
@@ -48,7 +48,8 @@ heddobureika-game = { path = "game" }
 smallvec = "1.15"
 typed_floats = "1.0"
 
-# cli
+# cli / xtask
+anyhow = "1"
 clap = "4"
 rand = "0.10"
 url = "2"

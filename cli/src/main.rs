@@ -4,26 +4,27 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::codec::{decode_result, encode};
-use heddobureika_core::room_id::{RoomId, ROOM_ID_ALPHABET, ROOM_ID_LEN};
+use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
 use heddobureika_core::{
-    puzzle_by_slug, AdminMsg, PuzzleImageRef, PuzzleSpec, RecordedCommand, RecordedCommandKind,
-    RecordedCommandOutcome, ServerMsg, ASSET_CHUNK_BYTES, PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG,
+    ASSET_CHUNK_BYTES, AdminMsg, PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG, PuzzleImageRef,
+    PuzzleSpec, RecordedCommand, RecordedCommandKind, RecordedCommandOutcome, ServerMsg,
+    puzzle_by_slug,
 };
 use mime_guess::MimeGuess;
-use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rand::RngExt;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::time::{timeout, Duration};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use url::Url;
 
 #[derive(Parser)]

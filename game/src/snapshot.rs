@@ -7,7 +7,7 @@ use crate::ids::{GroupId, PieceId};
 use crate::logical::{GroupSlot, LogicalInvariantError, LogicalState, PieceSlot};
 use crate::playable::{FlipState, PlayableInvariantError, PlayableState, Pose2};
 use crate::rules::PlayRules;
-use crate::topology::{build_topology_from_spec, GenericPlayableState, TopologySpec};
+use crate::topology::{GenericPlayableState, TopologySpec, build_topology_from_spec};
 use crate::traits::topology::PuzzleTopology;
 
 pub const PLAYABLE_SNAPSHOT_VERSION: u32 = 2;

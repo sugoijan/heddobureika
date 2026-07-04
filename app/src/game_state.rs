@@ -12,10 +12,10 @@
 use std::fmt;
 
 use heddobureika_core::{
-    build_topology_from_spec, scramble_pose, EdgeId, FlipState, GameRules, GenericPlayableState,
-    GroupId, ImagePlacement, LogicalState, PieceId, PlayableDelta, PlayableGameSnapshot,
-    PlayableGameSnapshotError, PlayableRoomUpdate, PlayableState, Pose2, ProjectionScratch,
-    PuzzleInfo, PuzzleTopology, TopologySpec, VisualState,
+    EdgeId, FlipState, GameRules, GenericPlayableState, GroupId, ImagePlacement, LogicalState,
+    PieceId, PlayableDelta, PlayableGameSnapshot, PlayableGameSnapshotError, PlayableRoomUpdate,
+    PlayableState, Pose2, ProjectionScratch, PuzzleInfo, PuzzleTopology, TopologySpec, VisualState,
+    build_topology_from_spec, scramble_pose,
 };
 
 /// Live app-side game state. Wraps the canonical generic `PlayableState`
@@ -292,7 +292,7 @@ mod tests {
     use super::*;
     use crate::core::GridChoice;
     use heddobureika_core::{
-        build_topology_from_spec, PlayableAction, PlayableRoomUpdateKind, Position2, PuzzleImageRef,
+        PlayableAction, PlayableRoomUpdateKind, Position2, PuzzleImageRef, build_topology_from_spec,
     };
 
     #[test]

@@ -11,11 +11,11 @@ use crate::game_state::AppGameState;
 use crate::input::{ClickGesture, ShakeDetector};
 use crate::runtime::CoreAction;
 use heddobureika_core::{
-    angle_delta, build_topology_from_spec, piece_bounds_px, safety_corrections_after_detach,
-    scramble_flips, scramble_layout_for_pieces, validate_image_ref, AngleDeg, CoreState, FlipState,
-    GameRules, ImagePlacement, MergePolicy, PieceId, PlayableAction, Pose2, Position2,
-    PuzzleImageRef, PuzzleInfo, PuzzleTopology, RestrictedPlayableAction, TopologySpec,
-    DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, MAX_LINE_BEND_RATIO,
+    AngleDeg, CoreState, DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, FlipState, GameRules, ImagePlacement,
+    MAX_LINE_BEND_RATIO, MergePolicy, PieceId, PlayableAction, Pose2, Position2, PuzzleImageRef,
+    PuzzleInfo, PuzzleTopology, RestrictedPlayableAction, TopologySpec, angle_delta,
+    build_topology_from_spec, piece_bounds_px, safety_corrections_after_detach, scramble_flips,
+    scramble_layout_for_pieces, validate_image_ref,
 };
 
 pub(crate) type AppSubscriber = Rc<dyn Fn()>;
@@ -785,8 +785,8 @@ impl AppCore {
                 match game.playable.logical.group_of(PieceId(piece_id as u32)) {
                     Some(primary_group) => {
                         let group_size = members.len();
-                        let rotation_locked = group_size == total
-                            || group_size > ROTATION_LOCK_THRESHOLD_DEFAULT;
+                        let rotation_locked =
+                            group_size == total || group_size > ROTATION_LOCK_THRESHOLD_DEFAULT;
                         let current_angle = game
                             .playable
                             .pose_of(primary_group)
@@ -998,7 +998,10 @@ impl AppCore {
         if drag.shake.update(x, y, now_ms_f32(), reference_len) {
             if let Some(anchor) = drag.members.first().copied() {
                 if let Some(game) = state.game.as_mut() {
-                    if game.playable.send_backward_to_fitting_depth(&[anchor as u32]) {
+                    if game
+                        .playable
+                        .send_backward_to_fitting_depth(&[anchor as u32])
+                    {
                         game.rebuild_visual();
                         state.pending_shake_to_back = Some(anchor);
                     }
@@ -2186,8 +2189,8 @@ pub(crate) fn now_ms_f32() -> f32 {
     {
         if let Some(window) = web_sys::window()
             && let Ok(perf) = Reflect::get(&window, &"performance".into())
-            && let Ok(now_fn) = Reflect::get(&perf, &"now".into())
-                .and_then(|value| value.dyn_into::<Function>())
+            && let Ok(now_fn) =
+                Reflect::get(&perf, &"now".into()).and_then(|value| value.dyn_into::<Function>())
             && let Ok(value) = now_fn.call0(&perf)
             && let Some(ms) = value.as_f64()
         {

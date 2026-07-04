@@ -1,6 +1,6 @@
 //! Composition utilities that apply connector profiles onto host-edge frames.
 
-use crate::edge_host::{map_local_point, map_point, HostEdgeFrame, WarpField};
+use crate::edge_host::{HostEdgeFrame, WarpField, map_local_point, map_point};
 use crate::shape::{PathMm, PathSegMm, PointMm};
 use crate::units::LengthMm;
 

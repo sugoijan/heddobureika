@@ -918,8 +918,8 @@ mod safety_tests {
     use super::*;
     use crate::snapshot::PuzzleImageRef;
     use heddobureika_game::{
-        build_topology_from_spec, GridTopology, LogicalState, PieceId, PlayRules, Pose2,
-        RestrictedPlayableAction, TopologySpec,
+        GridTopology, LogicalState, PieceId, PlayRules, Pose2, RestrictedPlayableAction,
+        TopologySpec, build_topology_from_spec,
     };
 
     /// The shared scatter contract: a scattered top-left maps to a pose whose

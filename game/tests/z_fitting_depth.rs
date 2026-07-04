@@ -64,7 +64,12 @@ fn group_world_aabb_rotation_45_enlarges_by_sqrt2() {
     let aabb = state.group_world_aabb(g).unwrap();
     // Rotated-rect width = ex*|cos| + ey*|sin| = (ex+ey)*√2/2.
     let expected_w = (ex + ey) * (2f32.sqrt() / 2.0);
-    assert!((aabb.width() - expected_w).abs() < 1e-2, "w={} exp={}", aabb.width(), expected_w);
+    assert!(
+        (aabb.width() - expected_w).abs() < 1e-2,
+        "w={} exp={}",
+        aabb.width(),
+        expected_w
+    );
 }
 
 #[test]
@@ -116,7 +121,10 @@ fn shake_keeps_shaken_group_visible_and_reveals_covered() {
     // above its container rather than stay hidden.
     let big_anchor = state.anchor_piece_of_group(big).unwrap().as_u32();
     state.set_z_order_by_anchors(&[big_anchor]);
-    assert!(zidx(&state, big) > zidx(&state, small), "big now hides small");
+    assert!(
+        zidx(&state, big) > zidx(&state, small),
+        "big now hides small"
+    );
     state.send_backward_to_fitting_depth(&[small.as_u32()]);
     assert!(
         zidx(&state, small) > zidx(&state, big),
@@ -134,7 +142,11 @@ fn isolated_group_goes_fully_forward_and_back() {
 
     state.bring_forward_to_fitting_depth(&[g.as_u32()]);
     let total = groups.len() as u32;
-    assert_eq!(zidx(&state, g), total - 1, "isolated bring-forward → absolute front");
+    assert_eq!(
+        zidx(&state, g),
+        total - 1,
+        "isolated bring-forward → absolute front"
+    );
 
     state.send_backward_to_fitting_depth(&[g.as_u32()]);
     assert_eq!(zidx(&state, g), 0, "isolated send-backward → absolute back");

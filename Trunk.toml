@@ -6,6 +6,39 @@ ignore = [
   "dist",
   "worker",
   "cli",
+  "xtask",
+  # Outputs of the gen-icons pre_build hook; ignored so regenerating
+  # them does not immediately trigger another rebuild.
+  "seo/favicon.svg",
+  "seo/favicon.ico",
+  "seo/apple-touch-icon.png",
+]
+
+# Regenerates target/seo/ from seo/metadata.toml so the fragments inlined by
+# index.html are always fresh and never need to be committed.
+[[hooks]]
+stage = "pre_build"
+command = "cargo"
+command_arguments = [
+  "run",
+  "-p",
+  "xtask",
+  "--",
+  "regen-seo",
+]
+
+# Regenerates the committed icons in seo/ from art/icon.sketch on machines
+# where Sketch's sketchtool is available; quietly skips everywhere else.
+[[hooks]]
+stage = "pre_build"
+command = "cargo"
+command_arguments = [
+  "run",
+  "-p",
+  "xtask",
+  "--",
+  "gen-icons",
+  "--auto",
 ]
 
 [[hooks]]

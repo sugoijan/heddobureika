@@ -4,13 +4,13 @@ use std::rc::Rc;
 use gloo::timers::callback::Timeout;
 use gloo::timers::future::TimeoutFuture;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::app_core::{AppCore, AppSnapshot, AppSubscription};
 use crate::app_router::{self, MultiplayerConfig};
 use crate::boot_runtime::{self, BootState};
 use crate::core::InitMode;
-use crate::local_snapshot::{apply_playable_snapshot_to_core, ApplySnapshotResult};
+use crate::local_snapshot::{ApplySnapshotResult, apply_playable_snapshot_to_core};
 use crate::multiplayer_game_sync::MultiplayerGameSync;
 use crate::runtime::{
     CoreAction, FailReason, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView,

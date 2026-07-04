@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::num::NonZeroU32;
 
 use heddobureika_game::{
-    path_to_svg_d, BorderFrameShape, GridJigsawShaper, GridShapeSettings, GridTopology, LengthMm,
+    BorderFrameShape, GridJigsawShaper, GridShapeSettings, GridTopology, LengthMm, path_to_svg_d,
 };
 
 fn main() {

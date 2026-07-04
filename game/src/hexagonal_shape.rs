@@ -34,7 +34,7 @@ use crate::shape::{
 };
 use crate::shape_atlas_builder::{PieceEdgeBuilderSpec, ShapeAtlasBuildError, ShapeAtlasBuilder};
 use crate::shape_profiles::{
-    profiled_path_with_sign, reverse_path, straight_path, BoundaryArcClassifier, Point2,
+    BoundaryArcClassifier, Point2, profiled_path_with_sign, reverse_path, straight_path,
 };
 use crate::traits::shaping::{PieceGeometryProvider, TopologyShaper};
 use crate::traits::topology::PuzzleTopology;

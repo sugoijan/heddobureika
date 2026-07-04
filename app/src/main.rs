@@ -8,6 +8,7 @@ mod boot;
 mod boot_runtime;
 mod core;
 mod crash;
+mod favicon;
 mod flip_anim;
 mod game_state;
 mod idb;

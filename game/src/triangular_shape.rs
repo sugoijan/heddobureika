@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::edge_compose::ConnectorSeg;
 use crate::edge_profile::{
-    build_edge_profile_segments, ConnectorShape, EdgeProfileInput, EdgeShapeStyle,
+    ConnectorShape, EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments,
 };
 use crate::ids::{BorderEdgeId, EdgeId, FrameEdgeId, PieceId};
 use crate::shape::{
@@ -300,7 +300,10 @@ fn build_atlas_from_mesh(
                 piece_edges[piece.as_usize()][*side_idx] =
                     Some(PieceEdgeRef::Border { edge: border });
             }
-            [(piece_a, side_idx_a, start_a, end_a), (piece_b, side_idx_b, start_b, end_b)] => {
+            [
+                (piece_a, side_idx_a, start_a, end_a),
+                (piece_b, side_idx_b, start_b, end_b),
+            ] => {
                 let (edge, side_a_label) = topology_edges
                     .get(&(*piece_a, *piece_b))
                     .copied()
@@ -1091,11 +1094,7 @@ fn point(value: Point2) -> Result<PointMm, TriangularTessellationShapeBuildError
 }
 
 fn ordered_edge_key(a: usize, b: usize) -> (usize, usize) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 fn distance(a: Point2, b: Point2) -> f32 {

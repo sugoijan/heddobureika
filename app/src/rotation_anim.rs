@@ -342,11 +342,7 @@ fn directed_delta(from: f32, to: f32, hint: f32) -> f32 {
         return short;
     }
     let pos = (to - from).rem_euclid(360.0);
-    if hint > 0.0 {
-        pos
-    } else {
-        pos - 360.0
-    }
+    if hint > 0.0 { pos } else { pos - 360.0 }
 }
 
 /// Rotates `point` about `pivot` by `angle_deg`.
@@ -738,7 +734,15 @@ mod tests {
         let mut min_disp = f32::INFINITY;
         let mut max_disp = f32::NEG_INFINITY;
         for _ in 0..600 {
-            let still = cw.step(target.0, target.1, target_angle, params, 1.0 / 60.0, 1.0, None);
+            let still = cw.step(
+                target.0,
+                target.1,
+                target_angle,
+                params,
+                1.0 / 60.0,
+                1.0,
+                None,
+            );
             min_disp = min_disp.min(cw.disp_angle);
             max_disp = max_disp.max(cw.disp_angle);
             if !still {
@@ -759,8 +763,15 @@ mod tests {
         let mut shortest = GroupAnim::settled(start.0, start.1, 0.0);
         let mut min_short = f32::INFINITY;
         for _ in 0..600 {
-            let still =
-                shortest.step(target.0, target.1, target_angle, params, 1.0 / 60.0, 0.0, None);
+            let still = shortest.step(
+                target.0,
+                target.1,
+                target_angle,
+                params,
+                1.0 / 60.0,
+                0.0,
+                None,
+            );
             min_short = min_short.min(shortest.disp_angle);
             if !still {
                 break;

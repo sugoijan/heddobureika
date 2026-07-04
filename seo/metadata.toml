@@ -1,0 +1,33 @@
+default_locale = "en"
+site_name = "ヘッドブレイカー"
+alternate_name = "Heddobureika"
+theme_color_light = "#fff"
+theme_color_dark = "#141312"
+canonical_url = "https://sugoijan.dev/heddobureika/"
+# Relative hrefs resolve correctly under any --public-url (dev and prod).
+favicon_href = "favicon.svg"
+favicon_ico_href = "favicon.ico"
+apple_touch_icon_href = "apple-touch-icon.png"
+social_image_url = "https://sugoijan.dev/heddobureika/og-image.jpg"
+social_image_alt = "Heddobureika — a jigsaw puzzle in the browser."
+social_image_type = "image/jpeg"
+social_image_width = 1200
+social_image_height = 630
+robots = "index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1"
+application_category = "GameApplication"
+operating_system = "Web browser"
+genres = ["Jigsaw puzzle"]
+play_modes = ["SinglePlayer", "MultiPlayer"]
+twitter_card = "summary_large_image"
+is_accessible_for_free = true
+
+[locales.en]
+lang = "en"
+og_locale = "en_US"
+title = "Heddobureika - online jigsaw puzzles"
+description = "Heddobureika - a free web-based jigsaw puzzle game. Drag, rotate, and snap pieces solo or together with friends in real-time multiplayer rooms."
+structured_data_description = "Free web-based jigsaw puzzles - solve them solo or with friends in real-time multiplayer rooms."
+accessible_name = "Heddobureika"
+accessible_summary = "Free web-based jigsaw puzzles — solo or real-time multiplayer, in the browser."
+noscript_title = "JavaScript is required."
+noscript = "Enable JavaScript to run the app."

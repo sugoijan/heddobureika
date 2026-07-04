@@ -1,11 +1,11 @@
 use std::num::NonZeroU32;
 
 use heddobureika_game::{
-    cache_to_svg_paths, frame_to_svg_paths, path_to_svg_d, BorderEdgeGeometryMm, BorderEdgeId,
-    EdgeId, EdgeShapeStyle, EdgeSide, EdgeSideGeometryMm, FrameEdgeId, FrameGeometryMm,
-    GridJigsawShaper, GridPuzzleDefinition, GridShapeSettings, GridTopology,
-    InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceEdgeRef, PieceGeometryMm,
+    BorderEdgeGeometryMm, BorderEdgeId, EdgeId, EdgeShapeStyle, EdgeSide, EdgeSideGeometryMm,
+    FrameEdgeId, FrameGeometryMm, GridJigsawShaper, GridPuzzleDefinition, GridShapeSettings,
+    GridTopology, InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceEdgeRef, PieceGeometryMm,
     PieceGeometryProvider, PieceId, PointMm, PuzzleTopology, ShapeAtlasMm, TopologyShaper,
+    cache_to_svg_paths, frame_to_svg_paths, path_to_svg_d,
 };
 
 #[test]

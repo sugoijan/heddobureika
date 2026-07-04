@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
-use gloo::render::{request_animation_frame, AnimationFrame};
+use gloo::render::{AnimationFrame, request_animation_frame};
 use glyphon::cosmic_text::Align;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use js_sys::{Date, Function, Reflect};
@@ -16,15 +16,15 @@ use crate::app_router;
 use crate::boot;
 use crate::core::*;
 use crate::input::{
+    ClickGesture, PointerKind, PointerPolicy, WheelIntent, WheelIntentTracker,
     screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
-    workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
-    WheelIntentTracker,
+    workspace_to_puzzle_coords,
 };
 use crate::persisted_store;
 use crate::puzzle_image::{
     create_object_url, resolve_puzzle_credit, resolve_puzzle_image_src, revoke_object_url,
 };
-use crate::renderer::{build_mask_atlas, MaskAtlasData, UiRotationOrigin, UiTextId, UiTextSpec};
+use crate::renderer::{MaskAtlasData, UiRotationOrigin, UiTextId, UiTextSpec, build_mask_atlas};
 use crate::runtime::{CoreAction, GameSyncView, GameView, SyncView, ViewHooks};
 use crate::sync_runtime;
 use crate::view_runtime;

@@ -14,9 +14,9 @@
 //! and re-test each piece with many points by restoring state each time.
 
 use heddobureika_game::{
-    build_topology_from_spec, FlipState, GroupId, LogicalState, PieceId, PlayRules, PlayableAction,
-    PlayableState, Pose2, Position2, PuzzleRenderGeometry, PuzzleTopology,
-    TriangularTessellationTopology,
+    FlipState, GroupId, LogicalState, PieceId, PlayRules, PlayableAction, PlayableState, Pose2,
+    Position2, PuzzleRenderGeometry, PuzzleTopology, TriangularTessellationTopology,
+    build_topology_from_spec,
 };
 
 // Non-square on purpose so pose-unit x and y differ (aspect != 1).

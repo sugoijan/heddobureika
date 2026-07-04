@@ -1,6 +1,6 @@
 use heddobureika_game::{
-    canonicalize_symmetry_angles, intersect_symmetry_angles, next_step_canonical, next_step_target,
     AngleDeg, EdgeId, PieceId, PuzzleTopology, RelativePose, StepDirection,
+    canonicalize_symmetry_angles, intersect_symmetry_angles, next_step_canonical, next_step_target,
 };
 
 #[test]

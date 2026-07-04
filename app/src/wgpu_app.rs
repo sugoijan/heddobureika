@@ -1,5 +1,5 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
-use gloo::render::{request_animation_frame, AnimationFrame};
+use gloo::render::{AnimationFrame, request_animation_frame};
 use gloo::timers::callback::Timeout;
 use glyphon::cosmic_text::Align;
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
@@ -8,35 +8,35 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use taffy::prelude::*;
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, Document, Element, Event, HtmlCanvasElement, HtmlImageElement,
     PointerEvent, WheelEvent,
 };
 
-use crate::app_core::{now_ms_f32, AppCore, AppSnapshot, PuzzleAssets, ViewRect};
+use crate::app_core::{AppCore, AppSnapshot, PuzzleAssets, ViewRect, now_ms_f32};
 use crate::app_router;
 use crate::boot;
 use crate::core::*;
+use crate::flip_anim::FlipAnim;
 use crate::input::{
-    screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle, screen_to_view_coords,
-    workspace_to_puzzle_coords, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
-    WheelIntentTracker, CLICK_MAX_DURATION_MS,
+    CLICK_MAX_DURATION_MS, ClickGesture, PointerKind, PointerPolicy, WheelIntent,
+    WheelIntentTracker, screen_delta_to_world, screen_scroll_to_world, screen_slop_to_puzzle,
+    screen_to_view_coords, workspace_to_puzzle_coords,
 };
 use crate::persisted_store;
 use crate::puzzle_image::{
     create_object_url, resolve_puzzle_credit, resolve_puzzle_image_src, revoke_object_url,
 };
-use crate::flip_anim::FlipAnim;
-use crate::rotation_anim::{
-    apply_group_transform, rotate_group_succession, GroupAnim, SpringParams,
-};
 use crate::renderer::{
-    build_mask_atlas, EdgeVertex, FlipEdgeSpan, FlipEdges, Instance, InstanceBatch, InstanceSet,
-    MaskAtlasData, UiRotationOrigin, UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec,
-    WgpuRenderer,
+    EdgeVertex, FlipEdgeSpan, FlipEdges, Instance, InstanceBatch, InstanceSet, MaskAtlasData,
+    UiRotationOrigin, UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
+    build_mask_atlas,
+};
+use crate::rotation_anim::{
+    GroupAnim, SpringParams, apply_group_transform, rotate_group_succession,
 };
 use crate::runtime::{CoreAction, GameSyncView, GameView, ViewHooks};
 use crate::sync_runtime;
@@ -1940,8 +1940,7 @@ impl WgpuView {
             // Use a *stable* reference point (the canonical-anchor piece's anchor)
             // rather than the membership mean: adding pieces on a merge must not
             // shift the reference, or the group jumps by the centroid delta.
-            let Some(center) = group_reference_point(positions, *anchor, members, geometry)
-            else {
+            let Some(center) = group_reference_point(positions, *anchor, members, geometry) else {
                 continue;
             };
             let (c_t_x, c_t_y) = center;
@@ -3397,11 +3396,7 @@ impl WgpuView {
         };
         let drag_origin = snapshot.drag_cursor;
         let drag_dir = if highlight_members.is_some() {
-            if snapshot.drag_right_click {
-                -1.0
-            } else {
-                1.0
-            }
+            if snapshot.drag_right_click { -1.0 } else { 1.0 }
         } else {
             0.0
         };
@@ -3803,7 +3798,10 @@ fn group_reference_point(
         .or_else(|| members.iter().copied().min())?;
     let pos = positions.get(ref_id)?;
     let piece = geometry.pieces.get(ref_id)?;
-    Some((pos.0 + piece.pose_anchor_px[0], pos.1 + piece.pose_anchor_px[1]))
+    Some((
+        pos.0 + piece.pose_anchor_px[0],
+        pos.1 + piece.pose_anchor_px[1],
+    ))
 }
 
 fn drag_group_position(
@@ -4103,10 +4101,22 @@ fn push_flip_edge_verts(outline: &[[f32; 2]], out: &mut Vec<EdgeVertex>) {
     for i in 0..n {
         let a = outline[i];
         let b = outline[(i + 1) % n];
-        let a_back = EdgeVertex { pos: a, z_sign: -1.0 };
-        let a_front = EdgeVertex { pos: a, z_sign: 1.0 };
-        let b_back = EdgeVertex { pos: b, z_sign: -1.0 };
-        let b_front = EdgeVertex { pos: b, z_sign: 1.0 };
+        let a_back = EdgeVertex {
+            pos: a,
+            z_sign: -1.0,
+        };
+        let a_front = EdgeVertex {
+            pos: a,
+            z_sign: 1.0,
+        };
+        let b_back = EdgeVertex {
+            pos: b,
+            z_sign: -1.0,
+        };
+        let b_front = EdgeVertex {
+            pos: b,
+            z_sign: 1.0,
+        };
         out.push(a_back);
         out.push(a_front);
         out.push(b_back);

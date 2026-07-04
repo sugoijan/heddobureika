@@ -109,10 +109,11 @@ fn snap_probe_applies_rotation_tolerance() {
         Pose2::try_from_mm_degrees(1.0, 0.0, 8.0).expect("finite"),
     );
     assert!(far.activate_edges.is_empty());
-    assert!(far
-        .rejections
-        .iter()
-        .any(|(_, reason)| *reason == SnapRejectionReason::RotationMismatch));
+    assert!(
+        far.rejections
+            .iter()
+            .any(|(_, reason)| *reason == SnapRejectionReason::RotationMismatch)
+    );
 }
 
 #[test]
@@ -129,10 +130,12 @@ fn snap_probe_ignores_rotation_mismatch_when_rotation_disabled() {
     );
 
     assert_eq!(proposal.activate_edges, vec![EdgeId(0)]);
-    assert!(!proposal
-        .rejections
-        .iter()
-        .any(|(_, reason)| *reason == SnapRejectionReason::RotationMismatch));
+    assert!(
+        !proposal
+            .rejections
+            .iter()
+            .any(|(_, reason)| *reason == SnapRejectionReason::RotationMismatch)
+    );
 }
 
 #[test]
@@ -147,10 +150,12 @@ fn snap_probe_rejects_flipped_fixed_group() {
     );
 
     assert!(proposal.activate_edges.is_empty());
-    assert!(proposal
-        .rejections
-        .iter()
-        .any(|(_, reason)| *reason == SnapRejectionReason::FlippedGroup));
+    assert!(
+        proposal
+            .rejections
+            .iter()
+            .any(|(_, reason)| *reason == SnapRejectionReason::FlippedGroup)
+    );
 }
 
 #[test]
@@ -304,11 +309,13 @@ fn proposal_batch_reports_accepted_metadata_and_updates() {
         batch.proposal.merged_groups[0].absorbed,
         heddobureika_game::GroupId(1)
     );
-    assert!(batch
-        .proposal
-        .final_group_poses
-        .iter()
-        .any(|update| update.group == heddobureika_game::GroupId(0)));
+    assert!(
+        batch
+            .proposal
+            .final_group_poses
+            .iter()
+            .any(|update| update.group == heddobureika_game::GroupId(0))
+    );
 }
 
 #[test]
@@ -762,10 +769,12 @@ fn snap_probe_rejects_flipped_groups() {
     let proposal = playable.probe_snaps(heddobureika_game::GroupId(1), proposed);
 
     assert!(proposal.activate_edges.is_empty());
-    assert!(proposal
-        .rejections
-        .iter()
-        .any(|(_, reason)| *reason == SnapRejectionReason::FlippedGroup));
+    assert!(
+        proposal
+            .rejections
+            .iter()
+            .any(|(_, reason)| *reason == SnapRejectionReason::FlippedGroup)
+    );
 }
 
 #[test]

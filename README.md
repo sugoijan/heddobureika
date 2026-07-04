@@ -8,6 +8,7 @@ A silly web-based jigsaw puzzle demo.
 
 Current puzzles:
 
+- `zoe-summer`: [source art here](https://x.com/zoe_IRIAM/status/2075324117818155373)
 - `zoe-assassin`: [source art here](https://x.com/zoe_IRIAM/status/2055778795991515182)
 - `zoe-potter`: [source art here](https://x.com/zoe_IRIAM/status/1933655531409060301)
 - `zoe-samurai`: [source art here](https://x.com/zoe_IRIAM/status/1907209022752878958)

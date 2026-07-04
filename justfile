@@ -172,8 +172,18 @@ code-check:
 image-pipeline-check:
     @cargo check -p heddobureika-image-pipeline --target wasm32-unknown-unknown
 
+# Regenerate the SEO fragments and sitemap from seo/metadata.toml
+# (trunk also runs this automatically as a pre_build hook)
+regen-seo:
+    @cargo run -p xtask -- regen-seo
+
+# Regenerate the committed web icons in seo/ from art/icon.sketch
+# (local-only: requires Sketch.app's bundled sketchtool)
+gen-icons:
+    @cargo run -p xtask -- gen-icons
+
 # Run all checks (worker uses wasm target, CLI uses native)
-check: worker-check cli-check app-check
+check: worker-check cli-check app-check regen-seo
 
 # Run wasm-bindgen tests in the browser via cargo runner
 wasm-test browser="firefox":

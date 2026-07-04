@@ -25,7 +25,11 @@ fn send_to_back_moves_group_to_bottom() {
     assert!(state.send_to_back_by_anchors(&[target]));
 
     let after: Vec<u32> = state.iter_z_asc().map(|g| g.as_u32()).collect();
-    assert_eq!(after.first().copied(), Some(target), "target must be bottom");
+    assert_eq!(
+        after.first().copied(),
+        Some(target),
+        "target must be bottom"
+    );
     // Everything else keeps its relative order.
     let rest: Vec<u32> = before.into_iter().filter(|g| *g != target).collect();
     assert_eq!(after[1..], rest[..]);

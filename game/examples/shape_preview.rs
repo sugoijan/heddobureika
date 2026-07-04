@@ -2,8 +2,8 @@ use std::fmt::Write;
 use std::num::NonZeroU32;
 
 use heddobureika_game::{
-    path_to_svg_d, GridPuzzleDefinition, GridShapeSettings, LengthMm, PieceEdgeRef,
-    PieceGeometryProvider, PieceId,
+    GridPuzzleDefinition, GridShapeSettings, LengthMm, PieceEdgeRef, PieceGeometryProvider,
+    PieceId, path_to_svg_d,
 };
 
 fn main() {
@@ -165,8 +165,7 @@ fn build_svg(puzzle: &GridPuzzleDefinition) -> String {
         let _ = writeln!(
             svg,
             "    <path d=\"{}\" fill=\"{}\" fill-opacity=\"0.75\" stroke=\"#222\" stroke-width=\"0.45\"/>",
-            outline_d,
-            fill
+            outline_d, fill
         );
 
         for (edge_idx, edge_ref) in geom.edges.iter().enumerate() {
