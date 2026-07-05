@@ -22,13 +22,13 @@ gloo = "0.12"
 js-sys = "0.3"
 glyphon = "0.11"
 taffy = "0.10"
-wgpu = { version = "29", default-features = false }
+wgpu = { version = "30", default-features = false }
 bytemuck = "1.25"
 web-sys = "0.3"
 getrandom_02 = { package = "getrandom", version = "0.2" }
 wasm-bindgen-test = "0.3"
 console_error_panic_hook = "0.1"
-naga = "29"
+naga = "30"
 
 # shared
 serde = "1"
@@ -67,6 +67,11 @@ img-parts = "0.4"
 moxcms = "0.8"
 png = "0.18"
 thiserror = "2"
+
+# glyphon 0.11 pins wgpu 29; drop this patch once a wgpu-30-compatible release ships
+# (tracking https://github.com/grovesNL/glyphon/pull/175)
+[patch.crates-io]
+glyphon = { git = "https://github.com/RuairidhWilliamson/glyphon", rev = "75c477039df18276ff6667cb9265611cee6fa932" }
 
 [profile.release]
 opt-level = "z"

@@ -853,9 +853,61 @@ impl WgpuRenderer {
         // the integrated GPU, so the discrete adapter can't present to it), so the
         // helper tries progressively more permissive options rather than bailing
         // on the first failure.
+        // wgpu 30's WebGPU backend mistakes a `null` `requestAdapter()` result
+        // for a real adapter (`JsOption::into_option` only treats `undefined`
+        // as empty), and every call on the resulting adapter aborts with an
+        // uncatchable JS exception. Probe `navigator.gpu.requestAdapter()` at
+        // the JS level with the same options wgpu would send (it only forwards
+        // `powerPreference`) so a null result is treated as "no adapter" and
+        // the WebGL fallback still engages. Remove once wgpu handles null.
+        async fn js_webgpu_adapter_available(power_preference: wgpu::PowerPreference) -> bool {
+            let Some(window) = web_sys::window() else {
+                return false;
+            };
+            let Ok(gpu) = js_sys::Reflect::get(&window.navigator(), &JsValue::from_str("gpu"))
+            else {
+                return false;
+            };
+            if gpu.is_undefined() || gpu.is_null() {
+                return false;
+            }
+            let options = js_sys::Object::new();
+            let mapped_power_preference = match power_preference {
+                wgpu::PowerPreference::None => None,
+                wgpu::PowerPreference::LowPower => Some("low-power"),
+                wgpu::PowerPreference::HighPerformance => Some("high-performance"),
+            };
+            if let Some(preference) = mapped_power_preference {
+                let _ = js_sys::Reflect::set(
+                    &options,
+                    &JsValue::from_str("powerPreference"),
+                    &JsValue::from_str(preference),
+                );
+            }
+            let Ok(request_adapter) =
+                js_sys::Reflect::get(&gpu, &JsValue::from_str("requestAdapter"))
+            else {
+                return false;
+            };
+            let Ok(request_adapter) = request_adapter.dyn_into::<js_sys::Function>() else {
+                return false;
+            };
+            let Ok(promise) = request_adapter.call1(&gpu, &options) else {
+                return false;
+            };
+            let Ok(promise) = promise.dyn_into::<js_sys::Promise>() else {
+                return false;
+            };
+            match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(adapter) => !adapter.is_null() && !adapter.is_undefined(),
+                Err(_) => false,
+            }
+        }
+
         async fn request_adapter_with_fallback(
             instance: &wgpu::Instance,
             surface: &wgpu::Surface<'_>,
+            probe_js_adapter: bool,
         ) -> Result<wgpu::Adapter, String> {
             let attempts = [
                 (wgpu::PowerPreference::HighPerformance, false),
@@ -865,11 +917,18 @@ impl WgpuRenderer {
             ];
             let mut last_err = None;
             for (power_preference, force_fallback_adapter) in attempts {
+                if probe_js_adapter && !js_webgpu_adapter_available(power_preference).await {
+                    last_err = Some(format!(
+                        "requestAdapter({power_preference:?}) returned no adapter"
+                    ));
+                    continue;
+                }
                 match instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference,
                         compatible_surface: Some(surface),
                         force_fallback_adapter,
+                        apply_limit_buckets: false,
                     })
                     .await
                 {
@@ -895,7 +954,8 @@ impl WgpuRenderer {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
             match instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())) {
-                Ok(surface) => match request_adapter_with_fallback(&instance, &surface).await {
+                Ok(surface) => match request_adapter_with_fallback(&instance, &surface, true).await
+                {
                     Ok(adapter) => acquired = Some((surface, adapter)),
                     Err(detail) => {
                         console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
@@ -936,7 +996,7 @@ impl WgpuRenderer {
                 .map_err(|err| {
                     wasm_bindgen::JsValue::from_str(&format!("create_surface failed: {err:?}"))
                 })?;
-                let adapter = request_adapter_with_fallback(&instance, &surface)
+                let adapter = request_adapter_with_fallback(&instance, &surface, false)
                     .await
                     .map_err(|detail| {
                         wasm_bindgen::JsValue::from_str(&format!("request_adapter failed: {detail}"))
@@ -1179,7 +1239,7 @@ impl WgpuRenderer {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vs_entry),
-                    buffers: &[Vertex::layout(), Instance::layout()],
+                    buffers: &[Some(Vertex::layout()), Some(Instance::layout())],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1226,7 +1286,7 @@ impl WgpuRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_flip_edge"),
-                buffers: &[EdgeVertex::layout(), Instance::layout()],
+                buffers: &[Some(EdgeVertex::layout()), Some(Instance::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1261,7 +1321,7 @@ impl WgpuRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_shadow"),
-                buffers: &[Vertex::layout(), Instance::layout()],
+                buffers: &[Some(Vertex::layout()), Some(Instance::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1406,7 +1466,7 @@ impl WgpuRenderer {
             vertex: wgpu::VertexState {
                 module: &frame_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::layout(), FrameInstance::layout()],
+                buffers: &[Some(Vertex::layout()), Some(FrameInstance::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1575,7 +1635,7 @@ impl WgpuRenderer {
             vertex: wgpu::VertexState {
                 module: &ui_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::layout(), UiInstance::layout()],
+                buffers: &[Some(Vertex::layout()), Some(UiInstance::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -2231,7 +2291,7 @@ impl WgpuRenderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
     }
 
     pub(crate) fn set_font_bytes(&mut self, font_bytes: Vec<u8>) {

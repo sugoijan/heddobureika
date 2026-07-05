@@ -31,8 +31,15 @@ fn ui_shader_compiles_in_webgl2() {
 
 #[wasm_bindgen_test(async)]
 async fn shaders_compile_in_webgpu() {
+    // wgpu 30's WebGPU backend mistakes a `null` `requestAdapter()` result for
+    // a real adapter, and every call on it aborts with an uncatchable JS
+    // exception. Probe at the JS level and skip the test when the browser has
+    // no WebGPU adapter. Remove once wgpu handles null.
+    if !webgpu_adapter_available().await {
+        return;
+    }
     let instance = wgpu::Instance::default();
-    let Some(adapter) = instance
+    let Ok(adapter) = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await
     else {
@@ -171,13 +178,43 @@ fn link_program(
     }
 }
 
+async fn webgpu_adapter_available() -> bool {
+    use wasm_bindgen::JsValue;
+    let Some(window) = window() else {
+        return false;
+    };
+    let Ok(gpu) = js_sys::Reflect::get(&window.navigator(), &JsValue::from_str("gpu")) else {
+        return false;
+    };
+    if gpu.is_undefined() || gpu.is_null() {
+        return false;
+    }
+    let Ok(request_adapter) = js_sys::Reflect::get(&gpu, &JsValue::from_str("requestAdapter"))
+    else {
+        return false;
+    };
+    let Ok(request_adapter) = request_adapter.dyn_into::<js_sys::Function>() else {
+        return false;
+    };
+    let Ok(promise) = request_adapter.call0(&gpu) else {
+        return false;
+    };
+    let Ok(promise) = promise.dyn_into::<js_sys::Promise>() else {
+        return false;
+    };
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(adapter) => !adapter.is_null() && !adapter.is_undefined(),
+        Err(_) => false,
+    }
+}
+
 async fn assert_webgpu_shader(device: &wgpu::Device, label: &str, source: &str) {
-    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
-    if let Some(err) = device.pop_error_scope().await {
+    if let Some(err) = scope.pop().await {
         panic!("WebGPU shader {label} failed validation: {err:?}");
     }
 }
