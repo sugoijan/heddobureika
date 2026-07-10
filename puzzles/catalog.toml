@@ -1,4 +1,11 @@
 [[puzzles]]
+label = "Zoe Summer"
+slug = "zoe-summer"
+src = "puzzles/zoe-summer.jpg"
+credit_text = "puzzle art by @moochisukii"
+credit_url = "https://x.com/moochisukii"
+
+[[puzzles]]
 label = "Zoe Assassin"
 slug = "zoe-assassin"
 src = "puzzles/zoe-assassin.jpg"
