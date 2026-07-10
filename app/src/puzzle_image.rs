@@ -16,6 +16,30 @@ pub(crate) fn resolve_puzzle_image_src(image_ref: &PuzzleImageRef) -> Option<Str
     }
 }
 
+/// The catalog credit line for a puzzle, plus the link it should open when
+/// clicked (if any).
+#[derive(Clone, Copy)]
+pub(crate) struct PuzzleCredit {
+    pub(crate) text: &'static str,
+    pub(crate) url: Option<&'static str>,
+}
+
+/// The catalog credit for a puzzle, if any. Only built-in catalog puzzles can
+/// carry one; blanks, custom/private images, and unknown slugs (e.g.
+/// multiplayer against a newer remote catalog) yield `None`. A `credit_url`
+/// without a `credit_text` is ignored — the text is the clickable surface.
+pub(crate) fn resolve_puzzle_credit(image_ref: &PuzzleImageRef) -> Option<PuzzleCredit> {
+    match image_ref {
+        PuzzleImageRef::BuiltIn { slug } => puzzle_by_slug(slug).and_then(|entry| {
+            entry.credit_text.map(|text| PuzzleCredit {
+                text,
+                url: entry.credit_url,
+            })
+        }),
+        PuzzleImageRef::Private { .. } => None,
+    }
+}
+
 /// Maps a blank test slug to its solid fill color, or `None` for ordinary
 /// puzzles. Kept in lock-step with `BLANK_PUZZLES` in the core catalog.
 fn blank_fill_color(slug: &str) -> Option<&'static str> {

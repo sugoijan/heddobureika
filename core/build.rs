@@ -18,6 +18,8 @@ struct PuzzleEntry {
     src: String,
     width: Option<u32>,
     height: Option<u32>,
+    credit_text: Option<String>,
+    credit_url: Option<String>,
 }
 
 fn main() {
@@ -73,6 +75,25 @@ fn main() {
         writeln!(&mut output, "        src: {},", rust_string(&entry.src)).unwrap();
         writeln!(&mut output, "        width: {},", width).unwrap();
         writeln!(&mut output, "        height: {},", height).unwrap();
+        writeln!(
+            &mut output,
+            "        credit_text: {},",
+            rust_opt_string(&entry.credit_text)
+        )
+        .unwrap();
+        // A credit_url without credit_text is ignored (warned about in
+        // validate_entries): the credit text is the only clickable surface.
+        let credit_url = if entry.credit_text.is_some() {
+            &entry.credit_url
+        } else {
+            &None
+        };
+        writeln!(
+            &mut output,
+            "        credit_url: {},",
+            rust_opt_string(credit_url)
+        )
+        .unwrap();
         writeln!(&mut output, "    }},").unwrap();
     }
 
@@ -101,6 +122,13 @@ fn rust_string(value: &str) -> String {
     format!("{:?}", value)
 }
 
+fn rust_opt_string(value: &Option<String>) -> String {
+    match value {
+        Some(text) => format!("Some({})", rust_string(text)),
+        None => "None".to_string(),
+    }
+}
+
 fn validate_entries(entries: &[PuzzleEntry], catalog_path: &Path) {
     let mut slugs = HashSet::new();
     let mut srcs = HashSet::new();
@@ -125,6 +153,29 @@ fn validate_entries(entries: &[PuzzleEntry], catalog_path: &Path) {
                 entry.slug,
                 catalog_path.display()
             );
+        }
+        if let Some(credit) = &entry.credit_text {
+            if credit.trim().is_empty() {
+                panic!(
+                    "puzzle '{}' has empty credit_text in {}",
+                    entry.slug,
+                    catalog_path.display()
+                );
+            }
+        }
+        if let Some(url) = &entry.credit_url {
+            if entry.credit_text.is_none() {
+                println!(
+                    "cargo:warning=puzzle '{}' has credit_url but no credit_text; the url is ignored",
+                    entry.slug
+                );
+            } else if !url.starts_with("https://") && !url.starts_with("http://") {
+                panic!(
+                    "puzzle '{}' credit_url must be an http(s) URL in {}",
+                    entry.slug,
+                    catalog_path.display()
+                );
+            }
         }
         if entry.width.is_some() ^ entry.height.is_some() {
             panic!(

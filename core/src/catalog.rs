@@ -5,6 +5,8 @@ pub struct PuzzleCatalogEntry {
     pub src: &'static str,
     pub width: u32,
     pub height: u32,
+    pub credit_text: Option<&'static str>,
+    pub credit_url: Option<&'static str>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/puzzle_catalog.rs"));
@@ -26,6 +28,8 @@ pub const BLANK_PUZZLES: &[PuzzleCatalogEntry] = &[
         src: "",
         width: 1024,
         height: 1024,
+        credit_text: None,
+        credit_url: None,
     },
     PuzzleCatalogEntry {
         label: "Blank (black)",
@@ -33,6 +37,8 @@ pub const BLANK_PUZZLES: &[PuzzleCatalogEntry] = &[
         src: "",
         width: 1024,
         height: 1024,
+        credit_text: None,
+        credit_url: None,
     },
 ];
 

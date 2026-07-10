@@ -21,20 +21,27 @@ use crate::input::{
     WheelIntentTracker,
 };
 use crate::persisted_store;
-use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
+use crate::puzzle_image::{
+    create_object_url, resolve_puzzle_credit, resolve_puzzle_image_src, revoke_object_url,
+};
 use crate::renderer::{build_mask_atlas, MaskAtlasData, UiRotationOrigin, UiTextId, UiTextSpec};
 use crate::runtime::{CoreAction, GameSyncView, GameView, SyncView, ViewHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
 use heddobureika_core::{PuzzleImageRef, PuzzleInfo};
 
-const CREDIT_TEXT: &str = "coded by すごいジャン";
+const CREDIT_TEXT: &str = "created by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
 const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
 const UI_FONT_BYTES: &[u8] = include_bytes!("../../fonts/chirufont.ttf");
 const UI_FONT_FAMILY: &str = "KaoriGel";
 const UI_CREDIT_FONT_RATIO: f32 = 0.026;
 const UI_CREDIT_ROTATION_DEG: f32 = -1.1;
+const UI_ART_CREDIT_FONT_RATIO: f32 = 0.022;
+const UI_ART_CREDIT_ROTATION_DEG: f32 = -1.1;
+/// Inset of the art credit from the puzzle frame's bottom-right corner,
+/// as a fraction of its font size.
+const UI_ART_CREDIT_PAD_RATIO: f32 = 0.6;
 const UI_MENU_SUB_FONT_RATIO: f32 = 0.028;
 const UI_MENU_SUB_ROTATION_DEG: f32 = 1.1;
 const UI_MENU_TITLE_FONT_RATIO: f32 = 0.05;
@@ -329,6 +336,9 @@ struct SvgView {
     debug_art_workspace: Element,
     pieces: RefCell<Vec<SvgPieceNodes>>,
     ui_credit_hitbox: RefCell<Option<UiHitbox>>,
+    /// Hitbox + target url for the art credit; only set when the current
+    /// puzzle's catalog entry has both credit_text and credit_url.
+    ui_art_credit_hitbox: RefCell<Option<(UiHitbox, &'static str)>>,
     ui_credit_hovered: Cell<bool>,
     pointer_policy: RefCell<PointerPolicy>,
     pan_state: RefCell<Option<PanState>>,
@@ -543,6 +553,7 @@ impl SvgView {
             debug_art_workspace,
             pieces: RefCell::new(Vec::new()),
             ui_credit_hitbox: RefCell::new(None),
+            ui_art_credit_hitbox: RefCell::new(None),
             ui_credit_hovered: Cell::new(false),
             pointer_policy: RefCell::new(PointerPolicy::new()),
             pan_state: RefCell::new(None),
@@ -997,7 +1008,12 @@ impl SvgView {
             return;
         }
         if self.hit_credit(view_x, view_y) {
-            open_credit_url();
+            open_url(CREDIT_URL);
+            event.prevent_default();
+            return;
+        }
+        if let Some(url) = self.hit_art_credit(view_x, view_y) {
+            open_url(url);
             event.prevent_default();
             return;
         }
@@ -1169,7 +1185,8 @@ impl SvgView {
             self.dispatch_action(CoreAction::SetHovered { hovered });
             return;
         }
-        let credit_hovered = self.hit_credit(view_x, view_y);
+        let credit_hovered =
+            self.hit_credit(view_x, view_y) || self.hit_art_credit(view_x, view_y).is_some();
         if self.ui_credit_hovered.get() != credit_hovered {
             self.ui_credit_hovered.set(credit_hovered);
             self.update_svg_class(&snapshot);
@@ -1631,6 +1648,9 @@ impl SvgView {
         if self.pan_state.borrow().is_some() {
             class.push_str(" panning");
         }
+        if self.ui_credit_hovered.get() {
+            class.push_str(" ui-link-hover");
+        }
         let _ = self.svg.set_attribute("class", &class);
     }
 
@@ -1861,7 +1881,7 @@ impl SvgView {
         }
         self.update_debug_overlay(snapshot);
         self.render_view(snapshot, &assets);
-        self.render_ui(snapshot);
+        self.render_ui(snapshot, &assets);
         self.render_pieces(snapshot, &assets, sync_view);
         self.update_z_order(snapshot);
         boot::ready();
@@ -3090,7 +3110,7 @@ impl SvgView {
         }
     }
 
-    fn render_ui(&self, snapshot: &AppSnapshot) {
+    fn render_ui(&self, snapshot: &AppSnapshot, assets: &PuzzleAssets) {
         clear_children(&self.ui_group);
         let layout = snapshot.layout;
         let width = snapshot
@@ -3127,6 +3147,7 @@ impl SvgView {
             ThemeMode::Light => false,
             ThemeMode::System => prefers_dark,
         };
+        let art_credit = resolve_puzzle_credit(&assets.info.image_ref);
         let mut measure_state = GlyphonMeasureState::new();
         let ui_specs = build_ui_specs(
             &mut measure_state,
@@ -3134,6 +3155,11 @@ impl SvgView {
             width,
             height,
             UI_TITLE_TEXT,
+            art_credit.map(|credit| credit.text),
+            {
+                let frame = assets.render_geometry.frame_shape.bounds;
+                [frame.x, frame.y, frame.width, frame.height]
+            },
             snapshot.solved,
             connections_label.as_str(),
             border_connections_label.as_str(),
@@ -3145,6 +3171,13 @@ impl SvgView {
             .find(|spec| matches!(spec.id, UiTextId::Credit))
             .map(|spec| ui_hitbox_for_spec(&mut measure_state, spec));
         *self.ui_credit_hitbox.borrow_mut() = credit_hitbox;
+        let art_credit_hitbox = art_credit.and_then(|credit| credit.url).and_then(|url| {
+            ui_specs
+                .iter()
+                .find(|spec| matches!(spec.id, UiTextId::ArtCredit))
+                .map(|spec| (ui_hitbox_for_spec(&mut measure_state, spec), url))
+        });
+        *self.ui_art_credit_hitbox.borrow_mut() = art_credit_hitbox;
         if ui_specs.is_empty() {
             return;
         }
@@ -3154,6 +3187,7 @@ impl SvgView {
                 UiTextId::Title => "ui-text ui-title",
                 UiTextId::Progress => "ui-text ui-progress",
                 UiTextId::Credit => "ui-text ui-credit",
+                UiTextId::ArtCredit => "ui-text ui-art-credit",
                 UiTextId::Success => "ui-text ui-success",
                 UiTextId::Debug => "ui-text ui-debug",
                 UiTextId::MenuTitle => "ui-text ui-menu-title",
@@ -3479,6 +3513,14 @@ impl SvgView {
         )
     }
 
+    /// The art credit's target url when (x, y) hits its hitbox. Art credits
+    /// without a url have no hitbox and are never hit.
+    fn hit_art_credit(&self, x: f32, y: f32) -> Option<&'static str> {
+        self.ui_art_credit_hitbox
+            .borrow()
+            .and_then(|(hitbox, url)| point_in_ui_hitbox(x, y, hitbox).then_some(url))
+    }
+
     fn hit_credit(&self, x: f32, y: f32) -> bool {
         self.ui_credit_hitbox
             .borrow()
@@ -3786,6 +3828,9 @@ fn apply_taffy_layout(
                 UiTextId::Title => (1, 1, false, JustifySelf::Start, AlignSelf::Start),
                 UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
                 UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
+                // Positioned directly against the puzzle frame rect in
+                // build_ui_specs; not part of the workspace gutter grid.
+                UiTextId::ArtCredit => continue,
                 UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
                 UiTextId::Debug => (1, 2, false, JustifySelf::End, AlignSelf::Start),
                 UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
@@ -3890,6 +3935,8 @@ fn build_ui_specs(
     width: f32,
     height: f32,
     title_text: &str,
+    art_credit_text: Option<&str>,
+    frame_rect: [f32; 4],
     solved: bool,
     connections_label: &str,
     border_connections_label: &str,
@@ -3971,6 +4018,33 @@ fn build_ui_specs(
             line_height: credit_size * 1.08,
             color: base_color,
         });
+
+        if let Some(text) = art_credit_text {
+            // Anchored to the puzzle frame's bottom-right corner rather than
+            // the workspace gutter grid, so it stays inside the frame on
+            // cropped topologies; apply_taffy_layout skips it.
+            let art_size = min_dim * UI_ART_CREDIT_FONT_RATIO;
+            let mut spec = UiTextSpec {
+                id: UiTextId::ArtCredit,
+                text: text.to_string(),
+                pos: [0.0, 0.0],
+                rotation_deg: UI_ART_CREDIT_ROTATION_DEG,
+                rotation_origin: UiRotationOrigin::BottomRight,
+                rotation_offset: [0.0, 0.0],
+                font_size: art_size,
+                line_height: art_size * 1.08,
+                color: base_color,
+            };
+            let (text_width, text_height) = layout_text_bounds(measure, &spec);
+            spec.rotation_offset =
+                rotation_offset_for(spec.rotation_origin, text_width, text_height);
+            let pad = art_size * UI_ART_CREDIT_PAD_RATIO;
+            spec.pos = [
+                frame_rect[0] + frame_rect[2] - pad - text_width * 0.5,
+                frame_rect[1] + frame_rect[3] - pad - text_height * 0.5,
+            ];
+            specs.push(spec);
+        }
 
         if solved {
             let success_size = min_dim * UI_SUCCESS_FONT_RATIO;
@@ -4383,9 +4457,9 @@ fn pick_piece_at(
     None
 }
 
-fn open_credit_url() {
+fn open_url(url: &str) {
     if let Some(window) = web_sys::window() {
-        let _ = window.open_with_url_and_target(CREDIT_URL, "_blank");
+        let _ = window.open_with_url_and_target(url, "_blank");
     }
 }
 

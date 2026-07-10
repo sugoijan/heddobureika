@@ -146,6 +146,7 @@ pub(crate) enum UiTextId {
     Title,
     Progress,
     Credit,
+    ArtCredit,
     Success,
     Debug,
     MenuTitle,

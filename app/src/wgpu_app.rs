@@ -26,7 +26,9 @@ use crate::input::{
     WheelIntentTracker, CLICK_MAX_DURATION_MS,
 };
 use crate::persisted_store;
-use crate::puzzle_image::{create_object_url, resolve_puzzle_image_src, revoke_object_url};
+use crate::puzzle_image::{
+    create_object_url, resolve_puzzle_credit, resolve_puzzle_image_src, revoke_object_url,
+};
 use crate::flip_anim::FlipAnim;
 use crate::rotation_anim::{
     apply_group_transform, rotate_group_succession, GroupAnim, SpringParams,
@@ -51,13 +53,18 @@ const POSE_UNIT_MM: f32 = 25.0;
 /// A piece counts as "mid-flip" (needs the extrusion pass) when its flip
 /// progress is this far from both 0 and 1.
 const FLIP_ACTIVE_EPS: f32 = 0.001;
-const CREDIT_TEXT: &str = "coded by すごいジャン";
+const CREDIT_TEXT: &str = "created by すごいジャン";
 const UI_TITLE_TEXT: &str = "ヘッドブレイカー";
 const CREDIT_URL: &str = "https://github.com/sugoijan/heddobureika";
 const FPS_FONT_BYTES: &[u8] = include_bytes!("../../fonts/chirufont.ttf");
 const UI_FONT_FAMILY: &str = "KaoriGel";
 const UI_CREDIT_FONT_RATIO: f32 = 0.026;
 const UI_CREDIT_ROTATION_DEG: f32 = -1.1;
+const UI_ART_CREDIT_FONT_RATIO: f32 = 0.022;
+const UI_ART_CREDIT_ROTATION_DEG: f32 = -1.1;
+/// Inset of the art credit from the puzzle frame's bottom-right corner,
+/// as a fraction of its font size.
+const UI_ART_CREDIT_PAD_RATIO: f32 = 0.6;
 const UI_MENU_SUB_FONT_RATIO: f32 = 0.028;
 const UI_MENU_SUB_ROTATION_DEG: f32 = 1.1;
 const UI_MENU_TITLE_FONT_RATIO: f32 = 0.05;
@@ -471,6 +478,9 @@ struct WgpuView {
     pending_ui: RefCell<Option<Vec<UiTextSpec>>>,
     ui_measure: RefCell<GlyphonMeasureState>,
     ui_credit_hitbox: RefCell<Option<UiHitbox>>,
+    /// Hitbox + target url for the art credit; only set when the current
+    /// puzzle's catalog entry has both credit_text and credit_url.
+    ui_art_credit_hitbox: RefCell<Option<(UiHitbox, &'static str)>>,
     ui_credit_hovered: Cell<bool>,
     pan_state: RefCell<Option<PanState>>,
     pinch_state: RefCell<Option<PinchState>>,
@@ -548,6 +558,7 @@ impl WgpuView {
             pending_ui: RefCell::new(None),
             ui_measure: RefCell::new(GlyphonMeasureState::new()),
             ui_credit_hitbox: RefCell::new(None),
+            ui_art_credit_hitbox: RefCell::new(None),
             ui_credit_hovered: Cell::new(false),
             pan_state: RefCell::new(None),
             pinch_state: RefCell::new(None),
@@ -896,7 +907,12 @@ impl WgpuView {
             return;
         }
         if self.hit_credit(view_x, view_y) {
-            open_credit_url();
+            open_url(CREDIT_URL);
+            event.prevent_default();
+            return;
+        }
+        if let Some(url) = self.hit_art_credit(view_x, view_y) {
+            open_url(url);
             event.prevent_default();
             return;
         }
@@ -1129,7 +1145,8 @@ impl WgpuView {
             self.dispatch_action(CoreAction::SetHovered { hovered });
             return;
         }
-        let credit_hovered = self.hit_credit(view_x, view_y);
+        let credit_hovered =
+            self.hit_credit(view_x, view_y) || self.hit_art_credit(view_x, view_y).is_some();
         if self.ui_credit_hovered.get() != credit_hovered {
             self.ui_credit_hovered.set(credit_hovered);
             self.update_canvas_class(&snapshot);
@@ -1714,6 +1731,14 @@ impl WgpuView {
             .borrow()
             .map(|hitbox| point_in_ui_hitbox(x, y, hitbox))
             .unwrap_or(false)
+    }
+
+    /// The art credit's target url when (x, y) hits its hitbox. Art credits
+    /// without a url have no hitbox and are never hit.
+    fn hit_art_credit(&self, x: f32, y: f32) -> Option<&'static str> {
+        self.ui_art_credit_hitbox
+            .borrow()
+            .and_then(|(hitbox, url)| point_in_ui_hitbox(x, y, hitbox).then_some(url))
     }
 
     fn set_hooks(&self, hooks: ViewHooks) {
@@ -3294,6 +3319,7 @@ impl WgpuView {
         } else {
             None
         };
+        let art_credit = resolve_puzzle_credit(&assets.info.image_ref);
         let mut measure_state = self.ui_measure.borrow_mut();
         let ui_specs = build_ui_specs(
             &mut measure_state,
@@ -3301,6 +3327,11 @@ impl WgpuView {
             assets.info.image_width as f32,
             assets.info.image_height as f32,
             UI_TITLE_TEXT,
+            art_credit.map(|credit| credit.text),
+            {
+                let frame = assets.render_geometry.frame_shape.bounds;
+                [frame.x, frame.y, frame.width, frame.height]
+            },
             snapshot.solved,
             connections_label.as_str(),
             border_connections_label.as_str(),
@@ -3314,6 +3345,13 @@ impl WgpuView {
             .find(|spec| matches!(spec.id, UiTextId::Credit))
             .map(|spec| ui_hitbox_for_spec(&mut measure_state, spec));
         *self.ui_credit_hitbox.borrow_mut() = credit_hitbox;
+        let art_credit_hitbox = art_credit.and_then(|credit| credit.url).and_then(|url| {
+            ui_specs
+                .iter()
+                .find(|spec| matches!(spec.id, UiTextId::ArtCredit))
+                .map(|spec| (ui_hitbox_for_spec(&mut measure_state, spec), url))
+        });
+        *self.ui_art_credit_hitbox.borrow_mut() = art_credit_hitbox;
         if snapshot.puzzle_info.is_none() {
             if self.set_preview_hover(PreviewHoverTarget::None) {
                 self.request_render();
@@ -4306,6 +4344,9 @@ fn apply_taffy_layout(
                 UiTextId::Title => (1, 1, false, JustifySelf::Start, AlignSelf::Start),
                 UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
                 UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
+                // Positioned directly against the puzzle frame rect in
+                // build_ui_specs; not part of the workspace gutter grid.
+                UiTextId::ArtCredit => continue,
                 UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
                 UiTextId::Debug => (1, 2, false, JustifySelf::End, AlignSelf::Start),
                 UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
@@ -4444,6 +4485,8 @@ fn build_ui_specs(
     width: f32,
     height: f32,
     title_text: &str,
+    art_credit_text: Option<&str>,
+    frame_rect: [f32; 4],
     solved: bool,
     connections_label: &str,
     border_connections_label: &str,
@@ -4527,6 +4570,33 @@ fn build_ui_specs(
             line_height: credit_size * 1.08,
             color: base_color,
         });
+
+        if let Some(text) = art_credit_text {
+            // Anchored to the puzzle frame's bottom-right corner rather than
+            // the workspace gutter grid, so it stays inside the frame on
+            // cropped topologies; apply_taffy_layout skips it.
+            let art_size = min_dim * UI_ART_CREDIT_FONT_RATIO;
+            let mut spec = UiTextSpec {
+                id: UiTextId::ArtCredit,
+                text: text.to_string(),
+                pos: [0.0, 0.0],
+                rotation_deg: UI_ART_CREDIT_ROTATION_DEG,
+                rotation_origin: UiRotationOrigin::BottomRight,
+                rotation_offset: [0.0, 0.0],
+                font_size: art_size,
+                line_height: art_size * 1.08,
+                color: base_color,
+            };
+            let (text_width, text_height) = layout_text_bounds(measure, &spec);
+            spec.rotation_offset =
+                rotation_offset_for(spec.rotation_origin, text_width, text_height);
+            let pad = art_size * UI_ART_CREDIT_PAD_RATIO;
+            spec.pos = [
+                frame_rect[0] + frame_rect[2] - pad - text_width * 0.5,
+                frame_rect[1] + frame_rect[3] - pad - text_height * 0.5,
+            ];
+            specs.push(spec);
+        }
 
         if solved {
             let success_size = min_dim * UI_SUCCESS_FONT_RATIO;
@@ -4681,8 +4751,8 @@ fn prefers_dark_mode() -> bool {
         .unwrap_or(false)
 }
 
-fn open_credit_url() {
+fn open_url(url: &str) {
     if let Some(window) = web_sys::window() {
-        let _ = window.open_with_url_and_target(CREDIT_URL, "_blank");
+        let _ = window.open_with_url_and_target(url, "_blank");
     }
 }

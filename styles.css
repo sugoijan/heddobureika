@@ -278,6 +278,10 @@ body {
   text-decoration: underline;
 }
 
+.ui-art-credit {
+  letter-spacing: 0.03em;
+}
+
 .ui-progress {
   letter-spacing: 0.04em;
 }
@@ -329,7 +333,8 @@ body {
   cursor: grabbing;
 }
 
-.puzzle-canvas.ui-link-hover {
+.puzzle-canvas.ui-link-hover,
+.puzzle-image.ui-link-hover {
   cursor: pointer;
 }
 
