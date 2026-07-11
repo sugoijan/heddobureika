@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
@@ -25,11 +25,22 @@ const VIEW_ZOOM_MIN: f32 = 0.2;
 const VIEW_ZOOM_MIN_FACTOR: f32 = 0.5;
 const VIEW_PAN_RUBBER_RATIO: f32 = 0.5;
 const VIEW_FIT_PADDING_RATIO: f32 = 0.02;
+const MAX_NOTIFY_PASSES: u32 = 8;
+
+/// Whether `z_order` is usable as a draw order for `total` pieces: right
+/// length and every id in range. Remote snapshots can violate this (e.g. a
+/// queued frame crossing a puzzle swap), and renderers index piece-sized
+/// arrays with these ids, so they must fall back rather than panic.
+pub(crate) fn z_order_is_valid(z_order: &[usize], total: usize) -> bool {
+    z_order.len() == total && z_order.iter().all(|&id| id < total)
+}
 
 pub(crate) struct AppCore {
     state: RefCell<AppState>,
     snapshots: RefCell<SnapshotBuffer>,
     subscribers: Rc<RefCell<Vec<AppSubscriber>>>,
+    notifying: Cell<bool>,
+    notify_pending: Cell<bool>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -330,6 +341,8 @@ impl AppCore {
             state: RefCell::new(state),
             snapshots: RefCell::new(snapshots),
             subscribers: Rc::new(RefCell::new(Vec::new())),
+            notifying: Cell::new(false),
+            notify_pending: Cell::new(false),
         })
     }
 
@@ -342,11 +355,41 @@ impl AppCore {
     }
 
     fn notify(&self) {
-        self.refresh_snapshot_from_state();
-        self.notify_subscribers();
+        // A subscriber may mutate the core and re-enter notify (e.g. the
+        // multiplayer bridge applying a predicted state); nested calls are
+        // deferred to a trailing pass instead of dispatching re-entrantly.
+        // Subscribers pull fresh state via `snapshot()`, so delivering only
+        // the final state is enough.
+        if self.notifying.get() {
+            self.notify_pending.set(true);
+            return;
+        }
+        self.notifying.set(true);
+        let mut passes = 0u32;
+        loop {
+            self.refresh_snapshot_from_state();
+            self.notify_subscribers();
+            if !self.notify_pending.replace(false) {
+                break;
+            }
+            passes += 1;
+            if passes >= MAX_NOTIFY_PASSES {
+                // Subscribers keep mutating state on every pass; stop here
+                // rather than looping forever.
+                #[cfg(target_arch = "wasm32")]
+                gloo::console::warn!("notify did not settle; dropping a pending pass");
+                break;
+            }
+        }
+        self.notifying.set(false);
     }
 
     fn notify_subscribers(&self) {
+        if crate::crash::is_aborted() {
+            return;
+        }
+        // Invariant for subscribers: never dispatch while holding a RefCell
+        // that another subscriber (or a nested notify) may also borrow.
         let subscribers = self.subscribers.borrow().clone();
         for subscriber in subscribers {
             (subscriber)();
@@ -2164,6 +2207,86 @@ pub(crate) fn now_ms_f32() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_notify_defers_to_trailing_pass() {
+        let core = AppCore::new();
+        let invocations = Rc::new(Cell::new(0u32));
+        let mutated = Rc::new(Cell::new(false));
+        let _mutator = core.subscribe(Rc::new({
+            let core = core.clone();
+            let invocations = invocations.clone();
+            let mutated = mutated.clone();
+            move || {
+                invocations.set(invocations.get() + 1);
+                if !mutated.replace(true) {
+                    // Re-enters notify from inside a subscriber; the nested
+                    // dispatch must be deferred to a trailing pass.
+                    core.set_hovered(Some(3));
+                }
+            }
+        }));
+        let last_seen = Rc::new(Cell::new(None));
+        let _observer = core.subscribe(Rc::new({
+            let core = core.clone();
+            let last_seen = last_seen.clone();
+            move || last_seen.set(core.snapshot().hovered_id)
+        }));
+        core.set_hovered(Some(1));
+        // Pass 1 mutates and defers; the trailing pass delivers final state.
+        assert_eq!(invocations.get(), 2);
+        assert_eq!(last_seen.get(), Some(3));
+    }
+
+    #[test]
+    fn nested_notify_livelock_is_bounded() {
+        let core = AppCore::new();
+        let invocations = Rc::new(Cell::new(0usize));
+        let _mutator = core.subscribe(Rc::new({
+            let core = core.clone();
+            let invocations = invocations.clone();
+            move || {
+                let count = invocations.get() + 1;
+                invocations.set(count);
+                // Never settles: every pass flips the hovered id.
+                core.set_hovered(Some(count % 2));
+            }
+        }));
+        core.set_hovered(Some(7));
+        assert_eq!(invocations.get(), MAX_NOTIFY_PASSES as usize);
+    }
+
+    #[test]
+    fn z_order_validity_checks_length_and_values() {
+        assert!(z_order_is_valid(&[], 0));
+        assert!(z_order_is_valid(&[2, 0, 1], 3));
+        // Wrong length.
+        assert!(!z_order_is_valid(&[0, 1], 3));
+        assert!(!z_order_is_valid(&[0, 1, 2, 3], 3));
+        // Out-of-range id (stale snapshot from a larger puzzle).
+        assert!(!z_order_is_valid(&[0, 1, 3], 3));
+        // Duplicates keep the right length and range; renderers tolerate
+        // them, so the check intentionally accepts this shape.
+        assert!(z_order_is_valid(&[1, 1, 2], 3));
+    }
+
+    #[test]
+    fn subscribe_during_notify_does_not_panic() {
+        let core = AppCore::new();
+        let late_subscription = Rc::new(RefCell::new(None));
+        let _subscriber = core.subscribe(Rc::new({
+            let core = core.clone();
+            let late_subscription = late_subscription.clone();
+            move || {
+                if late_subscription.borrow().is_none() {
+                    *late_subscription.borrow_mut() = Some(core.subscribe(Rc::new(|| {})));
+                }
+            }
+        }));
+        core.set_hovered(Some(1));
+        core.set_hovered(Some(2));
+        assert!(late_subscription.borrow().is_some());
+    }
 
     #[test]
     fn triangular_in_bounds_pose_survives_safety_correction() {

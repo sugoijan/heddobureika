@@ -329,6 +329,10 @@ fn notify_sync_view_changed() {
 
 thread_local! {
     static STATE: RefCell<SyncRuntimeState> = RefCell::new(SyncRuntimeState::new());
+    // Fallback for `sync_view()` when STATE is already mutably borrowed (a
+    // render triggered from inside a STATE mutation); one notify stale at
+    // worst.
+    static LAST_SYNC_VIEW: RefCell<SyncView> = RefCell::new(SyncView::default());
 }
 
 fn handle_local_snapshot(snapshot: AppSnapshot, core: Rc<AppCore>) {
@@ -415,6 +419,11 @@ fn connect_if_ready(state: &mut SyncRuntimeState) {
 }
 
 pub(crate) fn init_from_config(config: Option<MultiplayerConfig>) {
+    if config.is_none() {
+        // Leaving (or never entering) a room: a later crash reload must not
+        // warp the user back into it.
+        crate::boot::clear_room();
+    }
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         state.config = config;
@@ -484,6 +493,19 @@ pub(crate) fn set_system_hooks(hooks: SyncHooks) {
 
 pub(crate) fn multiplayer_handle() -> Option<Rc<RefCell<MultiplayerGameSync>>> {
     STATE.with(|slot| slot.borrow().multiplayer.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn set_multiplayer_for_tests(sync: Option<Rc<RefCell<MultiplayerGameSync>>>) {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.active = if sync.is_some() {
+            ActiveSync::Multiplayer
+        } else {
+            ActiveSync::Local
+        };
+        state.multiplayer = sync;
+    });
 }
 
 pub(crate) fn current_app_snapshot() -> Option<AppSnapshot> {
@@ -581,6 +603,10 @@ pub(crate) fn clear_sync_hooks() {
     });
 }
 
+// Invariant: never call core mutators or dispatch hooks while holding STATE
+// or the multiplayer sync RefCell — a nested notify re-enters subscribers
+// that borrow both (see `try_send_init`, `sync_view`). The take/put dance
+// for `LocalSyncAdapter` below is the model.
 pub(crate) fn handle_local_action(action: &CoreAction) {
     enum SyncHandle {
         Local(LocalSyncAdapter),
@@ -683,6 +709,9 @@ fn should_block_owned_action(core: &AppCore, action: &CoreAction) -> bool {
 }
 
 pub(crate) fn dispatch_view_action(core: &AppCore, action: CoreAction, apply_core: bool) {
+    if crate::crash::is_aborted() {
+        return;
+    }
     if should_block_actions() && !matches!(action, CoreAction::SetHovered { .. }) {
         return;
     }
@@ -805,36 +834,40 @@ pub(crate) fn clear_local_snapshot() {
 }
 
 pub(crate) fn sync_view() -> SyncView {
-    STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        match state.active {
-            ActiveSync::Local => {
-                let view = state
-                    .local_sync
-                    .as_ref()
-                    .map(|sync| sync.sync_view())
-                    .unwrap_or_default();
-                state.last_sync_view = view.clone();
-                view
-            }
+    // The render path calls this on every notify, including notifies
+    // dispatched while STATE is already mutably borrowed (retry/backoff
+    // timers, config init). Degrade to the cached view instead of panicking.
+    let view = STATE.with(|slot| {
+        let mut state = match slot.try_borrow_mut() {
+            Ok(state) => state,
+            Err(_) => return None,
+        };
+        let view = match state.active {
+            ActiveSync::Local => state
+                .local_sync
+                .as_ref()
+                .map(|sync| sync.sync_view())
+                .unwrap_or_default(),
             ActiveSync::Multiplayer => {
-                let multiplayer = state.multiplayer.clone();
-                let Some(sync) = multiplayer else {
-                    return state.last_sync_view.clone();
+                let Some(sync) = state.multiplayer.clone() else {
+                    return Some(state.last_sync_view.clone());
                 };
-                let view = match sync.try_borrow() {
-                    Ok(sync) => Some(sync.sync_view()),
-                    Err(_) => None,
-                };
-                if let Some(view) = view {
-                    state.last_sync_view = view.clone();
-                    view
-                } else {
-                    state.last_sync_view.clone()
+                match sync.try_borrow() {
+                    Ok(sync) => sync.sync_view(),
+                    Err(_) => return Some(state.last_sync_view.clone()),
                 }
             }
+        };
+        state.last_sync_view = view.clone();
+        Some(view)
+    });
+    match view {
+        Some(view) => {
+            LAST_SYNC_VIEW.with(|slot| *slot.borrow_mut() = view.clone());
+            view
         }
-    })
+        None => LAST_SYNC_VIEW.with(|slot| slot.borrow().clone()),
+    }
 }
 
 pub(crate) fn set_on_fail(handler: Rc<dyn Fn()>) {

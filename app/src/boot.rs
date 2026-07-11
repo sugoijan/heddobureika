@@ -78,6 +78,31 @@ pub(crate) fn fail(code: &str, message: &str, hint: &str) {
     }
 }
 
+/// Reports a Rust panic to the boot shell, which owns recovery (overlay +
+/// reload). The wasm instance is unusable once this is called.
+pub(crate) fn crash(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call("crash", &[JsValue::from_str(message)]);
+    }
+}
+
+/// Records the joined multiplayer room so a crash reload can restore the
+/// `#room=` route (the hash is cleared after joining).
+pub(crate) fn note_room(room_id: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call("noteRoom", &[JsValue::from_str(room_id)]);
+    }
+}
+
+pub(crate) fn clear_room() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call("clearRoom", &[]);
+    }
+}
+
 pub(crate) fn ready() {
     #[cfg(target_arch = "wasm32")]
     {

@@ -7,6 +7,7 @@ mod app_runtime;
 mod boot;
 mod boot_runtime;
 mod core;
+mod crash;
 mod flip_anim;
 mod game_state;
 mod idb;

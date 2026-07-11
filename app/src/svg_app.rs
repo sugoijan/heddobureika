@@ -484,15 +484,16 @@ pub(crate) fn run(core: Rc<AppCore>) {
                 sync_runtime::dispatch_view_action(&core_for_hooks, action, true);
             }),
         });
+        // Subscribers can run re-entrantly (a nested notify during render),
+        // so the render subscription must not hold a RefCell borrow while
+        // queueing; go through the view directly instead of the adapter.
         *view.subscription.borrow_mut() = Some(core.subscribe(Rc::new({
-            let adapter_for_render = adapter.clone();
+            let view = Rc::clone(&view);
             let core = core.clone();
             move || {
                 let snapshot = core.snapshot();
                 let sync_view = sync_runtime::sync_view();
-                adapter_for_render
-                    .borrow_mut()
-                    .render(&snapshot, &sync_view);
+                view.queue_render_snapshot(snapshot, sync_view);
             }
         })));
         view.install_listeners();
@@ -1846,6 +1847,12 @@ impl SvgView {
     }
 
     fn render_snapshot(self: &Rc<Self>, snapshot: &AppSnapshot, sync_view: &dyn GameSyncView) {
+        if crate::crash::is_aborted() {
+            return;
+        }
+        if crate::crash::take_panic_in_render() {
+            panic!("injected test panic (render)");
+        }
         if snapshot.view.width <= 0.0 || snapshot.view.height <= 0.0 {
             self.ensure_viewport_size();
         }
@@ -3479,7 +3486,7 @@ impl SvgView {
         if total == 0 {
             return;
         }
-        let mut order = if snapshot.z_order.len() == total {
+        let mut order = if crate::app_core::z_order_is_valid(&snapshot.z_order, total) {
             snapshot.z_order.clone()
         } else {
             (0..total).collect()

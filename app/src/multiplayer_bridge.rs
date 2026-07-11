@@ -174,11 +174,15 @@ impl MultiplayerBridgeState {
         _client_id: Option<ClientId>,
     ) {
         self.init_pending.set(!initialized);
+        crate::boot::note_room(&room_id);
         *self.room_id.borrow_mut() = Some(room_id);
         self.asset_downloads.borrow_mut().clear();
         self.requested_assets.borrow_mut().clear();
         if let Some(sync) = sync_runtime::multiplayer_handle() {
-            sync.borrow().set_state_applied(false);
+            match sync.try_borrow() {
+                Ok(sync) => sync.set_state_applied(false),
+                Err(_) => console::warn!("welcome: sync busy, state_applied reset skipped"),
+            }
         }
         *self.local_state.borrow_mut() = None;
         self.pending_by_anchor.borrow_mut().clear();
@@ -211,7 +215,10 @@ impl MultiplayerBridgeState {
         if applied {
             self.init_pending.set(false);
             if let Some(sync) = sync_runtime::multiplayer_handle() {
-                sync.borrow().set_state_applied(true);
+                match sync.try_borrow() {
+                    Ok(sync) => sync.set_state_applied(true),
+                    Err(_) => console::warn!("state: sync busy, state_applied update skipped"),
+                }
             }
         }
         self.request_private_asset_if_missing(&snapshot.puzzle);
@@ -750,7 +757,13 @@ impl MultiplayerBridgeState {
         };
         let msg = ClientMsg::Init { snapshot };
         if let Some(sync) = sync_runtime::multiplayer_handle() {
-            sync.borrow().send(msg);
+            // This runs as a core subscriber, so a local action may still
+            // hold the sync mutably (sync_runtime::handle_local_action).
+            // Bail out and keep `init_pending` set; the next notify retries.
+            let Ok(sync) = sync.try_borrow() else {
+                return;
+            };
+            sync.send(msg);
         }
         self.init_pending.set(false);
     }
@@ -1249,6 +1262,38 @@ mod tests {
             &[0, 1],
         )
         .expect("valid test game")
+    }
+
+    #[test]
+    fn try_send_init_defers_while_sync_is_borrowed() {
+        use crate::multiplayer_game_sync::MultiplayerGameSync;
+
+        let core = AppCore::new();
+        core.set_puzzle_with_topology(
+            "grid".to_string(),
+            PuzzleImageRef::BuiltIn {
+                slug: "grid".to_string(),
+            },
+            (300, 200),
+            heddobureika_core::TopologySpec::grid(3, 2),
+            None,
+        );
+        let state = install_with_core(core.clone());
+        sync_runtime::set_multiplayer_for_tests(Some(Rc::new(RefCell::new(
+            MultiplayerGameSync::new(),
+        ))));
+        let sync = sync_runtime::multiplayer_handle().expect("sync installed");
+
+        state.init_pending.set(true);
+        {
+            let _guard = sync.borrow_mut();
+            // A notify while the sync is mutably borrowed (as during local
+            // action dispatch) must defer the init send, not panic.
+            core.set_hovered(Some(0));
+            assert!(state.init_pending.get());
+        }
+        core.set_hovered(Some(1));
+        assert!(!state.init_pending.get());
     }
 
     #[test]

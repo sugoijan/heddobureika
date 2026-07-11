@@ -170,6 +170,9 @@ impl MultiplayerSyncAdapter {
         let onmessage = {
             let on_server_msg = on_server_msg.clone();
             Closure::wrap(Box::new(move |event: MessageEvent| {
+                if crate::crash::is_aborted() {
+                    return;
+                }
                 let data = event.data();
                 let Ok(buffer) = data.dyn_into::<js_sys::ArrayBuffer>() else {
                     return;

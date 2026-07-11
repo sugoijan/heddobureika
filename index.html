@@ -14,6 +14,7 @@
           progress: 0.08,
           blocked: null,
           ready: false,
+          crashed: false,
         };
         const dom = {
           ready: false,
@@ -145,12 +146,141 @@
         const ready = () => {
           state.ready = true;
           applyState();
+          // A session that stays healthy for a while earns fresh crash-reload
+          // budget; a boot-loop burns through it and lands on the overlay.
+          window.setTimeout(clearCrashReloads, CRASH_COUNTER_RESET_MS);
         };
+        const ROOM_KEY = "hb.room";
+        const CRASH_RELOADS_KEY = "hb.crash.reloads";
+        const CRASH_MAX_RELOADS = 2;
+        const CRASH_WINDOW_MS = 60000;
+        const CRASH_COUNTER_RESET_MS = 30000;
+        const noteRoom = (id) => {
+          try {
+            window.sessionStorage?.setItem(ROOM_KEY, String(id || ""));
+          } catch (err) {}
+        };
+        const clearRoom = () => {
+          try {
+            window.sessionStorage?.removeItem(ROOM_KEY);
+          } catch (err) {}
+        };
+        const readCrashReloads = () => {
+          try {
+            const raw = window.sessionStorage?.getItem(CRASH_RELOADS_KEY);
+            if (!raw) {
+              return null;
+            }
+            const parsed = JSON.parse(raw);
+            if (
+              typeof parsed.count !== "number" ||
+              typeof parsed.firstTs !== "number"
+            ) {
+              return null;
+            }
+            return parsed;
+          } catch (err) {
+            return null;
+          }
+        };
+        const writeCrashReloads = (value) => {
+          try {
+            window.sessionStorage?.setItem(
+              CRASH_RELOADS_KEY,
+              JSON.stringify(value)
+            );
+          } catch (err) {}
+        };
+        const clearCrashReloads = () => {
+          try {
+            window.sessionStorage?.removeItem(CRASH_RELOADS_KEY);
+          } catch (err) {}
+        };
+        const showCrashOverlay = (message, hint) => {
+          state.ready = false;
+          state.blocked = { code: "crashed", message, hint: hint || "" };
+          const root = resolveDom();
+          if (root && root.shell) {
+            // applyState never removes is-ready, and is-ready keeps the
+            // shell invisible and click-through; drop it explicitly so the
+            // overlay shows and blocks input into the dead canvas.
+            root.shell.classList.remove("is-ready");
+          }
+          applyState();
+        };
+        const restoreRoomHash = () => {
+          let room = "";
+          try {
+            room = window.sessionStorage?.getItem(ROOM_KEY) || "";
+          } catch (err) {}
+          if (room && !/(^|[#&])room=/.test(window.location.hash)) {
+            window.location.hash = "room=" + room;
+          }
+        };
+        // A crashed wasm instance cannot be resumed (leaked RefCell borrows,
+        // corrupted shadow stack); recovery is teardown + reload. Reload
+        // automatically a couple of times, then fall back to a manual prompt
+        // so a crash-on-boot cannot loop forever.
+        const crash = (message) => {
+          if (state.crashed) {
+            return;
+          }
+          state.crashed = true;
+          window.__HB_CRASHED = true;
+          const summary =
+            typeof message === "string" && message
+              ? message
+              : "The app hit an unexpected error.";
+          const now = Date.now();
+          let reloads = readCrashReloads();
+          if (!reloads || now - reloads.firstTs > CRASH_WINDOW_MS) {
+            reloads = { count: 0, firstTs: now };
+          }
+          if (reloads.count < CRASH_MAX_RELOADS) {
+            reloads.count += 1;
+            writeCrashReloads(reloads);
+            showCrashOverlay("Something went wrong — reloading…", summary);
+            restoreRoomHash();
+            window.setTimeout(() => window.location.reload(), 300);
+          } else {
+            showCrashOverlay(
+              "Something went wrong. Reload the page to continue.",
+              summary
+            );
+          }
+        };
+        // Catches raw wasm traps (RuntimeError: unreachable / index out of
+        // bounds / …) that escape without going through the Rust panic hook.
+        window.addEventListener("error", (event) => {
+          const err = event.error;
+          const message = event.message || "";
+          const isTrap =
+            (typeof WebAssembly === "object" &&
+              err instanceof WebAssembly.RuntimeError) ||
+            /RuntimeError.*(unreachable|index out of bounds|call_indirect)/i.test(
+              message
+            );
+          if (isTrap) {
+            crash(message || "WebAssembly runtime error");
+          }
+        });
+        window.addEventListener("unhandledrejection", (event) => {
+          const reason = event.reason;
+          if (
+            typeof WebAssembly === "object" &&
+            reason instanceof WebAssembly.RuntimeError
+          ) {
+            crash(String(reason && reason.message ? reason.message : reason));
+          }
+        });
         window.__HB_BOOT = {
           setPhase,
           setProgress,
           fail,
           ready,
+          crash,
+          noteRoom,
+          clearRoom,
         };
         if (document.readyState === "loading") {
           document.addEventListener("DOMContentLoaded", applyState, { once: true });

@@ -348,6 +348,7 @@ struct PreviewColors {
 thread_local! {
     static WGPU_VIEW: RefCell<Option<Rc<WgpuView>>> = RefCell::new(None);
     static WGPU_VIEW_ADAPTER: RefCell<Option<Rc<RefCell<WgpuViewAdapter>>>> = RefCell::new(None);
+    static WARNED_INVALID_Z_ORDER: Cell<bool> = Cell::new(false);
 }
 
 pub(crate) fn request_render() {
@@ -442,14 +443,13 @@ pub(crate) fn run(core: Rc<AppCore>) {
         });
         view.update_viewport_size();
         view.install_listeners();
+        // Subscribers can run re-entrantly (a nested notify during render),
+        // so the render subscription must not hold a RefCell borrow while
+        // queueing; go through the view directly instead of the adapter.
         let core_for_render = core.clone();
-        let adapter_for_render = adapter.clone();
+        let view_for_render = view.clone();
         let subscription = core.subscribe(Rc::new(move || {
-            let snapshot = core_for_render.snapshot();
-            let sync_view = sync_runtime::sync_view();
-            adapter_for_render
-                .borrow_mut()
-                .render(&snapshot, &sync_view);
+            view_for_render.queue_render_snapshot(core_for_render.snapshot());
         }));
         *view.subscription.borrow_mut() = Some(subscription);
         WGPU_VIEW.with(|slot| {
@@ -3041,6 +3041,9 @@ impl WgpuView {
     }
 
     fn auto_pan_frame(self: &Rc<Self>, timestamp: f64) {
+        if crate::crash::is_aborted() {
+            return;
+        }
         let (active, seen_inner, has_pointer, screen_x, screen_y, dt_sec) = {
             let mut state = self.auto_pan.borrow_mut();
             state.frame.take();
@@ -3166,11 +3169,28 @@ impl WgpuView {
     }
 
     fn perform_render(self: &Rc<Self>, schedule_idle: bool) {
-        let snapshot = self
+        if crate::crash::is_aborted() {
+            return;
+        }
+        if crate::crash::take_panic_in_render() {
+            panic!("injected test panic (render)");
+        }
+        let mut snapshot = self
             .pending_snapshot
             .borrow_mut()
             .take()
             .unwrap_or_else(|| self.core.snapshot());
+        // A queued snapshot can predate a puzzle swap (a remote State message
+        // replaces assets and game together); its piece-indexed data would
+        // then live in a different index space than the live geometry.
+        let live_total = self.core.assets().map(|a| a.render_geometry.pieces.len());
+        let snap_total = snapshot
+            .game
+            .as_ref()
+            .map(|g| g.playable.piece_count() as usize);
+        if live_total.is_some() && snap_total.is_some() && live_total != snap_total {
+            snapshot = self.core.snapshot();
+        }
         let show_fps = self.wgpu_settings.borrow().show_fps;
         let sync_view = sync_runtime::sync_view();
         let now = now_ms();
@@ -3832,9 +3852,20 @@ fn build_wgpu_instances(
             flip_edges: FlipEdges::default(),
         };
     }
-    let fallback_order = if z_order.len() == total {
+    let fallback_order = if crate::app_core::z_order_is_valid(z_order, total) {
         None
     } else {
+        if !z_order.is_empty() {
+            // Fingerprint of a desynced/malformed remote snapshot; keep it
+            // visible, but only once so a bad room doesn't spam the console.
+            WARNED_INVALID_Z_ORDER.with(|warned| {
+                if !warned.replace(true) {
+                    web_sys::console::warn_1(
+                        &"invalid z-order snapshot; falling back to canonical draw order".into(),
+                    );
+                }
+            });
+        }
         Some((0..total).collect::<Vec<_>>())
     };
     let order = match fallback_order.as_deref() {
