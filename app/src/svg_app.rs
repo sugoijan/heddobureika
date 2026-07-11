@@ -39,8 +39,9 @@ const UI_CREDIT_FONT_RATIO: f32 = 0.026;
 const UI_CREDIT_ROTATION_DEG: f32 = -1.1;
 const UI_ART_CREDIT_FONT_RATIO: f32 = 0.022;
 const UI_ART_CREDIT_ROTATION_DEG: f32 = -1.1;
-/// Inset of the art credit from the puzzle frame's bottom-right corner,
-/// as a fraction of its font size.
+/// Spacing between the art credit and the puzzle frame's bottom-right
+/// corner (inset from the right edge, gap below the bottom edge), as a
+/// fraction of its font size.
 const UI_ART_CREDIT_PAD_RATIO: f32 = 0.6;
 const UI_MENU_SUB_FONT_RATIO: f32 = 0.028;
 const UI_MENU_SUB_ROTATION_DEG: f32 = 1.1;
@@ -4020,9 +4021,9 @@ fn build_ui_specs(
         });
 
         if let Some(text) = art_credit_text {
-            // Anchored to the puzzle frame's bottom-right corner rather than
-            // the workspace gutter grid, so it stays inside the frame on
-            // cropped topologies; apply_taffy_layout skips it.
+            // Anchored just below the puzzle frame's bottom-right corner
+            // rather than the workspace gutter grid, so it stays visible
+            // once the puzzle is complete; apply_taffy_layout skips it.
             let art_size = min_dim * UI_ART_CREDIT_FONT_RATIO;
             let mut spec = UiTextSpec {
                 id: UiTextId::ArtCredit,
@@ -4041,7 +4042,7 @@ fn build_ui_specs(
             let pad = art_size * UI_ART_CREDIT_PAD_RATIO;
             spec.pos = [
                 frame_rect[0] + frame_rect[2] - pad - text_width * 0.5,
-                frame_rect[1] + frame_rect[3] - pad - text_height * 0.5,
+                frame_rect[1] + frame_rect[3] + pad + text_height * 0.5,
             ];
             specs.push(spec);
         }
