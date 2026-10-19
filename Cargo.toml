@@ -23,11 +23,13 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 gloo = "0.12"
 js-sys = "0.3"
-glyphon = "0.11"
-taffy = "0.10"
+glyphon = "0.12"
+taffy = "0.15"
 wgpu = { version = "30", default-features = false }
 bytemuck = "1.25"
 web-sys = "0.3"
+getrandom = "0.4"
+# Retain the older entropy backend required by the P2P Wasm tests.
 getrandom_02 = { package = "getrandom", version = "0.2" }
 wasm-bindgen-test = "0.3"
 console_error_panic_hook = "0.1"
@@ -36,19 +38,19 @@ naga = "30"
 # shared
 serde = "1"
 serde_json = "1"
-base64 = "0.22"
-rkyv = "0.8.16"
-p256 = "0.13"
+base64 = "0.23"
+rkyv = "0.8.18"
+p256 = "0.14"
 sha2 = "0.11"
 
 # core build
 dotenvy = "0.15"
 toml = "1"
-imagesize = "0.14"
+imagesize = "0.15"
 
 # game
 heddobureika-game = { path = "game" }
-smallvec = "1.15"
+smallvec = "1.16"
 typed_floats = "1.0"
 
 # cli / xtask
@@ -59,23 +61,18 @@ url = "2"
 mime_guess = "2"
 futures-util = "0.3"
 tokio = "1"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 rustls = "0.23"
 
 # worker
-worker = "0.8.3"
+worker = "0.8.7"
 
 # image pipeline
 image = { version = "0.25", default-features = false }
 img-parts = "0.4"
-moxcms = "0.8"
+moxcms = "0.9"
 png = "0.18"
 thiserror = "2"
-
-# glyphon 0.11 pins wgpu 29; drop this patch once a wgpu-30-compatible release ships
-# (tracking https://github.com/grovesNL/glyphon/pull/175)
-[patch.crates-io]
-glyphon = { git = "https://github.com/RuairidhWilliamson/glyphon", rev = "75c477039df18276ff6667cb9265611cee6fa932" }
 
 [profile.release]
 opt-level = "z"

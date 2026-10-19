@@ -16,7 +16,7 @@ use heddobureika_core::{
 };
 use mime_guess::MimeGuess;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use p256::elliptic_curve::Generate;
 use rand::RngExt;
 use serde::Deserialize;
 use serde::Serialize;
@@ -2073,9 +2073,9 @@ fn build_auth_protocol(
     const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
     const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
 
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
-    let public_key_sec1 = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
     let client_id = derive_client_id(&public_key_sec1);
     let ts = now_ms();
     let nonce = random_nonce();
@@ -2105,8 +2105,7 @@ fn derive_client_id(pubkey_sec1: &[u8]) -> u64 {
 }
 
 fn random_nonce() -> String {
-    let mut bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut bytes);
+    let bytes = <[u8; 12]>::generate();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

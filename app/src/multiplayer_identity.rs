@@ -5,7 +5,7 @@ use heddobureika_core::ClientId;
 use js_sys::Date;
 use p256::SecretKey;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use p256::elliptic_curve::Generate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
@@ -54,7 +54,7 @@ pub(crate) async fn build_auth_protocol(
 ) -> Result<String, String> {
     let identity = load_or_create_identity().await?;
     let ts = now_ms();
-    let nonce_bytes = random_bytes(NONCE_BYTES);
+    let nonce_bytes = <[u8; NONCE_BYTES]>::generate();
     let nonce = URL_SAFE_NO_PAD.encode(&nonce_bytes);
     let message = auth_message(room_id, ts, &nonce);
     let sig_bytes = sign_message(&identity.private_key, &message)?;
@@ -106,9 +106,9 @@ async fn load_or_create_identity() -> Result<ClientIdentity, String> {
 }
 
 async fn generate_identity() -> Result<ClientIdentity, String> {
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
-    let public_key_sec1 = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
     let client_id = derive_client_id(&public_key_sec1);
 
     let private_key_bytes = signing_key.to_bytes().to_vec();
@@ -138,7 +138,7 @@ fn import_identity(record: &StoredIdentity) -> Result<ClientIdentity, String> {
         .map_err(|_| "invalid private key".to_string())?;
     let signing_key = signing_key_from_bytes(&private_key_bytes)?;
     let verifying_key = signing_key.verifying_key();
-    let public_key_sec1 = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
     let client_id = derive_client_id(&public_key_sec1);
     Ok(ClientIdentity {
         client_id,
@@ -164,12 +164,6 @@ fn derive_client_id(public_key_sec1: &[u8]) -> ClientId {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     ClientId::from(u64::from_be_bytes(bytes))
-}
-
-fn random_bytes(len: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; len];
-    OsRng.fill_bytes(&mut bytes);
-    bytes
 }
 
 fn now_ms() -> i64 {

@@ -21,11 +21,13 @@ Catalog lives in `puzzles/catalog.toml`. Override it by setting `PUZZLE_CATALOG_
 Requirements:
 
 - Rust toolchain (cargo)
-- Node.js 22 or newer
+- Node.js 22 (at least 22.12), 24, or 26+ (24 LTS recommended)
 - `just`
 - `trunk` (for frontend dev)
-- `pnpm` (for JS tooling, including `pnpm exec wrangler` for worker dev)
+- `pnpm` 12.14.0 (install with `npm install -g pnpm@12.14.0`; for JS tooling, including `pnpm exec wrangler` for worker dev)
 - `worker-build` (`cargo install worker-build`)
+
+If an older Corepack shim cannot launch pnpm 12, run `corepack disable pnpm` before installing pnpm with npm.
 
 Dev tasks live in `justfile` (run `just --list`). Common flow:
 

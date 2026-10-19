@@ -2197,7 +2197,6 @@ impl WgpuRenderer {
                 if text_state.last_text != self.fps_text {
                     let attrs = Attrs::new().family(Family::Name(FPS_FONT_FAMILY));
                     text_state.buffer.set_text(
-                        &mut text_state.font_system,
                         &self.fps_text,
                         &attrs,
                         Shaping::Advanced,
@@ -2318,11 +2317,7 @@ impl WgpuRenderer {
         let line_height = FPS_LINE_HEIGHT * scale;
         let text_width = FPS_TEXT_WIDTH * scale;
         let mut buffer = Buffer::new(&mut font_system, Metrics::new(font_size, line_height));
-        buffer.set_size(
-            &mut font_system,
-            Some(text_width),
-            Some(self._config.height as f32),
-        );
+        buffer.set_size(Some(text_width), Some(self._config.height as f32));
         let mut state = GlyphonState {
             font_system,
             swash_cache,
@@ -2335,7 +2330,6 @@ impl WgpuRenderer {
         if !self.fps_text.is_empty() {
             let attrs = Attrs::new().family(Family::Name(FPS_FONT_FAMILY));
             state.buffer.set_text(
-                &mut state.font_system,
                 &self.fps_text,
                 &attrs,
                 Shaping::Advanced,
@@ -2475,33 +2469,21 @@ impl WgpuRenderer {
                 let metrics = Metrics::new(font_px, line_px);
                 let pad_px = UI_TEXT_PADDING * self.render_scale;
                 sprite.buffer = Buffer::new(&mut ui_state.font_system, metrics);
+                sprite.buffer.set_size(None, None);
+                let attrs = Attrs::new().family(Family::Name(UI_FONT_FAMILY));
                 sprite
                     .buffer
-                    .set_size(&mut ui_state.font_system, None, None);
-                let attrs = Attrs::new().family(Family::Name(UI_FONT_FAMILY));
-                sprite.buffer.set_text(
-                    &mut ui_state.font_system,
-                    &spec.text,
-                    &attrs,
-                    Shaping::Advanced,
-                    Some(Align::Left),
-                );
+                    .set_text(&spec.text, &attrs, Shaping::Advanced, Some(Align::Left));
                 sprite
                     .buffer
                     .shape_until_scroll(&mut ui_state.font_system, false);
                 let (text_w, text_h) = measure_text_bounds(&sprite.buffer);
                 let tex_w = (text_w + pad_px * 2.0).ceil().max(1.0) as u32;
                 let tex_h = (text_h + pad_px * 2.0).ceil().max(1.0) as u32;
+                sprite.buffer.set_size(Some(tex_w as f32), None);
                 sprite
                     .buffer
-                    .set_size(&mut ui_state.font_system, Some(tex_w as f32), None);
-                sprite.buffer.set_text(
-                    &mut ui_state.font_system,
-                    &spec.text,
-                    &attrs,
-                    Shaping::Advanced,
-                    Some(Align::Center),
-                );
+                    .set_text(&spec.text, &attrs, Shaping::Advanced, Some(Align::Center));
                 sprite
                     .buffer
                     .shape_until_scroll(&mut ui_state.font_system, false);

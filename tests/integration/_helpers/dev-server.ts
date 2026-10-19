@@ -1,4 +1,4 @@
-import { execa, type ExecaChildProcess } from "execa";
+import { execa, type Subprocess } from "execa";
 import waitOn from "wait-on";
 import {
   adminToken,
@@ -7,7 +7,7 @@ import {
   wranglerPort,
 } from "./paths";
 
-let wranglerProc: ExecaChildProcess | undefined;
+let wranglerProc: Subprocess | undefined;
 const wranglerOutput: string[] = [];
 const wranglerBootTimeoutMs = Number(
   process.env.INTEGRATION_WRANGLER_BOOT_TIMEOUT_MS ?? "240000"

@@ -1,8 +1,8 @@
 packages:
   - "."
 
-onlyBuiltDependencies:
-  - esbuild
-  - lightningcss-cli
-  - sharp
-  - workerd
+allowBuilds:
+  esbuild: true
+  lightningcss-cli: true
+  sharp: true
+  workerd: true

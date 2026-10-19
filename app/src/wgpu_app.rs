@@ -4246,15 +4246,9 @@ fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
 fn measure_text_block(measure: &mut GlyphonMeasureState, spec: &UiTextSpec) -> (f32, f32) {
     let metrics = Metrics::new(spec.font_size, spec.line_height);
     let mut buffer = Buffer::new(&mut measure.font_system, metrics);
-    buffer.set_size(&mut measure.font_system, None, None);
+    buffer.set_size(None, None);
     let attrs = Attrs::new().family(Family::Name(UI_FONT_FAMILY));
-    buffer.set_text(
-        &mut measure.font_system,
-        &spec.text,
-        &attrs,
-        Shaping::Advanced,
-        Some(Align::Left),
-    );
+    buffer.set_text(&spec.text, &attrs, Shaping::Advanced, Some(Align::Left));
     buffer.shape_until_scroll(&mut measure.font_system, false);
     let (width, height) = measure_text_bounds(&buffer);
     if width <= 0.0 || height <= 0.0 {
@@ -4317,8 +4311,8 @@ fn apply_taffy_layout(
             length(puzzle_height),
             length(bottom_gutter),
         ],
-        justify_items: Some(JustifyItems::Center),
-        align_items: Some(AlignItems::Center),
+        justify_items: JustifyItems::CENTER,
+        align_items: AlignItems::CENTER,
         ..Default::default()
     };
     let mut nodes: Vec<(UiTextId, NodeId)> = Vec::new();
@@ -4353,8 +4347,8 @@ fn apply_taffy_layout(
         let menu_style = Style {
             display: Display::Flex,
             flex_direction: FlexDirection::Column,
-            align_items: Some(AlignItems::Center),
-            justify_content: Some(JustifyContent::Center),
+            align_items: AlignItems::CENTER,
+            justify_content: JustifyContent::CENTER,
             gap: Size {
                 width: zero(),
                 height: length(gap),
@@ -4375,16 +4369,16 @@ fn apply_taffy_layout(
         let mut children = Vec::new();
         for spec in specs.iter_mut() {
             let (row, col, span_cols, justify, align) = match spec.id {
-                UiTextId::Title => (1, 1, false, JustifySelf::Start, AlignSelf::Start),
-                UiTextId::Progress => (3, 1, false, JustifySelf::Start, AlignSelf::End),
-                UiTextId::Credit => (3, 3, false, JustifySelf::End, AlignSelf::End),
+                UiTextId::Title => (1, 1, false, JustifySelf::START, AlignSelf::START),
+                UiTextId::Progress => (3, 1, false, JustifySelf::START, AlignSelf::END),
+                UiTextId::Credit => (3, 3, false, JustifySelf::END, AlignSelf::END),
                 // Positioned directly against the puzzle frame rect in
                 // build_ui_specs; not part of the workspace gutter grid.
                 UiTextId::ArtCredit => continue,
-                UiTextId::Success => (1, 2, false, JustifySelf::Center, AlignSelf::Center),
-                UiTextId::Debug => (1, 2, false, JustifySelf::End, AlignSelf::Start),
+                UiTextId::Success => (1, 2, false, JustifySelf::CENTER, AlignSelf::CENTER),
+                UiTextId::Debug => (1, 2, false, JustifySelf::END, AlignSelf::START),
                 UiTextId::MenuTitle | UiTextId::MenuSubtitle => {
-                    (2, 2, false, JustifySelf::Center, AlignSelf::Center)
+                    (2, 2, false, JustifySelf::CENTER, AlignSelf::CENTER)
                 }
             };
             let (text_width, text_height) = layout_text_bounds(measure, spec);
