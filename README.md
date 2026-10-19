@@ -43,6 +43,58 @@ Frontend multiplayer config (optional):
 - Add `#room=ROOM_ID` to the URL to auto-join a room.
 - Canonical dev config: set `TRUNK_PUBLIC_HEDDOBUREIKA_WS_BASE` in `.env` (default in this repo). It must end with `/ws`.
 
+### Shared multiplayer authority
+
+`heddobureika-session` owns the authoritative puzzle state, group ownership,
+gameplay command handling, and ownership expiry. The worker supplies authenticated
+client IDs and time, then handles the returned events, persistence, and alarms.
+The crate builds natively and for Wasm without browser, Cloudflare, or networking
+dependencies, so a future P2P host can reuse the same authority.
+
+Server remains the default connection mode. See [the session crate](session/README.md)
+for its API contract and validation commands.
+
+### Experimental P2P
+
+Build the frontend with `trunk serve --features experimental-p2p` (or
+`trunk build --release --features experimental-p2p`). In the Multiplayer panel,
+select Online, open Advanced host settings, and choose **P2P (experimental)**.
+Select **Host puzzle** to share the current catalog puzzle and its progress,
+then copy the P2P invite to a friend using the same P2P-enabled build. Guests
+join through the invite link. Server is selected by default for new hosting
+flows; existing room links and admin authentication continue to use the server.
+
+This experiment supports two players. The host resolves commands for both
+players, and a guest can reconnect while the host remains open. Browser traffic
+uses encrypted relays. The host saves confirmed puzzle progress and its private
+room identity together in IndexedDB, separately from ordinary local progress.
+Reloading the host tab automatically resumes the same room and invite. Guests
+pause while the host is offline and reconnect automatically with a fresh
+authoritative snapshot. Changing either player's renderer also preserves the
+room; WGPU remains the default renderer. The host flushes its confirmed state
+before an intentional renderer reload. Piece ownership is cleared on restart.
+
+Leaving the room or selecting another mode stops automatic hosting. To start a
+new room from saved progress, select Online → Advanced host settings → P2P →
+**Restore saved P2P puzzle**; this creates a new invite. Older progress-only
+saves can also be restored this way once, after which reloads resume the room.
+Only one host tab per browser origin is allowed. A browser lock prevents a
+second tab from hosting the saved identity simultaneously. Guest browsers do
+not save host progress. Duplicating a guest tab hands its identity to the new
+tab: the original stops, and the duplicate waits for its connection to close
+before joining. Browser locks and cross-tab messaging prevent relay reconnect
+loops; an ordinary reload can still rejoin with the same identity.
+
+The host panel shows when progress has committed or a save has failed. Saves
+run at most four times per second, with a final checkpoint on leaving. An abrupt
+reload or browser crash can lose changes since the last committed checkpoint.
+Storage is local to the browser and origin; clearing browser data removes it.
+Private images and automatic host migration remain follow-up work.
+
+The transport is in the portable [P2P crate](p2p/README.md). Default builds omit
+its dependencies and UI. If a P2P invite is opened in such a build, the app
+explains that P2P is unavailable instead of joining a saved server room.
+
 ### Bot CLI + command recording
 
 Create a room, then run one or more bot processes (one process = one simulated player):

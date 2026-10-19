@@ -20,6 +20,10 @@ mod multiplayer_bridge;
 mod multiplayer_game_sync;
 mod multiplayer_identity;
 mod multiplayer_sync;
+#[cfg(feature = "experimental-p2p")]
+mod p2p_sync;
+#[cfg(feature = "experimental-p2p")]
+mod p2p_progress;
 mod persisted;
 mod persisted_store;
 mod puzzle_image;

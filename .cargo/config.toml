@@ -3,3 +3,5 @@ runner = "wasm-bindgen-test-runner"
 
 [env]
 WASM_BINDGEN_TEST_HEADLESS = "0"
+# The system ar on macOS can produce empty archives for Wasm C objects.
+AR_wasm32_unknown_unknown = { value = "scripts/wasm-ar.sh", relative = true }

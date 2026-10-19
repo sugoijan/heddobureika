@@ -18,8 +18,17 @@ use heddobureika_core::{
     RoomPersistence, ServerMsg,
 };
 
+struct PendingOwnershipUpdate {
+    seq: u64,
+    update: RoomControlUpdate,
+    source: Option<ClientId>,
+    client_seq: Option<u64>,
+}
+
 pub(crate) struct MultiplayerGameSync {
     adapter: MultiplayerSyncAdapter,
+    #[cfg(feature = "experimental-p2p")]
+    p2p: Option<crate::p2p_sync::P2pSync>,
     last_seq: Rc<Cell<u64>>,
     next_client_seq: Rc<Cell<u64>>,
     last_sent_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
@@ -42,9 +51,20 @@ pub(crate) struct MultiplayerGameSync {
 }
 
 impl MultiplayerGameSync {
+    #[cfg(feature = "experimental-p2p")]
+    pub(crate) fn p2p_reload_handle(
+        &self,
+    ) -> Result<Option<(heddobureika_p2p::Handle, Rc<crate::p2p_progress::Saver>)>, String> {
+        match &self.p2p {
+            Some(p2p) => p2p.reload_handle(),
+            None => Ok(None),
+        }
+    }
     pub(crate) fn new() -> Self {
         Self {
             adapter: MultiplayerSyncAdapter::new(),
+            #[cfg(feature = "experimental-p2p")]
+            p2p: None,
             last_seq: Rc::new(Cell::new(0)),
             next_client_seq: Rc::new(Cell::new(0)),
             last_sent_by_anchor: Rc::new(RefCell::new(HashMap::new())),
@@ -63,6 +83,35 @@ impl MultiplayerGameSync {
             local_flip_observer: Rc::new(RefCell::new(None)),
             local_detach_observer: Rc::new(RefCell::new(None)),
             local_send_to_back_observer: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    pub(crate) fn connect_config(
+        &mut self,
+        config: &app_router::MultiplayerConfig,
+        snapshot: Option<heddobureika_core::PlayableGameSnapshot>,
+        on_fail: Rc<dyn Fn(FailReason)>,
+    ) {
+        if !config.is_p2p() {
+            self.connect(&config.room_id, on_fail);
+            return;
+        }
+        #[cfg(feature = "experimental-p2p")]
+        {
+            self.reset_state();
+            let hooks = self.hooks.borrow().clone();
+            let handler = self.install_handler(hooks);
+            self.p2p = Some(crate::p2p_sync::P2pSync::connect(
+                config,
+                snapshot,
+                handler,
+                self.connected.clone(),
+            ));
+        }
+        #[cfg(not(feature = "experimental-p2p"))]
+        {
+            let _ = snapshot;
+            on_fail(FailReason::Terminal);
         }
     }
 
@@ -110,11 +159,20 @@ impl MultiplayerGameSync {
         let next = self.connect_seq.get().wrapping_add(1);
         self.connect_seq.set(next);
         self.adapter.disconnect();
+        #[cfg(feature = "experimental-p2p")]
+        if let Some(p2p) = self.p2p.take() {
+            p2p.close();
+        }
         self.reset_state();
         self.handler.borrow_mut().take();
     }
 
     pub(crate) fn send(&self, msg: ClientMsg) {
+        #[cfg(feature = "experimental-p2p")]
+        if let Some(p2p) = self.p2p.as_ref() {
+            p2p.send(msg);
+            return;
+        }
         self.adapter.send(msg);
     }
 
@@ -188,196 +246,243 @@ impl MultiplayerGameSync {
         let on_remote_snapshot = hooks.on_remote_snapshot.clone();
         let on_remote_update = hooks.on_remote_update.clone();
         let on_remote_playable_update = hooks.on_remote_playable_update.clone();
-        Rc::new(move |msg: ServerMsg| match msg {
-            ServerMsg::Welcome {
-                room_id,
-                persistence,
-                initialized,
-                client_id,
-            } => {
-                console::log!(
-                    "multiplayer connected",
-                    room_id.clone(),
-                    format!("{persistence:?}"),
-                    format!("initialized={initialized}"),
-                    format!("client_id={:?}", client_id)
-                );
-                connected_cell.set(true);
-                client_id_cell.set(client_id);
-                init_required_cell.set(!initialized);
-                *room_id_cell.borrow_mut() = Some(room_id.clone());
-                persistence_cell.set(Some(persistence));
-                *ownership_by_anchor.borrow_mut() = Rc::new(HashMap::new());
-                (on_event)(SyncEvent::Connected {
-                    room_id: Some(room_id),
-                    persistence: Some(persistence),
-                    initialized,
-                    client_id,
-                });
-                if !initialized {
-                    (on_event)(SyncEvent::NeedInit);
+        let pending_ownership = RefCell::new(None::<PendingOwnershipUpdate>);
+        Rc::new(move |msg: ServerMsg| {
+            let next_seq = match &msg {
+                ServerMsg::ControlUpdate { seq, .. } | ServerMsg::PlayableUpdate { seq, .. } => {
+                    Some(*seq)
+                }
+                _ => None,
+            };
+            if next_seq.is_some_and(|next| {
+                pending_ownership
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|pending| pending.seq < next)
+            }) {
+                let pending = pending_ownership.borrow_mut().take().unwrap();
+                // A later revision proves that an ownership-only revision has
+                // no playable event left to apply. Commit it before the next
+                // delta, unless a same-revision playable/order event already did.
+                if pending.seq > last_seq.get() && state_applied.get() {
+                    last_seq.set(pending.seq);
+                    (on_remote_update)(
+                        pending.update,
+                        pending.seq,
+                        pending.source,
+                        pending.client_seq,
+                    );
                 }
             }
-            ServerMsg::AdminAck {
-                room_id,
-                persistence,
-            } => {
-                *room_id_cell.borrow_mut() = Some(room_id);
-                persistence_cell.set(Some(persistence));
-            }
-            ServerMsg::NeedInit => {
-                init_required_cell.set(true);
-                (on_event)(SyncEvent::NeedInit);
-            }
-            ServerMsg::Warning { minutes_idle } => {
-                console::warn!("room idle for", minutes_idle, "minutes");
-                (on_event)(SyncEvent::Warning { minutes_idle });
-            }
-            ServerMsg::AssetBegin {
-                hash,
-                mime,
-                width,
-                height,
-                size,
-            } => {
-                (on_asset)(AssetEvent::Begin {
+            match msg {
+                ServerMsg::Welcome {
+                    room_id,
+                    persistence,
+                    initialized,
+                    client_id,
+                } => {
+                    pending_ownership.borrow_mut().take();
+                    console::log!(
+                        "multiplayer connected",
+                        room_id.clone(),
+                        format!("{persistence:?}"),
+                        format!("initialized={initialized}"),
+                        format!("client_id={:?}", client_id)
+                    );
+                    connected_cell.set(true);
+                    client_id_cell.set(client_id);
+                    init_required_cell.set(!initialized);
+                    *room_id_cell.borrow_mut() = Some(room_id.clone());
+                    persistence_cell.set(Some(persistence));
+                    *ownership_by_anchor.borrow_mut() = Rc::new(HashMap::new());
+                    ownership_seq_by_anchor.borrow_mut().clear();
+                    (on_event)(SyncEvent::Connected {
+                        room_id: Some(room_id),
+                        persistence: Some(persistence),
+                        initialized,
+                        client_id,
+                    });
+                    if !initialized {
+                        (on_event)(SyncEvent::NeedInit);
+                    }
+                }
+                ServerMsg::AdminAck {
+                    room_id,
+                    persistence,
+                } => {
+                    *room_id_cell.borrow_mut() = Some(room_id);
+                    persistence_cell.set(Some(persistence));
+                }
+                ServerMsg::NeedInit => {
+                    init_required_cell.set(true);
+                    (on_event)(SyncEvent::NeedInit);
+                }
+                ServerMsg::Warning { minutes_idle } => {
+                    console::warn!("room idle for", minutes_idle, "minutes");
+                    (on_event)(SyncEvent::Warning { minutes_idle });
+                }
+                ServerMsg::AssetBegin {
                     hash,
                     mime,
                     width,
                     height,
                     size,
-                });
-            }
-            ServerMsg::AssetChunk { hash, index, bytes } => {
-                (on_asset)(AssetEvent::Chunk { hash, index, bytes });
-            }
-            ServerMsg::AssetEnd { hash } => {
-                (on_asset)(AssetEvent::End { hash });
-            }
-            ServerMsg::State { seq, snapshot } => {
-                console::log!(
-                    "multiplayer state received",
+                } => {
+                    (on_asset)(AssetEvent::Begin {
+                        hash,
+                        mime,
+                        width,
+                        height,
+                        size,
+                    });
+                }
+                ServerMsg::AssetChunk { hash, index, bytes } => {
+                    (on_asset)(AssetEvent::Chunk { hash, index, bytes });
+                }
+                ServerMsg::AssetEnd { hash } => {
+                    (on_asset)(AssetEvent::End { hash });
+                }
+                ServerMsg::State { seq, snapshot } => {
+                    pending_ownership.borrow_mut().take();
+                    console::log!(
+                        "multiplayer state received",
+                        seq,
+                        snapshot.state.topology_piece_count,
+                        format!("topology={}", snapshot.puzzle.topology.tag)
+                    );
+                    last_seq.set(seq);
+                    init_required_cell.set(false);
+                    (on_remote_snapshot)(snapshot, seq);
+                }
+                ServerMsg::ControlUpdate {
                     seq,
-                    snapshot.state.topology_piece_count,
-                    format!("topology={}", snapshot.puzzle.topology.tag)
-                );
-                last_seq.set(seq);
-                init_required_cell.set(false);
-                (on_remote_snapshot)(snapshot, seq);
-            }
-            ServerMsg::ControlUpdate {
-                seq,
-                update,
-                source,
-                client_seq,
-            } => {
-                let kind = control_update_kind(&update);
-                console::log!(
-                    "multiplayer control update received",
-                    seq,
-                    kind,
-                    format!("source={:?}", source)
-                );
-                if let RoomControlUpdate::Ownership {
-                    group_anchor,
-                    owner,
-                    ..
-                } = &update
-                {
-                    let should_apply = {
-                        let mut seq_map = ownership_seq_by_anchor.borrow_mut();
-                        match seq_map.get(group_anchor) {
-                            Some(last_seq) if *last_seq >= seq => false,
-                            _ => {
-                                seq_map.insert(*group_anchor, seq);
-                                true
+                    update,
+                    source,
+                    client_seq,
+                } => {
+                    let kind = control_update_kind(&update);
+                    console::log!(
+                        "multiplayer control update received",
+                        seq,
+                        kind,
+                        format!("source={:?}", source)
+                    );
+                    if let RoomControlUpdate::Ownership {
+                        group_anchor,
+                        owner,
+                        ..
+                    } = &update
+                    {
+                        let should_apply = {
+                            let mut seq_map = ownership_seq_by_anchor.borrow_mut();
+                            match seq_map.get(group_anchor) {
+                                Some(last_seq) if *last_seq >= seq => false,
+                                _ => {
+                                    seq_map.insert(*group_anchor, seq);
+                                    true
+                                }
                             }
+                        };
+                        if !should_apply {
+                            console::warn!(
+                                "multiplayer ownership update dropped (stale)",
+                                seq,
+                                format!("anchor={group_anchor}")
+                            );
+                            return;
                         }
-                    };
-                    if !should_apply {
+                        let next = {
+                            let current = ownership_by_anchor.borrow();
+                            let mut next = (**current).clone();
+                            if let Some(owner_id) = owner {
+                                next.insert(*group_anchor, *owner_id);
+                            } else {
+                                next.remove(group_anchor);
+                            }
+                            next
+                        };
+                        *ownership_by_anchor.borrow_mut() = Rc::new(next);
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            crate::wgpu_app::request_render();
+                        }
+                        (on_event)(SyncEvent::Ownership {
+                            anchor_id: *group_anchor,
+                            owner: *owner,
+                        });
+                        // Ownership can precede a snap at the very same revision.
+                        // Update its map immediately, but defer the revision bump.
+                        if seq > last_seq.get()
+                            && pending_ownership
+                                .borrow()
+                                .as_ref()
+                                .is_none_or(|pending| pending.seq < seq)
+                        {
+                            *pending_ownership.borrow_mut() = Some(PendingOwnershipUpdate {
+                                seq,
+                                update,
+                                source,
+                                client_seq,
+                            });
+                        }
+                        return;
+                    }
+                    let last = last_seq.get();
+                    if seq <= last {
                         console::warn!(
-                            "multiplayer ownership update dropped (stale)",
+                            "multiplayer control update dropped (stale)",
                             seq,
-                            format!("anchor={group_anchor}")
+                            last,
+                            kind
                         );
                         return;
                     }
-                    let next = {
-                        let current = ownership_by_anchor.borrow();
-                        let mut next = (**current).clone();
-                        if let Some(owner_id) = owner {
-                            next.insert(*group_anchor, *owner_id);
-                        } else {
-                            next.remove(group_anchor);
-                        }
-                        next
-                    };
-                    *ownership_by_anchor.borrow_mut() = Rc::new(next);
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        crate::wgpu_app::request_render();
+                    last_seq.set(seq);
+                    if !state_applied.get() {
+                        console::warn!("multiplayer control update dropped (not ready)", seq, kind);
+                        (on_event)(SyncEvent::DropNotReady);
+                        return;
                     }
-                    (on_event)(SyncEvent::Ownership {
-                        anchor_id: *group_anchor,
-                        owner: *owner,
-                    });
-                    return;
+                    (on_remote_update)(update, seq, source, client_seq);
                 }
-                let last = last_seq.get();
-                if seq <= last {
-                    console::warn!(
-                        "multiplayer control update dropped (stale)",
-                        seq,
-                        last,
-                        kind
-                    );
-                    return;
-                }
-                last_seq.set(seq);
-                if !state_applied.get() {
-                    console::warn!("multiplayer control update dropped (not ready)", seq, kind);
-                    (on_event)(SyncEvent::DropNotReady);
-                    return;
-                }
-                (on_remote_update)(update, seq, source, client_seq);
-            }
-            ServerMsg::PlayableUpdate {
-                seq,
-                update,
-                source,
-                client_seq,
-            } => {
-                console::log!(
-                    "multiplayer playable update received",
+                ServerMsg::PlayableUpdate {
                     seq,
-                    format!("{:?}", update.kind),
-                    format!("source={:?}", source),
-                    format!("client_seq={:?}", client_seq),
-                    format!("revision={}", update.revision_after)
-                );
-                let last = last_seq.get();
-                if seq <= last {
-                    console::warn!("multiplayer playable update dropped (stale)", seq, last);
-                    return;
+                    update,
+                    source,
+                    client_seq,
+                } => {
+                    console::log!(
+                        "multiplayer playable update received",
+                        seq,
+                        format!("{:?}", update.kind),
+                        format!("source={:?}", source),
+                        format!("client_seq={:?}", client_seq),
+                        format!("revision={}", update.revision_after)
+                    );
+                    let last = last_seq.get();
+                    if seq <= last {
+                        console::warn!("multiplayer playable update dropped (stale)", seq, last);
+                        return;
+                    }
+                    last_seq.set(seq);
+                    if !state_applied.get() {
+                        console::warn!("multiplayer playable update dropped (not ready)", seq);
+                        (on_event)(SyncEvent::DropNotReady);
+                        return;
+                    }
+                    (on_remote_playable_update)(update, seq, source, client_seq);
                 }
-                last_seq.set(seq);
-                if !state_applied.get() {
-                    console::warn!("multiplayer playable update dropped (not ready)", seq);
-                    (on_event)(SyncEvent::DropNotReady);
-                    return;
+                ServerMsg::Pong { .. } => {}
+                ServerMsg::UploadAck { hash } => {
+                    (on_asset)(AssetEvent::UploadAck { hash });
                 }
-                (on_remote_playable_update)(update, seq, source, client_seq);
-            }
-            ServerMsg::Pong { .. } => {}
-            ServerMsg::UploadAck { hash } => {
-                (on_asset)(AssetEvent::UploadAck { hash });
-            }
-            ServerMsg::RecordingStatus { .. }
-            | ServerMsg::RecordingRows { .. }
-            | ServerMsg::RecordingCleared => {}
-            ServerMsg::Error { code, message } => {
-                console::warn!("server error", code.clone(), message.clone());
-                (on_event)(SyncEvent::Error { code, message });
+                ServerMsg::RecordingStatus { .. }
+                | ServerMsg::RecordingRows { .. }
+                | ServerMsg::RecordingCleared => {}
+                ServerMsg::Error { code, message } => {
+                    console::warn!("server error", code.clone(), message.clone());
+                    (on_event)(SyncEvent::Error { code, message });
+                }
             }
         })
     }
@@ -565,6 +670,16 @@ impl GameSync for MultiplayerGameSync {
             self.persistence.get(),
             self.ownership_by_anchor.borrow().clone(),
         )
+        .with_p2p({
+            #[cfg(feature = "experimental-p2p")]
+            {
+                self.p2p.as_ref().map(|p| p.view.borrow().clone())
+            }
+            #[cfg(not(feature = "experimental-p2p"))]
+            {
+                None
+            }
+        })
     }
 }
 

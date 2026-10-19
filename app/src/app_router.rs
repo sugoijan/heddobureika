@@ -6,9 +6,31 @@ use crate::persisted::BootRoomSession;
 use crate::persisted_store;
 use heddobureika_core::is_valid_room_id;
 
+#[derive(Clone, Default, PartialEq)]
+pub(crate) enum MultiplayerConnection {
+    #[default]
+    Server,
+    P2pHost,
+    #[cfg_attr(not(feature = "experimental-p2p"), allow(dead_code))]
+    P2pGuest {
+        invite: String,
+    },
+}
+
+impl std::fmt::Debug for MultiplayerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Server => "Server",
+            Self::P2pHost => "P2pHost",
+            Self::P2pGuest { .. } => "P2pGuest",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MultiplayerConfig {
     pub(crate) room_id: String,
+    pub(crate) connection: MultiplayerConnection,
     pub(crate) clear_hash: bool,
     /// True when this config was restored from a previously saved session
     /// rather than an explicit join (hash/query link or UI action). A resumed
@@ -16,6 +38,12 @@ pub(crate) struct MultiplayerConfig {
     /// so the scheduler treats that as terminal; an explicit join to a
     /// not-yet-activated room is instead retried (it may be activating).
     pub(crate) resumed: bool,
+}
+
+impl MultiplayerConfig {
+    pub(crate) fn is_p2p(&self) -> bool {
+        !matches!(self.connection, MultiplayerConnection::Server)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +112,24 @@ pub(crate) fn clear_location_hash() {
     } else {
         let _ = location.set_hash("");
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn watch_p2p_invites() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    // Navigating to a replacement invite in the same tab only changes the
+    // fragment. Reboot the app so the old transport and pending input are
+    // discarded and the new capability goes through the normal route parser.
+    gloo::events::EventListener::new(&window.clone(), "hashchange", move |_| {
+        if let Ok(hash) = window.location().hash() {
+            if hash.starts_with("#p2p=") {
+                let _ = window.location().reload();
+            }
+        }
+    })
+    .forget();
 }
 
 pub(crate) fn save_room_session(room_id: &str) {
@@ -200,15 +246,52 @@ fn persist_renderer_preference(renderer: RendererKind) {
 #[cfg(not(target_arch = "wasm32"))]
 fn persist_renderer_preference(_renderer: RendererKind) {}
 
+pub(crate) fn p2p_link_error() -> Option<String> {
+    let hash = web_sys::window()?.location().hash().ok()?;
+    let value = hash.strip_prefix("#p2p=")?;
+    #[cfg(feature = "experimental-p2p")]
+    {
+        heddobureika_p2p::Invite::parse(value).err()
+    }
+    #[cfg(not(feature = "experimental-p2p"))]
+    {
+        let _ = value;
+        Some("P2P is unavailable in this version of the app".into())
+    }
+}
+
 fn load_multiplayer_config() -> Option<MultiplayerConfig> {
     let window = web_sys::window()?;
     let hash = window.location().hash().ok()?;
+    if let Some(_value) = hash.strip_prefix("#p2p=") {
+        #[cfg(feature = "experimental-p2p")]
+        if let Ok(invite) = heddobureika_p2p::Invite::parse(_value) {
+            return Some(MultiplayerConfig {
+                room_id: invite.room_id,
+                clear_hash: false,
+                resumed: false,
+                connection: MultiplayerConnection::P2pGuest {
+                    invite: _value.to_string(),
+                },
+            });
+        }
+        return None;
+    }
     if let Some(config) = parse_multiplayer_config_from_hash(&hash) {
         return Some(config);
     }
     let search = window.location().search().ok()?;
     if let Some(config) = parse_multiplayer_config_from_query(&search) {
         return Some(config);
+    }
+    #[cfg(feature = "experimental-p2p")]
+    if let Some(room_id) = crate::p2p_progress::active_room_id() {
+        return Some(MultiplayerConfig {
+            room_id,
+            connection: MultiplayerConnection::P2pHost,
+            clear_hash: false,
+            resumed: true,
+        });
     }
     load_room_session().and_then(|session| {
         let room_id = session.room_id.trim().to_string();
@@ -217,6 +300,7 @@ fn load_multiplayer_config() -> Option<MultiplayerConfig> {
             return None;
         }
         Some(MultiplayerConfig {
+            connection: MultiplayerConnection::Server,
             room_id,
             clear_hash: false,
             resumed: true,
@@ -253,6 +337,7 @@ fn parse_multiplayer_config_from_hash(hash: &str) -> Option<MultiplayerConfig> {
         return None;
     }
     Some(MultiplayerConfig {
+        connection: MultiplayerConnection::Server,
         room_id,
         clear_hash: true,
         resumed: false,
@@ -271,6 +356,7 @@ fn parse_multiplayer_config_from_query(search: &str) -> Option<MultiplayerConfig
         return None;
     }
     Some(MultiplayerConfig {
+        connection: MultiplayerConnection::Server,
         room_id,
         clear_hash: false,
         resumed: false,

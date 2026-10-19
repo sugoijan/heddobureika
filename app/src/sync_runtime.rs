@@ -29,6 +29,7 @@ struct SyncRuntimeState {
     core: Option<Rc<AppCore>>,
     core_subscription: Option<AppSubscription>,
     last_snapshot: Option<AppSnapshot>,
+    initial_snapshot: Option<heddobureika_core::PlayableGameSnapshot>,
     last_sync_view: SyncView,
     multiplayer: Option<Rc<RefCell<MultiplayerGameSync>>>,
     active: ActiveSync,
@@ -54,6 +55,7 @@ impl SyncRuntimeState {
             core: None,
             core_subscription: None,
             last_snapshot: None,
+            initial_snapshot: None,
             last_sync_view: SyncView::default(),
             multiplayer: None,
             active: ActiveSync::Local,
@@ -313,7 +315,7 @@ async fn probe_room_gone(url: &str, resumed: bool) -> bool {
     }
 }
 
-fn notify_sync_view_changed() {
+pub(crate) fn notify_sync_view_changed() {
     let hooks = STATE.with(|slot| {
         let state = slot.borrow();
         state
@@ -409,8 +411,15 @@ fn connect_if_ready(state: &mut SyncRuntimeState) {
         return;
     }
     sync.borrow_mut().disconnect();
-    sync.borrow_mut().connect(
-        &config.room_id,
+    let snapshot = state.initial_snapshot.take().or_else(|| {
+        state
+            .last_snapshot
+            .as_ref()
+            .and_then(crate::local_snapshot::build_playable_snapshot_from_app)
+    });
+    sync.borrow_mut().connect_config(
+        &config,
+        snapshot,
         Rc::new(move |reason| {
             schedule_multiplayer_retry(reason);
         }),
@@ -418,7 +427,49 @@ fn connect_if_ready(state: &mut SyncRuntimeState) {
     state.active_room = Some(config.room_id);
 }
 
+pub(crate) fn p2p_active() -> bool {
+    STATE.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|state| state.config.as_ref().map(|c| c.is_p2p()))
+            .unwrap_or(false)
+    })
+}
+
 pub(crate) fn init_from_config(config: Option<MultiplayerConfig>) {
+    init_with_snapshot(config, None);
+}
+
+#[cfg(feature = "experimental-p2p")]
+pub(crate) fn restore_p2p_host(
+    config: MultiplayerConfig,
+    snapshot: heddobureika_core::PlayableGameSnapshot,
+) -> Result<(), String> {
+    if !matches!(
+        config.connection,
+        app_router::MultiplayerConnection::P2pHost
+    ) {
+        return Err("Progress can only be restored by a P2P host".into());
+    }
+    heddobureika_p2p::validate_snapshot(&snapshot)?;
+    init_with_snapshot(Some(config), Some(snapshot));
+    Ok(())
+}
+
+fn init_with_snapshot(
+    config: Option<MultiplayerConfig>,
+    snapshot: Option<heddobureika_core::PlayableGameSnapshot>,
+) {
+    #[cfg(feature = "experimental-p2p")]
+    if !config.as_ref().is_some_and(|c| {
+        matches!(c.connection, app_router::MultiplayerConnection::P2pHost) && c.resumed
+    }) {
+        crate::p2p_progress::stop_resuming();
+    }
+    if config.as_ref().is_some_and(|c| c.is_p2p()) {
+        crate::boot::clear_room();
+        app_router::clear_room_session();
+    }
     if config.is_none() {
         // Leaving (or never entering) a room: a later crash reload must not
         // warp the user back into it.
@@ -427,12 +478,27 @@ pub(crate) fn init_from_config(config: Option<MultiplayerConfig>) {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         state.config = config;
+        state.initial_snapshot = snapshot;
         state.retry_attempts = 0;
         state.retry_timer.take();
         state.ensure_backend();
         connect_if_ready(&mut state);
     });
     notify_sync_view_changed();
+}
+
+pub(crate) async fn prepare_reload() -> Result<(), String> {
+    #[cfg(feature = "experimental-p2p")]
+    {
+        let host = match multiplayer_handle() {
+            Some(sync) => sync.borrow().p2p_reload_handle()?,
+            None => None,
+        };
+        if let Some((handle, saver)) = host {
+            saver.flush(handle.prepare_reload().await?).await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn wait_for_ready() {
@@ -448,6 +514,9 @@ pub(crate) async fn wait_for_ready() {
             }
         }
         if waited_ms >= BOOT_WAIT_TIMEOUT_MS {
+            if p2p_active() {
+                return;
+            }
             let on_fail = STATE.with(|slot| slot.borrow().on_fail.clone());
             on_fail();
             return;

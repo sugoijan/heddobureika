@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 heddobureika-core.workspace = true
+heddobureika-session.workspace = true
 heddobureika-game.workspace = true
 js-sys.workspace = true
 rkyv.workspace = true

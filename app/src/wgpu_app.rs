@@ -406,14 +406,6 @@ pub(crate) fn run(core: Rc<AppCore>) {
             .expect("canvas element");
         canvas.set_class_name("puzzle-canvas");
         root.append_child(&canvas).expect("append canvas");
-        let sync_status = document.create_element("div").expect("create sync status");
-        sync_status.set_class_name("sync-status");
-        sync_status
-            .set_attribute("title", "Server disconnected")
-            .ok();
-        sync_status.set_text_content(Some("!"));
-        root.append_child(&sync_status).ok();
-
         let render_settings = app_router::load_render_settings_with_init();
         let view = Rc::new(WgpuView::new(
             core.clone(),

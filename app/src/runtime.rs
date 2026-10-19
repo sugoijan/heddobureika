@@ -122,8 +122,27 @@ pub trait GameSyncView {
     fn ownership_by_anchor(&self) -> Rc<HashMap<u32, ClientId>>;
 }
 
+#[derive(Clone)]
+pub(crate) struct P2pView {
+    pub hosting: bool,
+    pub invite: Option<String>,
+    pub status: String,
+    pub save_status: Option<String>,
+}
+
+impl std::fmt::Debug for P2pView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("P2pView")
+            .field("hosting", &self.hosting)
+            .field("has_invite", &self.invite.is_some())
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SyncView {
+    p2p: Option<P2pView>,
     mode: InitMode,
     connected: bool,
     client_id: Option<ClientId>,
@@ -136,6 +155,7 @@ pub struct SyncView {
 impl Default for SyncView {
     fn default() -> Self {
         Self {
+            p2p: None,
             mode: InitMode::Local,
             connected: false,
             client_id: None,
@@ -148,6 +168,14 @@ impl Default for SyncView {
 }
 
 impl SyncView {
+    pub(crate) fn with_p2p(mut self, p2p: Option<P2pView>) -> Self {
+        self.p2p = p2p;
+        self
+    }
+    pub(crate) fn p2p(&self) -> Option<&P2pView> {
+        self.p2p.as_ref()
+    }
+
     pub(crate) fn new(
         mode: InitMode,
         connected: bool,
@@ -158,6 +186,7 @@ impl SyncView {
         ownership_by_anchor: Rc<HashMap<u32, ClientId>>,
     ) -> Self {
         Self {
+            p2p: None,
             mode,
             connected,
             client_id,

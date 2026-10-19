@@ -2,26 +2,22 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use heddobureika_core::codec::{decode, encode};
 use heddobureika_core::game::{
     DEFAULT_TAB_DEPTH_CAP, FLIP_CHANCE, MAX_LINE_BEND_RATIO, PUZZLE_SEED, compute_workspace_layout,
-    piece_bounds_px, rotate_vec, safety_corrections_after_detach, scramble_flips,
-    scramble_layout_for_pieces, scramble_nonce_from_seed, scramble_pose, scramble_rotations,
-    scramble_seed_from_topology, splitmix32,
+    piece_bounds_px, scramble_flips, scramble_layout_for_pieces, scramble_nonce_from_seed,
+    scramble_pose, scramble_rotations, scramble_seed_from_topology, splitmix32,
 };
 use heddobureika_core::room_id::{ROOM_ID_LEN, is_valid_room_id};
 use heddobureika_core::{
-    ASSET_CHUNK_BYTES, ActionId, AdminMsg, ClientId, ClientMsg, GameBridgeError, GameRules,
-    MergePolicy, OwnershipReason, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
-    PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableRoomUpdate,
-    PlayableRoomUpdateKind, PlayableTopologySnapshot, PlayableUpdateBatch, PuzzleImageRef,
-    PuzzleInfo, PuzzleSpec, RecordedCommand, RecordedCommandKind, RecordedCommandOutcome,
-    RoomControlUpdate, RoomPersistence, ServerMsg, validate_image_ref,
+    ASSET_CHUNK_BYTES, AdminMsg, ClientId, ClientMsg, GameRules, OwnershipReason,
+    PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES, PlayableGameSnapshot,
+    PlayableTopologySnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec, RecordedCommand,
+    RecordedCommandKind, RecordedCommandOutcome, RoomPersistence, ServerMsg, validate_image_ref,
 };
 use heddobureika_core::{
     DEFAULT_TARGET_COUNT, FALLBACK_GRID, logical_image_size, nearest_valid_grid, puzzle_by_slug,
     topology_kind_for_tag,
 };
-use heddobureika_game::{
-    AngleDeg, FlipState, GroupId, LogicalState, PlayableAction, PlayableState, TopologySpec,
-};
+use heddobureika_game::{FlipState, GroupId, LogicalState, PlayableState, TopologySpec};
+use heddobureika_session::SessionAuthority;
 use image_pipeline::{AlphaMode, PipelineConfig};
 use imagesize::{Compression, ImageType};
 use js_sys::Date;
@@ -43,7 +39,6 @@ const DEFAULT_RECORDING_MAX_EVENTS: u32 = 200_000;
 const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
 const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
 const FULL_STATE_INTERVAL_MS: i64 = 30 * 1000;
-const OWNERSHIP_TIMEOUT_MS: i64 = 30 * 1000;
 const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
 const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
 const AUTH_WINDOW_MS: i64 = 5 * 60 * 1000;
@@ -315,98 +310,11 @@ impl Default for RoomMeta {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Ownership {
-    owner_id: ClientId,
-    anchor_id: u32,
-    since_ms: i64,
-}
-
-/// In-memory live puzzle state for the durable-object worker.
-///
-/// `playable` is the authoritative live state — every action mutates it
-/// directly. `snapshot` is the transport/persistence shadow; we resync
-/// `snapshot.state` from `playable` whenever we are about to broadcast a
-/// `ServerMsg::State` or persist to KV. Other snapshot fields (`puzzle`,
-/// `rules`, `scramble_nonce`, `seq`) are owned by the snapshot and copied
-/// or read in place.
-struct RoomLivePuzzle {
-    snapshot: PlayableGameSnapshot,
-    playable: heddobureika_game::GenericPlayableState,
-    /// Cached pixel geometry for the bounds clamp. `None` only when the
-    /// puzzle is degenerate (zero image size / pieces). Recomputed only here,
-    /// since a live puzzle's topology, image size, and rules never change
-    /// once set — actions just move pieces.
-    geometry: Option<RoomGeometry>,
-}
-
-impl RoomLivePuzzle {
-    fn from_snapshot(snapshot: PlayableGameSnapshot) -> Option<Self> {
-        let playable = snapshot.restore_playable_from_spec().ok()?;
-        let geometry = RoomGeometry::from_topology(
-            &playable.logical.topology,
-            snapshot.puzzle.image_width,
-            snapshot.puzzle.image_height,
-            snapshot.rules.workspace_padding_ratio,
-        );
-        Some(Self {
-            snapshot,
-            playable,
-            geometry,
-        })
-    }
-
-    fn sync_snapshot_from_playable(&mut self) {
-        let focused_piece = self.snapshot.state.focused_piece;
-        self.snapshot.state = heddobureika_core::PlayableGameStateSnapshot::from_playable(
-            &self.playable,
-            focused_piece,
-        );
-        self.snapshot.seq = self.snapshot.state.revision;
-    }
-
-    /// Bumps the wire sequence number used for ordering room messages.
-    ///
-    /// All three of `snapshot.seq`, `state.revision`, and `playable.revision`
-    /// are kept identical so that the next action's wire
-    /// `revision_before` matches whatever the client has tracked from the
-    /// latest control or playable update. Clients must mirror this by
-    /// advancing their local `playable.revision` on every control update too.
-    fn set_seq(&mut self, seq: u64) {
-        self.snapshot.seq = seq;
-        self.snapshot.state.revision = seq;
-        self.playable.revision = seq;
-    }
-
-    /// Drag-start reorder: bring the group containing `anchor` toward the front
-    /// to its geometry-aware "fitting depth" (see [`heddobureika_game::z_depth`]).
-    /// Deterministic, so it matches the originating client's optimistic result.
-    fn bring_forward(&mut self, anchor: u32) -> bool {
-        let changed = self.playable.bring_forward_to_fitting_depth(&[anchor]);
-        if changed {
-            self.sync_snapshot_from_playable();
-        }
-        changed
-    }
-
-    /// Shake reorder: send the group containing `anchor` to its geometry-aware
-    /// "fitting depth" (as far back as possible without hiding it). Deterministic.
-    fn send_backward(&mut self, anchor: u32) -> bool {
-        let changed = self.playable.send_backward_to_fitting_depth(&[anchor]);
-        if changed {
-            self.sync_snapshot_from_playable();
-        }
-        changed
-    }
-}
-
 struct RoomRuntime {
     loaded: bool,
     room_id: Option<String>,
     meta: RoomMeta,
-    live: Option<RoomLivePuzzle>,
-    owners_by_anchor: HashMap<u32, Ownership>,
-    owner_by_client: HashMap<ClientId, u32>,
+    authority: SessionAuthority,
     recent_nonces: HashMap<String, i64>,
     pending_releases: HashMap<ClientId, i64>,
     assets: HashMap<String, StoredAsset>,
@@ -419,240 +327,13 @@ impl RoomRuntime {
             loaded: false,
             room_id: None,
             meta: RoomMeta::default(),
-            live: None,
-            owners_by_anchor: HashMap::new(),
-            owner_by_client: HashMap::new(),
+            authority: SessionAuthority::new(),
             recent_nonces: HashMap::new(),
             pending_releases: HashMap::new(),
             assets: HashMap::new(),
             pending_uploads: HashMap::new(),
         }
     }
-}
-
-fn bridge_action_id(client_id: ClientId, client_seq: Option<u64>, room_seq: u64) -> ActionId {
-    let sequence = client_seq.filter(|value| *value != 0).unwrap_or(room_seq);
-    let mixed = mix_bridge_action_id(
-        client_id.as_u64().wrapping_add(0x9e37_79b9_7f4a_7c15)
-            ^ sequence.wrapping_mul(0xbf58_476d_1ce4_e5b9),
-    );
-    ActionId(if mixed == 0 { 1 } else { mixed })
-}
-
-fn mix_bridge_action_id(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn apply_bridge_live_move(
-    live: &mut RoomLivePuzzle,
-    anchor_id: u32,
-    drop_pos: PlayablePositionSnapshot,
-    action_id: ActionId,
-) -> Result<PlayableUpdateBatch, GameBridgeError> {
-    let group = playable_group_for_anchor(&live.playable, anchor_id)?;
-    let action = PlayableAction::TranslateGroup {
-        group,
-        drop_pos: drop_pos.to_position()?,
-    };
-    let batch = live.playable.apply_action_only(action, Some(action_id));
-    live.sync_snapshot_from_playable();
-    Ok(batch)
-}
-
-fn apply_bridge_live_transform(
-    live: &mut RoomLivePuzzle,
-    anchor_id: u32,
-    drop_pose: PlayablePoseSnapshot,
-    action_id: ActionId,
-) -> Result<PlayableUpdateBatch, GameBridgeError> {
-    let group = playable_group_for_anchor(&live.playable, anchor_id)?;
-    let pose = drop_pose.to_pose()?;
-    let action = PlayableAction::TransformGroupTo {
-        group,
-        drop_pos: heddobureika_game::Position2 {
-            x: pose.x,
-            y: pose.y,
-        },
-        drop_rotation: pose.rotation,
-    };
-    let batch = live.playable.apply_action_only(action, Some(action_id));
-    live.sync_snapshot_from_playable();
-    Ok(batch)
-}
-
-fn apply_bridge_finalize(
-    live: &mut RoomLivePuzzle,
-    anchor_id: u32,
-    drop_pos: Option<PlayablePositionSnapshot>,
-    rot_deg: Option<f32>,
-    action_id: ActionId,
-) -> Result<PlayableUpdateBatch, GameBridgeError> {
-    let group = playable_group_for_anchor(&live.playable, anchor_id)?;
-    let action = match (drop_pos, rot_deg) {
-        (Some(drop_pos), Some(rot_deg)) => {
-            let drop_rotation =
-                AngleDeg::try_new(rot_deg).ok_or(GameBridgeError::InvalidActionPose)?;
-            PlayableAction::TransformGroupTo {
-                group,
-                drop_pos: drop_pos.to_position()?,
-                drop_rotation,
-            }
-        }
-        (Some(drop_pos), None) => PlayableAction::TranslateGroup {
-            group,
-            drop_pos: drop_pos.to_position()?,
-        },
-        (None, Some(rot_deg)) => {
-            let drop_rotation =
-                AngleDeg::try_new(rot_deg).ok_or(GameBridgeError::InvalidActionPose)?;
-            PlayableAction::RotateGroupTo {
-                group,
-                drop_rotation,
-            }
-        }
-        (None, None) => PlayableAction::RotateGroupTo {
-            group,
-            drop_rotation: live
-                .playable
-                .pose_of(group)
-                .ok_or(GameBridgeError::InvalidPieceId {
-                    piece_id: anchor_id,
-                })?
-                .rotation,
-        },
-    };
-    let batch =
-        live.playable
-            .apply_action_with_snap(action, Some(action_id), MergePolicy::KeepFixedGroup);
-    live.sync_snapshot_from_playable();
-    Ok(batch)
-}
-
-fn playable_group_for_anchor(
-    playable: &heddobureika_game::GenericPlayableState,
-    anchor_id: u32,
-) -> Result<GroupId, GameBridgeError> {
-    playable
-        .logical
-        .group_of(heddobureika_game::PieceId(anchor_id))
-        .ok_or(GameBridgeError::InvalidPieceId {
-            piece_id: anchor_id,
-        })
-}
-
-fn apply_bridge_flip(
-    live: &mut RoomLivePuzzle,
-    piece_id: u32,
-    flipped: bool,
-    drop_pose: Option<PlayablePoseSnapshot>,
-    action_id: ActionId,
-) -> Result<PlayableUpdateBatch, GameBridgeError> {
-    let piece = heddobureika_game::PieceId(piece_id);
-    if piece.as_usize() >= live.playable.piece_count() {
-        return Err(GameBridgeError::InvalidPieceId { piece_id });
-    }
-    // The client computes the click-pivoted post-flip pose and sends it, so
-    // the authoritative state reproduces that exact pose. Fall back to the
-    // current world pose (reflect-about-anchor) when none is supplied.
-    let target_pose = match drop_pose.and_then(|pose| pose.to_pose().ok()) {
-        Some(pose) => pose,
-        None => live
-            .playable
-            .piece_world_pose(piece)
-            .ok_or(GameBridgeError::InvalidPieceId { piece_id })?,
-    };
-    let target_flip = if flipped {
-        heddobureika_game::FlipState::Flipped
-    } else {
-        heddobureika_game::FlipState::Normal
-    };
-    let action = heddobureika_game::RestrictedPlayableAction::DetachPieceAsGroup {
-        piece,
-        target_pose,
-        target_flip,
-    };
-    let batch = live
-        .playable
-        .apply_restricted_action_batch(action, Some(action_id));
-    live.sync_snapshot_from_playable();
-    Ok(batch)
-}
-
-fn apply_bridge_detach(
-    live: &mut RoomLivePuzzle,
-    piece_id: u32,
-    action_id: ActionId,
-) -> Result<PlayableUpdateBatch, GameBridgeError> {
-    let piece = heddobureika_game::PieceId(piece_id);
-    if piece.as_usize() >= live.playable.piece_count() {
-        return Err(GameBridgeError::InvalidPieceId { piece_id });
-    }
-    let group = live
-        .playable
-        .logical
-        .group_of(piece)
-        .ok_or(GameBridgeError::InvalidPieceId { piece_id })?;
-    let target_pose = live
-        .playable
-        .piece_world_pose(piece)
-        .ok_or(GameBridgeError::InvalidPieceId { piece_id })?;
-    let target_flip = live.playable.flip_of(group).unwrap_or_default();
-    // Capture the original group's members before the detach so we can
-    // visit every component the detach may produce and apply safety
-    // corrections.
-    let original_members: Vec<heddobureika_game::PieceId> =
-        live.playable.logical.members_of(group).collect();
-    let action = heddobureika_game::RestrictedPlayableAction::DetachPieceAsGroup {
-        piece,
-        target_pose,
-        target_flip,
-    };
-    let mut batch = live
-        .playable
-        .apply_restricted_action_batch(action, Some(action_id));
-    // Force-move each resulting group whose anchor sits outside its applicable
-    // safety bound (loose for singletons, tight for multi-piece). The
-    // corrections are merged into the detach batch's dirty-group set so the
-    // wire update carries the post-correction poses atomically — a client
-    // receiving the update sees the final state directly, no intermediate
-    // "unsafe" pose flash.
-    let puzzle = live.snapshot.puzzle.clone();
-    let rules = live.snapshot.rules;
-    let placement = heddobureika_core::build_topology_from_spec(&puzzle.to_spec())
-        .map(|t| t.image_placement(puzzle.image_width, puzzle.image_height))
-        .unwrap_or(heddobureika_game::ImagePlacement {
-            pose_unit_px: [1.0, 1.0],
-            origin_px: [0.0, 0.0],
-            frame_px: [puzzle.image_width as f32, puzzle.image_height as f32],
-        });
-    let corrections = safety_corrections_after_detach(
-        &live.playable,
-        &original_members,
-        &puzzle,
-        &rules,
-        placement,
-    );
-    for (corr_group, drop_pos) in corrections {
-        let correction_batch = live.playable.apply_action_only(
-            PlayableAction::TranslateGroup {
-                group: corr_group,
-                drop_pos,
-            },
-            None,
-        );
-        for dirty_group in correction_batch.delta.dirty_groups.iter().copied() {
-            if !batch.delta.dirty_groups.contains(&dirty_group) {
-                batch.delta.dirty_groups.push(dirty_group);
-            }
-        }
-        batch.revision_after = correction_batch.revision_after;
-    }
-    live.sync_snapshot_from_playable();
-    Ok(batch)
 }
 
 fn encode_stored_snapshot(snapshot: &PlayableGameSnapshot) -> Option<Vec<u8>> {
@@ -673,35 +354,6 @@ fn state_msg_from_snapshot(snapshot: &PlayableGameSnapshot) -> ServerMsg {
 fn set_playable_snapshot_seq(snapshot: &mut PlayableGameSnapshot, seq: u64) {
     snapshot.seq = seq;
     snapshot.state.revision = seq;
-}
-
-fn playable_update_msg_from_batch(
-    snapshot: &PlayableGameSnapshot,
-    batch: &PlayableUpdateBatch,
-    kind: PlayableRoomUpdateKind,
-    source: Option<ClientId>,
-    client_seq: Option<u64>,
-) -> ServerMsg {
-    ServerMsg::PlayableUpdate {
-        seq: snapshot.seq,
-        update: PlayableRoomUpdate::from_batch_and_state(kind, batch, &snapshot.state),
-        source,
-        client_seq,
-    }
-}
-
-fn control_update_msg(
-    seq: u64,
-    update: RoomControlUpdate,
-    source: Option<ClientId>,
-    client_seq: Option<u64>,
-) -> ServerMsg {
-    ServerMsg::ControlUpdate {
-        seq,
-        update,
-        source,
-        client_seq,
-    }
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -930,7 +582,7 @@ impl DurableObject for Room {
         if activated {
             let (persistence, initialized) = {
                 let inner = self.inner.borrow();
-                (inner.meta.persistence, inner.live.is_some())
+                (inner.meta.persistence, inner.authority.snapshot().is_some())
             };
             let welcome = ServerMsg::Welcome {
                 room_id: room_id.to_string(),
@@ -941,12 +593,7 @@ impl DurableObject for Room {
             let _ = self.send_server_msg(&server, &welcome);
 
             if initialized {
-                let snapshot_clone = self
-                    .inner
-                    .borrow()
-                    .live
-                    .as_ref()
-                    .map(|live| live.snapshot.clone());
+                let snapshot_clone = self.inner.borrow().authority.snapshot().cloned();
                 if let Some(snapshot) = snapshot_clone {
                     let msg = state_msg_from_snapshot(&snapshot);
                     let _ = self.send_server_msg(&server, &msg);
@@ -1055,59 +702,15 @@ impl DurableObject for Room {
         let dispatch = match msg {
             ClientMsg::Init { snapshot } => self.handle_init(ws.clone(), snapshot).await,
             ClientMsg::AssetRequest { hash } => self.handle_asset_request(ws.clone(), hash).await,
-            ClientMsg::Select { piece_id } => self.handle_select(client_id, piece_id).await,
-            ClientMsg::Move {
-                piece_id,
-                drop_pos,
-                client_seq,
-                base_revision: _,
-            } => {
-                self.handle_move(client_id, piece_id, drop_pos, client_seq)
-                    .await
-            }
-            ClientMsg::Transform {
-                piece_id,
-                drop_pose,
-                client_seq,
-                base_revision: _,
-            } => {
-                self.handle_transform(client_id, piece_id, drop_pose, client_seq)
-                    .await
-            }
-            ClientMsg::Rotate {
-                piece_id,
-                drop_rotation_deg,
-                base_revision: _,
-            } => {
-                self.handle_rotate(client_id, piece_id, drop_rotation_deg)
-                    .await
-            }
-            ClientMsg::Place {
-                piece_id,
-                drop_pose,
-                client_seq,
-                base_revision: _,
-            } => {
-                self.handle_place(client_id, piece_id, drop_pose, client_seq)
-                    .await
-            }
-            ClientMsg::Flip {
-                piece_id,
-                flipped,
-                drop_pose,
-                base_revision: _,
-            } => {
-                self.handle_flip(client_id, piece_id, flipped, drop_pose)
-                    .await
-            }
-            ClientMsg::Detach {
-                piece_id,
-                base_revision: _,
-            } => self.handle_detach(client_id, piece_id).await,
-            ClientMsg::Release { piece_id } => self.handle_release(client_id, piece_id).await,
-            ClientMsg::SendToBack { piece_id } => {
-                self.handle_send_to_back(client_id, piece_id).await
-            }
+            command @ (ClientMsg::Select { .. }
+            | ClientMsg::Move { .. }
+            | ClientMsg::Transform { .. }
+            | ClientMsg::Rotate { .. }
+            | ClientMsg::Place { .. }
+            | ClientMsg::Flip { .. }
+            | ClientMsg::Detach { .. }
+            | ClientMsg::Release { .. }
+            | ClientMsg::SendToBack { .. }) => self.handle_game_command(client_id, command).await,
             ClientMsg::Ping { nonce } => {
                 let response = ServerMsg::Pong { nonce };
                 let _ = self.send_server_msg(&ws, &response);
@@ -1164,7 +767,7 @@ impl DurableObject for Room {
                 inner.meta.last_command_at,
                 inner.meta.last_warning_at,
                 inner.meta.last_full_state_at,
-                inner.live.is_some(),
+                inner.authority.snapshot().is_some(),
             )
         };
         if !activated {
@@ -1201,86 +804,6 @@ impl DurableObject for Room {
 
         self.schedule_alarm().await?;
         Response::ok("scheduled")
-    }
-}
-
-/// Topology-agnostic pixel geometry for the authoritative bounds clamp.
-///
-/// Derived from the topology's [`ImagePlacement`] — the SAME mapping the client
-/// renderer uses — so the server and client never disagree on where pieces sit.
-/// A pose-mm point `p` maps to the pixel `origin + p * pose_unit`. `pose_unit`
-/// is per-cell pixel size for stretch-to-fill topologies (grid/hex/voronoi) and
-/// a uniform scale for cropping ones (triangular); `origin` is the frame's
-/// top-left (non-zero only when letterboxed). `piece_half_*` hold each piece's
-/// half bounding-box in pixels, and `view_*` is the workspace rect in pixels.
-///
-/// Built once per puzzle (cached on `RoomLivePuzzle`) — actions only move
-/// pieces, never change the topology, image size, or rules it derives from.
-struct RoomGeometry {
-    pose_unit_x: f32,
-    pose_unit_y: f32,
-    origin_x: f32,
-    origin_y: f32,
-    view_min_x: f32,
-    view_max_x: f32,
-    view_min_y: f32,
-    view_max_y: f32,
-    piece_half_w: Vec<f32>,
-    piece_half_h: Vec<f32>,
-}
-
-impl RoomGeometry {
-    fn from_topology(
-        topology: &heddobureika_game::GenericTopology,
-        image_width: u32,
-        image_height: u32,
-        workspace_padding_ratio: f32,
-    ) -> Option<Self> {
-        if image_width == 0 || image_height == 0 {
-            return None;
-        }
-        let total = topology.piece_count() as usize;
-        if total == 0 {
-            return None;
-        }
-        let placement = topology.image_placement(image_width, image_height);
-        let [pose_unit_x, pose_unit_y] = placement.pose_unit_px;
-        let [origin_x, origin_y] = placement.origin_px;
-        let [frame_w, frame_h] = placement.frame_px;
-        if pose_unit_x <= 0.0 || pose_unit_y <= 0.0 || frame_w <= 0.0 || frame_h <= 0.0 {
-            return None;
-        }
-        let layout = compute_workspace_layout(
-            origin_x,
-            origin_y,
-            frame_w,
-            frame_h,
-            workspace_padding_ratio,
-        );
-        let puzzle_scale = layout.puzzle_scale.max(1.0e-4);
-        let view_min_x = layout.view_min_x / puzzle_scale;
-        let view_min_y = layout.view_min_y / puzzle_scale;
-        let view_max_x = view_min_x + layout.view_width / puzzle_scale;
-        let view_max_y = view_min_y + layout.view_height / puzzle_scale;
-        let mut piece_half_w = Vec::with_capacity(total);
-        let mut piece_half_h = Vec::with_capacity(total);
-        for idx in 0..total as u32 {
-            let (ex, ey) = topology.piece_extent_mm(heddobureika_game::PieceId(idx));
-            piece_half_w.push(ex.as_mm_f32() * pose_unit_x * 0.5);
-            piece_half_h.push(ey.as_mm_f32() * pose_unit_y * 0.5);
-        }
-        Some(Self {
-            pose_unit_x,
-            pose_unit_y,
-            origin_x,
-            origin_y,
-            view_min_x,
-            view_max_x,
-            view_min_y,
-            view_max_y,
-            piece_half_w,
-            piece_half_h,
-        })
     }
 }
 
@@ -1326,7 +849,7 @@ impl Room {
         }
         if let Some(bytes) = snapshot_bytes {
             if let Some(snapshot) = decode_stored_snapshot(&bytes) {
-                inner.live = RoomLivePuzzle::from_snapshot(snapshot);
+                inner.authority.set_snapshot(snapshot);
             }
         }
         if let Some(room_id) = room_id {
@@ -1477,15 +1000,15 @@ impl Room {
     fn current_snapshot_seq(&self) -> Option<u64> {
         self.inner
             .borrow()
-            .live
-            .as_ref()
-            .map(|live| live.snapshot.seq)
+            .authority
+            .snapshot()
+            .map(|live| live.seq)
     }
 
     fn current_snapshot_progress(&self) -> Option<SnapshotProgress> {
         let inner = self.inner.borrow();
-        let live = inner.live.as_ref()?;
-        Self::progress_for_snapshot(&live.snapshot)
+        let live = inner.authority.snapshot()?;
+        Self::progress_for_snapshot(live)
     }
 
     fn progress_for_snapshot(snapshot: &PlayableGameSnapshot) -> Option<SnapshotProgress> {
@@ -2087,9 +1610,7 @@ impl Room {
             inner.meta.last_command_at = Some(now);
             inner.meta.last_warning_at = None;
             inner.meta.last_full_state_at = None;
-            inner.live = RoomLivePuzzle::from_snapshot(snapshot);
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.set_snapshot(snapshot);
         }
 
         self.persist_meta().await?;
@@ -2121,9 +1642,9 @@ impl Room {
                 return Ok(());
             }
             inner
-                .live
-                .as_ref()
-                .map(|live| live.snapshot.rules.clone())
+                .authority
+                .snapshot()
+                .map(|live| live.rules.clone())
                 .unwrap_or_default()
         };
         let (puzzle, scramble_override) = match self.build_puzzle_from_spec(puzzle, &rules) {
@@ -2155,14 +1676,12 @@ impl Room {
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .live
-                .as_ref()
-                .map(|live| live.snapshot.seq.saturating_add(1))
+                .authority
+                .snapshot()
+                .map(|live| live.seq.saturating_add(1))
                 .unwrap_or(0);
             set_playable_snapshot_seq(&mut snapshot, next_seq);
-            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.set_snapshot(snapshot.clone());
         }
 
         self.touch_command(now, true).await?;
@@ -2354,9 +1873,9 @@ impl Room {
                 return Ok(());
             }
             inner
-                .live
-                .as_ref()
-                .map(|live| live.snapshot.rules.clone())
+                .authority
+                .snapshot()
+                .map(|live| live.rules.clone())
                 .unwrap_or_default()
         };
         let (image_width, image_height) =
@@ -2430,14 +1949,12 @@ impl Room {
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .live
-                .as_ref()
-                .map(|live| live.snapshot.seq.saturating_add(1))
+                .authority
+                .snapshot()
+                .map(|live| live.seq.saturating_add(1))
                 .unwrap_or(0);
             set_playable_snapshot_seq(&mut snapshot, next_seq);
-            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.set_snapshot(snapshot.clone());
         }
 
         let _ = self.send_server_msg(&ws, &ServerMsg::UploadAck { hash: hash.clone() });
@@ -2462,7 +1979,7 @@ impl Room {
                 );
                 return Ok(());
             }
-            let Some(snapshot) = inner.live.as_ref() else {
+            let Some(snapshot) = inner.authority.snapshot() else {
                 let _ = self.send_server_msg(
                     &ws,
                     &ServerMsg::Error {
@@ -2472,10 +1989,7 @@ impl Room {
                 );
                 return Ok(());
             };
-            (
-                snapshot.snapshot.puzzle.clone(),
-                snapshot.snapshot.rules.clone(),
-            )
+            (snapshot.puzzle.clone(), snapshot.rules.clone())
         };
         // Scramble nonce is salted with the topology so the same numeric
         // seed yields different scrambles for different topologies. Grid
@@ -2500,14 +2014,12 @@ impl Room {
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .live
-                .as_ref()
-                .map(|live| live.snapshot.seq.saturating_add(1))
+                .authority
+                .snapshot()
+                .map(|live| live.seq.saturating_add(1))
                 .unwrap_or(0);
             set_playable_snapshot_seq(&mut snapshot, next_seq);
-            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.set_snapshot(snapshot.clone());
         }
 
         self.touch_command(now, true).await?;
@@ -2531,7 +2043,7 @@ impl Room {
                 );
                 return Ok(());
             }
-            let Some(snapshot) = inner.live.as_ref() else {
+            let Some(snapshot) = inner.authority.snapshot() else {
                 let _ = self.send_server_msg(
                     &ws,
                     &ServerMsg::Error {
@@ -2541,10 +2053,7 @@ impl Room {
                 );
                 return Ok(());
             };
-            (
-                snapshot.snapshot.puzzle.clone(),
-                snapshot.snapshot.rules.clone(),
-            )
+            (snapshot.puzzle.clone(), snapshot.rules.clone())
         };
         let mut snapshot = match Self::build_solved_snapshot(puzzle, rules) {
             Some(snapshot) => snapshot,
@@ -2562,14 +2071,12 @@ impl Room {
         {
             let mut inner = self.inner.borrow_mut();
             let next_seq = inner
-                .live
-                .as_ref()
-                .map(|live| live.snapshot.seq.saturating_add(1))
+                .authority
+                .snapshot()
+                .map(|live| live.seq.saturating_add(1))
                 .unwrap_or(0);
             set_playable_snapshot_seq(&mut snapshot, next_seq);
-            inner.live = RoomLivePuzzle::from_snapshot(snapshot.clone());
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.set_snapshot(snapshot.clone());
         }
 
         self.touch_command(now, true).await?;
@@ -2810,7 +2317,7 @@ impl Room {
                 );
                 return Ok(());
             }
-            if inner.live.is_some() {
+            if inner.authority.snapshot().is_some() {
                 let _ = self.send_server_msg(
                     &ws,
                     &ServerMsg::Error {
@@ -2852,9 +2359,7 @@ impl Room {
         let stored_snapshot = snapshot.clone();
         {
             let mut inner = self.inner.borrow_mut();
-            inner.live = RoomLivePuzzle::from_snapshot(stored_snapshot);
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.set_snapshot(stored_snapshot);
         }
 
         self.touch_command(now, true).await?;
@@ -2983,924 +2488,51 @@ impl Room {
         ))
     }
 
-    async fn handle_select(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
+    async fn handle_game_command(&self, client_id: ClientId, command: ClientMsg) -> Result<()> {
         let now = now_ms();
-        let (pending_updates, update_msg, group_order_update) = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if piece_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id = members[0] as u32;
-
-            if let Some(existing) = inner.owners_by_anchor.get(&anchor_id) {
-                if existing.owner_id != client_id {
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            }
-
-            let mut pending_updates = Vec::new();
-            if let Some(prev_anchor) = inner.owner_by_client.get(&client_id).copied() {
-                if prev_anchor != anchor_id {
-                    inner.owner_by_client.remove(&client_id);
-                    inner.owners_by_anchor.remove(&prev_anchor);
-                    console_log!(
-                        "auto-release ownership: client={} anchor={}",
-                        client_id,
-                        prev_anchor
-                    );
-                    let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
-                    runtime_snapshot.set_seq(seq);
-                    pending_updates.push(control_update_msg(
-                        seq,
-                        RoomControlUpdate::Ownership {
-                            group_anchor: prev_anchor,
-                            owner: None,
-                            reason: OwnershipReason::AutoRelease,
-                        },
-                        Some(client_id),
-                        None,
-                    ));
-                }
-            }
-
-            inner.owners_by_anchor.insert(
-                anchor_id,
-                Ownership {
-                    owner_id: client_id,
-                    anchor_id,
-                    since_ms: now,
-                },
-            );
-            inner.owner_by_client.insert(client_id, anchor_id);
-
-            // Bring the selected group toward the front to its geometry-aware
-            // fitting depth (matches the client's optimistic reorder), then
-            // broadcast the resulting full order.
-            let _ = runtime_snapshot.bring_forward(anchor_id);
-            let group_order = playable_group_order_anchors(&runtime_snapshot.snapshot);
-
-            let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
-            runtime_snapshot.set_seq(seq);
-            let update_msg = control_update_msg(
-                seq,
-                RoomControlUpdate::Ownership {
-                    group_anchor: anchor_id,
-                    owner: Some(client_id),
-                    reason: OwnershipReason::Granted,
-                },
-                Some(client_id),
-                None,
-            );
-            let group_order_update = control_update_msg(
-                seq,
-                RoomControlUpdate::GroupOrder { order: group_order },
-                Some(client_id),
-                None,
-            );
-
-            inner.live = Some(runtime_snapshot);
-            (pending_updates, update_msg, group_order_update)
+        // The existing server propagates broadcast errors only for the final
+        // playable update produced by place/rotate; preserve that behaviour.
+        let propagate_final =
+            matches!(&command, ClientMsg::Place { .. } | ClientMsg::Rotate { .. });
+        let effects = self
+            .inner
+            .borrow_mut()
+            .authority
+            .apply(client_id, command, now);
+        let Some(effects) = effects else {
+            return Ok(());
         };
-
-        self.touch_command(now, false).await?;
+        self.touch_command(now, effects.full_state).await?;
         self.persist_snapshot_if_needed().await?;
-        for msg in pending_updates {
-            let _ = self.broadcast(&msg);
-        }
-        let _ = self.broadcast(&update_msg);
-        let _ = self.broadcast(&group_order_update);
-        self.schedule_alarm().await?;
-
-        Ok(())
-    }
-
-    /// Shake-to-back: demote the owner's group to the bottom of the z-stack and
-    /// broadcast the resulting order. Only the group's current owner may
-    /// reorder it; a no-op order change is silently ignored.
-    async fn handle_send_to_back(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
-        let now = now_ms();
-        let group_order_update = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if piece_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id = members[0] as u32;
-
-            let owns_anchor = inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false);
-            if !owns_anchor {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            // Send the group to its geometry-aware fitting depth (matches the
-            // client's optimistic reorder); skip the broadcast if nothing moved.
-            if !runtime_snapshot.send_backward(anchor_id) {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            let group_order = playable_group_order_anchors(&runtime_snapshot.snapshot);
-
-            let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
-            runtime_snapshot.set_seq(seq);
-            let group_order_update = control_update_msg(
-                seq,
-                RoomControlUpdate::GroupOrder { order: group_order },
-                Some(client_id),
-                None,
-            );
-
-            inner.live = Some(runtime_snapshot);
-            group_order_update
-        };
-
-        self.touch_command(now, false).await?;
-        self.persist_snapshot_if_needed().await?;
-        let _ = self.broadcast(&group_order_update);
-        self.schedule_alarm().await?;
-
-        Ok(())
-    }
-
-    async fn handle_move(
-        &self,
-        client_id: ClientId,
-        anchor_id: u32,
-        drop_pos: PlayablePositionSnapshot,
-        client_seq: u64,
-    ) -> Result<()> {
-        let now = now_ms();
-        let update = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let owns_anchor = inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false);
-            if !owns_anchor {
-                console_log!(
-                    "move ignored: not owner (client={} anchor={})",
-                    client_id,
-                    anchor_id
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
-                owner.since_ms = now;
-            }
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if anchor_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id_usize = members[0];
-            if anchor_id_usize as u32 != anchor_id {
-                console_log!(
-                    "move ignored: anchor mismatch (client={} anchor={} canonical={})",
-                    client_id,
-                    anchor_id,
-                    anchor_id_usize
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            // A move keeps the group's current rotation; project members about
-            // the proposed drop center and reject only if the whole group would
-            // leave the workspace.
-            let out_of_bounds = if let Some(geometry) = runtime_snapshot.geometry.as_ref() {
-                let group = runtime_snapshot
-                    .snapshot
-                    .state
-                    .piece_group
-                    .get(anchor_id_usize)
-                    .map(|g| *g as usize)
-                    .unwrap_or(0);
-                let anchor_rot = runtime_snapshot
-                    .snapshot
-                    .state
-                    .group_pose
-                    .get(group)
-                    .map(|pose| pose.rotation_deg)
-                    .unwrap_or(0.0);
-                !group_in_bounds(
-                    &runtime_snapshot.snapshot,
-                    geometry,
-                    &members,
-                    anchor_id_usize,
-                    (drop_pos.x_mm, drop_pos.y_mm),
-                    anchor_rot,
-                )
-            } else {
-                false
-            };
-            if out_of_bounds {
-                console_log!(
-                    "move ignored: out of bounds (client={} anchor={})",
-                    client_id,
-                    anchor_id
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let action_id =
-                bridge_action_id(client_id, Some(client_seq), runtime_snapshot.snapshot.seq);
-            let batch =
-                match apply_bridge_live_move(&mut runtime_snapshot, anchor_id, drop_pos, action_id)
-                {
-                    Ok(batch) => batch,
-                    Err(err) => {
-                        console_log!(
-                            "move ignored: bridge error (client={} anchor={} err={:?})",
-                            client_id,
-                            anchor_id,
-                            err
-                        );
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-
-            let update = Some(playable_update_msg_from_batch(
-                &runtime_snapshot.snapshot,
-                &batch,
-                PlayableRoomUpdateKind::ActionOnly,
-                Some(client_id),
-                Some(client_seq).filter(|value| *value != 0),
-            ));
-            inner.live = Some(runtime_snapshot);
-            update
-        };
-
-        self.touch_command(now, false).await?;
-        self.persist_snapshot_if_needed().await?;
-        if let Some(update) = update {
-            console_log!(
-                "move accepted: client={} anchor={} seq={}",
-                client_id,
-                anchor_id,
-                match &update {
-                    ServerMsg::PlayableUpdate { seq, .. } => *seq,
-                    _ => 0,
-                }
-            );
-            let _ = self.broadcast(&update);
-        }
-        self.schedule_alarm().await?;
-        Ok(())
-    }
-
-    async fn handle_transform(
-        &self,
-        client_id: ClientId,
-        anchor_id: u32,
-        drop_pose: PlayablePoseSnapshot,
-        client_seq: u64,
-    ) -> Result<()> {
-        let now = now_ms();
-        let update = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let owns_anchor = inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false);
-            if !owns_anchor {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            if let Some(owner) = inner.owners_by_anchor.get_mut(&anchor_id) {
-                owner.since_ms = now;
-            }
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if anchor_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id_usize = members[0];
-            if anchor_id_usize as u32 != anchor_id {
-                console_log!(
-                    "transform ignored: anchor mismatch (client={} anchor={} canonical={})",
-                    client_id,
-                    anchor_id,
-                    anchor_id_usize
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            // A transform sets the group's rotation to the drop pose's; project
-            // members about the proposed center + rotation.
-            let out_of_bounds = if let Some(geometry) = runtime_snapshot.geometry.as_ref() {
-                !group_in_bounds(
-                    &runtime_snapshot.snapshot,
-                    geometry,
-                    &members,
-                    anchor_id_usize,
-                    (drop_pose.x_mm, drop_pose.y_mm),
-                    drop_pose.rotation_deg,
-                )
-            } else {
-                false
-            };
-            if out_of_bounds {
-                console_log!(
-                    "transform ignored: out of bounds (client={} anchor={})",
-                    client_id,
-                    anchor_id
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let action_id =
-                bridge_action_id(client_id, Some(client_seq), runtime_snapshot.snapshot.seq);
-            let batch = match apply_bridge_live_transform(
-                &mut runtime_snapshot,
-                anchor_id,
-                drop_pose,
-                action_id,
-            ) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    console_log!(
-                        "transform ignored: bridge error (client={} anchor={} err={:?})",
-                        client_id,
-                        anchor_id,
-                        err
-                    );
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-
-            let update = Some(playable_update_msg_from_batch(
-                &runtime_snapshot.snapshot,
-                &batch,
-                PlayableRoomUpdateKind::ActionOnly,
-                Some(client_id),
-                Some(client_seq).filter(|value| *value != 0),
-            ));
-            inner.live = Some(runtime_snapshot);
-            update
-        };
-
-        self.touch_command(now, false).await?;
-        self.persist_snapshot_if_needed().await?;
-        if let Some(update) = update {
-            console_log!(
-                "transform accepted: client={} anchor={} seq={}",
-                client_id,
-                anchor_id,
-                match &update {
-                    ServerMsg::PlayableUpdate { seq, .. } => *seq,
-                    _ => 0,
-                }
-            );
-            let _ = self.broadcast(&update);
-        }
-        self.schedule_alarm().await?;
-        Ok(())
-    }
-
-    async fn handle_flip(
-        &self,
-        client_id: ClientId,
-        piece_id: u32,
-        flipped: bool,
-        drop_pose: PlayablePoseSnapshot,
-    ) -> Result<()> {
-        let now = now_ms();
-        let updates = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if piece_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id = members[0] as u32;
-            if members.len() != 1 || anchor_id != piece_id {
-                console_log!(
-                    "flip rejected: piece in group (client={} piece={} anchor={} size={})",
-                    client_id,
-                    piece_id,
-                    anchor_id,
-                    members.len()
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let owns_anchor = inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false);
-            if !owns_anchor {
-                console_log!(
-                    "flip rejected: not owner (client={} piece={} anchor={})",
-                    client_id,
-                    piece_id,
-                    anchor_id
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let action_id = bridge_action_id(client_id, None, runtime_snapshot.snapshot.seq);
-            let batch = match apply_bridge_flip(
-                &mut runtime_snapshot,
-                piece_id,
-                flipped,
-                Some(drop_pose),
-                action_id,
-            ) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    console_log!(
-                        "flip rejected: bridge error (client={} piece={} err={:?})",
-                        client_id,
-                        piece_id,
-                        err
-                    );
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-
-            inner.owner_by_client.remove(&client_id);
-            inner.owners_by_anchor.remove(&anchor_id);
-
-            let flip_update = playable_update_msg_from_batch(
-                &runtime_snapshot.snapshot,
-                &batch,
-                PlayableRoomUpdateKind::RestrictedAction,
-                Some(client_id),
-                None,
-            );
-            let ownership_update = control_update_msg(
-                runtime_snapshot.snapshot.seq,
-                RoomControlUpdate::Ownership {
-                    group_anchor: anchor_id,
-                    owner: None,
-                    reason: OwnershipReason::Released,
-                },
-                Some(client_id),
-                None,
-            );
-            inner.live = Some(runtime_snapshot);
-            Some((flip_update, ownership_update))
-        };
-
-        self.touch_command(now, false).await?;
-        self.persist_snapshot_if_needed().await?;
-        if let Some((flip_update, ownership_update)) = updates {
-            console_log!(
-                "flip accepted: client={} piece={} flipped={}",
-                client_id,
-                piece_id,
-                flipped
-            );
-            let _ = self.broadcast(&flip_update);
-            let _ = self.broadcast(&ownership_update);
-        }
-        self.schedule_alarm().await?;
-        Ok(())
-    }
-
-    async fn handle_detach(&self, client_id: ClientId, piece_id: u32) -> Result<()> {
-        let now = now_ms();
-        let updates = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if piece_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id = members[0] as u32;
-            if members.len() == 1 && anchor_id == piece_id {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let owns_anchor = inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false);
-            if !owns_anchor {
-                console_log!(
-                    "detach rejected: not owner (client={} piece={} anchor={})",
-                    client_id,
-                    piece_id,
-                    anchor_id
-                );
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let action_id = bridge_action_id(client_id, None, runtime_snapshot.snapshot.seq);
-            let batch = match apply_bridge_detach(&mut runtime_snapshot, piece_id, action_id) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    console_log!(
-                        "detach rejected: bridge error (client={} piece={} err={:?})",
-                        client_id,
-                        piece_id,
-                        err
-                    );
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-
-            inner.owner_by_client.insert(client_id, piece_id);
-            if anchor_id != piece_id {
-                inner.owners_by_anchor.remove(&anchor_id);
-            }
-            inner.owners_by_anchor.insert(
-                piece_id,
-                Ownership {
-                    owner_id: client_id,
-                    anchor_id: piece_id,
-                    since_ms: now,
-                },
-            );
-
-            let detach_update = playable_update_msg_from_batch(
-                &runtime_snapshot.snapshot,
-                &batch,
-                PlayableRoomUpdateKind::RestrictedAction,
-                Some(client_id),
-                None,
-            );
-            let seq = runtime_snapshot.snapshot.seq;
-            let mut ownership_updates = Vec::new();
-            if anchor_id != piece_id {
-                ownership_updates.push(control_update_msg(
-                    seq,
-                    RoomControlUpdate::Ownership {
-                        group_anchor: anchor_id,
-                        owner: None,
-                        reason: OwnershipReason::Released,
-                    },
-                    Some(client_id),
-                    None,
-                ));
-            }
-            ownership_updates.push(control_update_msg(
-                seq,
-                RoomControlUpdate::Ownership {
-                    group_anchor: piece_id,
-                    owner: Some(client_id),
-                    reason: OwnershipReason::Granted,
-                },
-                Some(client_id),
-                None,
-            ));
-            inner.live = Some(runtime_snapshot);
-            Some((detach_update, ownership_updates))
-        };
-
-        self.touch_command(now, true).await?;
-        self.persist_snapshot_if_needed().await?;
-        if let Some((detach_update, ownership_updates)) = updates {
-            console_log!("detach accepted: client={} piece={}", client_id, piece_id);
-            let _ = self.broadcast(&detach_update);
-            for update in ownership_updates {
-                let _ = self.broadcast(&update);
+        let count = effects.events.len();
+        for (index, event) in effects.events.iter().enumerate() {
+            let result = self.broadcast(event);
+            if propagate_final && index + 1 == count {
+                result?;
             }
         }
         self.schedule_alarm().await?;
-        Ok(())
-    }
-
-    async fn handle_rotate(
-        &self,
-        client_id: ClientId,
-        anchor_id: u32,
-        drop_rotation_deg: f32,
-    ) -> Result<()> {
-        self.handle_finalize(client_id, anchor_id, None, Some(drop_rotation_deg), None)
-            .await
-    }
-
-    async fn handle_place(
-        &self,
-        client_id: ClientId,
-        anchor_id: u32,
-        drop_pose: PlayablePoseSnapshot,
-        client_seq: u64,
-    ) -> Result<()> {
-        self.handle_finalize(
-            client_id,
-            anchor_id,
-            Some(PlayablePositionSnapshot {
-                x_mm: drop_pose.x_mm,
-                y_mm: drop_pose.y_mm,
-            }),
-            Some(drop_pose.rotation_deg),
-            Some(client_seq),
-        )
-        .await
-    }
-
-    async fn handle_finalize(
-        &self,
-        client_id: ClientId,
-        anchor_id: u32,
-        drop_pos: Option<PlayablePositionSnapshot>,
-        rot_deg: Option<f32>,
-        client_seq: Option<u64>,
-    ) -> Result<()> {
-        let now = now_ms();
-        let (playable_update, released_anchor) = {
-            let mut inner = self.inner.borrow_mut();
-            let mut runtime_snapshot = match inner.live.take() {
-                Some(snapshot) => snapshot,
-                None => return Ok(()),
-            };
-            let owns_anchor = inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false);
-            if !owns_anchor {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            let total = runtime_snapshot.snapshot.state.topology_piece_count as usize;
-            if anchor_id as usize >= total {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        inner.live = Some(runtime_snapshot);
-                        return Ok(());
-                    }
-                };
-            members.sort_unstable();
-            let anchor_id_usize = members[0];
-            if anchor_id_usize as u32 != anchor_id {
-                inner.live = Some(runtime_snapshot);
-                return Ok(());
-            }
-
-            let action_id = bridge_action_id(client_id, client_seq, runtime_snapshot.snapshot.seq);
-            let batch = match apply_bridge_finalize(
-                &mut runtime_snapshot,
-                anchor_id,
-                drop_pos,
-                rot_deg,
-                action_id,
-            ) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    console_log!(
-                        "finalize ignored: bridge error (client={} anchor={} err={:?})",
-                        client_id,
-                        anchor_id,
-                        err
-                    );
-                    inner.live = Some(runtime_snapshot);
-                    return Ok(());
-                }
-            };
-
-            let released_anchor = inner.owner_by_client.remove(&client_id);
-            if let Some(released_anchor) = released_anchor {
-                inner.owners_by_anchor.remove(&released_anchor);
-            }
-            let playable_update = playable_update_msg_from_batch(
-                &runtime_snapshot.snapshot,
-                &batch,
-                PlayableRoomUpdateKind::Snap,
-                Some(client_id),
-                client_seq.filter(|value| *value != 0),
-            );
-            inner.live = Some(runtime_snapshot);
-            (playable_update, released_anchor)
-        };
-
-        self.touch_command(now, true).await?;
-        self.persist_snapshot_if_needed().await?;
-        if let Some(anchor_id) = released_anchor {
-            let update = control_update_msg(
-                match &playable_update {
-                    ServerMsg::PlayableUpdate { seq, .. } => *seq,
-                    _ => 0,
-                },
-                RoomControlUpdate::Ownership {
-                    group_anchor: anchor_id,
-                    owner: None,
-                    reason: OwnershipReason::Released,
-                },
-                Some(client_id),
-                client_seq.filter(|value| *value != 0),
-            );
-            let _ = self.broadcast(&update);
-        }
-        let seq = match &playable_update {
-            ServerMsg::PlayableUpdate { seq, .. } => *seq,
-            _ => 0,
-        };
-        self.broadcast(&playable_update)?;
-        console_log!(
-            "finalize accepted: client={} anchor={} seq={}",
-            client_id,
-            anchor_id,
-            seq
-        );
-        self.schedule_alarm().await?;
-        Ok(())
-    }
-
-    async fn handle_release(&self, client_id: ClientId, anchor_id: u32) -> Result<()> {
-        let now = now_ms();
-        let released = {
-            let inner = self.inner.borrow();
-            inner
-                .owners_by_anchor
-                .get(&anchor_id)
-                .map(|owner| owner.owner_id == client_id)
-                .unwrap_or(false)
-        };
-        if released {
-            self.release_by_client(client_id, OwnershipReason::Released)?;
-            self.touch_command(now, false).await?;
-            self.persist_snapshot_if_needed().await?;
-            self.schedule_alarm().await?;
-        }
         Ok(())
     }
 
     fn release_by_client(&self, client_id: ClientId, reason: OwnershipReason) -> Result<()> {
-        if let Some(anchor_id) = self.clear_ownership_for_client(client_id) {
-            let seq = self.bump_seq_for_update();
-            let msg = control_update_msg(
-                seq,
-                RoomControlUpdate::Ownership {
-                    group_anchor: anchor_id,
-                    owner: None,
-                    reason,
-                },
-                Some(client_id),
-                None,
-            );
-            let _ = self.broadcast(&msg);
+        let event = self
+            .inner
+            .borrow_mut()
+            .authority
+            .release_client(client_id, reason);
+        if let Some(event) = event {
+            let _ = self.broadcast(&event);
         }
         Ok(())
-    }
-
-    fn clear_ownership_for_client(&self, client_id: ClientId) -> Option<u32> {
-        let mut inner = self.inner.borrow_mut();
-        let anchor_id = inner.owner_by_client.remove(&client_id);
-        if let Some(anchor_id) = anchor_id {
-            inner.owners_by_anchor.remove(&anchor_id);
-        }
-        anchor_id
     }
 
     fn release_timeouts(&self, now: i64) -> Result<()> {
-        let expired: Vec<Ownership> = {
-            let inner = self.inner.borrow();
-            inner
-                .owners_by_anchor
-                .values()
-                .copied()
-                .filter(|owner| now.saturating_sub(owner.since_ms) >= OWNERSHIP_TIMEOUT_MS)
-                .collect()
-        };
-        for owner in expired {
-            {
-                let mut inner = self.inner.borrow_mut();
-                inner.owners_by_anchor.remove(&owner.anchor_id);
-                inner.owner_by_client.remove(&owner.owner_id);
-            }
-            console_log!(
-                "ownership timeout: client={} anchor={}",
-                owner.owner_id,
-                owner.anchor_id
-            );
-            let seq = self.bump_seq_for_update();
-            let msg = control_update_msg(
-                seq,
-                RoomControlUpdate::Ownership {
-                    group_anchor: owner.anchor_id,
-                    owner: None,
-                    reason: OwnershipReason::Timeout,
-                },
-                None,
-                None,
-            );
-            let _ = self.broadcast(&msg);
+        let events = self.inner.borrow_mut().authority.expire_ownership(now);
+        for event in events {
+            let _ = self.broadcast(&event);
         }
         Ok(())
-    }
-
-    fn bump_seq_for_update(&self) -> u64 {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(live) = inner.live.as_mut() {
-            let next = live.snapshot.seq.saturating_add(1);
-            live.set_seq(next);
-            next
-        } else {
-            0
-        }
     }
 
     async fn touch_command(&self, now: i64, full_state: bool) -> Result<()> {
@@ -3926,10 +2558,7 @@ impl Room {
     async fn persist_snapshot_if_needed(&self) -> Result<()> {
         let (persistence, snapshot) = {
             let inner = self.inner.borrow();
-            (
-                inner.meta.persistence,
-                inner.live.as_ref().map(|live| live.snapshot.clone()),
-            )
+            (inner.meta.persistence, inner.authority.snapshot().cloned())
         };
 
         if matches!(persistence, RoomPersistence::Durable) {
@@ -3953,13 +2582,13 @@ impl Room {
     async fn schedule_alarm(&self) -> Result<()> {
         let now = now_ms();
         let has_clients = !self.state.get_websockets().is_empty();
-        let (last_command_at, last_full_state_at, has_snapshot, ownerships, pending_releases) = {
+        let (last_command_at, last_full_state_at, has_snapshot, ownership_expiry, pending_releases) = {
             let inner = self.inner.borrow();
             (
                 inner.meta.last_command_at,
                 inner.meta.last_full_state_at,
-                inner.live.is_some(),
-                inner.owners_by_anchor.values().copied().collect::<Vec<_>>(),
+                inner.authority.snapshot().is_some(),
+                inner.authority.next_ownership_expiry(),
                 inner.pending_releases.values().copied().collect::<Vec<_>>(),
             )
         };
@@ -3988,8 +2617,7 @@ impl Room {
             });
         }
 
-        for owner in ownerships {
-            let expires_at = owner.since_ms + OWNERSHIP_TIMEOUT_MS;
+        if let Some(expires_at) = ownership_expiry {
             next_at = Some(match next_at {
                 Some(current) => current.min(expires_at),
                 None => expires_at,
@@ -4018,9 +2646,7 @@ impl Room {
             inner.meta.last_command_at = None;
             inner.meta.last_warning_at = None;
             inner.meta.last_full_state_at = None;
-            inner.live = None;
-            inner.owners_by_anchor.clear();
-            inner.owner_by_client.clear();
+            inner.authority.clear();
             inner.pending_releases.clear();
             inner.recent_nonces.clear();
             inner.assets.clear();
@@ -4050,7 +2676,7 @@ impl Room {
     async fn broadcast_full_state(&self) -> Result<()> {
         let snapshot = {
             let mut inner = self.inner.borrow_mut();
-            let Some(snapshot) = inner.live.as_ref().map(|live| live.snapshot.clone()) else {
+            let Some(snapshot) = inner.authority.snapshot().cloned() else {
                 return Ok(());
             };
             inner.meta.last_full_state_at = Some(now_ms());
@@ -4900,135 +3526,6 @@ impl CommandStore {
     }
 }
 
-fn playable_group_members(snapshot: &PlayableGameSnapshot, piece_id: usize) -> Option<Vec<usize>> {
-    let total = snapshot.state.topology_piece_count as usize;
-    if piece_id >= total || snapshot.state.piece_group.len() != total {
-        return None;
-    }
-    let group = *snapshot.state.piece_group.get(piece_id)?;
-    let mut members = snapshot
-        .state
-        .piece_group
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(idx, candidate)| (candidate == group).then_some(idx))
-        .collect::<Vec<_>>();
-    members.sort_unstable();
-    (!members.is_empty()).then_some(members)
-}
-
-fn playable_group_anchor(snapshot: &PlayableGameSnapshot, group: u32) -> Option<usize> {
-    snapshot
-        .state
-        .piece_group
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(idx, candidate)| (candidate == group).then_some(idx))
-        .min()
-}
-
-fn playable_group_order_anchors(snapshot: &PlayableGameSnapshot) -> Vec<u32> {
-    let mut order = Vec::with_capacity(snapshot.state.z_order.len());
-    for group in snapshot.state.z_order.iter().copied() {
-        let Some(anchor) = playable_group_anchor(snapshot, group) else {
-            continue;
-        };
-        let anchor = anchor as u32;
-        if !order.contains(&anchor) {
-            order.push(anchor);
-        }
-    }
-    order
-}
-
-/// Authoritative bounds clamp for a proposed group move/transform.
-///
-/// Projects every member piece to its pixel center for the proposed anchor
-/// pose, then accepts the placement when at least one piece center stays
-/// inside the workspace (inset by that piece's own half extent — and a full
-/// extent for multi-piece groups, matching the original grid heuristic). The
-/// rejection condition is "the whole group would leave the workspace".
-///
-/// Works for any topology: `pose_unit_*` scale pose-mm to pixels (equal to a
-/// grid cell's pixel size for grids, so grid behaviour is preserved) and
-/// `piece_half_*` carry each piece's true bounding box.
-fn group_in_bounds(
-    snapshot: &PlayableGameSnapshot,
-    geometry: &RoomGeometry,
-    members: &[usize],
-    anchor_id: usize,
-    anchor_center_mm: (f32, f32),
-    anchor_rot_deg: f32,
-) -> bool {
-    let Some(group) = snapshot
-        .state
-        .piece_group
-        .get(anchor_id)
-        .map(|g| *g as usize)
-    else {
-        return false;
-    };
-    let Some(anchor_local) = snapshot.state.piece_local_pose.get(anchor_id).copied() else {
-        return false;
-    };
-    let flipped = snapshot
-        .state
-        .group_flip
-        .get(group)
-        .copied()
-        .unwrap_or(false);
-    let multi = members.len() > 1;
-    let anchor_px = (
-        geometry.origin_x + anchor_center_mm.0 * geometry.pose_unit_x,
-        geometry.origin_y + anchor_center_mm.1 * geometry.pose_unit_y,
-    );
-    for &id in members {
-        let Some(piece_local) = snapshot.state.piece_local_pose.get(id).copied() else {
-            continue;
-        };
-        // Scale the local offset to pixels first, THEN rotate — the same
-        // aspect-aware order the renderer uses (pose units are not square).
-        let mut dx = (piece_local.x_mm - anchor_local.x_mm) * geometry.pose_unit_x;
-        let dy = (piece_local.y_mm - anchor_local.y_mm) * geometry.pose_unit_y;
-        if flipped {
-            dx = -dx;
-        }
-        let (rx, ry) = rotate_vec(dx, dy, anchor_rot_deg);
-        let center_x = anchor_px.0 + rx;
-        let center_y = anchor_px.1 + ry;
-        let half_w = geometry
-            .piece_half_w
-            .get(id)
-            .copied()
-            .unwrap_or(geometry.pose_unit_x * 0.5);
-        let half_h = geometry
-            .piece_half_h
-            .get(id)
-            .copied()
-            .unwrap_or(geometry.pose_unit_y * 0.5);
-        let inset_w = if multi { half_w * 3.0 } else { half_w };
-        let inset_h = if multi { half_h * 3.0 } else { half_h };
-        let (mut min_x, mut max_x) = (geometry.view_min_x + inset_w, geometry.view_max_x - inset_w);
-        if max_x < min_x {
-            let mid = (geometry.view_min_x + geometry.view_max_x) * 0.5;
-            min_x = mid;
-            max_x = mid;
-        }
-        let (mut min_y, mut max_y) = (geometry.view_min_y + inset_h, geometry.view_max_y - inset_h);
-        if max_y < min_y {
-            let mid = (geometry.view_min_y + geometry.view_max_y) * 0.5;
-            min_y = mid;
-            max_y = mid;
-        }
-        if center_x >= min_x && center_x <= max_x && center_y >= min_y && center_y <= max_y {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5036,54 +3533,6 @@ mod tests {
         EdgeId, FlipState, GenericPlayableState, GridTopology, LogicalState, PieceId, PlayRules,
         PlayableState, Pose2, PuzzleTopology,
     };
-
-    /// The server's geometry must use the SAME pose→pixel placement the client
-    /// renders with, or scattered/clamped pieces would land in different spots
-    /// in multiplayer than in single-player. For triangular (uniform scale +
-    /// letterboxed centred frame) this used to diverge from the worker's old
-    /// stretch-to-fill model.
-    #[test]
-    fn room_geometry_matches_client_placement_for_triangular() {
-        let spec = heddobureika_core::TopologySpec::triangular_tessellation(4, 5);
-        let topology = heddobureika_core::build_topology_from_spec(&spec).expect("topology");
-        let (w, h) = (1200u32, 700u32);
-        let ratio = GameRules::default().workspace_padding_ratio;
-        let geom = RoomGeometry::from_topology(&topology, w, h, ratio).expect("room geometry");
-        let render = topology
-            .build_render_geometry(
-                w,
-                h,
-                0,
-                &heddobureika_core::TriangularTessellationShapeSettings::default(),
-            )
-            .expect("render geometry");
-
-        let approx = |a: f32, b: f32| (a - b).abs() < 1.0e-3;
-        assert!(
-            approx(geom.pose_unit_x, render.pose_unit_px[0])
-                && approx(geom.pose_unit_y, render.pose_unit_px[1]),
-            "pose units diverge: worker {:?} vs client {:?}",
-            (geom.pose_unit_x, geom.pose_unit_y),
-            render.pose_unit_px,
-        );
-        assert!(
-            approx(geom.origin_x, render.pose_origin_px[0])
-                && approx(geom.origin_y, render.pose_origin_px[1]),
-            "frame origin diverges: worker {:?} vs client {:?}",
-            (geom.origin_x, geom.origin_y),
-            render.pose_origin_px,
-        );
-        // Triangular: square pose units (uniform scale) and a letterboxed,
-        // non-zero centred origin — the exact properties the old worker lacked.
-        assert!(
-            approx(geom.pose_unit_x, geom.pose_unit_y),
-            "triangular pose units should be square"
-        );
-        assert!(
-            geom.origin_x > 0.0 || geom.origin_y > 0.0,
-            "triangular frame should be letterboxed (centred origin)"
-        );
-    }
 
     /// Per-piece fixture data used by the 2x1 test builder.
     struct LegacyFixture {
@@ -5102,28 +3551,6 @@ mod tests {
         snapshot
             .restore_playable_from_spec()
             .expect("restore playable")
-    }
-
-    fn piece_position_px(playable: &GenericPlayableState, piece: u32) -> (f32, f32) {
-        let pose = playable
-            .piece_world_pose(PieceId(piece))
-            .expect("piece world pose");
-        (pose.x_mm() * 100.0 - 50.0, pose.y_mm() * 100.0 - 50.0)
-    }
-
-    fn piece_rotation_deg(playable: &GenericPlayableState, piece: u32) -> f32 {
-        playable
-            .piece_world_pose(PieceId(piece))
-            .expect("piece world pose")
-            .rotation_degrees()
-    }
-
-    fn piece_flipped(playable: &GenericPlayableState, piece: u32) -> bool {
-        let group = playable
-            .logical
-            .group_of(PieceId(piece))
-            .expect("piece group");
-        playable.flip_of(group) == Some(FlipState::Flipped)
     }
 
     fn group_order_anchors(playable: &GenericPlayableState) -> Vec<u32> {
@@ -5152,208 +3579,6 @@ mod tests {
             }
         }
         false
-    }
-
-    #[test]
-    fn bridge_action_id_is_deterministic_and_uses_client_sequence_when_present() {
-        let client = ClientId::from(42);
-
-        let from_client_seq = bridge_action_id(client, Some(7), 100);
-        assert_eq!(from_client_seq, bridge_action_id(client, Some(7), 200));
-        assert_ne!(from_client_seq, bridge_action_id(client, Some(8), 100));
-        assert_ne!(
-            from_client_seq,
-            bridge_action_id(ClientId::from(43), Some(7), 100)
-        );
-
-        let from_room_seq = bridge_action_id(client, None, 100);
-        assert_eq!(from_room_seq, bridge_action_id(client, Some(0), 100));
-        assert_ne!(from_room_seq, bridge_action_id(client, None, 101));
-        assert_ne!(from_room_seq.0, 0);
-    }
-
-    #[test]
-    fn bridge_live_move_updates_connected_group_positions_without_snapping() {
-        // Start from the canonical solved state (pose `(0.5, 0.5)` →
-        // piece 0 top-left at pixel `(0, 0)`) and move to a target far
-        // enough from `(0.5, 0.5)` to stay outside the frame snap radius.
-        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
-            positions: vec![(0.0, 0.0), (100.0, 0.0)],
-            rotations: vec![0.0, 0.0],
-            flips: vec![false, false],
-            connections: vec![[false, true, false, false], [false; 4]],
-            group_order: vec![0],
-            scramble_nonce: 7,
-        }))
-        .expect("live puzzle");
-        let action_id = ActionId(11);
-
-        let batch =
-            apply_bridge_live_move(&mut live, 0, playable_position((200.0, 250.0)), action_id)
-                .expect("move should apply");
-
-        assert_eq!(batch.proposal.action_id, Some(action_id));
-        assert_eq!(batch.revision_before, 5);
-        assert_eq!(batch.revision_after, 6);
-        assert_eq!(batch.delta.revision, 6);
-        assert_eq!(live.snapshot.seq, 6);
-        assert_eq!(live.snapshot.scramble_nonce, 7);
-        let restored = restore_grid(&live.snapshot);
-        let p0 = piece_position_px(&restored, 0);
-        let p1 = piece_position_px(&restored, 1);
-        assert_approx(p0.0, 200.0);
-        assert_approx(p0.1, 250.0);
-        assert_approx(p1.0, 300.0);
-        assert_approx(p1.1, 250.0);
-        assert_approx(piece_rotation_deg(&restored, 0), 0.0);
-        assert_approx(piece_rotation_deg(&restored, 1), 0.0);
-        assert!(edge_active_between(&restored, 0, 1));
-    }
-
-    #[test]
-    fn bridge_live_transform_rotates_connected_group_without_snapping() {
-        // Same baseline as the live-move test: start at the canonical pose
-        // `(0.5, 0.5)` and transform to a far target so no frame snap fires.
-        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
-            positions: vec![(0.0, 0.0), (100.0, 0.0)],
-            rotations: vec![0.0, 0.0],
-            flips: vec![false, false],
-            connections: vec![[false, true, false, false], [false; 4]],
-            group_order: vec![0],
-            scramble_nonce: 8,
-        }))
-        .expect("live puzzle");
-        let action_id = ActionId(12);
-
-        let batch = apply_bridge_live_transform(
-            &mut live,
-            0,
-            playable_pose((200.0, 250.0), 90.0),
-            action_id,
-        )
-        .expect("transform should apply");
-
-        assert_eq!(batch.proposal.action_id, Some(action_id));
-        assert_eq!(batch.revision_before, 5);
-        assert_eq!(batch.revision_after, 6);
-        assert_eq!(batch.delta.revision, 6);
-        assert_eq!(live.snapshot.seq, 6);
-        let restored = restore_grid(&live.snapshot);
-        let p0 = piece_position_px(&restored, 0);
-        let p1 = piece_position_px(&restored, 1);
-        assert_approx(p0.0, 200.0);
-        assert_approx(p0.1, 250.0);
-        assert_approx(p1.0, 200.0);
-        assert_approx(p1.1, 350.0);
-        assert_approx(piece_rotation_deg(&restored, 0), 90.0);
-        assert_approx(piece_rotation_deg(&restored, 1), 90.0);
-        assert_eq!(group_order_anchors(&restored), vec![0]);
-    }
-
-    #[test]
-    fn bridge_finalize_keeps_fixed_group_pose_and_snaps_neighbor() {
-        // Two singletons positioned so piece 0 is already at the canonical
-        // workspace TL (pose `(0.5, 0.5)`) and piece 1 sits slightly past
-        // its solved neighbor pose. Finalize joins them; the completed
-        // group then identity-snaps to anchor pose `(0.5, 0.5)` →
-        // piece 0 TL `(0, 0)`, piece 1 TL `(100, 0)`.
-        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
-            positions: vec![(0.0, 0.0), (105.0, 0.0)],
-            rotations: vec![0.0, 0.0],
-            flips: vec![false, false],
-            connections: vec![[false; 4]; 2],
-            group_order: vec![0, 1],
-            scramble_nonce: 9,
-        }))
-        .expect("live puzzle");
-        let action_id = ActionId(13);
-
-        let batch = apply_bridge_finalize(
-            &mut live,
-            1,
-            Some(playable_position((105.0, 0.0))),
-            Some(0.0),
-            action_id,
-        )
-        .expect("finalize should apply");
-
-        assert_eq!(batch.proposal.action_id, Some(action_id));
-        assert_eq!(batch.revision_before, 5);
-        assert_eq!(batch.revision_after, 6);
-        assert_eq!(batch.delta.revision, 6);
-        assert_eq!(live.snapshot.seq, 6);
-        let restored = restore_grid(&live.snapshot);
-        assert!(edge_active_between(&restored, 0, 1));
-        let p0 = piece_position_px(&restored, 0);
-        let p1 = piece_position_px(&restored, 1);
-        assert_approx(p0.0, 0.0);
-        assert_approx(p0.1, 0.0);
-        assert_approx(p1.0, 100.0);
-        assert_approx(p1.1, 0.0);
-        assert_eq!(group_order_anchors(&restored), vec![0]);
-    }
-
-    #[test]
-    fn bridge_flip_updates_singleton_with_playable_snapshot() {
-        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
-            positions: vec![(-50.0, -50.0), (50.0, -50.0)],
-            rotations: vec![0.0, 0.0],
-            flips: vec![false, false],
-            connections: vec![[false; 4]; 2],
-            group_order: vec![0, 1],
-            scramble_nonce: 10,
-        }))
-        .expect("live puzzle");
-        let action_id = ActionId(14);
-
-        let batch =
-            apply_bridge_flip(&mut live, 1, true, None, action_id).expect("flip should apply");
-
-        assert_eq!(batch.proposal.action_id, Some(action_id));
-        assert_eq!(batch.revision_before, 5);
-        assert_eq!(batch.revision_after, 6);
-        assert_eq!(batch.delta.revision, 6);
-        assert_eq!(live.snapshot.seq, 6);
-        assert_eq!(live.snapshot.scramble_nonce, 10);
-        let restored = restore_grid(&live.snapshot);
-        assert!(!piece_flipped(&restored, 0));
-        assert!(piece_flipped(&restored, 1));
-        assert!(!edge_active_between(&restored, 0, 1));
-        assert_eq!(group_order_anchors(&restored), vec![0, 1]);
-        let p1 = piece_position_px(&restored, 1);
-        assert_approx(p1.0, 50.0);
-        assert_approx(p1.1, -50.0);
-    }
-
-    #[test]
-    fn bridge_detach_splits_piece_without_moving_original_group() {
-        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
-            positions: vec![(20.0, 30.0), (120.0, 30.0)],
-            rotations: vec![0.0, 0.0],
-            flips: vec![false, false],
-            connections: vec![[false, true, false, false], [false; 4]],
-            group_order: vec![0],
-            scramble_nonce: 11,
-        }))
-        .expect("live puzzle");
-        let action_id = ActionId(15);
-
-        let batch = apply_bridge_detach(&mut live, 1, action_id).expect("detach should apply");
-
-        assert_eq!(batch.proposal.action_id, Some(action_id));
-        assert_eq!(batch.revision_before, 5);
-        assert_eq!(batch.revision_after, 6);
-        assert_eq!(batch.delta.revision, 6);
-        assert_eq!(live.snapshot.seq, 6);
-        let restored = restore_grid(&live.snapshot);
-        assert!(!edge_active_between(&restored, 0, 1));
-        assert_eq!(group_order_anchors(&restored), vec![0, 1]);
-        let p0 = piece_position_px(&restored, 0);
-        let p1 = piece_position_px(&restored, 1);
-        assert_approx(p0.0, 20.0);
-        assert_approx(p0.1, 30.0);
-        assert_approx(p1.0, 120.0);
-        assert_approx(p1.1, 30.0);
     }
 
     #[test]
@@ -5423,84 +3648,6 @@ mod tests {
         assert_eq!(snapshot.state.topology_piece_count, 2);
     }
 
-    #[test]
-    fn playable_update_message_carries_group_changes_and_revision() {
-        let mut live = RoomLivePuzzle::from_snapshot(snapshot_2x1(LegacyFixture {
-            positions: vec![(-50.0, -50.0), (50.0, -50.0)],
-            rotations: vec![0.0, 0.0],
-            flips: vec![false, false],
-            connections: vec![[false, true, false, false], [false; 4]],
-            group_order: vec![0],
-            scramble_nonce: 24,
-        }))
-        .expect("live puzzle");
-        let action_id = ActionId(15);
-        let batch =
-            apply_bridge_live_move(&mut live, 0, playable_position((10.0, 20.0)), action_id)
-                .expect("move should apply");
-
-        let msg = playable_update_msg_from_batch(
-            &live.snapshot,
-            &batch,
-            PlayableRoomUpdateKind::ActionOnly,
-            Some(ClientId::from(7)),
-            Some(99),
-        );
-
-        let ServerMsg::PlayableUpdate {
-            seq,
-            update,
-            source,
-            client_seq,
-        } = msg
-        else {
-            panic!("expected playable update");
-        };
-        assert_eq!(seq, 6);
-        assert_eq!(source, Some(ClientId::from(7)));
-        assert_eq!(client_seq, Some(99));
-        assert_eq!(update.kind, PlayableRoomUpdateKind::ActionOnly);
-        assert_eq!(update.action_id, Some(action_id.0));
-        assert_eq!(update.revision_before, 5);
-        assert_eq!(update.revision_after, 6);
-        assert!(!update.group_changes.is_empty());
-    }
-
-    #[test]
-    fn control_update_message_carries_ownership_without_room_update() {
-        let msg = control_update_msg(
-            12,
-            RoomControlUpdate::Ownership {
-                group_anchor: 3,
-                owner: Some(ClientId::from(9)),
-                reason: OwnershipReason::Granted,
-            },
-            Some(ClientId::from(9)),
-            None,
-        );
-
-        let ServerMsg::ControlUpdate {
-            seq,
-            update,
-            source,
-            client_seq,
-        } = msg
-        else {
-            panic!("expected control update");
-        };
-        assert_eq!(seq, 12);
-        assert_eq!(source, Some(ClientId::from(9)));
-        assert_eq!(client_seq, None);
-        assert!(matches!(
-            update,
-            RoomControlUpdate::Ownership {
-                group_anchor: 3,
-                owner: Some(owner),
-                reason: OwnershipReason::Granted,
-            } if owner == ClientId::from(9)
-        ));
-    }
-
     fn snapshot_2x1(state: LegacyFixture) -> PlayableGameSnapshot {
         let puzzle = PuzzleInfo {
             label: "test".to_string(),
@@ -5567,29 +3714,6 @@ mod tests {
         );
         set_playable_snapshot_seq(&mut snapshot, 5);
         snapshot
-    }
-
-    fn playable_position(pos: (f32, f32)) -> PlayablePositionSnapshot {
-        PlayablePositionSnapshot {
-            x_mm: (pos.0 + 50.0) / 100.0,
-            y_mm: (pos.1 + 50.0) / 100.0,
-        }
-    }
-
-    fn playable_pose(pos: (f32, f32), rot_deg: f32) -> PlayablePoseSnapshot {
-        let drop_pos = playable_position(pos);
-        PlayablePoseSnapshot {
-            x_mm: drop_pos.x_mm,
-            y_mm: drop_pos.y_mm,
-            rotation_deg: rot_deg,
-        }
-    }
-
-    fn assert_approx(actual: f32, expected: f32) {
-        assert!(
-            (actual - expected).abs() <= 1.0e-4,
-            "expected {expected}, got {actual}"
-        );
     }
 
     #[test]
@@ -5698,72 +3822,6 @@ mod tests {
     }
 
     #[test]
-    fn every_topology_gets_per_piece_bounds_geometry() {
-        // Regression: the bounds geometry used to be grid-only, so every
-        // action handler bailed for non-grid topologies and no move/flip/etc.
-        // processed on triangular/hexagonal/Voronoi rooms. Geometry is now
-        // built from each topology's per-piece extents, so it's present for
-        // all of them — and the action still applies.
-        for spec in [
-            TopologySpec::grid(3, 2),
-            TopologySpec::triangular_tessellation(3, 2),
-            TopologySpec::hexagonal(5, 4, 1.5),
-            TopologySpec::voronoi(40, 1, 1.5),
-        ] {
-            let tag = spec.tag.clone();
-            let live = RoomLivePuzzle::from_snapshot(snapshot_for_topology(spec, 600, 400))
-                .expect("live puzzle");
-            let geometry = live
-                .geometry
-                .as_ref()
-                .unwrap_or_else(|| panic!("{tag} should have bounds geometry"));
-            assert_eq!(
-                geometry.piece_half_w.len(),
-                live.snapshot.state.topology_piece_count as usize,
-                "{tag} has a half-extent per piece"
-            );
-            assert!(
-                geometry.piece_half_w.iter().all(|w| *w > 0.0),
-                "{tag} piece extents are positive"
-            );
-        }
-
-        // The action itself applies on a non-grid topology.
-        let triangular =
-            snapshot_for_topology(TopologySpec::triangular_tessellation(3, 2), 600, 400);
-        let mut live = RoomLivePuzzle::from_snapshot(triangular).expect("live puzzle");
-        let batch = apply_bridge_flip(&mut live, 0, true, None, ActionId(7)).expect("flip applies");
-        assert_eq!(batch.proposal.action_id, Some(ActionId(7)));
-        assert_eq!(batch.revision_after, batch.revision_before + 1);
-        assert_eq!(live.snapshot.seq, batch.revision_after);
-    }
-
-    #[test]
-    fn bridge_flip_honors_client_supplied_drop_pose() {
-        // The click-pivot adjustment is computed client-side; the server must
-        // reproduce it by applying the post-flip pose carried on the wire,
-        // not by recomputing the pre-flip world pose.
-        let triangular =
-            snapshot_for_topology(TopologySpec::triangular_tessellation(3, 2), 600, 400);
-        let mut live = RoomLivePuzzle::from_snapshot(triangular).expect("live puzzle");
-        let group = heddobureika_game::GroupId(0);
-        let pivoted = PlayablePoseSnapshot {
-            x_mm: 4.25,
-            y_mm: 1.75,
-            rotation_deg: 0.0,
-        };
-        let _ = apply_bridge_flip(&mut live, 0, true, Some(pivoted.clone()), ActionId(9))
-            .expect("flip applies");
-        let pose = live.playable.pose_of(group).expect("group pose");
-        assert!(
-            (pose.x_mm() - pivoted.x_mm).abs() <= 1.0e-3
-                && (pose.y_mm() - pivoted.y_mm).abs() <= 1.0e-3,
-            "server must adopt the wire drop_pose ({pivoted:?}) but got {pose:?}"
-        );
-        assert_eq!(live.playable.flip_of(group), Some(FlipState::Flipped));
-    }
-
-    #[test]
     fn admin_solve_anchors_at_each_topologys_frame_anchor() {
         // The solved puzzle must sit at the topology's canonical frame anchor
         // so it lines up with the frame outline. Regression: the worker used
@@ -5795,36 +3853,5 @@ mod tests {
                 expected.y_mm(),
             );
         }
-    }
-
-    #[test]
-    fn group_in_bounds_accepts_centered_and_rejects_offscreen() {
-        let live = RoomLivePuzzle::from_snapshot(snapshot_for_topology(
-            TopologySpec::grid(3, 2),
-            600,
-            400,
-        ))
-        .expect("live puzzle");
-        let geometry = live.geometry.as_ref().expect("geometry");
-        let members = [0usize];
-        // The image center in pose-mm (extent 3x2 → center ~ (1.5, 1.0)) sits
-        // comfortably inside the workspace.
-        assert!(group_in_bounds(
-            &live.snapshot,
-            geometry,
-            &members,
-            0,
-            (1.5, 1.0),
-            0.0
-        ));
-        // A wildly off-screen anchor is rejected.
-        assert!(!group_in_bounds(
-            &live.snapshot,
-            geometry,
-            &members,
-            0,
-            (100.0, 100.0),
-            0.0
-        ));
     }
 }

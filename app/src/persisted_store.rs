@@ -29,6 +29,8 @@ pub(crate) async fn bootstrap() -> Result<(), String> {
     SNAPSHOT_CACHE.with(|slot| {
         *slot.borrow_mut() = snapshot;
     });
+    #[cfg(feature = "experimental-p2p")]
+    crate::p2p_progress::load(&db).await;
     Ok(())
 }
 
@@ -85,6 +87,23 @@ pub(crate) fn set_snapshot(next: Option<PlayableGameSnapshot>) {
     spawn_local(async move {
         let _ = save_snapshot(next).await;
     });
+}
+
+pub(crate) async fn flush_preferences() -> Result<(), String> {
+    let db = idb::open_db().await.map_err(idb::js_err)?;
+    let result = async {
+        let boot = encode(&boot_record()).ok_or("Could not save boot preferences")?;
+        let settings = encode(&settings_blob()).ok_or("Could not save renderer preferences")?;
+        idb::idb_put_bytes_committed(&db, idb::IDB_STORE_BOOT, BOOT_RECORD_KEY, &boot)
+            .await
+            .map_err(idb::js_err)?;
+        idb::idb_put_bytes_committed(&db, idb::IDB_STORE_SETTINGS, SETTINGS_KEY, &settings)
+            .await
+            .map_err(idb::js_err)
+    }
+    .await;
+    db.close();
+    result
 }
 
 pub(crate) async fn load_private_image(hash: &str) -> Result<Option<PrivateImageEntry>, String> {

@@ -23,6 +23,8 @@ p256 = { workspace = true, features = ["ecdsa"] }
 sha2.workspace = true
 web-sys = { workspace = true, features = ["BinaryType", "Blob", "BlobPropertyBag", "CanvasRenderingContext2d", "CloseEvent", "Document", "DomRect", "Element", "ErrorEvent", "Event", "File", "FileList", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "HtmlSelectElement", "IdbDatabase", "IdbFactory", "IdbObjectStore", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbVersionChangeEvent", "ImageData", "InputEvent", "KeyboardEvent", "MessageEvent", "Path2d", "PointerEvent", "Response", "Storage", "Touch", "TouchEvent", "TouchList", "Url", "UrlSearchParams", "WebGl2RenderingContext", "WebGlProgram", "WebGlShader", "WebSocket", "WheelEvent", "Window"] }
 heddobureika-core.workspace = true
+heddobureika-p2p = { workspace = true, optional = true }
+futures-channel = { workspace = true, optional = true }
 image-pipeline.workspace = true
 console_error_panic_hook.workspace = true
 
@@ -37,3 +39,4 @@ naga = { workspace = true, features = ["wgsl-in", "glsl-out"] }
 [features]
 default = ["dev-panel-yew"]
 dev-panel-yew = ["yew"]
+experimental-p2p = ["dep:heddobureika-p2p", "dep:futures-channel"]

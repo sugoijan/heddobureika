@@ -489,6 +489,8 @@ impl BootCoordinator {
 
 pub(crate) fn run() {
     crate::crash::install_hook();
+    #[cfg(target_arch = "wasm32")]
+    app_router::watch_p2p_invites();
     let core = AppCore::new();
     sync_runtime::attach_core(core.clone());
     #[cfg(target_arch = "wasm32")]

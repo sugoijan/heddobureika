@@ -77,6 +77,36 @@ pub(crate) async fn idb_get_string(
     Ok(Some(raw))
 }
 
+/// A save is durable only when its transaction completes, not when the put
+/// request succeeds (the transaction can still abort after that request).
+pub(crate) async fn idb_put_bytes_committed(
+    db: &IdbDatabase,
+    store: &str,
+    key: &str,
+    value: &[u8],
+) -> Result<(), JsValue> {
+    let tx = db.transaction_with_str_and_mode(store, IdbTransactionMode::Readwrite)?;
+    let completion = js_sys::Promise::new(&mut |resolve, reject| {
+        tx.set_oncomplete(Some(&resolve));
+        tx.set_onabort(Some(&reject));
+        tx.set_onerror(Some(&reject));
+    });
+    let result = async {
+        let array = js_sys::Uint8Array::from(value);
+        tx.object_store(store)?
+            .put_with_key(&array.buffer(), &JsValue::from_str(key))?;
+        wasm_bindgen_futures::JsFuture::from(completion)
+            .await
+            .map_err(|_| JsValue::from_str("IndexedDB transaction did not commit"))?;
+        Ok(())
+    }
+    .await;
+    tx.set_oncomplete(None);
+    tx.set_onabort(None);
+    tx.set_onerror(None);
+    result
+}
+
 pub(crate) async fn idb_put_string(
     db: &IdbDatabase,
     store: &str,
@@ -105,6 +135,11 @@ pub(crate) async fn idb_delete_key(
 pub(crate) fn js_err(error: JsValue) -> String {
     if let Some(value) = error.as_string() {
         return value;
+    }
+    if let Ok(message) = js_sys::Reflect::get(&error, &JsValue::from_str("message")) {
+        if let Some(message) = message.as_string() {
+            return message;
+        }
     }
     if let Ok(json) = js_sys::JSON::stringify(&error) {
         if let Some(value) = json.as_string() {

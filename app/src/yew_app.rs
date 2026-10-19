@@ -1027,7 +1027,8 @@ fn app(props: &AppProps) -> Html {
     let init_config = app_runtime::init_config();
     let multiplayer_config = use_state(|| init_config.multiplayer.clone());
     let multiplayer_config_value = (*multiplayer_config).clone();
-    let online_setup = use_state(|| false);
+    let host_p2p = use_state(|| false);
+    let online_setup = use_state(|| app_router::p2p_link_error().is_some());
     let online_setup_value = *online_setup;
     let room_id_draft = use_state(|| {
         init_config
@@ -1039,7 +1040,7 @@ fn app(props: &AppProps) -> Html {
     let room_id_draft_value = (*room_id_draft).clone();
     let room_setup_status = use_state(|| RoomSetupStatus::Idle);
     let room_setup_status_value = *room_setup_status;
-    let room_setup_error = use_state(|| None::<String>);
+    let room_setup_error = use_state(app_router::p2p_link_error);
     let room_setup_error_value = (*room_setup_error).clone();
     let admin_token_input = use_state(|| load_admin_token().unwrap_or_default());
     let admin_token_input_value = (*admin_token_input).clone();
@@ -1085,13 +1086,26 @@ fn app(props: &AppProps) -> Html {
     let boot_ready_value = *boot_ready;
     let sync_view = sync_runtime::sync_view();
     let multiplayer_active = matches!(sync_view.mode(), InitMode::Online);
+    let p2p_active = multiplayer_config_value
+        .as_ref()
+        .is_some_and(|config| config.is_p2p());
+    let p2p_selected = *host_p2p && cfg!(feature = "experimental-p2p");
+    #[cfg(feature = "experimental-p2p")]
+    let p2p_restore_available = crate::p2p_progress::has_saved_progress();
+    #[cfg(not(feature = "experimental-p2p"))]
+    let p2p_restore_available = false;
+    #[cfg(feature = "experimental-p2p")]
+    let p2p_restore_error = crate::p2p_progress::load_error();
+    #[cfg(not(feature = "experimental-p2p"))]
+    let p2p_restore_error: Option<String> = None;
     let multiplayer_controls_online = multiplayer_active || online_setup_value;
     let show_online_setup = online_setup_value && !multiplayer_active;
     let mp_init_required_value = sync_view.init_required();
     // Admins may reconfigure the room through the same puzzle controls, so
     // they stay unlocked for them. Non-admin players in an initialized room
     // see the controls disabled (reflecting the room's current puzzle).
-    let admin_enabled = multiplayer_active && matches!(admin_status_value, AdminStatus::Accepted);
+    let admin_enabled =
+        multiplayer_active && !p2p_active && matches!(admin_status_value, AdminStatus::Accepted);
     let lock_puzzle_controls =
         !boot_ready_value || (multiplayer_active && !mp_init_required_value && !admin_enabled);
     let _ = *sync_revision;
@@ -1300,12 +1314,32 @@ fn app(props: &AppProps) -> Html {
     } else {
         None
     };
-    let share_link_label = if multiplayer_active {
+    let share_link_label = if p2p_active {
+        if sync_view.p2p().is_some_and(|p| p.hosting) {
+            "P2P host invite"
+        } else {
+            "P2P invite"
+        }
+    } else if multiplayer_active {
         "Room link"
     } else {
         "Share link"
     };
-    let share_link = if let Some(config) = multiplayer_config_value.as_ref() {
+    let share_link = if p2p_active {
+        let invite =
+            sync_view.p2p().and_then(|p| p.invite.clone()).or_else(
+                || match multiplayer_config_value.as_ref().map(|c| &c.connection) {
+                    Some(app_router::MultiplayerConnection::P2pGuest { invite }) => {
+                        Some(invite.clone())
+                    }
+                    _ => None,
+                },
+            );
+        match (base_url_without_hash(), invite) {
+            (Some(base), Some(invite)) => format!("{base}#p2p={invite}"),
+            _ => "Preparing P2P invite…".to_string(),
+        }
+    } else if let Some(config) = multiplayer_config_value.as_ref() {
         base_url_without_hash()
             .map(|base| {
                 let room_id = encode_hash_value(&config.room_id);
@@ -1338,11 +1372,16 @@ fn app(props: &AppProps) -> Html {
                 .map(|config| config.room_id.clone())
         })
         .unwrap_or_else(|| "—".to_string());
-    let mp_connection_label = if sync_view.connected() {
-        "Connected"
-    } else {
-        "Connecting"
-    };
+    let mp_connection_label = sync_view
+        .p2p()
+        .map(|p| p.status.clone())
+        .unwrap_or_else(|| {
+            if sync_view.connected() {
+                "Connected".into()
+            } else {
+                "Connecting".into()
+            }
+        });
     let admin_room_id = sync_view
         .room_id()
         .map(|room_id| room_id.to_string())
@@ -1368,6 +1407,7 @@ fn app(props: &AppProps) -> Html {
         RoomSetupStatus::Creating | RoomSetupStatus::Connecting
     );
     let cancel_online_setup: Rc<dyn Fn()> = {
+        let host_p2p = host_p2p.clone();
         let online_setup = online_setup.clone();
         let room_setup_status = room_setup_status.clone();
         let room_setup_error = room_setup_error.clone();
@@ -1375,6 +1415,7 @@ fn app(props: &AppProps) -> Html {
         let room_transition_seq = room_transition_seq.clone();
         let pending_created_room = pending_created_room.clone();
         Rc::new(move || {
+            host_p2p.set(false);
             {
                 let mut seq = room_transition_seq.borrow_mut();
                 *seq = seq.wrapping_add(1);
@@ -1387,6 +1428,7 @@ fn app(props: &AppProps) -> Html {
         })
     };
     let leave_online_room: Rc<dyn Fn(Option<String>)> = {
+        let host_p2p = host_p2p.clone();
         let room_id_draft = room_id_draft.clone();
         let next_room_draft = next_room_draft.clone();
         let online_setup = online_setup.clone();
@@ -1397,6 +1439,7 @@ fn app(props: &AppProps) -> Html {
         let room_transition_seq = room_transition_seq.clone();
         let pending_created_room = pending_created_room.clone();
         Rc::new(move |error: Option<String>| {
+            host_p2p.set(false);
             let show_setup = error.is_some();
             {
                 let mut seq = room_transition_seq.borrow_mut();
@@ -1438,6 +1481,7 @@ fn app(props: &AppProps) -> Html {
             room_setup_error.set(None);
             online_setup.set(false);
             multiplayer_config.set(Some(app_router::MultiplayerConfig {
+                connection: app_router::MultiplayerConnection::Server,
                 room_id: room_id.clone(),
                 clear_hash: false,
                 resumed: false,
@@ -1445,6 +1489,7 @@ fn app(props: &AppProps) -> Html {
             app_router::save_room_session(&room_id);
             app_router::save_mode_preference(InitMode::Online);
             sync_runtime::init_from_config(Some(app_router::MultiplayerConfig {
+                connection: app_router::MultiplayerConnection::Server,
                 room_id: room_id.clone(),
                 clear_hash: false,
                 resumed: false,
@@ -1551,7 +1596,7 @@ fn app(props: &AppProps) -> Html {
         let admin_status = admin_status.clone();
         let admin_room_id = admin_room_id.clone();
         let admin_token_value = admin_token_active_value.clone();
-        let multiplayer_active = multiplayer_active;
+        let multiplayer_active = multiplayer_active && !p2p_active;
         let online_setup_value = online_setup_value;
         use_effect_with(
             (
@@ -2154,7 +2199,9 @@ fn app(props: &AppProps) -> Html {
                     app_router::clear_location_hash();
                 }
             }
-            sync_runtime::set_state_applied(false);
+            if !config.as_ref().is_some_and(|c| c.is_p2p()) {
+                sync_runtime::set_state_applied(false);
+            }
             bump_sync_revision();
             || ()
         });
@@ -3004,7 +3051,51 @@ fn app(props: &AppProps) -> Html {
             }
         })
     };
+    let on_connection_mode = {
+        let host_p2p = host_p2p.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlSelectElement = event.target_unchecked_into();
+            host_p2p.set(input.value() == "p2p");
+        })
+    };
+    #[cfg(feature = "experimental-p2p")]
+    let on_restore_p2p = {
+        let multiplayer_config = multiplayer_config.clone();
+        let online_setup = online_setup.clone();
+        let room_setup_error = room_setup_error.clone();
+        let room_setup_status = room_setup_status.clone();
+        Callback::from(move |_: MouseEvent| {
+            let Some(snapshot) = crate::p2p_progress::saved_snapshot() else {
+                return;
+            };
+            let config = app_router::MultiplayerConfig {
+                connection: app_router::MultiplayerConnection::P2pHost,
+                room_id: generate_room_id(),
+                clear_hash: false,
+                resumed: false,
+            };
+            match sync_runtime::restore_p2p_host(config.clone(), snapshot) {
+                Ok(()) => {
+                    app_router::clear_location_hash();
+                    room_setup_error.set(None);
+                    room_setup_status.set(RoomSetupStatus::Idle);
+                    online_setup.set(false);
+                    multiplayer_config.set(Some(config));
+                }
+                Err(message) => {
+                    room_setup_error.set(Some(message));
+                    room_setup_status.set(RoomSetupStatus::Failed);
+                }
+            }
+        })
+    };
+    #[cfg(not(feature = "experimental-p2p"))]
+    let on_restore_p2p = Callback::from(|_: MouseEvent| {});
     let on_create_room = {
+        let host_p2p = host_p2p.clone();
+        let app_core = app_core.clone();
+        let multiplayer_config = multiplayer_config.clone();
+        let online_setup = online_setup.clone();
         let admin_token_input = admin_token_input.clone();
         let admin_token_active = admin_token_active.clone();
         let admin_status = admin_status.clone();
@@ -3019,6 +3110,31 @@ fn app(props: &AppProps) -> Html {
         let create_descriptor = local_topology_descriptor.clone();
         let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |_: MouseEvent| {
+            if *host_p2p && cfg!(feature = "experimental-p2p") {
+                let current =
+                    crate::local_snapshot::build_playable_snapshot_from_app(&app_core.snapshot());
+                if !current
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.puzzle.image_ref, PuzzleImageRef::BuiltIn { .. }))
+                {
+                    room_setup_error.set(Some("Load a catalog puzzle before hosting P2P. Private images are not supported yet.".into()));
+                    room_setup_status.set(RoomSetupStatus::Failed);
+                    return;
+                }
+                let config = app_router::MultiplayerConfig {
+                    connection: app_router::MultiplayerConnection::P2pHost,
+                    room_id: generate_room_id(),
+                    clear_hash: false,
+                    resumed: false,
+                };
+                app_router::clear_location_hash();
+                room_setup_error.set(None);
+                room_setup_status.set(RoomSetupStatus::Idle);
+                online_setup.set(false);
+                multiplayer_config.set(Some(config.clone()));
+                sync_runtime::init_from_config(Some(config));
+                return;
+            }
             let room_id = room_id_draft_trimmed.trim().to_string();
             if !room_id_draft_valid {
                 room_setup_status.set(RoomSetupStatus::Failed);
@@ -3133,10 +3249,17 @@ fn app(props: &AppProps) -> Html {
             leave_online_room(None);
         })
     };
+    let renderer_reload_error = use_state(|| None::<String>);
+    let renderer_reloading = use_state(|| false);
     let on_renderer_change = {
+        let renderer_reloading = renderer_reloading.clone();
+        let renderer_reload_error = renderer_reload_error.clone();
         let render_settings = render_settings.clone();
         let app_core = app_core.clone();
         Callback::from(move |event: Event| {
+            if *renderer_reloading {
+                return;
+            }
             let input: HtmlSelectElement = event.target_unchecked_into();
             let next_renderer = match input.value().as_str() {
                 "svg" => RendererKind::Svg,
@@ -3149,12 +3272,34 @@ fn app(props: &AppProps) -> Html {
             }
             let mut next = (*render_settings).clone();
             next.renderer = next_renderer;
-            app_router::save_renderer_preference(next_renderer, &next);
-            render_settings.set(next);
-            app_core.set_renderer_kind(next_renderer);
-            if let Some(window) = web_sys::window() {
-                let _ = window.location().reload();
-            }
+            let render_settings = render_settings.clone();
+            let app_core = app_core.clone();
+            let error = renderer_reload_error.clone();
+            let reloading = renderer_reloading.clone();
+            reloading.set(true);
+            spawn_local(async move {
+                error.set(None);
+                if let Err(message) = sync_runtime::prepare_reload().await {
+                    reloading.set(false);
+                    error.set(Some(format!(
+                        "Could not save P2P room before reloading: {message}"
+                    )));
+                    return;
+                }
+                app_router::save_renderer_preference(next_renderer, &next);
+                if let Err(message) = persisted_store::flush_preferences().await {
+                    reloading.set(false);
+                    error.set(Some(format!(
+                        "Could not save renderer preference: {message}"
+                    )));
+                    return;
+                }
+                render_settings.set(next);
+                app_core.set_renderer_kind(next_renderer);
+                if let Some(window) = web_sys::window() {
+                    let _ = window.location().reload();
+                }
+            });
         })
     };
     let on_animations_toggle = {
@@ -3467,7 +3612,9 @@ fn app(props: &AppProps) -> Html {
         let multiplayer_config = multiplayer_config_value.clone();
         use_effect_with(multiplayer_config, move |config| {
             if let Some(config) = config.as_ref() {
-                app_router::save_room_session(&config.room_id);
+                if !config.is_p2p() {
+                    app_router::save_room_session(&config.room_id);
+                }
             }
             || ()
         });
@@ -3959,6 +4106,29 @@ fn app(props: &AppProps) -> Html {
                     </option>
                 </select>
             </div>
+            { if show_online_setup && cfg!(feature = "experimental-p2p") {
+                html! {
+                    <details class="control-group">
+                        <summary>{ "Advanced host settings" }</summary>
+                        <div class="control">
+                            <label for="connection-mode">{ "Connection mode" }</label>
+                            <select id="connection-mode" onchange={on_connection_mode} disabled={room_setup_busy}>
+                                <option value="server" selected={!p2p_selected}>{ "Server" }</option>
+                                <option value="p2p" selected={p2p_selected}>{ "P2P (experimental)" }</option>
+                            </select>
+                        </div>
+                        { if p2p_selected { html! { <>
+                            <p>{ "Host from your device. Keep the puzzle open so your friend can play. Two players; catalog puzzles only. Progress is saved on this device. Reloads and renderer changes resume the same room automatically." }</p>
+                            { if p2p_restore_available { html! { <>
+                                <button id="restore-p2p" class="control-button" type="button" onclick={on_restore_p2p} disabled={room_setup_busy}>{ "Restore saved P2P puzzle" }</button>
+                                <p>{ "Starts a new session with a new invite. Your friend will need the new link." }</p>
+                            </> } } else { html! {} } }
+                            { if let Some(message) = p2p_restore_error { html! { <p>{ message }</p> } } else { html! {} } }
+                        </> } } else { html! {} } }
+                    </details>
+                }
+            } else { html! {} } }
+            { if !p2p_active && !p2p_selected { html! {
             <div class="control">
                 <label for="admin-token">
                     { "Admin token" }
@@ -3978,9 +4148,11 @@ fn app(props: &AppProps) -> Html {
                 </button>
                 <span class="control-value">{ admin_status_label }</span>
             </div>
+            } } else { html! {} } }
             { if show_online_setup {
                 html! {
                     <>
+                        { if !p2p_selected { html! { <>
                         <div class="control">
                             <label for="room-id-draft">{ "Room id" }</label>
                             <input
@@ -4004,16 +4176,20 @@ fn app(props: &AppProps) -> Html {
                                 disabled={room_setup_busy}
                             />
                         </div>
+                        </>
+                        } } else { html! {} } }
                         <div class="control">
                             <button
                                 class="control-button"
                                 type="button"
+                                id="create-room"
                                 onclick={on_create_room}
                                 disabled={room_setup_busy}
                             >
-                                { "Create room" }
+                                { if p2p_selected { "Host puzzle" } else { "Create room" } }
                             </button>
                         </div>
+                        { if !p2p_selected { html! {
                         <div class="control">
                             <button
                                 class="control-button"
@@ -4024,6 +4200,7 @@ fn app(props: &AppProps) -> Html {
                                 { "Join room" }
                             </button>
                         </div>
+                        } } else { html! {} } }
                         { if !room_setup_status_text.is_empty() {
                             html! {
                                 <div class="control">
@@ -4060,6 +4237,7 @@ fn app(props: &AppProps) -> Html {
                             <button
                                 class="control-button"
                                 type="button"
+                                id="leave-room"
                                 onclick={on_leave_room}
                             >
                                 { "Leave room" }
@@ -4077,6 +4255,9 @@ fn app(props: &AppProps) -> Html {
                                 <span class="control-value">{ mp_connection_label }</span>
                             </label>
                         </div>
+                        { if let Some(status) = sync_view.p2p().and_then(|p| p.save_status.clone()) {
+                            html! { <p id="p2p-save-status" role="status">{ status }</p> }
+                        } else { html! {} } }
                         { if admin_enabled {
                             // Puzzle configuration (art, topology, pieces,
                             // regenerate, scramble, private upload) lives in
@@ -4169,6 +4350,7 @@ fn app(props: &AppProps) -> Html {
                     id="renderer-select"
                     value={renderer_value}
                     onchange={on_renderer_change}
+                    disabled={*renderer_reloading}
                 >
                     <option value="wgpu" selected={renderer_kind == RendererKind::Wgpu}>
                         { "WGPU" }
@@ -4177,6 +4359,9 @@ fn app(props: &AppProps) -> Html {
                         { "SVG" }
                     </option>
                 </select>
+                { if let Some(message) = &*renderer_reload_error {
+                    html! { <p role="alert">{ message }</p> }
+                } else { html! {} } }
             </div>
             <div class="control">
                 <label for="image-max-dim">
@@ -4891,9 +5076,9 @@ fn app(props: &AppProps) -> Html {
     } else {
         html! {}
     };
-    let sync_status = if multiplayer_active {
+    let sync_status = if multiplayer_active && !sync_view.connected() {
         html! {
-            <div class="sync-status" title="Server disconnected">
+            <div class="sync-status" title={if p2p_active { "P2P disconnected" } else { "Server disconnected" }}>
                 { "!" }
             </div>
         }
@@ -5071,6 +5256,193 @@ mod tests {
         assert!(text.contains("Create room"));
         assert!(text.contains("Join room"));
 
+        root.remove();
+    }
+
+    #[cfg(feature = "experimental-p2p")]
+    #[wasm_bindgen_test(async)]
+    async fn p2p_host_setting_keeps_server_default_and_hosts_current_puzzle() {
+        set_panic_hook();
+        boot_runtime::set_boot_state(BootState::Ready);
+        sync_runtime::init_from_config(None);
+        let core = AppCore::new();
+        sync_runtime::attach_core(core.clone());
+        crate::multiplayer_bridge::install(core.clone());
+        let document = web_sys::window().unwrap().document().unwrap();
+        let root = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&root).unwrap();
+        let app = yew::Renderer::<App>::with_root_and_props(
+            root.clone(),
+            AppProps { core: core.clone() },
+        )
+        .render();
+        TimeoutFuture::new(50).await;
+        let mode = document
+            .get_element_by_id("mode-select")
+            .unwrap()
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        mode.set_value("online");
+        mode.dispatch_event(&Event::new("change").unwrap()).unwrap();
+        TimeoutFuture::new(50).await;
+        let connection = document
+            .get_element_by_id("connection-mode")
+            .unwrap()
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        assert_eq!(connection.value(), "server");
+        assert!(document.get_element_by_id("admin-token").is_some());
+        connection.set_value("p2p");
+        connection
+            .dispatch_event(&Event::new("change").unwrap())
+            .unwrap();
+        TimeoutFuture::new(50).await;
+        assert!(document.get_element_by_id("admin-token").is_none());
+        assert!(document.get_element_by_id("room-id-draft").is_none());
+        assert!(root.text_content().unwrap().contains("P2P (experimental)"));
+        assert!(!root.text_content().unwrap().contains("iroh"));
+        let entry = &PUZZLE_CATALOG[0];
+        let dims = logical_image_size(entry.width, entry.height, core.image_max_dim());
+        core.set_puzzle_with_topology(
+            entry.label.into(),
+            PuzzleImageRef::BuiltIn {
+                slug: entry.slug.into(),
+            },
+            dims,
+            TopologySpec::grid(2, 1),
+            Some(42),
+        );
+        let expected =
+            crate::local_snapshot::build_playable_snapshot_from_app(&core.snapshot()).unwrap();
+        document
+            .get_element_by_id("create-room")
+            .unwrap()
+            .dispatch_event(&Event::new("click").unwrap())
+            .unwrap();
+        let started = Date::now();
+        loop {
+            if sync_runtime::sync_view().connected() {
+                break;
+            }
+            assert!(
+                Date::now() - started < 10_000.0,
+                "local P2P host did not initialise"
+            );
+            TimeoutFuture::new(25).await;
+        }
+        let actual =
+            crate::local_snapshot::build_playable_snapshot_from_app(&core.snapshot()).unwrap();
+        assert_eq!(
+            heddobureika_core::encode(&actual.state),
+            heddobureika_core::encode(&expected.state)
+        );
+        assert_eq!(actual.scramble_nonce, expected.scramble_nonce);
+        assert!(sync_runtime::sync_view().p2p().unwrap().hosting);
+        assert!(persisted_store::boot_record().room_session.is_none());
+        let old_room = sync_runtime::sync_view().room_id().unwrap().to_string();
+        let sync = sync_runtime::multiplayer_handle().unwrap();
+        sync.borrow()
+            .send(heddobureika_core::ClientMsg::Select { piece_id: 0 });
+        sync.borrow().send(heddobureika_core::ClientMsg::Move {
+            piece_id: 0,
+            drop_pos: heddobureika_core::PlayablePositionSnapshot {
+                x_mm: 1.0,
+                y_mm: 0.75,
+            },
+            client_seq: 1,
+            base_revision: 0,
+        });
+        let saved = loop {
+            if let Some(saved) = crate::p2p_progress::saved_snapshot() {
+                let pose = saved
+                    .restore_playable_from_spec()
+                    .unwrap()
+                    .piece_world_pose(heddobureika_core::PieceId(0))
+                    .unwrap();
+                if (pose.x_mm() - 1.0).abs() < 0.001 && (pose.y_mm() - 0.75).abs() < 0.001 {
+                    break saved;
+                }
+            }
+            assert!(
+                Date::now() - started < 15_000.0,
+                "host progress was not committed"
+            );
+            TimeoutFuture::new(25).await;
+        };
+        TimeoutFuture::new(25).await;
+        document
+            .get_element_by_id("leave-room")
+            .unwrap()
+            .dispatch_event(&Event::new("click").unwrap())
+            .unwrap();
+        TimeoutFuture::new(25).await;
+        assert!(!sync_runtime::p2p_active());
+        let mode = document
+            .get_element_by_id("mode-select")
+            .unwrap()
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        mode.set_value("online");
+        mode.dispatch_event(&Event::new("change").unwrap()).unwrap();
+        TimeoutFuture::new(25).await;
+        let connection = document
+            .get_element_by_id("connection-mode")
+            .unwrap()
+            .dyn_into::<HtmlSelectElement>()
+            .unwrap();
+        assert_eq!(
+            connection.value(),
+            "server",
+            "new hosting flow must default to Server"
+        );
+        // Re-read persisted bytes, as boot does after a reload, and change the
+        // currently loaded local puzzle to prove restore uses the saved host.
+        persisted_store::bootstrap().await.unwrap();
+        let other = &PUZZLE_CATALOG[1];
+        let dims = logical_image_size(other.width, other.height, core.image_max_dim());
+        core.set_puzzle_with_topology(
+            other.label.into(),
+            PuzzleImageRef::BuiltIn {
+                slug: other.slug.into(),
+            },
+            dims,
+            TopologySpec::grid(3, 1),
+            Some(99),
+        );
+        connection.set_value("p2p");
+        connection
+            .dispatch_event(&Event::new("change").unwrap())
+            .unwrap();
+        TimeoutFuture::new(50).await;
+        document
+            .get_element_by_id("restore-p2p")
+            .expect("saved host restore action")
+            .dispatch_event(&Event::new("click").unwrap())
+            .unwrap();
+        let restoring = Date::now();
+        loop {
+            if sync_runtime::sync_view().connected()
+                && sync_runtime::sync_view().room_id() != Some(old_room.as_str())
+            {
+                break;
+            }
+            assert!(
+                Date::now() - restoring < 10_000.0,
+                "restored host did not initialise"
+            );
+            TimeoutFuture::new(25).await;
+        }
+        let restored =
+            crate::local_snapshot::build_playable_snapshot_from_app(&core.snapshot()).unwrap();
+        assert_eq!(
+            heddobureika_core::encode(&restored.state),
+            heddobureika_core::encode(&saved.state)
+        );
+        assert_eq!(restored.puzzle.image_ref, saved.puzzle.image_ref);
+        assert_eq!(restored.scramble_nonce, saved.scramble_nonce);
+        assert!(sync_runtime::sync_view().ownership_by_anchor().is_empty());
+        sync_runtime::init_from_config(None);
+        app.destroy();
         root.remove();
     }
 

@@ -174,7 +174,9 @@ impl MultiplayerBridgeState {
         _client_id: Option<ClientId>,
     ) {
         self.init_pending.set(!initialized);
-        crate::boot::note_room(&room_id);
+        if !sync_runtime::p2p_active() {
+            crate::boot::note_room(&room_id);
+        }
         *self.room_id.borrow_mut() = Some(room_id);
         self.asset_downloads.borrow_mut().clear();
         self.requested_assets.borrow_mut().clear();
@@ -309,7 +311,16 @@ impl MultiplayerBridgeState {
 
     fn handle_drop_not_ready(&self) {}
 
-    fn handle_error(&self, _code: String, _message: String) {}
+    fn handle_error(&self, code: String, _message: String) {
+        if code == "p2p_reset" || code == "p2p_paused" {
+            self.core.cancel_drag();
+            self.pending_by_anchor.borrow_mut().clear();
+            self.pending_snaps.borrow_mut().clear();
+            self.pending_flips.borrow_mut().clear();
+            self.pending_detaches.borrow_mut().clear();
+            let _ = self.apply_predicted_state(false);
+        }
+    }
 
     fn handle_asset(self: &Rc<Self>, event: AssetEvent) {
         match event {
@@ -1294,6 +1305,151 @@ mod tests {
         }
         core.set_hovered(Some(1));
         assert!(!state.init_pending.get());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn ownership_revisions_preserve_moves_and_same_revision_snaps() {
+        use crate::multiplayer_game_sync::MultiplayerGameSync;
+        use heddobureika_core::{OwnershipReason, ServerMsg, encode};
+
+        console_error_panic_hook::set_once();
+        let initial = unsnapped_two_piece_game().to_snapshot();
+        let state = Rc::new(MultiplayerBridgeState::new(AppCore::new()));
+        let mut sync = MultiplayerGameSync::new();
+        let handler = sync.install_handler(state.build_hooks());
+        handler(ServerMsg::State {
+            seq: initial.seq,
+            snapshot: initial.clone(),
+        });
+        sync.set_state_applied(true);
+        let mut canonical = AppGameState::from_snapshot(initial.clone()).unwrap();
+        let ownership = |seq, anchor, reason| ServerMsg::ControlUpdate {
+            seq,
+            update: RoomControlUpdate::Ownership {
+                group_anchor: anchor,
+                owner: None,
+                reason,
+            },
+            source: None,
+            client_seq: None,
+        };
+        let assert_canonical = |canonical: &AppGameState| {
+            let local = state.local_state.borrow();
+            let local = local.as_ref().unwrap();
+            assert_eq!(local.seq, canonical.seq);
+            assert_eq!(
+                encode(&local.to_snapshot().state),
+                encode(&canonical.to_snapshot().state)
+            );
+        };
+
+        // Reconnect release, lease expiry, and two consecutive expiries must
+        // each leave a held group's subsequent deltas applicable.
+        for (reason, releases) in [
+            (OwnershipReason::Released, 1),
+            (OwnershipReason::Timeout, 1),
+            (OwnershipReason::Timeout, 2),
+        ] {
+            for anchor in 0..releases {
+                canonical.playable.revision += 1;
+                handler(ownership(canonical.playable.revision, anchor, reason));
+            }
+            let group = canonical.playable.logical.group_of(PieceId(0)).unwrap();
+            let batch = canonical.playable.apply_action_only(
+                PlayableAction::TranslateGroup {
+                    group,
+                    drop_pos: Position2::try_from_mm(1.5, 1.5).unwrap(),
+                },
+                None,
+            );
+            let update = PlayableRoomUpdate::from_batch_and_playable(
+                PlayableRoomUpdateKind::ActionOnly,
+                &batch,
+                &canonical.playable,
+            );
+            canonical.seq = update.revision_after;
+            handler(ServerMsg::PlayableUpdate {
+                seq: canonical.seq,
+                update,
+                source: None,
+                client_seq: None,
+            });
+            assert_canonical(&canonical);
+        }
+
+        // Final placement releases ownership BEFORE its snap at the same seq.
+        // Eagerly committing that ownership revision would reject this merge.
+        let group = canonical.playable.logical.group_of(PieceId(0)).unwrap();
+        let batch = canonical.playable.apply_action_with_snap(
+            PlayableAction::TranslateGroup {
+                group,
+                drop_pos: Position2::try_from_mm(2.0, 0.5).unwrap(),
+            },
+            None,
+            MergePolicy::KeepFixedGroup,
+        );
+        let update = PlayableRoomUpdate::from_batch_and_playable(
+            PlayableRoomUpdateKind::Snap,
+            &batch,
+            &canonical.playable,
+        );
+        assert!(
+            !update.activated_edges.is_empty(),
+            "test must exercise a real merge"
+        );
+        canonical.seq = update.revision_after;
+        handler(ownership(canonical.seq, 0, OwnershipReason::Released));
+        let message = ServerMsg::PlayableUpdate {
+            seq: canonical.seq,
+            update,
+            source: None,
+            client_seq: None,
+        };
+        handler(message.clone());
+        handler(message); // Duplicates must remain harmless.
+        assert_canonical(&canonical);
+
+        // A reset must discard deferred ownership from the previous timeline.
+        handler(ownership(canonical.seq + 100, 0, OwnershipReason::Timeout));
+        handler(ServerMsg::Welcome {
+            room_id: "P2Ptest001".into(),
+            persistence: RoomPersistence::BestEffort,
+            initialized: true,
+            client_id: Some(ClientId(1)),
+        });
+        handler(ServerMsg::State {
+            seq: initial.seq,
+            snapshot: initial.clone(),
+        });
+        canonical = AppGameState::from_snapshot(initial).unwrap();
+        canonical.playable.revision += 1;
+        handler(ownership(
+            canonical.playable.revision,
+            1,
+            OwnershipReason::Released,
+        ));
+        let group = canonical.playable.logical.group_of(PieceId(0)).unwrap();
+        let batch = canonical.playable.apply_action_only(
+            PlayableAction::TranslateGroup {
+                group,
+                drop_pos: Position2::try_from_mm(1.5, 1.5).unwrap(),
+            },
+            None,
+        );
+        let update = PlayableRoomUpdate::from_batch_and_playable(
+            PlayableRoomUpdateKind::ActionOnly,
+            &batch,
+            &canonical.playable,
+        );
+        canonical.seq = update.revision_after;
+        handler(ServerMsg::PlayableUpdate {
+            seq: canonical.seq,
+            update,
+            source: None,
+            client_seq: None,
+        });
+        assert_canonical(&canonical);
     }
 
     #[test]

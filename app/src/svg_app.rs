@@ -436,12 +436,6 @@ pub(crate) fn run(core: Rc<AppCore>) {
         let _ = svg.append_child(&puzzle_group);
         let _ = root.append_child(&svg);
 
-        let sync_status = document.create_element("div").expect("create sync status");
-        sync_status.set_class_name("sync-status");
-        let _ = sync_status.set_attribute("title", "Server disconnected");
-        sync_status.set_text_content(Some("!"));
-        let _ = root.append_child(&sync_status);
-
         let render_settings = app_router::load_render_settings_with_init();
         let view = Rc::new(SvgView::new(
             core.clone(),

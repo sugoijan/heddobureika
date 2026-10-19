@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["app", "core", "game", "worker", "cli", "image_pipeline", "xtask"]
+members = ["app", "core", "game", "session", "p2p", "worker", "cli", "image_pipeline", "xtask"]
 default-members = ["app"]
 
 [workspace.package]
@@ -10,8 +10,11 @@ rust-version = "1.96"
 license = "CC-BY-NC-SA-4.0"
 
 [workspace.dependencies]
+futures-channel = "0.3"
 # local crates
 heddobureika-core.path = "core"
+heddobureika-session.path = "session"
+heddobureika-p2p.path = "p2p"
 image-pipeline = { package = "heddobureika-image-pipeline", path = "image_pipeline" }
 
 # app / web
