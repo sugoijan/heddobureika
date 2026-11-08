@@ -405,7 +405,7 @@ impl MultiplayerBridgeState {
                     }
                     #[cfg(target_arch = "wasm32")]
                     {
-                        crate::wgpu_app::request_render();
+                        crate::wgpu_app::private_image_stored(&hash);
                         crate::svg_app::request_render();
                     }
                 });

@@ -359,6 +359,14 @@ pub(crate) fn request_render() {
     });
 }
 
+/// Tells the renderer a downloaded private image is now in the local store.
+pub(crate) fn private_image_stored(hash: &str) {
+    let view = WGPU_VIEW.with(|slot| slot.borrow().clone());
+    if let Some(view) = view {
+        view.retry_private_image(hash);
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct PuzzleKey {
     image_ref: PuzzleImageRef,
@@ -730,6 +738,19 @@ impl WgpuView {
             view.load_image_for_puzzle(key, url, image_max_dim, render_scale);
         });
         None
+    }
+
+    /// A first-time room joiner misses the local store while the image is still
+    /// downloading. `ensure_puzzle_image` only runs once per puzzle, so without
+    /// this retry the image never loads and the boot shell never clears.
+    fn retry_private_image(self: &Rc<Self>, hash: &str) {
+        let missed = self.private_image_error.borrow().as_deref() == Some(hash);
+        let key = self.last_puzzle.borrow().clone();
+        if let (true, Some(key)) = (missed, key) {
+            self.private_image_error.borrow_mut().take();
+            self.ensure_private_image_src(hash, key);
+        }
+        self.request_render();
     }
 
     fn update_viewport_size(&self) {
