@@ -24,7 +24,7 @@ Requirements:
 - Node.js 22 (at least 22.12), 24, or 26+ (24 LTS recommended)
 - `just`
 - `trunk` (for frontend dev)
-- `pnpm` 12.14.0 (install with `npm install -g pnpm@12.14.0`; for JS tooling, including `pnpm exec wrangler` for worker dev)
+- `pnpm` 12.18.0 (install with `npm install -g pnpm@12.18.0`; for JS tooling, including `pnpm exec wrangler` for worker dev)
 - `worker-build` (`cargo install worker-build`)
 
 If an older Corepack shim cannot launch pnpm 12, run `corepack disable pnpm` before installing pnpm with npm.
