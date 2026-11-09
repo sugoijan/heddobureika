@@ -2,13 +2,13 @@ use crate::core::{
     CORNER_RADIUS_RATIO, DRAG_SCALE, EMBOSS_OPACITY, EMBOSS_RIM, PuzzleRenderGeometry,
     WGPU_EDGE_AA_DEFAULT, WGPU_RENDER_SCALE_MIN,
 };
+use crate::web::now_ms;
 use bytemuck::{Pod, Zeroable};
 use glyphon::cosmic_text::Align;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use js_sys::Date;
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Path2d, console};
@@ -692,10 +692,6 @@ struct IconAtlas {
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: Rc<wgpu::BindGroup>,
-}
-
-fn now_ms() -> f32 {
-    (Date::now() % 1_000_000.0) as f32
 }
 
 pub(crate) struct WgpuRenderer {
@@ -2104,13 +2100,13 @@ impl WgpuRenderer {
                     // shadow under them, so a group never shadows itself.
                     render_pass.set_pipeline(&self.pipeline_shadow);
                     render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
-                    render_pass.set_vertex_buffer(1, slice.clone());
+                    render_pass.set_vertex_buffer(1, slice);
                     render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
                 }
                 if span.draw_outline {
                     render_pass.set_pipeline(&self.pipeline_outline);
                     render_pass.set_bind_group(0, &self.bind_group_outline, &[]);
-                    render_pass.set_vertex_buffer(1, slice.clone());
+                    render_pass.set_vertex_buffer(1, slice);
                     render_pass.draw_indexed(0..self.index_count, 0, 0..span.count);
                 }
                 if let Some(edge_vbuf) = &self.flip_edge_buffer {
@@ -2131,7 +2127,7 @@ impl WgpuRenderer {
                             render_pass.set_pipeline(&self.pipeline_flip_edge);
                             render_pass.set_bind_group(0, &self.bind_group_fill, &[]);
                             render_pass.set_vertex_buffer(0, edge_vbuf.slice(..));
-                            render_pass.set_vertex_buffer(1, slice.clone());
+                            render_pass.set_vertex_buffer(1, slice);
                             bound = true;
                         }
                         let inst = edge.instance_index - span.start;
@@ -3005,7 +3001,7 @@ impl WgpuRenderer {
     }
 }
 
-fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
+pub(crate) fn measure_text_bounds(buffer: &Buffer) -> (f32, f32) {
     let mut max_width = 0.0;
     let mut max_height = 0.0;
     for run in buffer.layout_runs() {
@@ -3099,7 +3095,7 @@ fn gaussian_blur_rgba(pixels: &mut [u8], width: u32, height: u32, radius: usize,
     let h = height as i32;
     let r = radius as i32;
     let stride = (width * 4) as usize;
-    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut kernel = Vec::with_capacity(radius * 2 + 1);
     let mut sum = 0.0f32;
     for i in -r..=r {
         let x = i as f32;

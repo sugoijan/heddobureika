@@ -163,10 +163,6 @@ impl<T: PuzzleTopology> LogicalState<T> {
         &self.edge_active
     }
 
-    pub fn piece_slots(&self) -> &[PieceSlot] {
-        &self.pieces
-    }
-
     pub fn group_slots(&self) -> &[GroupSlot] {
         &self.groups
     }

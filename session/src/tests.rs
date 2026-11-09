@@ -559,8 +559,8 @@ fn bridge_flip_honors_client_supplied_drop_pose() {
         y_mm: 1.75,
         rotation_deg: 0.0,
     };
-    let _ = apply_bridge_flip(&mut live, 0, true, Some(pivoted.clone()), ActionId(9))
-        .expect("flip applies");
+    let _ =
+        apply_bridge_flip(&mut live, 0, true, Some(pivoted), ActionId(9)).expect("flip applies");
     let pose = live.playable.pose_of(group).expect("group pose");
     assert!(
         (pose.x_mm() - pivoted.x_mm).abs() <= 1.0e-3

@@ -31,7 +31,7 @@ where
 {
     let align = core::mem::align_of::<T::Archived>();
     let ptr = bytes.as_ptr() as usize;
-    if align <= 1 || ptr % align == 0 {
+    if align <= 1 || ptr.is_multiple_of(align) {
         return rkyv::from_bytes::<T, Error>(bytes);
     }
 

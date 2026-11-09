@@ -2,6 +2,7 @@
 
 use crate::delta::PlayableDelta;
 use crate::ids::{GroupId, PieceId};
+use crate::math::shortest_angle_delta;
 use crate::playable::{PlayableState, Pose2};
 use crate::topology::PuzzleTopology;
 use crate::units::{AngleDeg, LengthMm};
@@ -379,14 +380,4 @@ fn lerp_pose(from: Pose2, to: Pose2, amount: f32) -> Pose2 {
 
 fn lerp(from: f32, to: f32, amount: f32) -> f32 {
     from + (to - from) * amount
-}
-
-fn shortest_angle_delta(from: f32, to: f32) -> f32 {
-    let mut delta = (to - from) % 360.0;
-    if delta < -180.0 {
-        delta += 360.0;
-    } else if delta > 180.0 {
-        delta -= 360.0;
-    }
-    delta
 }

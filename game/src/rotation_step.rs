@@ -1,5 +1,8 @@
 //! Shared step-rotation solver for piece and group symmetry sets.
 
+use std::sync::OnceLock;
+
+use crate::math::shortest_angle_delta;
 use crate::units::AngleDeg;
 
 const SYMMETRY_EPSILON_DEG: f32 = 1.0e-3;
@@ -354,11 +357,28 @@ fn aggregate_weak_symmetry(pieces: &[(&[AngleDeg], SymmetryStrength)]) -> Vec<An
 }
 
 fn circular_angle_distance(a: f32, b: f32) -> f32 {
-    let mut diff = (a - b).abs() % 360.0;
-    if diff > 180.0 {
-        diff = 360.0 - diff;
-    }
-    diff
+    shortest_angle_delta(a, b).abs()
+}
+
+/// Symmetry angles of a shape invariant under quarter turns (square grid
+/// pieces, half triangles, hexagonal boundary pieces).
+pub fn symmetry_angles_90() -> &'static [AngleDeg] {
+    static ANGLES: OnceLock<Box<[AngleDeg]>> = OnceLock::new();
+    ANGLES.get_or_init(|| symmetry_angles_with_step(90.0))
+}
+
+/// Symmetry angles of a shape invariant under sixth turns (regular
+/// triangles and hexagons).
+pub fn symmetry_angles_60() -> &'static [AngleDeg] {
+    static ANGLES: OnceLock<Box<[AngleDeg]>> = OnceLock::new();
+    ANGLES.get_or_init(|| symmetry_angles_with_step(60.0))
+}
+
+fn symmetry_angles_with_step(step_deg: f32) -> Box<[AngleDeg]> {
+    let count = (360.0 / step_deg).round() as usize;
+    (1..count)
+        .map(|k| AngleDeg::try_new(step_deg * k as f32).expect("finite"))
+        .collect()
 }
 
 #[cfg(test)]

@@ -16,13 +16,14 @@ use crate::edge_profile::{
     ConnectorShape, EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments,
 };
 use crate::ids::EdgeId;
+use crate::math::{rand_range, splitmix32};
 use crate::shape::{PathMm, PathSegMm, PointMm};
 
-const TAB_DEPTH_LIMIT: f32 = 0.24;
-const TAB_WIDTH_AVG_MIN: f32 = 0.075;
-const TAB_WIDTH_AVG_MAX: f32 = 0.115;
-const TAB_DEPTH_AVG_MIN: f32 = 0.055;
-const TAB_DEPTH_AVG_MAX: f32 = 0.075;
+pub(crate) const TAB_DEPTH_LIMIT: f32 = 0.24;
+pub(crate) const TAB_WIDTH_AVG_MIN: f32 = 0.075;
+pub(crate) const TAB_WIDTH_AVG_MAX: f32 = 0.115;
+pub(crate) const TAB_DEPTH_AVG_MIN: f32 = 0.055;
+pub(crate) const TAB_DEPTH_AVG_MAX: f32 = 0.075;
 
 /// 2D point in pixel coordinates, shared by every shaper.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -116,7 +117,14 @@ pub fn profiled_path_with_sign(
             connector: Some(params),
         };
         let segments = build_edge_profile_segments(EdgeShapeStyle::Classic, &input);
-        let fits = connector_segments_fit_frame(start, end, &segments, frame_width, frame_height);
+        let fits = connector_segments_fit_frame(
+            start,
+            end,
+            &segments,
+            frame_width,
+            frame_height,
+            FRAME_FIT_TOLERANCE_PX,
+        );
         let path = path_from_connector_segments(start, end, &segments)?;
         if fits {
             return Some(path);
@@ -168,12 +176,13 @@ pub fn reverse_path(path: &PathMm) -> PathMm {
     PathMm::new(current, segs.into_boxed_slice(), false)
 }
 
-fn connector_segments_fit_frame(
+pub(crate) fn connector_segments_fit_frame(
     start: Point2,
     end: Point2,
     segments: &[ConnectorSeg],
     frame_width: f32,
     frame_height: f32,
+    tolerance: f32,
 ) -> bool {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
@@ -192,7 +201,7 @@ fn connector_segments_fit_frame(
                 let candidates = [*c1, *c2, *to];
                 for local in candidates {
                     let p = map_local(start, tx, ty, nx, ny, local);
-                    if !point_in_frame(p, frame_width, frame_height) {
+                    if !point_in_frame(p, frame_width, frame_height, tolerance) {
                         return false;
                     }
                 }
@@ -201,7 +210,7 @@ fn connector_segments_fit_frame(
         };
         for local in points {
             let p = map_local(start, tx, ty, nx, ny, *local);
-            if !point_in_frame(p, frame_width, frame_height) {
+            if !point_in_frame(p, frame_width, frame_height, tolerance) {
                 return false;
             }
         }
@@ -209,7 +218,7 @@ fn connector_segments_fit_frame(
     true
 }
 
-fn path_from_connector_segments(
+pub(crate) fn path_from_connector_segments(
     start: Point2,
     end: Point2,
     segments: &[ConnectorSeg],
@@ -242,11 +251,16 @@ fn path_from_connector_segments(
         }
     }
     let mut path = PathMm::new(point(start)?, path_segments.into_boxed_slice(), false);
-    set_path_end_point(&mut path, point(end)?);
+    path.set_end_point(point(end)?);
     Some(path)
 }
 
-fn connector_for_edge(seed: u32, edge: EdgeId, len: f32, average_edge_len: f32) -> ConnectorShape {
+pub(crate) fn connector_for_edge(
+    seed: u32,
+    edge: EdgeId,
+    len: f32,
+    average_edge_len: f32,
+) -> ConnectorShape {
     let base = seed ^ edge.as_u32().wrapping_mul(0x9E37_79B9);
     let average = average_edge_len.max(1.0e-5);
     let tab_width = average * rand_range(base, 0, TAB_WIDTH_AVG_MIN, TAB_WIDTH_AVG_MAX);
@@ -266,29 +280,37 @@ fn connector_for_edge(seed: u32, edge: EdgeId, len: f32, average_edge_len: f32) 
     }
 }
 
-fn map_local(start: Point2, tx: f32, ty: f32, nx: f32, ny: f32, local: (f32, f32)) -> Point2 {
+pub(crate) fn map_local(
+    start: Point2,
+    tx: f32,
+    ty: f32,
+    nx: f32,
+    ny: f32,
+    local: (f32, f32),
+) -> Point2 {
     Point2 {
         x: start.x + tx * local.0 + nx * local.1,
         y: start.y + ty * local.0 + ny * local.1,
     }
 }
 
-fn point_in_frame(p: Point2, frame_width: f32, frame_height: f32) -> bool {
-    // Tolerance is in pixels. The check sees cubic-Bézier *control*
-    // points, which routinely sit 1–2 px outside the actual curve for
-    // a tab on a short edge. The pre-existing 0.01-px tolerance was
-    // strict enough that short partial-clipped border-piece edges
-    // would fall back to straight lines — even though the visible
-    // bulge stays well inside the frame. 2 px lets those through
-    // while still rejecting tabs that genuinely escape the puzzle.
-    let epsilon = 2.0;
+/// Frame-fit tolerance in pixels. The check sees cubic-Bézier *control*
+/// points, which routinely sit 1–2 px outside the actual curve for a tab on
+/// a short edge. The pre-existing 0.01-px tolerance was strict enough that
+/// short partial-clipped border-piece edges would fall back to straight
+/// lines — even though the visible bulge stays well inside the frame. 2 px
+/// lets those through while still rejecting tabs that genuinely escape the
+/// puzzle.
+pub(crate) const FRAME_FIT_TOLERANCE_PX: f32 = 2.0;
+
+pub(crate) fn point_in_frame(p: Point2, frame_width: f32, frame_height: f32, epsilon: f32) -> bool {
     p.x >= -epsilon
         && p.y >= -epsilon
         && p.x <= frame_width + epsilon
         && p.y <= frame_height + epsilon
 }
 
-fn point(value: Point2) -> Option<PointMm> {
+pub(crate) fn point(value: Point2) -> Option<PointMm> {
     let x = if value.x > -0.01 && value.x < 0.0 {
         0.0
     } else {
@@ -302,39 +324,10 @@ fn point(value: Point2) -> Option<PointMm> {
     PointMm::try_from_mm(x, y)
 }
 
-fn set_path_end_point(path: &mut PathMm, target: PointMm) {
-    if let Some(last) = path.segs.last_mut() {
-        match last {
-            PathSegMm::LineTo { to } => *to = target,
-            PathSegMm::CubicTo { to, .. } => *to = target,
-        }
-    } else {
-        path.start = target;
-    }
-}
-
-fn distance(a: Point2, b: Point2) -> f32 {
+pub(crate) fn distance(a: Point2, b: Point2) -> f32 {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     (dx * dx + dy * dy).sqrt()
-}
-
-fn splitmix32(mut value: u32) -> u32 {
-    value = value.wrapping_add(0x9E37_79B9);
-    let mut z = value;
-    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
-    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
-    z ^ (z >> 16)
-}
-
-fn rand_unit(seed: u32, salt: u32) -> f32 {
-    let mixed = splitmix32(seed ^ salt);
-    let top = mixed >> 8;
-    top as f32 / ((1u32 << 24) as f32)
-}
-
-fn rand_range(seed: u32, salt: u32, min: f32, max: f32) -> f32 {
-    min + (max - min) * rand_unit(seed, salt)
 }
 
 // ---------------------------------------------------------------------
@@ -365,7 +358,7 @@ pub fn arc_cubic_path(start: Point2, end: Point2, centre: Point2) -> Option<Path
 /// segment was appended, `Some(false)` if the sweep is effectively
 /// zero (caller should emit a straight line), or `None` if any
 /// generated `PointMm` couldn't be constructed.
-fn push_arc_cubic_seg(
+pub(crate) fn push_arc_cubic_seg(
     out: &mut Vec<PathSegMm>,
     start: Point2,
     end: Point2,
@@ -504,36 +497,6 @@ impl BoundaryArcClassifier {
 
     pub fn radius(&self) -> f32 {
         self.radius
-    }
-
-    /// Returns the two transition points (where the arc meets the
-    /// straight sections) for the corner closest to `(cx, cy)`. Used
-    /// by callers that need to inset a sharp-corner polygon vertex
-    /// onto the rounded outline.
-    pub fn corner_transitions(&self, cx: f32, cy: f32) -> [Point2; 2] {
-        let idx = self
-            .nearest_corner_idx(Point2 { x: cx, y: cy })
-            .unwrap_or(0);
-        self.arcs[idx].transitions
-    }
-
-    fn nearest_corner_idx(&self, p: Point2) -> Option<usize> {
-        let mut best: Option<(usize, f32)> = None;
-        for (i, arc) in self.arcs.iter().enumerate() {
-            let cx = match arc.corner {
-                FrameCorner::TopLeft | FrameCorner::BottomLeft => 0.0,
-                FrameCorner::TopRight | FrameCorner::BottomRight => self.width,
-            };
-            let cy = match arc.corner {
-                FrameCorner::TopLeft | FrameCorner::TopRight => 0.0,
-                FrameCorner::BottomLeft | FrameCorner::BottomRight => self.height,
-            };
-            let d = (p.x - cx).hypot(p.y - cy);
-            if best.is_none_or(|(_, b)| d < b) {
-                best = Some((i, d));
-            }
-        }
-        best.map(|(i, _)| i)
     }
 
     fn in_arc_quadrant(&self, p: Point2, arc: &ArcInfo) -> bool {

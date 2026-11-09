@@ -784,7 +784,7 @@ fn neighbour_in_direction(
 ) -> Option<PieceId> {
     let c = col as i32;
     let r = row_in_col as i32;
-    let (n_col, n_row) = if col % 2 == 0 {
+    let (n_col, n_row) = if col.is_multiple_of(2) {
         match side_idx {
             0 => (c + 1, r - 1), // NE
             1 => (c + 1, r),     // SE
@@ -862,7 +862,7 @@ mod tests {
         // 4 corners + 1 top cut + 1 bottom cut + 1 left cut + 1 right
         // cut + 4 tangents = 12 border pieces; piece 6 is interior.
         let interior_count = (0..topology.piece_count() as usize)
-            .filter(|&i| topology.is_frame_border_piece(PieceId(i as u32)) == false)
+            .filter(|&i| !topology.is_frame_border_piece(PieceId(i as u32)))
             .count();
         assert_eq!(interior_count, 1);
     }
@@ -943,7 +943,7 @@ mod tests {
                 .max(2.0);
             let init_rows = init_rows_f.round() as u32;
             let mut init_cols = (init_rows_f * kind_target_aspect + 1.0).round() as u32;
-            if init_cols % 2 == 0 {
+            if init_cols.is_multiple_of(2) {
                 init_cols += 1;
             }
             let init_cols = init_cols.max(3);

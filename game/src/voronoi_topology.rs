@@ -13,10 +13,11 @@ use crate::edge_compose::ConnectorSeg;
 use crate::edge_profile::{ConnectorShape, EdgeProfileInput, build_edge_profile_segments};
 use crate::grid_shape::GridShapeSettings;
 use crate::ids::{EdgeId, PieceId};
+use crate::math::{normalize_angle, rand_range, rand_unit, shortest_angle_delta};
 use crate::playable::Pose2;
 use crate::render_geometry::{PuzzleRenderGeometry, build_render_geometry_from_atlas};
 use crate::rotation_step::SymmetryStrength;
-use crate::shape::{EdgeSideGeometryMm, PathMm, PathSegMm, PointMm, ShapeAtlasMm};
+use crate::shape::{EdgeSideGeometryMm, PathMm, PathSegMm, PointMm, ShapeAtlasMm, point_mm};
 use crate::shape_atlas_builder::{PieceEdgeBuilderSpec, ShapeAtlasBuilder};
 use crate::topology::{RelativePose, SerializableTopology, TopologySpec};
 use crate::traits::topology::{FrameBounds, PieceOuterFeature, PuzzleTopology};
@@ -722,7 +723,7 @@ impl Dsu {
 fn initial_sites(piece_count: u32, seed: u32, extent_x: f32, extent_y: f32) -> Vec<Point> {
     let aspect = (extent_x / extent_y).max(EPS);
     let mut rows = ((piece_count as f32 / aspect).sqrt().ceil() as u32).max(1);
-    let mut cols = ((piece_count + rows - 1) / rows).max(1);
+    let mut cols = piece_count.div_ceil(rows).max(1);
     while rows.saturating_mul(cols) < piece_count {
         cols = cols.saturating_add(1);
     }
@@ -1289,11 +1290,8 @@ fn normalize_half_turn(mut angle: f32) -> f32 {
     }
 }
 
-fn normalize_full_turn(mut angle: f32) -> f32 {
-    angle %= 360.0;
-    if angle < 0.0 {
-        angle += 360.0;
-    }
+fn normalize_full_turn(angle: f32) -> f32 {
+    let angle = normalize_angle(angle);
     if angle <= 1.0e-3 || (360.0 - angle) <= 1.0e-3 {
         0.0
     } else {
@@ -1308,19 +1306,11 @@ fn push_angle_value(values: &mut Vec<f32>, value: f32) {
     }
     if values
         .iter()
-        .any(|existing| shortest_angle_distance(*existing, value).abs() <= 1.0)
+        .any(|existing| shortest_angle_delta(*existing, value).abs() <= 1.0)
     {
         return;
     }
     values.push(value);
-}
-
-fn shortest_angle_distance(a: f32, b: f32) -> f32 {
-    let mut diff = normalize_full_turn(b - a);
-    if diff > 180.0 {
-        diff -= 360.0;
-    }
-    diff
 }
 
 fn build_voronoi_atlas(
@@ -1389,7 +1379,7 @@ fn build_voronoi_atlas(
                         corner_radius_px,
                     );
                     let start = border_path.start;
-                    let end = path_end_point(&border_path);
+                    let end = border_path.end_point();
                     let side_geometry = EdgeSideGeometryMm {
                         path: border_path,
                         connection_point: point_mm(
@@ -1742,7 +1732,7 @@ fn side_geometry_from_path(
     let start = scale_point(canonical_start, pose_unit_px);
     let end = scale_point(canonical_end, pose_unit_px);
     path.start = point_mm(start.x, start.y);
-    set_path_end_point(&mut path, point_mm(end.x, end.y));
+    path.set_end_point(point_mm(end.x, end.y));
     EdgeSideGeometryMm {
         connection_point: path_midpoint(&path),
         path,
@@ -1775,45 +1765,18 @@ fn reverse_path(path: &PathMm) -> PathMm {
     PathMm::new(start, segs.into_boxed_slice(), false)
 }
 
-fn set_path_end_point(path: &mut PathMm, target: PointMm) {
-    if let Some(last) = path.segs.last_mut() {
-        match last {
-            PathSegMm::LineTo { to } => *to = target,
-            PathSegMm::CubicTo { to, .. } => *to = target,
-        }
-    }
-}
-
 fn path_midpoint(path: &PathMm) -> PointMm {
-    let end = path_end_point(path);
+    let end = path.end_point();
     point_mm(
         f32::midpoint(path.start.x_mm(), end.x_mm()),
         f32::midpoint(path.start.y_mm(), end.y_mm()),
     )
 }
 
-fn path_end_point(path: &PathMm) -> PointMm {
-    let mut current = path.start;
-    for seg in path.segs.iter() {
-        current = match seg {
-            PathSegMm::LineTo { to } => *to,
-            PathSegMm::CubicTo { to, .. } => *to,
-        };
-    }
-    current
-}
-
 fn scale_point(point: Point, pose_unit_px: [f32; 2]) -> Point {
     Point {
         x: point.x * pose_unit_px[0],
         y: point.y * pose_unit_px[1],
-    }
-}
-
-fn point_mm(x: f32, y: f32) -> PointMm {
-    PointMm {
-        x: LengthMm::try_new(x).unwrap_or_default(),
-        y: LengthMm::try_new(y).unwrap_or_default(),
     }
 }
 
@@ -1953,23 +1916,6 @@ fn border_sort_key(a: Point, b: Point, side: usize) -> f32 {
 
 fn near(a: f32, b: f32, eps: f32) -> bool {
     (a - b).abs() <= eps
-}
-
-fn splitmix32(mut value: u32) -> u32 {
-    value = value.wrapping_add(0x9E37_79B9);
-    let mut z = value;
-    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
-    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
-    z ^ (z >> 16)
-}
-
-fn rand_unit(seed: u32, salt: u32) -> f32 {
-    let mixed = splitmix32(seed ^ salt);
-    (mixed >> 8) as f32 / ((1u32 << 24) as f32)
-}
-
-fn rand_range(seed: u32, salt: u32, min: f32, max: f32) -> f32 {
-    min + (max - min) * rand_unit(seed, salt)
 }
 
 #[cfg(test)]

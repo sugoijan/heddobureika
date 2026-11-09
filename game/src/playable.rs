@@ -3,9 +3,10 @@
 use crate::delta::PlayableDelta;
 use crate::ids::{EdgeId, GroupId, PieceId};
 use crate::logical::{LogicalInvariantError, LogicalState, LogicalStateSummary};
+use crate::math::angle_matches;
 use crate::rotation_step::{StepDirection, group_symmetry_angles, next_step_canonical};
 use crate::rules::PlayRules;
-use crate::snap::{ActionId, MergePolicy, SnapProposal, angle_matches};
+use crate::snap::{ActionId, MergePolicy, SnapProposal};
 use crate::topology::{PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
 use crate::update::{
@@ -15,7 +16,7 @@ use crate::update::{
 use crate::z_depth::{Aabb, Gesture, reorder_for_fitting_depth};
 
 /// World-space XY position.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Position2 {
     pub x: LengthMm,
     pub y: LengthMm,
@@ -38,17 +39,8 @@ impl Position2 {
     }
 }
 
-impl Default for Position2 {
-    fn default() -> Self {
-        Self {
-            x: LengthMm::zero(),
-            y: LengthMm::zero(),
-        }
-    }
-}
-
 /// World-space pose for a group anchor transform.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pose2 {
     pub x: LengthMm,
     pub y: LengthMm,
@@ -74,16 +66,6 @@ impl Pose2 {
 
     pub fn rotation_degrees(self) -> f32 {
         self.rotation.as_degrees_f32()
-    }
-}
-
-impl Default for Pose2 {
-    fn default() -> Self {
-        Self {
-            x: LengthMm::zero(),
-            y: LengthMm::zero(),
-            rotation: AngleDeg::zero(),
-        }
     }
 }
 

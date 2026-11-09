@@ -1,6 +1,7 @@
 //! Non-mutating snap probing and proposal contracts.
 
 use crate::ids::{EdgeId, GroupId, PieceId};
+use crate::math::angle_matches;
 use crate::playable::{FlipState, PlayableState, Pose2, rotate_offset_with_aspect};
 use crate::topology::PuzzleTopology;
 
@@ -258,14 +259,4 @@ fn candidate_for_edge<T: PuzzleTopology>(
         desired_mover_pose,
         distance_mm,
     })
-}
-
-pub(crate) fn angle_matches(a: f32, b: f32, tolerance: f32) -> bool {
-    let mut diff = (a - b) % 360.0;
-    if diff < -180.0 {
-        diff += 360.0;
-    } else if diff > 180.0 {
-        diff -= 360.0;
-    }
-    diff.abs() <= tolerance
 }

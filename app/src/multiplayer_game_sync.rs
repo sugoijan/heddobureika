@@ -43,12 +43,36 @@ pub(crate) struct MultiplayerGameSync {
     ownership_by_anchor: Rc<RefCell<Rc<HashMap<u32, ClientId>>>>,
     ownership_seq_by_anchor: Rc<RefCell<HashMap<u32, u64>>>,
     hooks: RefCell<SyncHooks>,
-    local_transform_observer:
-        Rc<RefCell<Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>>>,
-    local_flip_observer: Rc<RefCell<Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>>>,
-    local_detach_observer: Rc<RefCell<Option<Rc<dyn Fn(u32)>>>>,
-    local_send_to_back_observer: Rc<RefCell<Option<Rc<dyn Fn(u32)>>>>,
+    local_event_observer: RefCell<Option<LocalEventObserver>>,
 }
+
+/// A locally applied action, reported right after it is sent so the bridge
+/// can keep it as a pending prediction until the server echoes it back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LocalEvent {
+    Transform {
+        anchor_id: u32,
+        pos: (f32, f32),
+        rot_deg: Option<f32>,
+        client_seq: u64,
+        /// Whether the transform came from a place/snap rather than a free move.
+        snap: bool,
+    },
+    Flip {
+        piece_id: u32,
+        flipped: bool,
+        pos: (f32, f32),
+        rot_deg: f32,
+    },
+    Detach {
+        piece_id: u32,
+    },
+    SendToBack {
+        piece_id: u32,
+    },
+}
+
+pub(crate) type LocalEventObserver = Rc<dyn Fn(LocalEvent)>;
 
 impl MultiplayerGameSync {
     #[cfg(feature = "experimental-p2p")]
@@ -79,10 +103,7 @@ impl MultiplayerGameSync {
             ownership_by_anchor: Rc::new(RefCell::new(Rc::new(HashMap::new()))),
             ownership_seq_by_anchor: Rc::new(RefCell::new(HashMap::new())),
             hooks: RefCell::new(SyncHooks::empty()),
-            local_transform_observer: Rc::new(RefCell::new(None)),
-            local_flip_observer: Rc::new(RefCell::new(None)),
-            local_detach_observer: Rc::new(RefCell::new(None)),
-            local_send_to_back_observer: Rc::new(RefCell::new(None)),
+            local_event_observer: RefCell::new(None),
         }
     }
 
@@ -176,26 +197,14 @@ impl MultiplayerGameSync {
         self.adapter.send(msg);
     }
 
-    pub(crate) fn set_local_transform_observer(
-        &self,
-        observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
-    ) {
-        *self.local_transform_observer.borrow_mut() = observer;
+    pub(crate) fn set_local_event_observer(&self, observer: Option<LocalEventObserver>) {
+        *self.local_event_observer.borrow_mut() = observer;
     }
 
-    pub(crate) fn set_local_flip_observer(
-        &self,
-        observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
-    ) {
-        *self.local_flip_observer.borrow_mut() = observer;
-    }
-
-    pub(crate) fn set_local_detach_observer(&self, observer: Option<Rc<dyn Fn(u32)>>) {
-        *self.local_detach_observer.borrow_mut() = observer;
-    }
-
-    pub(crate) fn set_local_send_to_back_observer(&self, observer: Option<Rc<dyn Fn(u32)>>) {
-        *self.local_send_to_back_observer.borrow_mut() = observer;
+    fn emit_local(&self, event: LocalEvent) {
+        if let Some(observer) = self.local_event_observer.borrow().as_ref() {
+            observer(event);
+        }
     }
 
     fn next_client_seq_for(&self, anchor_id: u32) -> u64 {
@@ -402,10 +411,7 @@ impl MultiplayerGameSync {
                             next
                         };
                         *ownership_by_anchor.borrow_mut() = Rc::new(next);
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            crate::wgpu_app::request_render();
-                        }
+                        crate::view_runtime::request_render();
                         (on_event)(SyncEvent::Ownership {
                             anchor_id: *group_anchor,
                             owner: *owner,
@@ -550,9 +556,9 @@ impl GameSync for MultiplayerGameSync {
                         piece_id: *piece_id as u32,
                         base_revision: 0,
                     });
-                    if let Some(observer) = self.local_detach_observer.borrow().as_ref() {
-                        observer(*piece_id as u32);
-                    }
+                    self.emit_local(LocalEvent::Detach {
+                        piece_id: *piece_id as u32,
+                    });
                 }
             }
             CoreAction::Sync(sync_action) => match sync_action {
@@ -568,9 +574,13 @@ impl GameSync for MultiplayerGameSync {
                         client_seq,
                         base_revision: 0,
                     });
-                    if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
-                        observer(*anchor_id as u32, *pos, None, client_seq, false);
-                    }
+                    self.emit_local(LocalEvent::Transform {
+                        anchor_id: *anchor_id as u32,
+                        pos: *pos,
+                        rot_deg: None,
+                        client_seq,
+                        snap: false,
+                    });
                 }
                 SyncAction::Transform {
                     anchor_id,
@@ -589,9 +599,13 @@ impl GameSync for MultiplayerGameSync {
                         client_seq,
                         base_revision: 0,
                     });
-                    if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
-                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq, false);
-                    }
+                    self.emit_local(LocalEvent::Transform {
+                        anchor_id: *anchor_id as u32,
+                        pos: *pos,
+                        rot_deg: Some(*rot_deg),
+                        client_seq,
+                        snap: false,
+                    });
                 }
                 SyncAction::Place {
                     anchor_id,
@@ -610,9 +624,13 @@ impl GameSync for MultiplayerGameSync {
                         client_seq,
                         base_revision: 0,
                     });
-                    if let Some(observer) = self.local_transform_observer.borrow().as_ref() {
-                        observer(*anchor_id as u32, *pos, Some(*rot_deg), client_seq, true);
-                    }
+                    self.emit_local(LocalEvent::Transform {
+                        anchor_id: *anchor_id as u32,
+                        pos: *pos,
+                        rot_deg: Some(*rot_deg),
+                        client_seq,
+                        snap: true,
+                    });
                 }
                 SyncAction::Flip {
                     piece_id,
@@ -631,9 +649,12 @@ impl GameSync for MultiplayerGameSync {
                         drop_pose,
                         base_revision: 0,
                     });
-                    if let Some(observer) = self.local_flip_observer.borrow().as_ref() {
-                        observer(*piece_id as u32, *flipped, *pos, *rot_deg);
-                    }
+                    self.emit_local(LocalEvent::Flip {
+                        piece_id: *piece_id as u32,
+                        flipped: *flipped,
+                        pos: *pos,
+                        rot_deg: *rot_deg,
+                    });
                 }
                 SyncAction::Release { anchor_id } => {
                     self.send(ClientMsg::Release {
@@ -647,9 +668,9 @@ impl GameSync for MultiplayerGameSync {
                     // Mirror the demotion into the predicted local state so a
                     // server pose-echo doesn't snap z-order back to front before
                     // the authoritative GroupOrder broadcast arrives.
-                    if let Some(observer) = self.local_send_to_back_observer.borrow().as_ref() {
-                        observer(*anchor_id as u32);
-                    }
+                    self.emit_local(LocalEvent::SendToBack {
+                        piece_id: *anchor_id as u32,
+                    });
                 }
             },
             _ => {}

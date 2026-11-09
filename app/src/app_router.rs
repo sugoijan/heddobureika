@@ -214,7 +214,7 @@ fn normalize_ws_base(raw: &str) -> String {
     }
 }
 
-fn decode_hash_value(value: &str) -> String {
+pub(crate) fn decode_hash_value(value: &str) -> String {
     let raw = value.trim();
     if raw.is_empty() {
         return String::new();
@@ -223,6 +223,23 @@ fn decode_hash_value(value: &str) -> String {
         .ok()
         .and_then(|decoded| decoded.as_string())
         .unwrap_or_else(|| raw.to_string())
+}
+
+/// Splits a `#key=value;key2=value2` fragment into trimmed `(key, value)`
+/// pairs. The leading `#` is ignored, empty chunks are skipped and a chunk
+/// without `=` yields an empty value.
+pub(crate) fn hash_params(hash: &str) -> impl Iterator<Item = (&str, &str)> {
+    hash.trim()
+        .trim_start_matches('#')
+        .split(';')
+        .filter_map(|chunk| {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                return None;
+            }
+            let (key, value) = chunk.split_once('=').unwrap_or((chunk, ""));
+            Some((key.trim(), value.trim()))
+        })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -236,11 +253,7 @@ fn persist_renderer_preference(renderer: RendererKind) {
     let Ok(Some(storage)) = window.local_storage() else {
         return;
     };
-    let value = match renderer {
-        RendererKind::Svg => "svg",
-        RendererKind::Wgpu => "wgpu",
-    };
-    let _ = storage.set_item(RENDERER_PREF_KEY, value);
+    let _ = storage.set_item(RENDERER_PREF_KEY, renderer.as_str());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -318,14 +331,7 @@ fn parse_multiplayer_config_from_hash(hash: &str) -> Option<MultiplayerConfig> {
         return None;
     }
     let mut room_id = None;
-    for chunk in raw.split(';') {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut iter = chunk.splitn(2, '=');
-        let key = iter.next().unwrap_or("").trim();
-        let value = iter.next().unwrap_or("").trim();
+    for (key, value) in hash_params(raw) {
         if key.eq_ignore_ascii_case("room") || key.eq_ignore_ascii_case("room_id") {
             let decoded = decode_hash_value(value);
             room_id = Some(decoded);

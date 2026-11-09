@@ -7,10 +7,11 @@ use heddobureika_core::game::{
 };
 use heddobureika_core::room_id::{ROOM_ID_LEN, is_valid_room_id};
 use heddobureika_core::{
-    ASSET_CHUNK_BYTES, AdminMsg, ClientId, ClientMsg, GameRules, OwnershipReason,
-    PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES, PlayableGameSnapshot,
-    PlayableTopologySnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec, RecordedCommand,
-    RecordedCommandKind, RecordedCommandOutcome, RoomPersistence, ServerMsg, validate_image_ref,
+    ASSET_CHUNK_BYTES, AUTH_PROTOCOL_PREFIX, AdminMsg, ChunkAssembler, ClientId, ClientMsg,
+    GameRules, OwnershipReason, PRIVATE_ASSET_MAX_BYTES, PRIVATE_UPLOAD_MAX_BYTES,
+    PlayableGameSnapshot, PlayableTopologySnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec,
+    RecordedCommand, RecordedCommandKind, RecordedCommandOutcome, RoomPersistence, ServerMsg,
+    auth_message, client_id_from_public_key, decode_auth_protocol, validate_image_ref,
 };
 use heddobureika_core::{
     DEFAULT_TARGET_COUNT, FALLBACK_GRID, logical_image_size, nearest_valid_grid, puzzle_by_slug,
@@ -18,13 +19,9 @@ use heddobureika_core::{
 };
 use heddobureika_game::{FlipState, GroupId, LogicalState, PlayableState, TopologySpec};
 use heddobureika_session::SessionAuthority;
-use image_pipeline::{AlphaMode, PipelineConfig};
-use imagesize::{Compression, ImageType};
 use js_sys::Date;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use rkyv::{Archive, Deserialize, Serialize};
-use serde::Deserialize as SerdeDeserialize;
-use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use worker::*;
@@ -39,8 +36,6 @@ const DEFAULT_RECORDING_MAX_EVENTS: u32 = 200_000;
 const INACTIVITY_WARNING_MS: i64 = 10 * 60 * 1000;
 const INACTIVITY_EXPIRE_MS: i64 = 60 * 60 * 1000;
 const FULL_STATE_INTERVAL_MS: i64 = 30 * 1000;
-const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
-const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
 const AUTH_WINDOW_MS: i64 = 5 * 60 * 1000;
 const DISCONNECT_GRACE_MS: i64 = 1000;
 
@@ -205,51 +200,6 @@ fn decode_base64_url(value: &str) -> Result<Vec<u8>, ()> {
     URL_SAFE_NO_PAD.decode(value).map_err(|_| ())
 }
 
-fn auth_message(room_id: &str, ts: i64, nonce: &str) -> Vec<u8> {
-    format!("{room_id}\n{ts}\n{nonce}\n{AUTH_CONTEXT}").into_bytes()
-}
-
-fn derive_client_id(pubkey_spki: &[u8]) -> Result<ClientId, ()> {
-    let digest = Sha256::digest(pubkey_spki);
-    if digest.len() < 8 {
-        return Err(());
-    }
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    Ok(ClientId::from(u64::from_be_bytes(bytes)))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{:02x}", byte);
-    }
-    out
-}
-
-fn transcode_to_avif(bytes: &[u8]) -> Result<image_pipeline::TranscodeResult, String> {
-    let mut config = PipelineConfig::default();
-    config.alpha_mode = AlphaMode::Preserve;
-    image_pipeline::transcode_to_avif(bytes, config).map_err(|err| err.to_string())
-}
-
-fn detect_image_info(bytes: &[u8]) -> Result<(u32, u32, ImageType), String> {
-    let image_type = imagesize::image_type(bytes).map_err(|err| err.to_string())?;
-    let size = imagesize::blob_size(bytes).map_err(|err| err.to_string())?;
-    let width = u32::try_from(size.width).map_err(|_| "image width too large".to_string())?;
-    let height = u32::try_from(size.height).map_err(|_| "image height too large".to_string())?;
-    if width == 0 || height == 0 {
-        return Err("image dimensions are zero".to_string());
-    }
-    Ok((width, height, image_type))
-}
-
-fn is_avif(image_type: ImageType) -> bool {
-    matches!(image_type, ImageType::Heif(Compression::Av1))
-}
-
 fn verify_signature(pubkey_spki: &[u8], message: &[u8], signature: &[u8]) -> Result<bool, ()> {
     let verifying_key = VerifyingKey::from_sec1_bytes(pubkey_spki).map_err(|_| ())?;
     let signature = Signature::from_slice(signature).map_err(|_| ())?;
@@ -269,18 +219,6 @@ fn client_id_from_tags(tags: &[String]) -> Option<ClientId> {
 
 fn is_admin_from_tags(tags: &[String]) -> bool {
     tags.iter().any(|tag| tag == "admin")
-}
-
-#[derive(Debug, SerdeDeserialize)]
-struct AuthPayload {
-    v: u8,
-    client_id: String,
-    ts: i64,
-    nonce: String,
-    pubkey: String,
-    sig: String,
-    #[serde(default)]
-    admin_token: Option<String>,
 }
 
 struct AuthContext {
@@ -318,7 +256,7 @@ struct RoomRuntime {
     recent_nonces: HashMap<String, i64>,
     pending_releases: HashMap<ClientId, i64>,
     assets: HashMap<String, StoredAsset>,
-    pending_uploads: HashMap<ClientId, PendingUpload>,
+    pending_uploads: HashMap<ClientId, ChunkAssembler>,
 }
 
 impl RoomRuntime {
@@ -369,13 +307,6 @@ struct StoredAssetMeta {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 struct StoredAsset {
     meta: StoredAssetMeta,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingUpload {
-    size: u32,
-    received: u32,
     bytes: Vec<u8>,
 }
 
@@ -527,7 +458,7 @@ impl DurableObject for Room {
         let is_websocket = req
             .headers()
             .get("Upgrade")?
-            .map(|h| h.to_ascii_lowercase() == "websocket")
+            .map(|h| h.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
 
         let path = req.path();
@@ -695,7 +626,6 @@ impl DurableObject for Room {
             return Ok(());
         };
 
-        let classify_msg = msg.clone();
         let record = Self::record_from_client_msg(&msg);
         let pre_seq = self.current_snapshot_seq();
         let pre_progress = self.current_snapshot_progress();
@@ -720,7 +650,7 @@ impl DurableObject for Room {
         let post_seq = self.current_snapshot_seq();
         let post_progress = self.current_snapshot_progress();
         let outcome = match &dispatch {
-            Ok(()) => Self::classify_command_outcome(&classify_msg, pre_seq, post_seq),
+            Ok(()) => Self::classify_command_outcome(record.kind, pre_seq, post_seq),
             Err(err) => CommandHandlingResult {
                 outcome: RecordedCommandOutcome::HandlerError,
                 reason: Some(err.to_string()),
@@ -869,16 +799,9 @@ impl Room {
             Ok(None) => return Err(error_response("missing auth", 401)),
             Err(_) => return Err(error_response("invalid auth", 401)),
         };
-        let Some(payload_b64) = protocol.strip_prefix(AUTH_PROTOCOL_PREFIX) else {
+        let Some(payload) = decode_auth_protocol(&protocol) else {
             return Err(error_response("invalid auth", 401));
         };
-        let payload_bytes =
-            decode_base64_url(payload_b64).map_err(|_| error_response("invalid auth", 401))?;
-        let payload: AuthPayload = serde_json::from_slice(&payload_bytes)
-            .map_err(|_| error_response("invalid auth", 401))?;
-        if payload.v != 1 {
-            return Err(error_response("invalid auth", 401));
-        }
         let client_id = ClientId::from(
             payload
                 .client_id
@@ -898,9 +821,7 @@ impl Room {
             decode_base64_url(&payload.pubkey).map_err(|_| error_response("invalid auth", 401))?;
         let sig_bytes =
             decode_base64_url(&payload.sig).map_err(|_| error_response("invalid auth", 401))?;
-        let derived_id =
-            derive_client_id(&pubkey_bytes).map_err(|_| error_response("invalid auth", 401))?;
-        if derived_id != client_id {
+        if client_id_from_public_key(&pubkey_bytes) != client_id {
             return Err(error_response("invalid auth", 401));
         }
         let message = auth_message(room_id, payload.ts, &payload.nonce);
@@ -1230,8 +1151,23 @@ impl Room {
         }
     }
 
+    /// Rejects the message with `inactive` unless the room has been activated.
+    fn require_active(&self, ws: &WebSocket) -> bool {
+        if self.inner.borrow().meta.activated {
+            return true;
+        }
+        let _ = self.send_server_msg(
+            ws,
+            &ServerMsg::Error {
+                code: "inactive".to_string(),
+                message: "room not activated".to_string(),
+            },
+        );
+        false
+    }
+
     fn classify_command_outcome(
-        msg: &ClientMsg,
+        kind: RecordedCommandKind,
         pre_seq: Option<u64>,
         post_seq: Option<u64>,
     ) -> CommandHandlingResult {
@@ -1244,20 +1180,20 @@ impl Room {
             return CommandHandlingResult::applied(post_seq);
         }
         let seq = post_seq.or(pre_seq);
-        match msg {
-            ClientMsg::Ping { .. } | ClientMsg::AssetRequest { .. } => {
+        match kind {
+            RecordedCommandKind::Ping | RecordedCommandKind::AssetRequest => {
                 CommandHandlingResult::accepted_no_state_change(seq)
             }
-            ClientMsg::Init { .. } => CommandHandlingResult::rejected("init_not_applied", seq),
-            ClientMsg::Select { .. }
-            | ClientMsg::Move { .. }
-            | ClientMsg::Transform { .. }
-            | ClientMsg::Rotate { .. }
-            | ClientMsg::Place { .. }
-            | ClientMsg::Flip { .. }
-            | ClientMsg::Detach { .. }
-            | ClientMsg::Release { .. }
-            | ClientMsg::SendToBack { .. } => {
+            RecordedCommandKind::Init => CommandHandlingResult::rejected("init_not_applied", seq),
+            RecordedCommandKind::Select
+            | RecordedCommandKind::Move
+            | RecordedCommandKind::Transform
+            | RecordedCommandKind::Rotate
+            | RecordedCommandKind::Place
+            | RecordedCommandKind::Flip
+            | RecordedCommandKind::Detach
+            | RecordedCommandKind::Release
+            | RecordedCommandKind::SendToBack => {
                 CommandHandlingResult::ignored("ignored_or_conflict", seq)
             }
         }
@@ -1408,7 +1344,9 @@ impl Room {
         self.expire_room().await
     }
 
-    fn command_store_stub(&self) -> std::result::Result<Stub, String> {
+    /// Stub for this room's companion object in the `binding` namespace,
+    /// addressed by room id.
+    fn durable_stub(&self, binding: &str) -> std::result::Result<Stub, String> {
         let room_id = self
             .inner
             .borrow()
@@ -1417,7 +1355,7 @@ impl Room {
             .ok_or_else(|| "missing room id".to_string())?;
         let namespace = self
             .env
-            .durable_object("COMMANDS")
+            .durable_object(binding)
             .map_err(|err| err.to_string())?;
         namespace
             .get_by_name(&room_id)
@@ -1429,7 +1367,7 @@ impl Room {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> std::result::Result<Vec<u8>, String> {
-        let stub = self.command_store_stub()?;
+        let stub = self.durable_stub("COMMANDS")?;
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
         if let Some(body) = body {
@@ -1631,20 +1569,13 @@ impl Room {
         let now = now_ms();
         let rules = {
             let inner = self.inner.borrow();
-            if !inner.meta.activated {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "inactive".to_string(),
-                        message: "room not activated".to_string(),
-                    },
-                );
+            if !self.require_active(&ws) {
                 return Ok(());
             }
             inner
                 .authority
                 .snapshot()
-                .map(|live| live.rules.clone())
+                .map(|live| live.rules)
                 .unwrap_or_default()
         };
         let (puzzle, scramble_override) = match self.build_puzzle_from_spec(puzzle, &rules) {
@@ -1697,7 +1628,7 @@ impl Room {
         _mime: String,
         size: u32,
     ) -> Result<()> {
-        if size == 0 || size > PRIVATE_UPLOAD_MAX_BYTES {
+        let Ok(pending) = ChunkAssembler::begin(size, PRIVATE_UPLOAD_MAX_BYTES) else {
             let _ = self.send_server_msg(
                 &ws,
                 &ServerMsg::Error {
@@ -1709,33 +1640,18 @@ impl Room {
                 },
             );
             return Ok(());
-        }
+        };
         let tags = self.state.get_tags(&ws);
         let Some(client_id) = client_id_from_tags(&tags) else {
             return Ok(());
         };
-        {
-            let inner = self.inner.borrow();
-            if !inner.meta.activated {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "inactive".to_string(),
-                        message: "room not activated".to_string(),
-                    },
-                );
-                return Ok(());
-            }
+        if !self.require_active(&ws) {
+            return Ok(());
         }
-        let mut inner = self.inner.borrow_mut();
-        inner.pending_uploads.insert(
-            client_id,
-            PendingUpload {
-                size,
-                received: 0,
-                bytes: Vec::with_capacity(size as usize),
-            },
-        );
+        self.inner
+            .borrow_mut()
+            .pending_uploads
+            .insert(client_id, pending);
         Ok(())
     }
 
@@ -1748,10 +1664,7 @@ impl Room {
         let Some(pending) = inner.pending_uploads.get_mut(&client_id) else {
             return Ok(());
         };
-        let next = pending
-            .received
-            .saturating_add(bytes.len().min(u32::MAX as usize) as u32);
-        if next > pending.size || next > PRIVATE_UPLOAD_MAX_BYTES {
+        if pending.push(&bytes).is_err() {
             inner.pending_uploads.remove(&client_id);
             let _ = self.send_server_msg(
                 &ws,
@@ -1765,8 +1678,6 @@ impl Room {
             );
             return Ok(());
         }
-        pending.bytes.extend_from_slice(&bytes);
-        pending.received = next;
         Ok(())
     }
 
@@ -1790,7 +1701,7 @@ impl Room {
         let Some(pending) = pending else {
             return Ok(());
         };
-        if pending.received != pending.size {
+        let Ok(bytes) = pending.finish() else {
             let _ = self.send_server_msg(
                 &ws,
                 &ServerMsg::Error {
@@ -1799,55 +1710,22 @@ impl Room {
                 },
             );
             return Ok(());
-        }
-        let (raw_width, raw_height, image_type) = match detect_image_info(&pending.bytes) {
-            Ok(info) => info,
-            Err(message) => {
+        };
+        let stored = match image_pipeline::prepare_stored_image(bytes) {
+            Ok(stored) => stored,
+            Err(err) => {
                 let _ = self.send_server_msg(
                     &ws,
                     &ServerMsg::Error {
                         code: "invalid_image".to_string(),
-                        message,
+                        message: err.to_string(),
                     },
                 );
                 return Ok(());
             }
         };
-        if matches!(image_type, ImageType::Heif(_)) && !is_avif(image_type) {
-            let _ = self.send_server_msg(
-                &ws,
-                &ServerMsg::Error {
-                    code: "invalid_image".to_string(),
-                    message: "unsupported HEIF compression".to_string(),
-                },
-            );
-            return Ok(());
-        }
-        let mut stored_width = raw_width;
-        let mut stored_height = raw_height;
-        let stored_bytes = if is_avif(image_type) {
-            pending.bytes
-        } else {
-            match transcode_to_avif(&pending.bytes) {
-                Ok(result) => {
-                    stored_width = result.width;
-                    stored_height = result.height;
-                    result.bytes
-                }
-                Err(message) => {
-                    let _ = self.send_server_msg(
-                        &ws,
-                        &ServerMsg::Error {
-                            code: "invalid_image".to_string(),
-                            message,
-                        },
-                    );
-                    return Ok(());
-                }
-            }
-        };
-        let stored_mime = "image/avif".to_string();
-        if stored_bytes.len() > PRIVATE_ASSET_MAX_BYTES as usize {
+        let stored_mime = image_pipeline::STORED_IMAGE_MIME.to_string();
+        if stored.bytes.len() > PRIVATE_ASSET_MAX_BYTES as usize {
             let _ = self.send_server_msg(
                 &ws,
                 &ServerMsg::Error {
@@ -1862,28 +1740,20 @@ impl Room {
         }
         let rules = {
             let inner = self.inner.borrow();
-            if !inner.meta.activated {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "inactive".to_string(),
-                        message: "room not activated".to_string(),
-                    },
-                );
+            if !self.require_active(&ws) {
                 return Ok(());
             }
             inner
                 .authority
                 .snapshot()
-                .map(|live| live.rules.clone())
+                .map(|live| live.rules)
                 .unwrap_or_default()
         };
         let (image_width, image_height) =
-            logical_image_size(stored_width, stored_height, rules.image_max_dimension);
-        let hash = sha256_hex(&stored_bytes);
-        let size = stored_bytes.len() as u32;
-        let chunks =
-            ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES) as u32;
+            logical_image_size(stored.width, stored.height, rules.image_max_dimension);
+        let hash = heddobureika_core::sha256_hex(&stored.bytes);
+        let size = stored.bytes.len() as u32;
+        let chunks = (size as usize).div_ceil(ASSET_STORAGE_CHUNK_BYTES) as u32;
         let asset = StoredAsset {
             meta: StoredAssetMeta {
                 mime: stored_mime.clone(),
@@ -1893,7 +1763,7 @@ impl Room {
                 created_at: now,
                 chunks,
             },
-            bytes: stored_bytes,
+            bytes: stored.bytes,
         };
         if let Err(message) = self.store_asset(&hash, asset).await {
             let _ = self.send_server_msg(
@@ -1969,14 +1839,7 @@ impl Room {
         let now = now_ms();
         let (puzzle, rules) = {
             let inner = self.inner.borrow();
-            if !inner.meta.activated {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "inactive".to_string(),
-                        message: "room not activated".to_string(),
-                    },
-                );
+            if !self.require_active(&ws) {
                 return Ok(());
             }
             let Some(snapshot) = inner.authority.snapshot() else {
@@ -1989,7 +1852,7 @@ impl Room {
                 );
                 return Ok(());
             };
-            (snapshot.puzzle.clone(), snapshot.rules.clone())
+            (snapshot.puzzle.clone(), snapshot.rules)
         };
         // Scramble nonce is salted with the topology so the same numeric
         // seed yields different scrambles for different topologies. Grid
@@ -2033,14 +1896,7 @@ impl Room {
         let now = now_ms();
         let (puzzle, rules) = {
             let inner = self.inner.borrow();
-            if !inner.meta.activated {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "inactive".to_string(),
-                        message: "room not activated".to_string(),
-                    },
-                );
+            if !self.require_active(&ws) {
                 return Ok(());
             }
             let Some(snapshot) = inner.authority.snapshot() else {
@@ -2053,7 +1909,7 @@ impl Room {
                 );
                 return Ok(());
             };
-            (snapshot.puzzle.clone(), snapshot.rules.clone())
+            (snapshot.puzzle.clone(), snapshot.rules)
         };
         let mut snapshot = match Self::build_solved_snapshot(puzzle, rules) {
             Some(snapshot) => snapshot,
@@ -2205,22 +2061,6 @@ impl Room {
         Ok(asset)
     }
 
-    fn asset_store_stub(&self) -> std::result::Result<Stub, String> {
-        let room_id = self
-            .inner
-            .borrow()
-            .room_id
-            .clone()
-            .ok_or_else(|| "missing room id".to_string())?;
-        let namespace = self
-            .env
-            .durable_object("ASSETS")
-            .map_err(|err| err.to_string())?;
-        namespace
-            .get_by_name(&room_id)
-            .map_err(|err| err.to_string())
-    }
-
     async fn asset_store_put(
         &self,
         hash: &str,
@@ -2229,7 +2069,7 @@ impl Room {
         let Some(body) = encode(asset) else {
             return Err("failed to encode asset".to_string());
         };
-        let stub = self.asset_store_stub()?;
+        let stub = self.durable_stub("ASSETS")?;
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
         init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
@@ -2253,7 +2093,7 @@ impl Room {
         &self,
         hash: &str,
     ) -> std::result::Result<Option<StoredAsset>, String> {
-        let stub = self.asset_store_stub()?;
+        let stub = self.durable_stub("ASSETS")?;
         let mut init = RequestInit::new();
         init.with_method(Method::Get);
         let req = Request::new_with_init(&format!("https://asset/asset/{hash}"), &init)
@@ -2284,7 +2124,7 @@ impl Room {
         if !matches!(persistence, RoomPersistence::Durable) {
             return Ok(());
         }
-        let stub = self.asset_store_stub()?;
+        let stub = self.durable_stub("ASSETS")?;
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
         let req =
@@ -2307,14 +2147,7 @@ impl Room {
         let now = now_ms();
         {
             let inner = self.inner.borrow();
-            if !inner.meta.activated {
-                let _ = self.send_server_msg(
-                    &ws,
-                    &ServerMsg::Error {
-                        code: "inactive".to_string(),
-                        message: "room not activated".to_string(),
-                    },
-                );
+            if !self.require_active(&ws) {
                 return Ok(());
             }
             if inner.authority.snapshot().is_some() {
@@ -2835,8 +2668,7 @@ impl AssetStore {
         if size != asset.meta.size {
             return Err("asset size mismatch".to_string());
         }
-        let expected_chunks =
-            ((size as usize + ASSET_STORAGE_CHUNK_BYTES - 1) / ASSET_STORAGE_CHUNK_BYTES) as u32;
+        let expected_chunks = (size as usize).div_ceil(ASSET_STORAGE_CHUNK_BYTES) as u32;
         if expected_chunks != asset.meta.chunks {
             return Err("asset chunk count mismatch".to_string());
         }
@@ -2976,34 +2808,72 @@ impl AssetStore {
         value: &SqlStorageValue,
         field: &str,
     ) -> std::result::Result<String, String> {
-        match value {
-            SqlStorageValue::String(value) => Ok(value.clone()),
-            _ => Err(format!("invalid asset {field}")),
-        }
+        sql_required(sql_string(value), "asset", field)
     }
 
     fn sql_value_i64(value: &SqlStorageValue, field: &str) -> std::result::Result<i64, String> {
-        match value {
-            SqlStorageValue::Integer(value) => Ok(*value),
-            SqlStorageValue::Float(value) => Ok(*value as i64),
-            _ => Err(format!("invalid asset {field}")),
-        }
+        sql_required(sql_i64(value), "asset", field)
     }
 
     fn sql_value_u32(value: &SqlStorageValue, field: &str) -> std::result::Result<u32, String> {
-        let raw = Self::sql_value_i64(value, field)?;
-        u32::try_from(raw).map_err(|_| format!("invalid asset {field}"))
+        sql_required(sql_u32(value), "asset", field)
     }
 
     fn sql_value_blob(
         value: &SqlStorageValue,
         field: &str,
     ) -> std::result::Result<Vec<u8>, String> {
-        match value {
-            SqlStorageValue::Blob(value) => Ok(value.clone()),
-            _ => Err(format!("invalid asset {field}")),
-        }
+        sql_required(sql_blob(value), "asset", field)
     }
+}
+
+/// `SqlStorageValue` → Rust conversions shared by the asset and command
+/// stores. Integers stored as SQLite floats are accepted (truncated).
+fn sql_i64(value: &SqlStorageValue) -> Option<i64> {
+    match value {
+        SqlStorageValue::Integer(value) => Some(*value),
+        SqlStorageValue::Float(value) => Some(*value as i64),
+        _ => None,
+    }
+}
+
+fn sql_u32(value: &SqlStorageValue) -> Option<u32> {
+    sql_i64(value).and_then(|raw| u32::try_from(raw).ok())
+}
+
+fn sql_u64(value: &SqlStorageValue) -> Option<u64> {
+    sql_i64(value).and_then(|raw| u64::try_from(raw).ok())
+}
+
+fn sql_f32(value: &SqlStorageValue) -> Option<f32> {
+    match value {
+        SqlStorageValue::Integer(value) => Some(*value as f32),
+        SqlStorageValue::Float(value) => Some(*value as f32),
+        _ => None,
+    }
+}
+
+fn sql_string(value: &SqlStorageValue) -> Option<String> {
+    match value {
+        SqlStorageValue::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn sql_blob(value: &SqlStorageValue) -> Option<Vec<u8>> {
+    match value {
+        SqlStorageValue::Blob(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn sql_required<T>(value: Option<T>, what: &str, field: &str) -> std::result::Result<T, String> {
+    value.ok_or_else(|| format!("invalid {what} {field}"))
+}
+
+/// `None` → SQL `NULL`, otherwise the value's natural SQL type.
+fn sql_opt(value: Option<impl Into<SqlStorageValue>>) -> SqlStorageValue {
+    value.map_or(SqlStorageValue::Null, Into::into)
 }
 
 struct CommandStoreRuntime {
@@ -3296,15 +3166,15 @@ impl CommandStore {
                 request.ts_ms.into(),
                 format!("u64:{}", request.client_id.as_u64()).into(),
                 (request.kind as i64).into(),
-                Self::opt_i64(request.piece_id.map(|value| value as i64)),
-                Self::opt_i64(request.anchor_id.map(|value| value as i64)),
-                Self::opt_f64(request.pos.map(|value| value.0 as f64)),
-                Self::opt_f64(request.pos.map(|value| value.1 as f64)),
-                Self::opt_f64(request.rot_deg.map(|value| value as f64)),
-                Self::opt_i64(request.client_seq.map(|value| value as i64)),
-                Self::opt_i64(request.room_seq.map(|value| value as i64)),
+                sql_opt(request.piece_id.map(|value| value as i64)),
+                sql_opt(request.anchor_id.map(|value| value as i64)),
+                sql_opt(request.pos.map(|value| value.0 as f64)),
+                sql_opt(request.pos.map(|value| value.1 as f64)),
+                sql_opt(request.rot_deg.map(|value| value as f64)),
+                sql_opt(request.client_seq.map(|value| value as i64)),
+                sql_opt(request.room_seq.map(|value| value as i64)),
                 (request.outcome as i64).into(),
-                Self::opt_string(request.reason),
+                sql_opt(request.reason),
             ]),
         )
         .map_err(|err| err.to_string())?;
@@ -3351,20 +3221,17 @@ impl CommandStore {
                 ts_ms,
                 client_id: ClientId::from(client_id_raw),
                 kind: Self::decode_kind(kind_raw)?,
-                piece_id: Self::sql_optional_u32(&row[4]),
-                anchor_id: Self::sql_optional_u32(&row[5]),
-                pos: match (
-                    Self::sql_optional_f32(&row[6]),
-                    Self::sql_optional_f32(&row[7]),
-                ) {
+                piece_id: sql_u32(&row[4]),
+                anchor_id: sql_u32(&row[5]),
+                pos: match (sql_f32(&row[6]), sql_f32(&row[7])) {
                     (Some(x), Some(y)) => Some((x, y)),
                     _ => None,
                 },
-                rot_deg: Self::sql_optional_f32(&row[8]),
-                client_seq: Self::sql_optional_u64(&row[9]),
-                room_seq: Self::sql_optional_u64(&row[10]),
+                rot_deg: sql_f32(&row[8]),
+                client_seq: sql_u64(&row[9]),
+                room_seq: sql_u64(&row[10]),
                 outcome: Self::decode_outcome(outcome_raw)?,
-                reason: Self::sql_optional_string(&row[12]),
+                reason: sql_string(&row[12]),
             };
             next_after_id = Some(id);
             out.push(command);
@@ -3424,43 +3291,16 @@ impl CommandStore {
         }
     }
 
-    fn opt_i64(value: Option<i64>) -> SqlStorageValue {
-        match value {
-            Some(value) => value.into(),
-            None => SqlStorageValue::Null,
-        }
-    }
-
-    fn opt_f64(value: Option<f64>) -> SqlStorageValue {
-        match value {
-            Some(value) => value.into(),
-            None => SqlStorageValue::Null,
-        }
-    }
-
-    fn opt_string(value: Option<String>) -> SqlStorageValue {
-        match value {
-            Some(value) => value.into(),
-            None => SqlStorageValue::Null,
-        }
-    }
-
     fn sql_required_i64(value: &SqlStorageValue, field: &str) -> std::result::Result<i64, String> {
-        match value {
-            SqlStorageValue::Integer(value) => Ok(*value),
-            SqlStorageValue::Float(value) => Ok(*value as i64),
-            _ => Err(format!("invalid command {field}")),
-        }
+        sql_required(sql_i64(value), "command", field)
     }
 
     fn sql_required_u32(value: &SqlStorageValue, field: &str) -> std::result::Result<u32, String> {
-        let raw = Self::sql_required_i64(value, field)?;
-        u32::try_from(raw).map_err(|_| format!("invalid command {field}"))
+        sql_required(sql_u32(value), "command", field)
     }
 
     fn sql_required_u64(value: &SqlStorageValue, field: &str) -> std::result::Result<u64, String> {
-        let raw = Self::sql_required_i64(value, field)?;
-        u64::try_from(raw).map_err(|_| format!("invalid command {field}"))
+        sql_required(sql_u64(value), "command", field)
     }
 
     fn sql_required_client_id(value: &SqlStorageValue) -> std::result::Result<u64, String> {
@@ -3491,37 +3331,6 @@ impl CommandStore {
                 }
             }
             _ => Err("invalid command client_id".to_string()),
-        }
-    }
-
-    fn sql_optional_u32(value: &SqlStorageValue) -> Option<u32> {
-        match value {
-            SqlStorageValue::Integer(value) => u32::try_from(*value).ok(),
-            SqlStorageValue::Float(value) => u32::try_from(*value as i64).ok(),
-            _ => None,
-        }
-    }
-
-    fn sql_optional_u64(value: &SqlStorageValue) -> Option<u64> {
-        match value {
-            SqlStorageValue::Integer(value) => u64::try_from(*value).ok(),
-            SqlStorageValue::Float(value) => u64::try_from(*value as i64).ok(),
-            _ => None,
-        }
-    }
-
-    fn sql_optional_f32(value: &SqlStorageValue) -> Option<f32> {
-        match value {
-            SqlStorageValue::Integer(value) => Some(*value as f32),
-            SqlStorageValue::Float(value) => Some(*value as f32),
-            _ => None,
-        }
-    }
-
-    fn sql_optional_string(value: &SqlStorageValue) -> Option<String> {
-        match value {
-            SqlStorageValue::String(value) => Some(value.clone()),
-            _ => None,
         }
     }
 }

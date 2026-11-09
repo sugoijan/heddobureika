@@ -43,7 +43,7 @@ impl Default for BootRecord {
     }
 }
 
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct WsDelaySettings {
     pub(crate) inbound_ms: Option<u32>,
     pub(crate) outbound_ms: Option<u32>,
@@ -65,16 +65,6 @@ pub(crate) struct PrivateImageEntry {
 pub(crate) struct PrivateImageRefs {
     pub(crate) hashes: Vec<String>,
     pub(crate) updated_at: u64,
-}
-
-impl Default for WsDelaySettings {
-    fn default() -> Self {
-        Self {
-            inbound_ms: None,
-            outbound_ms: None,
-            jitter_ms: None,
-        }
-    }
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

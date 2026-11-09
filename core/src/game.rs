@@ -13,13 +13,10 @@ pub const SNAP_DISTANCE_RATIO_DEFAULT: f32 = 0.200;
 pub const SNAP_DISTANCE_RATIO_MIN: f32 = 0.050;
 pub const SNAP_DISTANCE_RATIO_MAX: f32 = 0.350;
 
-pub const SOLVE_TOLERANCE_RATIO: f32 = 0.080;
-
 pub const ROTATION_STEP_DEG: f32 = 90.0;
 pub const ROTATION_SNAP_TOLERANCE_DEFAULT_DEG: f32 = 5.0;
 pub const ROTATION_SNAP_TOLERANCE_MIN_DEG: f32 = 0.5;
 pub const ROTATION_SNAP_TOLERANCE_MAX_DEG: f32 = 12.0;
-pub const ROTATION_SOLVE_TOLERANCE_DEG: f32 = 1.5;
 
 pub const FLIP_CHANCE: f32 = 0.2;
 
@@ -30,7 +27,6 @@ pub const WORKSPACE_PADDING_RATIO_DEFAULT: f32 = 0.8;
 pub const FRAME_SNAP_MIN: f32 = 0.4;
 pub const FRAME_SNAP_MAX: f32 = 3.0;
 pub const FRAME_SNAP_DEFAULT: f32 = 1.0;
-pub const COMPLETE_SNAP_MULTIPLIER: f32 = 2.0;
 
 pub const IMAGE_MAX_DIMENSION_MIN: u32 = 512;
 pub const IMAGE_MAX_DIMENSION_MAX: u32 = 4096;
@@ -88,295 +84,20 @@ pub fn compute_workspace_layout(
     }
 }
 
-pub fn splitmix32(mut value: u32) -> u32 {
-    value = value.wrapping_add(0x9E37_79B9);
-    let mut z = value;
-    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
-    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
-    z ^ (z >> 16)
-}
+pub use heddobureika_game::{
+    angle_matches, normalize_angle, rand_range, rand_unit, rotate_point, rotate_vec,
+    shortest_angle_delta, splitmix32,
+};
 
-pub fn rand_unit(seed: u32, salt: u32) -> f32 {
-    let mixed = splitmix32(seed ^ salt);
-    let top = mixed >> 8;
-    top as f32 / ((1u32 << 24) as f32)
-}
-
-pub fn rand_range(seed: u32, salt: u32, min: f32, max: f32) -> f32 {
-    min + (max - min) * rand_unit(seed, salt)
-}
-
-pub fn normalize_angle(mut angle: f32) -> f32 {
-    angle = angle % 360.0;
-    if angle < 0.0 {
-        angle += 360.0;
-    }
-    angle
-}
-
+/// Signed rotation from `current` to `target` in `(-180, 180]`. Unlike
+/// [`shortest_angle_delta`], an exact half turn always comes out positive so
+/// click-to-rotate animates in a consistent direction.
 pub fn angle_delta(target: f32, current: f32) -> f32 {
     let mut diff = normalize_angle(target - current);
     if diff > 180.0 {
         diff -= 360.0;
     }
     diff
-}
-
-pub fn angle_matches(a: f32, b: f32, tolerance: f32) -> bool {
-    angle_delta(a, b).abs() <= tolerance
-}
-
-pub fn rotate_vec(x: f32, y: f32, angle_deg: f32) -> (f32, f32) {
-    let theta = angle_deg.to_radians();
-    let (sin, cos) = theta.sin_cos();
-    (x * cos - y * sin, x * sin + y * cos)
-}
-
-pub fn piece_local_offset(
-    id: usize,
-    anchor: usize,
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-) -> (f32, f32) {
-    let col = (id % cols) as f32;
-    let row = (id / cols) as f32;
-    let anchor_col = (anchor % cols) as f32;
-    let anchor_row = (anchor / cols) as f32;
-    (
-        (col - anchor_col) * piece_width,
-        (row - anchor_row) * piece_height,
-    )
-}
-
-pub fn derive_piece_state(
-    anchor_of: &[usize],
-    group_pos: &[(f32, f32)],
-    group_rot: &[f32],
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-) -> (Vec<(f32, f32)>, Vec<f32>) {
-    let total = anchor_of.len();
-    let mut positions = vec![(0.0, 0.0); total];
-    let mut rotations = vec![0.0; total];
-    for id in 0..total {
-        let anchor = anchor_of[id];
-        if anchor >= group_pos.len() || anchor >= group_rot.len() {
-            continue;
-        }
-        let base = group_pos[anchor];
-        let rot = group_rot[anchor];
-        let (dx, dy) = piece_local_offset(id, anchor, cols, piece_width, piece_height);
-        let (rx, ry) = rotate_vec(dx, dy, rot);
-        positions[id] = (base.0 + rx, base.1 + ry);
-        rotations[id] = rot;
-    }
-    (positions, rotations)
-}
-
-pub fn update_group_members_state(
-    members: &[usize],
-    anchor_id: usize,
-    group_pos: &[(f32, f32)],
-    group_rot: &[f32],
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-    positions: &mut [(f32, f32)],
-    rotations: &mut [f32],
-) {
-    if anchor_id >= group_pos.len() || anchor_id >= group_rot.len() {
-        return;
-    }
-    let base = group_pos[anchor_id];
-    let rot = group_rot[anchor_id];
-    for &id in members {
-        if id >= positions.len() || id >= rotations.len() {
-            continue;
-        }
-        let (dx, dy) = piece_local_offset(id, anchor_id, cols, piece_width, piece_height);
-        let (rx, ry) = rotate_vec(dx, dy, rot);
-        positions[id] = (base.0 + rx, base.1 + ry);
-        rotations[id] = rot;
-    }
-}
-
-pub fn build_group_order_from_piece_order(
-    piece_order: &[usize],
-    anchor_of: &[usize],
-) -> Vec<usize> {
-    let total = anchor_of.len();
-    let mut seen = vec![false; total];
-    let mut group_order = Vec::new();
-    for &id in piece_order {
-        if id >= total {
-            continue;
-        }
-        let anchor = anchor_of[id];
-        if anchor < total && !seen[anchor] {
-            seen[anchor] = true;
-            group_order.push(anchor);
-        }
-    }
-    for anchor in 0..total {
-        if anchor_of[anchor] == anchor && !seen[anchor] {
-            group_order.push(anchor);
-        }
-    }
-    group_order
-}
-
-pub fn build_piece_order_from_groups(group_order: &[usize], anchor_of: &[usize]) -> Vec<usize> {
-    let total = anchor_of.len();
-    let mut members: Vec<Vec<usize>> = vec![Vec::new(); total];
-    for id in 0..total {
-        let anchor = anchor_of[id];
-        if anchor < total {
-            members[anchor].push(id);
-        }
-    }
-    for group in &mut members {
-        if group.len() > 1 {
-            group.sort_unstable();
-        }
-    }
-    let mut group_seen = vec![false; total];
-    for &anchor in group_order {
-        if anchor < total {
-            group_seen[anchor] = true;
-        }
-    }
-    let mut order = Vec::with_capacity(total);
-    for &anchor in group_order {
-        if anchor < total {
-            order.extend_from_slice(&members[anchor]);
-        }
-    }
-    for anchor in 0..total {
-        if anchor_of[anchor] == anchor && !group_seen[anchor] {
-            order.extend_from_slice(&members[anchor]);
-        }
-    }
-    if order.len() < total {
-        let mut seen = vec![false; total];
-        for &id in &order {
-            if id < total {
-                seen[id] = true;
-            }
-        }
-        for id in 0..total {
-            if !seen[id] {
-                order.push(id);
-            }
-        }
-    }
-    order
-}
-
-pub fn rebuild_groups_from_piece_state(
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-    connections: &[[bool; 4]],
-    cols: usize,
-    rows: usize,
-    piece_order: Option<&[usize]>,
-) -> (Vec<usize>, Vec<(f32, f32)>, Vec<f32>, Vec<usize>) {
-    let total = cols * rows;
-    let mut anchor_of = vec![0usize; total];
-    let mut group_pos = vec![(0.0, 0.0); total];
-    let mut group_rot = vec![0.0; total];
-    let groups = groups_from_connections(connections, cols, rows);
-    for group in &groups {
-        if group.is_empty() {
-            continue;
-        }
-        let anchor = group[0];
-        for &id in group {
-            if id < total {
-                anchor_of[id] = anchor;
-            }
-        }
-        if anchor < positions.len() {
-            group_pos[anchor] = positions[anchor];
-        }
-        if anchor < rotations.len() {
-            group_rot[anchor] = rotations[anchor];
-        }
-    }
-    let group_order = if let Some(order) = piece_order {
-        build_group_order_from_piece_order(order, &anchor_of)
-    } else {
-        let mut order = Vec::new();
-        for id in 0..total {
-            if anchor_of[id] == id {
-                order.push(id);
-            }
-        }
-        order
-    };
-    (anchor_of, group_pos, group_rot, group_order)
-}
-
-pub fn rebuild_group_state(
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-    connections: &[[bool; 4]],
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
-    piece_order: Option<&[usize]>,
-) -> (
-    Vec<usize>,
-    Vec<(f32, f32)>,
-    Vec<f32>,
-    Vec<usize>,
-    Vec<(f32, f32)>,
-    Vec<f32>,
-    Vec<usize>,
-) {
-    let (anchor_of, group_pos, group_rot, group_order) =
-        rebuild_groups_from_piece_state(positions, rotations, connections, cols, rows, piece_order);
-    let (derived_positions, derived_rotations) = derive_piece_state(
-        &anchor_of,
-        &group_pos,
-        &group_rot,
-        cols,
-        piece_width,
-        piece_height,
-    );
-    let piece_order = build_piece_order_from_groups(&group_order, &anchor_of);
-    (
-        anchor_of,
-        group_pos,
-        group_rot,
-        group_order,
-        derived_positions,
-        derived_rotations,
-        piece_order,
-    )
-}
-
-pub fn group_transforms_from_anchor(
-    anchor_of: &[usize],
-    positions: &[(f32, f32)],
-    rotations: &[f32],
-) -> (Vec<(f32, f32)>, Vec<f32>) {
-    let total = anchor_of.len();
-    let mut group_pos = vec![(0.0, 0.0); total];
-    let mut group_rot = vec![0.0; total];
-    for (id, anchor) in anchor_of.iter().copied().enumerate() {
-        if anchor == id {
-            if let Some(pos) = positions.get(id) {
-                group_pos[id] = *pos;
-            }
-            if let Some(rot) = rotations.get(id) {
-                group_rot[id] = *rot;
-            }
-        }
-    }
-    (group_pos, group_rot)
 }
 
 pub fn neighbor_id(id: usize, cols: usize, rows: usize, dir: usize) -> Option<usize> {
@@ -389,78 +110,6 @@ pub fn neighbor_id(id: usize, cols: usize, rows: usize, dir: usize) -> Option<us
         DIR_LEFT if col > 0 => Some(id - 1),
         _ => None,
     }
-}
-
-pub fn opposite_dir(dir: usize) -> usize {
-    match dir {
-        DIR_UP => DIR_DOWN,
-        DIR_RIGHT => DIR_LEFT,
-        DIR_DOWN => DIR_UP,
-        DIR_LEFT => DIR_RIGHT,
-        _ => DIR_UP,
-    }
-}
-
-pub fn set_connection(
-    connections: &mut Vec<[bool; 4]>,
-    id: usize,
-    dir: usize,
-    value: bool,
-    cols: usize,
-    rows: usize,
-) {
-    if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
-        if let Some(edges) = connections.get_mut(id) {
-            edges[dir] = value;
-        }
-        let opposite = opposite_dir(dir);
-        if let Some(edges) = connections.get_mut(neighbor) {
-            edges[opposite] = value;
-        }
-    }
-}
-
-pub fn clear_piece_connections(
-    connections: &mut Vec<[bool; 4]>,
-    id: usize,
-    cols: usize,
-    rows: usize,
-) {
-    for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-        set_connection(connections, id, dir, false, cols, rows);
-    }
-}
-
-pub fn collect_group(
-    connections: &[[bool; 4]],
-    start: usize,
-    cols: usize,
-    rows: usize,
-) -> Vec<usize> {
-    let total = cols * rows;
-    if start >= total {
-        return Vec::new();
-    }
-    let mut visited = vec![false; total];
-    let mut queue = VecDeque::new();
-    let mut group = Vec::new();
-    visited[start] = true;
-    queue.push_back(start);
-
-    while let Some(id) = queue.pop_front() {
-        group.push(id);
-        for dir in [DIR_UP, DIR_RIGHT, DIR_DOWN, DIR_LEFT] {
-            if connections.get(id).map(|edges| edges[dir]).unwrap_or(false) {
-                if let Some(neighbor) = neighbor_id(id, cols, rows, dir) {
-                    if !visited[neighbor] {
-                        visited[neighbor] = true;
-                        queue.push_back(neighbor);
-                    }
-                }
-            }
-        }
-    }
-    group
 }
 
 pub fn groups_from_connections(
@@ -501,82 +150,6 @@ pub fn groups_from_connections(
     groups
 }
 
-pub fn is_fully_connected(connections: &[[bool; 4]], cols: usize, rows: usize) -> bool {
-    let total = cols * rows;
-    if total == 0 || connections.len() != total {
-        return false;
-    }
-    collect_group(connections, 0, cols, rows).len() == total
-}
-
-pub fn aligned_center_from_anchor(
-    anchor_row: i32,
-    anchor_col: i32,
-    anchor_center: (f32, f32),
-    id: usize,
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-    rotation: f32,
-) -> (f32, f32) {
-    let row = (id / cols) as i32;
-    let col = (id % cols) as i32;
-    let dx = (col - anchor_col) as f32 * piece_width;
-    let dy = (row - anchor_row) as f32 * piece_height;
-    let (rx, ry) = rotate_vec(dx, dy, rotation);
-    (anchor_center.0 + rx, anchor_center.1 + ry)
-}
-
-pub fn align_group_to_anchor(
-    positions: &mut Vec<(f32, f32)>,
-    rotations: &mut Vec<f32>,
-    members: &[usize],
-    anchor_id: usize,
-    anchor_center: (f32, f32),
-    target_rot: f32,
-    cols: usize,
-    piece_width: f32,
-    piece_height: f32,
-) {
-    let anchor_row = (anchor_id / cols) as i32;
-    let anchor_col = (anchor_id % cols) as i32;
-    for id in members {
-        let center = aligned_center_from_anchor(
-            anchor_row,
-            anchor_col,
-            anchor_center,
-            *id,
-            cols,
-            piece_width,
-            piece_height,
-            target_rot,
-        );
-        if let Some(pos) = positions.get_mut(*id) {
-            *pos = (center.0 - piece_width * 0.5, center.1 - piece_height * 0.5);
-        }
-        if let Some(rot) = rotations.get_mut(*id) {
-            *rot = target_rot;
-        }
-    }
-}
-
-pub fn build_full_connections(cols: usize, rows: usize) -> Vec<[bool; 4]> {
-    let total = cols * rows;
-    let mut connections = vec![[false; 4]; total];
-    for row in 0..rows {
-        for col in 0..cols {
-            let id = row * cols + col;
-            if col + 1 < cols {
-                set_connection(&mut connections, id, DIR_RIGHT, true, cols, rows);
-            }
-            if row + 1 < rows {
-                set_connection(&mut connections, id, DIR_DOWN, true, cols, rows);
-            }
-        }
-    }
-    connections
-}
-
 pub fn scramble_seed(base: u32, nonce: u32, cols: usize, rows: usize) -> u32 {
     let grid = ((cols as u32) << 16) ^ (rows as u32);
     base ^ nonce.wrapping_mul(0x9E37_79B9) ^ grid ^ 0x5CA7_7EED
@@ -609,29 +182,6 @@ pub fn scramble_seed_from_topology(
         hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
     }
     base ^ nonce.wrapping_mul(0x9E37_79B9) ^ hash
-}
-
-/// Inverse of `scramble_seed_from_topology` — recover the nonce from a
-/// seed and topology. Used by code that wants to round-trip a "share-this-
-/// scramble" seed back into a `scramble_nonce`.
-pub fn scramble_nonce_from_topology_seed(
-    base: u32,
-    seed: u32,
-    topology: &heddobureika_game::TopologySpec,
-) -> u32 {
-    let mut hash: u32 = 0x5CA7_7EED;
-    // Hash both the tag and the opaque payload — together they uniquely
-    // identify the topology instance. We don't care about the payload's
-    // internal structure; the FNV-style mix is enough to avoid trivial
-    // collisions between topologies.
-    for byte in topology.tag.as_bytes() {
-        hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
-    }
-    for byte in &topology.payload {
-        hash = hash.wrapping_mul(0x0100_0193) ^ (*byte as u32);
-    }
-    let mixed = seed ^ base ^ hash;
-    mixed.wrapping_mul(0x144C_BC89)
 }
 
 /// Per-piece bounding box used by the topology-agnostic scramble layout.
@@ -728,47 +278,6 @@ pub fn scramble_pose<T: PuzzleTopology>(
         (center_y - origin_y) / pose_unit_y,
         rotation_deg,
     )
-}
-
-pub fn scramble_layout(
-    seed: u32,
-    cols: usize,
-    rows: usize,
-    piece_width: f32,
-    piece_height: f32,
-    view_min_x: f32,
-    view_min_y: f32,
-    view_width: f32,
-    view_height: f32,
-    margin: f32,
-) -> (Vec<(f32, f32)>, Vec<usize>) {
-    let total = cols * rows;
-    let min_x = view_min_x + margin;
-    let mut max_x = view_min_x + view_width - piece_width - margin;
-    let min_y = view_min_y + margin;
-    let mut max_y = view_min_y + view_height - piece_height - margin;
-    if max_x < min_x {
-        max_x = min_x;
-    }
-    if max_y < min_y {
-        max_y = min_y;
-    }
-
-    let mut positions = Vec::with_capacity(total);
-    for id in 0..total {
-        let salt = (id as u32) << 1;
-        let x = rand_range(seed, salt, min_x, max_x);
-        let y = rand_range(seed, salt + 1, min_y, max_y);
-        positions.push((x, y));
-    }
-
-    let mut order: Vec<usize> = (0..total).collect();
-    for i in (1..order.len()).rev() {
-        let salt = 0xC0DE_u32 + i as u32;
-        let j = (rand_unit(seed, salt) * (i as f32 + 1.0)) as usize;
-        order.swap(i, j);
-    }
-    (positions, order)
 }
 
 pub fn scramble_rotations(seed: u32, total: usize, enabled: bool) -> Vec<f32> {
@@ -890,7 +399,7 @@ pub fn safety_corrections_after_detach<T: PuzzleTopology>(
                 break;
             }
             let dist = dx * dx + dy * dy;
-            if best.map_or(true, |(best_dist, _, _)| dist < best_dist) {
+            if best.is_none_or(|(best_dist, _, _)| dist < best_dist) {
                 best = Some((dist, dx, dy));
             }
         }

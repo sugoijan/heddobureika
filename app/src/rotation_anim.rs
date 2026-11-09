@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
+use crate::core::{rotate_point, shortest_angle_delta};
+
 /// Tunable spring feel. `response` is roughly the time (seconds) to reach the
 /// target; `damping` is the damping ratio (1.0 critical, <1.0 bouncy).
 #[derive(Clone, Copy, Debug)]
@@ -318,17 +320,6 @@ pub(crate) fn rotate_group_succession(
     dest
 }
 
-/// Signed shortest angular difference `to - from`, wrapped to `[-180, 180]` deg.
-pub(crate) fn shortest_angle_delta(from: f32, to: f32) -> f32 {
-    let mut delta = (to - from) % 360.0;
-    if delta < -180.0 {
-        delta += 360.0;
-    } else if delta > 180.0 {
-        delta -= 360.0;
-    }
-    delta
-}
-
 /// Signed angle to travel from `from` to `to`. With `hint == 0` this is the
 /// shortest path (`[-180, 180]`); with `hint > 0` it is forced positive
 /// (clockwise / increasing angle, `[0, 360)`) and with `hint < 0` forced
@@ -347,10 +338,7 @@ fn directed_delta(from: f32, to: f32, hint: f32) -> f32 {
 
 /// Rotates `point` about `pivot` by `angle_deg`.
 fn rotate_about(point: (f32, f32), pivot: (f32, f32), angle_deg: f32) -> (f32, f32) {
-    let (s, c) = angle_deg.to_radians().sin_cos();
-    let ex = point.0 - pivot.0;
-    let ey = point.1 - pivot.1;
-    (c * ex - s * ey + pivot.0, s * ex + c * ey + pivot.1)
+    rotate_point(point.0, point.1, pivot.0, pivot.1, angle_deg)
 }
 
 /// Fixed point (pole) of the planar rigid motion that maps `from_centroid` to

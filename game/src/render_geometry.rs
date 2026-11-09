@@ -1,9 +1,9 @@
 use crate::ids::{EdgeId, PieceId};
+use crate::math::{self, rotate_point};
 use crate::playable::Pose2;
 use crate::shape::{PathMm, PathSegMm, PieceEdgeRef, PointMm, ShapeAtlasMm};
 use crate::shape_svg::path_to_svg_d;
 use crate::traits::topology::PuzzleTopology;
-use crate::units::LengthMm;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RectPx {
@@ -226,16 +226,6 @@ impl PuzzleRenderGeometry {
     }
 }
 
-fn rotate_point(x: f32, y: f32, origin_x: f32, origin_y: f32, angle_deg: f32) -> (f32, f32) {
-    let theta = angle_deg.to_radians();
-    let (sin, cos) = theta.sin_cos();
-    let (dx, dy) = (x - origin_x, y - origin_y);
-    (
-        origin_x + dx * cos - dy * sin,
-        origin_y + dx * sin + dy * cos,
-    )
-}
-
 fn path_bounds(path: &PathMm) -> Option<RectPx> {
     let mut min_x = path.start.x_mm();
     let mut min_y = path.start.y_mm();
@@ -304,17 +294,11 @@ fn path_dense_points(path: &PathMm) -> Box<[[f32; 2]]> {
     points.into_boxed_slice()
 }
 
-/// De Casteljau evaluation of a cubic Bézier at parameter `t`.
+/// Evaluates a cubic Bézier between millimetre points at parameter `t`.
 fn cubic_point(p0: PointMm, c1: PointMm, c2: PointMm, p1: PointMm, t: f32) -> [f32; 2] {
-    let mt = 1.0 - t;
-    let a = mt * mt * mt;
-    let b = 3.0 * mt * mt * t;
-    let c = 3.0 * mt * t * t;
-    let d = t * t * t;
-    [
-        a * p0.x_mm() + b * c1.x_mm() + c * c2.x_mm() + d * p1.x_mm(),
-        a * p0.y_mm() + b * c1.y_mm() + c * c2.y_mm() + d * p1.y_mm(),
-    ]
+    let mm = |p: PointMm| (p.x_mm(), p.y_mm());
+    let (x, y) = math::cubic_point(mm(p0), mm(c1), mm(c2), mm(p1), t);
+    [x, y]
 }
 
 /// Standard even-odd ray-cast point-in-polygon test.
@@ -460,12 +444,4 @@ where
         typical_piece_extent_px,
         frame_shape,
     })
-}
-
-/// Helper for topologies that want to declare their image extent in
-/// pose-unit terms and have the helper derive pose_unit_px.
-pub fn pose_unit_px_from_image(image_w: u32, image_h: u32, extent: (f32, f32)) -> [f32; 2] {
-    let (xu, yu) = extent;
-    let _ = LengthMm::zero(); // keep import in use
-    [image_w as f32 / xu.max(1.0), image_h as f32 / yu.max(1.0)]
 }

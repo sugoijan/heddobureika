@@ -278,8 +278,8 @@ pub trait PuzzleTopology {
             dy = 1.0;
         }
         (
-            LengthMm::try_new(dx).unwrap_or(LengthMm::zero()),
-            LengthMm::try_new(dy).unwrap_or(LengthMm::zero()),
+            LengthMm::try_new(dx).unwrap_or_default(),
+            LengthMm::try_new(dy).unwrap_or_default(),
         )
     }
 
@@ -306,8 +306,8 @@ pub trait PuzzleTopology {
         let median_x = xs[mid];
         let median_y = ys[mid];
         (
-            LengthMm::try_new(median_x).unwrap_or(LengthMm::zero()),
-            LengthMm::try_new(median_y).unwrap_or(LengthMm::zero()),
+            LengthMm::try_new(median_x).unwrap_or_default(),
+            LengthMm::try_new(median_y).unwrap_or_default(),
         )
     }
 

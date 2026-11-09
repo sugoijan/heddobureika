@@ -70,8 +70,7 @@ pub fn gen_icons(args: &GenIconsArgs) -> Result<()> {
     }
     let work = PathBuf::from("target/gen-icons");
     fs::create_dir_all(&work).context("creating target/gen-icons")?;
-    fs::create_dir_all(&args.out)
-        .with_context(|| format!("creating {}", args.out.display()))?;
+    fs::create_dir_all(&args.out).with_context(|| format!("creating {}", args.out.display()))?;
 
     let artboards = artboard_ids_by_name(&tool, &args.sketch)?;
     let favicon_id = artboards.get(&args.favicon_item).ok_or_else(|| {
@@ -102,15 +101,15 @@ pub fn gen_icons(args: &GenIconsArgs) -> Result<()> {
     println!("wrote {}", favicon_svg.display());
 
     let favicon_png = export_artboard(&tool, &args.sketch, favicon_id, "png", Some(2), &work)?;
-    let favicon_src = image::open(&favicon_png)
-        .with_context(|| format!("decoding {}", favicon_png.display()))?;
+    let favicon_src =
+        image::open(&favicon_png).with_context(|| format!("decoding {}", favicon_png.display()))?;
     let favicon_ico = args.out.join("favicon.ico");
     write_ico(&favicon_src, &favicon_ico)?;
     println!("wrote {}", favicon_ico.display());
 
     let touch_png = export_artboard(&tool, &args.sketch, touch_id, "png", Some(2), &work)?;
-    let touch_src = image::open(&touch_png)
-        .with_context(|| format!("decoding {}", touch_png.display()))?;
+    let touch_src =
+        image::open(&touch_png).with_context(|| format!("decoding {}", touch_png.display()))?;
     let touch_out = args.out.join("apple-touch-icon.png");
     touch_src
         .resize_exact(APPLE_TOUCH_SIZE, APPLE_TOUCH_SIZE, FilterType::Lanczos3)
@@ -142,7 +141,10 @@ fn locate_sketchtool() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("SKETCHTOOL") {
         let path = PathBuf::from(path);
         if !path.exists() {
-            bail!("SKETCHTOOL points at {}, which does not exist", path.display());
+            bail!(
+                "SKETCHTOOL points at {}, which does not exist",
+                path.display()
+            );
         }
         return Ok(path);
     }
@@ -224,15 +226,17 @@ fn export_artboard(
     if let Some(scale) = scale {
         candidates.insert(0, out_dir.join(format!("{artboard_id}@{scale}x.{format}")));
     }
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| anyhow!("sketchtool reported success but no {format} export found for {artboard_id}"))
+    candidates.into_iter().find(|p| p.exists()).ok_or_else(|| {
+        anyhow!("sketchtool reported success but no {format} export found for {artboard_id}")
+    })
 }
 
 fn write_ico(source: &DynamicImage, out: &Path) -> Result<()> {
-    let resized = ICO_SIZES
-        .map(|size| source.resize_exact(size, size, FilterType::Lanczos3).to_rgba8());
+    let resized = ICO_SIZES.map(|size| {
+        source
+            .resize_exact(size, size, FilterType::Lanczos3)
+            .to_rgba8()
+    });
     let frames = resized
         .iter()
         .zip(ICO_SIZES)

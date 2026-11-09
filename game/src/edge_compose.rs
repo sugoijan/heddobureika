@@ -1,8 +1,8 @@
 //! Composition utilities that apply connector profiles onto host-edge frames.
 
 use crate::edge_host::{HostEdgeFrame, WarpField, map_local_point, map_point};
-use crate::shape::{PathMm, PathSegMm, PointMm};
-use crate::units::LengthMm;
+use crate::math::cubic_point;
+use crate::shape::{PathMm, PathSegMm, point_mm};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConnectorSeg {
@@ -75,34 +75,6 @@ pub fn map_segments_to_path(
     }
 
     PathMm::new(point_mm(sx, sy), segs.into_boxed_slice(), false)
-}
-
-pub fn append_mapped_segments(
-    out: &mut Vec<PathSegMm>,
-    segments: &[ConnectorSeg],
-    frame: HostEdgeFrame,
-    warp: &WarpField<'_>,
-) {
-    for segment in segments {
-        match *segment {
-            ConnectorSeg::LineTo { to } => {
-                let (tx, ty) = map_point(frame, to.0, to.1, warp);
-                out.push(PathSegMm::LineTo {
-                    to: point_mm(tx, ty),
-                });
-            }
-            ConnectorSeg::CubicTo { c1, c2, to } => {
-                let (c1x, c1y) = map_point(frame, c1.0, c1.1, warp);
-                let (c2x, c2y) = map_point(frame, c2.0, c2.1, warp);
-                let (tx, ty) = map_point(frame, to.0, to.1, warp);
-                out.push(PathSegMm::CubicTo {
-                    c1: point_mm(c1x, c1y),
-                    c2: point_mm(c2x, c2y),
-                    to: point_mm(tx, ty),
-                });
-            }
-        }
-    }
 }
 
 pub fn append_mapped_local_line_points(
@@ -287,29 +259,4 @@ fn circumcenter(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<(f32, f32
     let ux = (a2 * (b.1 - c.1) + b2 * (c.1 - a.1) + c2 * (a.1 - b.1)) / d;
     let uy = (a2 * (c.0 - b.0) + b2 * (a.0 - c.0) + c2 * (b.0 - a.0)) / d;
     Some((ux, uy))
-}
-
-fn cubic_point(
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    p3: (f32, f32),
-    t: f32,
-) -> (f32, f32) {
-    let u = 1.0 - t;
-    let tt = t * t;
-    let uu = u * u;
-    let uuu = uu * u;
-    let ttt = tt * t;
-    (
-        uuu * p0.0 + 3.0 * uu * t * p1.0 + 3.0 * u * tt * p2.0 + ttt * p3.0,
-        uuu * p0.1 + 3.0 * uu * t * p1.1 + 3.0 * u * tt * p2.1 + ttt * p3.1,
-    )
-}
-
-fn point_mm(x: f32, y: f32) -> PointMm {
-    PointMm {
-        x: LengthMm::try_new(x).unwrap_or_default(),
-        y: LengthMm::try_new(y).unwrap_or_default(),
-    }
 }

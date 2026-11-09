@@ -29,6 +29,16 @@ impl PointMm {
     }
 }
 
+/// Builds a point from raw millimetre coordinates, mapping non-finite
+/// inputs to zero. Used by the shape generators, whose arithmetic is
+/// finite by construction.
+pub(crate) fn point_mm(x: f32, y: f32) -> PointMm {
+    PointMm {
+        x: LengthMm::try_new(x).unwrap_or_default(),
+        y: LengthMm::try_new(y).unwrap_or_default(),
+    }
+}
+
 /// Path segment in piece-local millimeter coordinates.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PathSegMm {
@@ -56,6 +66,22 @@ impl PathMm {
             start,
             segs,
             closed,
+        }
+    }
+
+    /// Final point of the path (its start when it has no segments).
+    pub fn end_point(&self) -> PointMm {
+        self.segs.last().map_or(self.start, |seg| match seg {
+            PathSegMm::LineTo { to } => *to,
+            PathSegMm::CubicTo { to, .. } => *to,
+        })
+    }
+
+    /// Moves the final point of the path (its start when it has no segments).
+    pub fn set_end_point(&mut self, target: PointMm) {
+        match self.segs.last_mut() {
+            Some(PathSegMm::LineTo { to }) | Some(PathSegMm::CubicTo { to, .. }) => *to = target,
+            None => self.start = target,
         }
     }
 }
@@ -228,7 +254,7 @@ impl ShapeAtlasMm {
                         return Err(GeometryInvariantError::PieceRingNotContiguous);
                     }
                 }
-                prev_end = Some(path_end_point(&side_geom.path));
+                prev_end = Some(side_geom.path.end_point());
             }
 
             let first_start = self.resolve_piece_edge_ref(piece_geom.edges[0]).path.start;
@@ -268,15 +294,4 @@ impl ShapeAtlasMm {
             }
         }
     }
-}
-
-fn path_end_point(path: &PathMm) -> PointMm {
-    let mut current = path.start;
-    for seg in path.segs.iter() {
-        current = match seg {
-            PathSegMm::LineTo { to } => *to,
-            PathSegMm::CubicTo { to, .. } => *to,
-        };
-    }
-    current
 }

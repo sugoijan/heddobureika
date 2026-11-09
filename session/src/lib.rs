@@ -356,14 +356,13 @@ impl SessionAuthority {
 
             let seq = runtime_snapshot.snapshot.seq.saturating_add(1);
             runtime_snapshot.set_seq(seq);
-            let group_order_update = control_update_msg(
+
+            control_update_msg(
                 seq,
                 RoomControlUpdate::GroupOrder { order: group_order },
                 Some(client_id),
                 None,
-            );
-
-            group_order_update
+            )
         };
         Some(CommandEffects::new(vec![value], false))
     }
@@ -450,15 +449,13 @@ impl SessionAuthority {
                     }
                 };
 
-            let update = Some(playable_update_msg_from_batch(
+            Some(playable_update_msg_from_batch(
                 &runtime_snapshot.snapshot,
                 &batch,
                 PlayableRoomUpdateKind::ActionOnly,
                 Some(client_id),
                 Some(client_seq).filter(|value| *value != 0),
-            ));
-
-            update
+            ))
         };
         Some(CommandEffects::new(vec![value?], false))
     }
@@ -535,15 +532,13 @@ impl SessionAuthority {
                 }
             };
 
-            let update = Some(playable_update_msg_from_batch(
+            Some(playable_update_msg_from_batch(
                 &runtime_snapshot.snapshot,
                 &batch,
                 PlayableRoomUpdateKind::ActionOnly,
                 Some(client_id),
                 Some(client_seq).filter(|value| *value != 0),
-            ));
-
-            update
+            ))
         };
         Some(CommandEffects::new(vec![value?], false))
     }
@@ -1237,25 +1232,18 @@ fn playable_group_members(snapshot: &PlayableGameSnapshot, piece_id: usize) -> O
     (!members.is_empty()).then_some(members)
 }
 
-fn playable_group_anchor(snapshot: &PlayableGameSnapshot, group: u32) -> Option<usize> {
-    snapshot
-        .state
-        .piece_group
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(idx, candidate)| (candidate == group).then_some(idx))
-        .min()
-}
-
 fn playable_group_order_anchors(snapshot: &PlayableGameSnapshot) -> Vec<u32> {
+    // A group's anchor is its lowest piece id, so one ascending pass over
+    // `piece_group` records the first piece seen for each group.
+    let mut anchor_by_group: HashMap<u32, u32> = HashMap::new();
+    for (idx, group) in snapshot.state.piece_group.iter().copied().enumerate() {
+        anchor_by_group.entry(group).or_insert(idx as u32);
+    }
     let mut order = Vec::with_capacity(snapshot.state.z_order.len());
-    for group in snapshot.state.z_order.iter().copied() {
-        let Some(anchor) = playable_group_anchor(snapshot, group) else {
-            continue;
-        };
-        let anchor = anchor as u32;
-        if !order.contains(&anchor) {
+    for group in &snapshot.state.z_order {
+        if let Some(&anchor) = anchor_by_group.get(group)
+            && !order.contains(&anchor)
+        {
             order.push(anchor);
         }
     }

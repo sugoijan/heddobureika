@@ -7,12 +7,74 @@ use crate::snapshot::{
     PlayablePositionSnapshot, PlayableTopologySnapshot, PuzzleImageRef,
 };
 use heddobureika_game::{
-    EdgeId, FlipState, GroupId, GroupMergeUpdate, PlayableState, PlayableUpdateBatch, Pose2,
+    EdgeId, FlipState, GroupId, GroupMergeUpdate, PlayableState, PlayableUpdateBatch,
     ProposalApplyRejection, ProposalApplyStatus, PuzzleTopology, SnapRejectionReason,
 };
 
 pub const PRIVATE_UPLOAD_MAX_BYTES: u32 = 10 * 1024 * 1024;
 pub const PRIVATE_ASSET_MAX_BYTES: u32 = 3 * 1024 * 1024;
+
+/// Reassembles a chunked asset transfer (`AssetBegin`/`AssetChunk`/`AssetEnd`,
+/// or the admin upload trio) while enforcing the declared size and a hard byte
+/// budget, so every endpoint applies the same limits.
+#[derive(Debug, Clone)]
+pub struct ChunkAssembler {
+    size: u32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkError {
+    /// The declared size is zero or over budget, or a chunk overflows it.
+    TooLarge,
+    /// The transfer ended before all declared bytes arrived.
+    Incomplete,
+}
+
+impl ChunkAssembler {
+    pub fn begin(size: u32, max_bytes: u32) -> Result<Self, ChunkError> {
+        if size == 0 || size > max_bytes {
+            return Err(ChunkError::TooLarge);
+        }
+        Ok(Self {
+            size,
+            bytes: Vec::with_capacity(size as usize),
+        })
+    }
+
+    /// Declared total size in bytes.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), ChunkError> {
+        if self.bytes.len() + chunk.len() > self.size as usize {
+            return Err(ChunkError::TooLarge);
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>, ChunkError> {
+        if self.bytes.len() != self.size as usize {
+            return Err(ChunkError::Incomplete);
+        }
+        Ok(self.bytes)
+    }
+}
+
+/// Lowercase hex SHA-256 of `bytes`: the identity of a stored private asset
+/// (see [`PuzzleImageRef::Private`]).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
 pub const ASSET_CHUNK_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -410,9 +472,7 @@ impl PlayableRoomUpdate {
             .copied()
             .map(|group| GroupChangeSnapshot {
                 group: group.as_u32(),
-                pose: PlayablePoseSnapshot::from_pose(
-                    playable.pose_of(group).unwrap_or(Pose2::default()),
-                ),
+                pose: PlayablePoseSnapshot::from_pose(playable.pose_of(group).unwrap_or_default()),
                 flipped: playable.flip_of(group) == Some(FlipState::Flipped),
                 alive: playable
                     .logical
@@ -765,7 +825,8 @@ pub enum ServerMsg {
 mod tests {
     use super::*;
     use heddobureika_game::{
-        GridTopology, LogicalState, PieceId, PlayRules, PlayableState, RestrictedPlayableAction,
+        GridTopology, LogicalState, PieceId, PlayRules, PlayableState, Pose2,
+        RestrictedPlayableAction,
     };
 
     /// Regression: a server-confirmed detach must leave the client's

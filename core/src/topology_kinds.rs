@@ -318,7 +318,7 @@ fn best_triangular_params(
 }
 
 fn diff_abs(a: u32, b: u32) -> u32 {
-    if a >= b { a - b } else { b - a }
+    a.abs_diff(b)
 }
 
 fn triangular_spec_label(spec: &TopologySpec) -> Option<String> {
@@ -406,7 +406,7 @@ fn hexagonal_resolve_target(
     let init_rows = init_rows_f.round() as u32;
     let init_cols_f = init_rows_f * target_pose_aspect + 1.0;
     let mut init_cols = init_cols_f.round() as u32;
-    if init_cols % 2 == 0 {
+    if init_cols.is_multiple_of(2) {
         init_cols += 1;
     }
     let init_cols = init_cols.max(3);
@@ -419,10 +419,10 @@ fn hexagonal_resolve_target(
             // Keep cols odd and ≥ 3.
             let raw_cols = init_cols as i32 + d_cols * 2;
             let cols = raw_cols.max(3) as u32;
-            if cols % 2 == 0 {
+            if cols.is_multiple_of(2) {
                 continue;
             }
-            let count = (cols * (2 * rows - 1) + 1) / 2;
+            let count = (cols * (2 * rows - 1)).div_ceil(2);
             if count == 0 {
                 continue;
             }

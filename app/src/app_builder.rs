@@ -17,7 +17,6 @@ use heddobureika_core::catalog::{
     PUZZLE_CATALOG, PuzzleCatalogEntry, logical_image_size, puzzle_by_slug,
 };
 use heddobureika_core::{PuzzleImageRef, TopologySpec};
-use js_sys::decode_uri_component;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
@@ -57,18 +56,6 @@ struct BootSelection {
     topology: Option<TopologySpec>,
     seed: Option<u32>,
     clear_hash: bool,
-    force_new: bool,
-}
-
-fn decode_hash_value(value: &str) -> String {
-    let raw = value.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-    decode_uri_component(raw)
-        .ok()
-        .and_then(|decoded| decoded.as_string())
-        .unwrap_or_else(|| raw.to_string())
 }
 
 fn parse_seed_value(value: &str) -> Option<u32> {
@@ -109,18 +96,11 @@ fn parse_hash_route() -> Option<HashRoute> {
     let mut seed = None;
     let mut saw_param = false;
     let mut saw_known = false;
-    for chunk in raw.split(';') {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
+    for (key, value) in app_router::hash_params(raw) {
         saw_param = true;
-        let mut iter = chunk.splitn(2, '=');
-        let key = iter.next().unwrap_or("").trim();
-        let value = iter.next().unwrap_or("").trim();
         if key.eq_ignore_ascii_case("puzzle") {
             saw_known = true;
-            let decoded = decode_hash_value(value);
+            let decoded = app_router::decode_hash_value(value);
             puzzle_entry = puzzle_by_slug(&decoded).copied();
         } else if key.eq_ignore_ascii_case("pieces") {
             saw_known = true;
@@ -207,6 +187,9 @@ fn resolve_boot_selection() -> Option<BootSelection> {
                 pieces,
                 seed,
             } => {
+                // An explicit puzzle route always starts fresh.
+                clear_saved_puzzle_selection();
+                sync_runtime::clear_local_snapshot();
                 let grid_override =
                     pieces.and_then(|target| nearest_valid_grid(entry.width, entry.height, target));
                 return Some(BootSelection {
@@ -215,7 +198,6 @@ fn resolve_boot_selection() -> Option<BootSelection> {
                     topology: None,
                     seed,
                     clear_hash: route.clear_hash,
-                    force_new: true,
                 });
             }
             HashRouteMode::Resume => {
@@ -240,12 +222,7 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
         let topology_spec: heddobureika_core::TopologySpec = snapshot.state.topology.clone().into();
         let topology_ok = heddobureika_core::build_topology_from_spec(&topology_spec).is_some();
         if !topology_ok {
-            #[cfg(target_arch = "wasm32")]
-            {
-                gloo::console::log!(
-                    "boot: discarding incompatible saved snapshot (unknown topology spec)"
-                );
-            }
+            crate::web::log("boot: discarding incompatible saved snapshot (unknown topology spec)");
             crate::local_snapshot::clear_local_snapshot();
         } else if let PuzzleImageRef::BuiltIn { slug } = &snapshot.puzzle.image_ref {
             if let Some(entry) = puzzle_by_slug(slug).copied() {
@@ -263,7 +240,6 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
                     topology: Some(topology_spec),
                     seed: None,
                     clear_hash,
-                    force_new: false,
                 });
             }
         }
@@ -278,7 +254,6 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
                 topology: None,
                 seed: None,
                 clear_hash,
-                force_new: false,
             });
         }
     }
@@ -292,7 +267,6 @@ fn resolve_saved_selection(clear_hash: bool) -> Option<BootSelection> {
         topology: None,
         seed: None,
         clear_hash,
-        force_new: false,
     })
 }
 
@@ -361,7 +335,6 @@ pub(crate) fn request_puzzle_change(
         topology: None,
         seed: None,
         clear_hash: false,
-        force_new: false,
     };
     apply_selection(core, image_max_dim, selection, shape_seed);
 }
@@ -397,10 +370,6 @@ fn boot_local_game(core: Rc<AppCore>, settings: &RenderSettings) {
     let Some(selection) = resolve_boot_selection() else {
         return;
     };
-    if selection.force_new {
-        clear_saved_puzzle_selection();
-        sync_runtime::clear_local_snapshot();
-    }
     if selection.clear_hash {
         app_router::clear_location_hash();
     }

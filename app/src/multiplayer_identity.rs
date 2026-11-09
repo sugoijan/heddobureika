@@ -1,41 +1,25 @@
 use std::cell::RefCell;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use heddobureika_core::ClientId;
+use heddobureika_core::{AuthPayload, auth_message, encode_auth_protocol};
 use js_sys::Date;
 use p256::SecretKey;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::elliptic_curve::Generate;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
 use web_sys::IdbDatabase;
 
 use crate::idb;
 
-const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
-const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
 const NONCE_BYTES: usize = 12;
 
 const IDB_KEY: &str = "client-keypair-v1";
 
 #[derive(Clone)]
 pub(crate) struct ClientIdentity {
-    pub(crate) client_id: ClientId,
     pub(crate) public_key_sec1: Vec<u8>,
     pub(crate) private_key: Vec<u8>,
-}
-
-#[derive(Serialize)]
-struct AuthPayload {
-    v: u8,
-    client_id: String,
-    ts: i64,
-    nonce: String,
-    pubkey: String,
-    sig: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    admin_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,26 +39,20 @@ pub(crate) async fn build_auth_protocol(
     let identity = load_or_create_identity().await?;
     let ts = now_ms();
     let nonce_bytes = <[u8; NONCE_BYTES]>::generate();
-    let nonce = URL_SAFE_NO_PAD.encode(&nonce_bytes);
+    let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
     let message = auth_message(room_id, ts, &nonce);
     let sig_bytes = sign_message(&identity.private_key, &message)?;
-    let sig = URL_SAFE_NO_PAD.encode(sig_bytes);
-    let pubkey = URL_SAFE_NO_PAD.encode(&identity.public_key_sec1);
-    let payload = AuthPayload {
-        v: 1,
-        client_id: identity.client_id.to_string(),
+    let payload = AuthPayload::new(
         ts,
         nonce,
-        pubkey,
-        sig,
-        admin_token: admin_token
+        &identity.public_key_sec1,
+        &sig_bytes,
+        admin_token
             .map(str::trim)
             .filter(|token| !token.is_empty())
             .map(|token| token.to_string()),
-    };
-    let payload_bytes = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
-    let encoded = URL_SAFE_NO_PAD.encode(payload_bytes);
-    Ok(format!("{AUTH_PROTOCOL_PREFIX}{encoded}"))
+    );
+    encode_auth_protocol(&payload).map_err(|err| err.to_string())
 }
 
 pub(crate) async fn reset_identity() -> Result<(), String> {
@@ -109,7 +87,6 @@ async fn generate_identity() -> Result<ClientIdentity, String> {
     let signing_key = SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
     let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
-    let client_id = derive_client_id(&public_key_sec1);
 
     let private_key_bytes = signing_key.to_bytes().to_vec();
     let record = StoredIdentity {
@@ -123,7 +100,6 @@ async fn generate_identity() -> Result<ClientIdentity, String> {
         .map_err(idb::js_err)?;
 
     Ok(ClientIdentity {
-        client_id,
         public_key_sec1,
         private_key: private_key_bytes,
     })
@@ -139,9 +115,7 @@ fn import_identity(record: &StoredIdentity) -> Result<ClientIdentity, String> {
     let signing_key = signing_key_from_bytes(&private_key_bytes)?;
     let verifying_key = signing_key.verifying_key();
     let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
-    let client_id = derive_client_id(&public_key_sec1);
     Ok(ClientIdentity {
-        client_id,
         public_key_sec1,
         private_key: private_key_bytes,
     })
@@ -159,19 +133,8 @@ fn sign_message(private_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, Str
     Ok(signature.to_bytes().to_vec())
 }
 
-fn derive_client_id(public_key_sec1: &[u8]) -> ClientId {
-    let digest = Sha256::digest(public_key_sec1);
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    ClientId::from(u64::from_be_bytes(bytes))
-}
-
 fn now_ms() -> i64 {
     Date::now() as i64
-}
-
-fn auth_message(room_id: &str, ts: i64, nonce: &str) -> Vec<u8> {
-    format!("{room_id}\n{ts}\n{nonce}\n{AUTH_CONTEXT}").into_bytes()
 }
 
 async fn load_identity_record(db: &IdbDatabase) -> Result<Option<StoredIdentity>, JsValue> {

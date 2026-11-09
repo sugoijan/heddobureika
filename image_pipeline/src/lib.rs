@@ -88,7 +88,6 @@ pub struct PipelineConfig {
     pub tone_map: ToneMap,
     pub dither: bool,
     pub output: OutputKind,
-    pub assume_opaque: bool,
 }
 
 impl Default for PipelineConfig {
@@ -101,7 +100,6 @@ impl Default for PipelineConfig {
             tone_map: ToneMap::Auto,
             dither: false,
             output: OutputKind::SrgbRgb8,
-            assume_opaque: true,
         }
     }
 }
@@ -125,16 +123,11 @@ impl ImagePipeline {
 
         let pixels = match self.config.output {
             OutputKind::SrgbRgb8 => {
-                let rgb = map_rgba16_to_srgb_rgb8(
-                    &rgba,
-                    &metadata,
-                    self.config.assume_opaque,
-                    self.config.dither,
-                )?;
+                let rgb = map_rgba16_to_srgb_rgb8(&rgba, &metadata, self.config.dither)?;
                 PixelData::SrgbRgb8(rgb)
             }
             OutputKind::SrgbRgb16 => {
-                let rgb = map_rgba16_to_srgb_rgb16(&rgba, &metadata, self.config.assume_opaque)?;
+                let rgb = map_rgba16_to_srgb_rgb16(&rgba, &metadata)?;
                 PixelData::SrgbRgb16(rgb)
             }
             OutputKind::SrgbRgba8 => {
@@ -175,6 +168,58 @@ pub enum PixelData {
     SrgbRgba8(image::RgbaImage),
 }
 
+/// MIME type every private image is stored and served as.
+pub const STORED_IMAGE_MIME: &str = "image/avif";
+
+/// A private image normalised for storage, see [`prepare_stored_image`].
+#[derive(Debug, Clone)]
+pub struct StoredImage {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Normalises an uploaded image into the stored format: AVIF uploads pass
+/// through untouched (dimensions read from the container), everything else is
+/// transcoded to AVIF with alpha preserved. Both the browser (local uploads)
+/// and the Worker (CLI uploads) go through here so they agree on what gets
+/// stored under a given hash.
+pub fn prepare_stored_image(bytes: Vec<u8>) -> Result<StoredImage, PipelineError> {
+    use imagesize::{Compression, ImageType};
+
+    let image_type =
+        imagesize::image_type(&bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
+    match image_type {
+        ImageType::Heif(Compression::Av1) => {
+            let size = imagesize::blob_size(&bytes)
+                .map_err(|err| PipelineError::Decode(err.to_string()))?;
+            match (u32::try_from(size.width), u32::try_from(size.height)) {
+                (Ok(width), Ok(height)) if width > 0 && height > 0 => Ok(StoredImage {
+                    bytes,
+                    width,
+                    height,
+                }),
+                _ => Err(PipelineError::Dimensions),
+            }
+        }
+        ImageType::Heif(_) => Err(PipelineError::Decode(
+            "unsupported HEIF compression".to_string(),
+        )),
+        _ => {
+            let config = PipelineConfig {
+                alpha_mode: AlphaMode::Preserve,
+                ..PipelineConfig::default()
+            };
+            let result = transcode_to_avif(&bytes, config)?;
+            Ok(StoredImage {
+                bytes: result.bytes,
+                width: result.width,
+                height: result.height,
+            })
+        }
+    }
+}
+
 pub fn transcode_to_avif(
     bytes: &[u8],
     config: PipelineConfig,
@@ -194,8 +239,7 @@ pub fn transcode_to_avif(
 
     match config.alpha_mode {
         AlphaMode::Discard => {
-            let rgb =
-                map_rgba16_to_srgb_rgb8(&rgba, &metadata, config.assume_opaque, config.dither)?;
+            let rgb = map_rgba16_to_srgb_rgb8(&rgba, &metadata, config.dither)?;
             encoder
                 .write_image(&rgb, width, height, ExtendedColorType::Rgb8)
                 .map_err(|err| PipelineError::Encode(err.to_string()))?;
@@ -223,17 +267,6 @@ pub fn decode_rgba16(
     let image =
         image::load_from_memory(bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
     let rgba = image.to_rgba16();
-    let rgba = apply_exif_orientation(rgba, metadata.orientation);
-    Ok((rgba, metadata))
-}
-
-pub fn decode_rgba32f(
-    bytes: &[u8],
-) -> Result<(ImageBuffer<Rgba<f32>, Vec<f32>>, ImageMetadata), PipelineError> {
-    let metadata = read_image_metadata(bytes)?;
-    let image =
-        image::load_from_memory(bytes).map_err(|err| PipelineError::Decode(err.to_string()))?;
-    let rgba = image.to_rgba32f();
     let rgba = apply_exif_orientation(rgba, metadata.orientation);
     Ok((rgba, metadata))
 }
@@ -287,7 +320,6 @@ fn map_rgba16_to_linear_srgb_f32(
 fn transform_rgb16_with_profile(
     rgba: &ImageBuffer<Rgba<u16>, Vec<u16>>,
     src_profile: &ColorProfile,
-    assume_opaque: bool,
 ) -> Result<Vec<u16>, PipelineError> {
     let options = TransformOptions {
         // Enables CICP transfer functions when available (PQ/HLG, etc.).
@@ -298,11 +330,7 @@ fn transform_rgb16_with_profile(
 
     // NOTE: moxcms does not currently handle alpha; drop it unless a later
     // pipeline stage explicitly composites it.
-    let src_rgb = if assume_opaque {
-        rgba16_to_rgb16(rgba)
-    } else {
-        rgba16_to_rgb16(rgba)
-    };
+    let src_rgb = rgba16_to_rgb16(rgba);
     let mut dst_rgb = vec![0u16; src_rgb.len()];
 
     let transform = src_profile
@@ -448,7 +476,6 @@ fn linear_to_u8_srgb_dithered(linear: f32, offset: f32) -> u8 {
 pub fn map_rgba16_to_srgb_rgb16(
     rgba: &ImageBuffer<Rgba<u16>, Vec<u16>>,
     metadata: &ImageMetadata,
-    assume_opaque: bool,
 ) -> Result<ImageBuffer<Rgb<u16>, Vec<u16>>, PipelineError> {
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
@@ -479,7 +506,7 @@ pub fn map_rgba16_to_srgb_rgb16(
                 }
             }
         } else {
-            match transform_rgb16_with_profile(rgba, &src_info.profile, assume_opaque) {
+            match transform_rgb16_with_profile(rgba, &src_info.profile) {
                 Ok(dst_rgb) => {
                     return ImageBuffer::from_raw(width, height, dst_rgb)
                         .ok_or(PipelineError::Dimensions);
@@ -499,7 +526,6 @@ pub fn map_rgba16_to_srgb_rgb16(
 pub fn map_rgba16_to_srgb_rgb8(
     rgba: &ImageBuffer<Rgba<u16>, Vec<u16>>,
     metadata: &ImageMetadata,
-    assume_opaque: bool,
     dither: bool,
 ) -> Result<image::RgbImage, PipelineError> {
     let (width, height) = rgba.dimensions();
@@ -538,7 +564,7 @@ pub fn map_rgba16_to_srgb_rgb8(
                 }
             }
         } else {
-            match transform_rgb16_with_profile(rgba, &src_info.profile, assume_opaque) {
+            match transform_rgb16_with_profile(rgba, &src_info.profile) {
                 Ok(dst_rgb) => {
                     let mut out = Vec::with_capacity(dst_rgb.len());
                     for value in dst_rgb {
@@ -599,7 +625,7 @@ pub fn map_rgba16_to_srgb_rgba8(
                 }
             }
         } else {
-            match transform_rgb16_with_profile(rgba, &src_info.profile, false) {
+            match transform_rgb16_with_profile(rgba, &src_info.profile) {
                 Ok(dst_rgb) => {
                     let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
                     let mut rgb_iter = dst_rgb.chunks_exact(3);
@@ -622,23 +648,6 @@ pub fn map_rgba16_to_srgb_rgba8(
                 }
             }
         }
-    }
-}
-
-pub fn process_to_srgb_rgb8(bytes: &[u8]) -> Result<image::RgbImage, PipelineError> {
-    let pipeline = ImagePipeline::new(PipelineConfig::default());
-    let output = pipeline.process(bytes)?;
-    match output.pixels {
-        PixelData::SrgbRgb8(image) => Ok(image),
-        PixelData::SrgbRgb16(image) => {
-            let (width, height) = image.dimensions();
-            let mut out = Vec::with_capacity((width as usize) * (height as usize) * 3);
-            for value in image.into_raw() {
-                out.push(u16_to_u8(value));
-            }
-            image::RgbImage::from_raw(width, height, out).ok_or(PipelineError::Dimensions)
-        }
-        PixelData::SrgbRgba8(image) => rgba8_to_rgb8(image),
     }
 }
 
@@ -748,7 +757,7 @@ fn transfer_kind_from_cicp(cicp: &CicpProfile) -> TransferKind {
 }
 
 fn source_profile_info_from_profile(profile: ColorProfile, from_icc: bool) -> SourceProfileInfo {
-    let cicp = profile.cicp.clone();
+    let cicp = profile.cicp;
     let transfer = cicp
         .as_ref()
         .map(transfer_kind_from_cicp)
@@ -778,7 +787,7 @@ fn build_src_profile_from_metadata(
     fallback_cicp: Option<CicpProfile>,
 ) -> Result<SourceProfileInfo, PipelineError> {
     if let Some(cicp) = fallback_cicp {
-        let profile = ColorProfile::new_from_cicp(cicp.clone());
+        let profile = ColorProfile::new_from_cicp(cicp);
         return Ok(SourceProfileInfo {
             profile,
             transfer: transfer_kind_from_cicp(&cicp),
@@ -788,7 +797,7 @@ fn build_src_profile_from_metadata(
     }
 
     if let Some(cicp) = metadata.cicp.as_ref().and_then(cicp_profile_from_png) {
-        let profile = ColorProfile::new_from_cicp(cicp.clone());
+        let profile = ColorProfile::new_from_cicp(cicp);
         return Ok(SourceProfileInfo {
             profile,
             transfer: transfer_kind_from_cicp(&cicp),
@@ -840,7 +849,7 @@ fn build_fallback_profile(
     if !primary.from_icc {
         return None;
     }
-    build_src_profile_from_metadata(metadata, primary.cicp.clone()).ok()
+    build_src_profile_from_metadata(metadata, primary.cicp).ok()
 }
 
 #[derive(Clone, Copy)]
@@ -979,17 +988,6 @@ where
     }
 }
 
-fn rgba8_to_rgb8(image: image::RgbaImage) -> Result<image::RgbImage, PipelineError> {
-    let (width, height) = image.dimensions();
-    let mut out = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    for chunk in image.into_raw().chunks_exact(4) {
-        out.push(chunk[0]);
-        out.push(chunk[1]);
-        out.push(chunk[2]);
-    }
-    image::RgbImage::from_raw(width, height, out).ok_or(PipelineError::Dimensions)
-}
-
 fn u16_to_u8(value: u16) -> u8 {
     ((value as u32 + 128) / 257) as u8
 }
@@ -1072,17 +1070,11 @@ mod tests {
     }
 
     #[test]
-    fn tone_map_outputs_within_bounds() {
-        let (rgba, metadata) = decode_rgba16(PQ_PNG).expect("decode");
-        let rgb = map_rgba16_to_srgb_rgb8(&rgba, &metadata, true, false).expect("map");
-        for value in rgb.into_raw() {
-            assert!(value <= 255);
-        }
-
-        let (rgba, metadata) = decode_rgba16(HLG_PNG).expect("decode");
-        let rgb = map_rgba16_to_srgb_rgb8(&rgba, &metadata, true, false).expect("map");
-        for value in rgb.into_raw() {
-            assert!(value <= 255);
+    fn tone_map_preserves_dimensions() {
+        for bytes in [PQ_PNG, HLG_PNG] {
+            let (rgba, metadata) = decode_rgba16(bytes).expect("decode");
+            let rgb = map_rgba16_to_srgb_rgb8(&rgba, &metadata, false).expect("map");
+            assert_eq!(rgb.dimensions(), rgba.dimensions());
         }
     }
 

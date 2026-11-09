@@ -4,57 +4,12 @@ use web_sys::{DomRect, Element, HtmlCanvasElement, WheelEvent};
 
 use crate::app_core::ViewRect;
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PointerKind {
     Mouse,
     Touch,
     Pen,
     Unknown,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PointerId(pub i32);
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct InputModifiers {
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
-    pub meta: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InputPointer {
-    pub id: PointerId,
-    pub kind: PointerKind,
-    pub is_primary: bool,
-    pub buttons: u16,
-    pub pressure: f32,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InputEventKind {
-    Down,
-    Move,
-    Up,
-    Cancel,
-    Hover,
-    Leave,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InputEvent {
-    pub kind: InputEventKind,
-    pub pointer: InputPointer,
-    pub view_x: f32,
-    pub view_y: f32,
-    pub modifiers: InputModifiers,
 }
 
 pub(crate) const INPUT_KIND_COOLDOWN_MS: f32 = 2000.0;
@@ -189,7 +144,6 @@ pub(crate) const CLICK_MAX_DURATION_MS: f32 = 240.0;
 pub(crate) const CLICK_QUICK_TAP_MS: f32 = 120.0;
 pub(crate) const CLICK_DEFAULT_SLOP_PX: f32 = 4.0;
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClickGesture {
     start: [f32; 2],
@@ -199,7 +153,6 @@ pub(crate) struct ClickGesture {
     active: bool,
 }
 
-#[allow(dead_code)]
 impl ClickGesture {
     pub(crate) fn new_default() -> Self {
         Self::new_with_slop(CLICK_DEFAULT_SLOP_PX)
@@ -254,11 +207,6 @@ impl ClickGesture {
         elapsed <= CLICK_MAX_DURATION_MS
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.active = false;
-        self.moved = false;
-    }
-
     /// Press timestamp (same clock as the `now_ms` passed to [`arm`]).
     pub(crate) fn start_ms(&self) -> f32 {
         self.start_ms
@@ -266,37 +214,6 @@ impl ClickGesture {
 
     /// Whether the pointer has moved beyond the click slop (no longer a click).
     pub(crate) fn moved(&self) -> bool {
-        self.moved
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DragSlopGate {
-    start: [f32; 2],
-    slop: f32,
-    moved: bool,
-}
-
-#[allow(dead_code)]
-impl DragSlopGate {
-    pub(crate) fn new(start_x: f32, start_y: f32, slop: f32) -> Self {
-        Self {
-            start: [start_x, start_y],
-            slop,
-            moved: false,
-        }
-    }
-
-    pub(crate) fn update(&mut self, x: f32, y: f32) -> bool {
-        if self.moved {
-            return true;
-        }
-        let dx = x - self.start[0];
-        let dy = y - self.start[1];
-        if dx * dx + dy * dy > self.slop * self.slop {
-            self.moved = true;
-        }
         self.moved
     }
 }
@@ -393,7 +310,6 @@ struct ShakeLeg {
 /// sweeps, and idle jitter via a product of independent sub-scores (see
 /// [`ShakeTuning`]). One-shot: once it fires it stays latched until a fresh
 /// detector is created for the next drag.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct ShakeDetector {
     tuning: ShakeTuning,
@@ -401,7 +317,6 @@ pub(crate) struct ShakeDetector {
     fired: bool,
 }
 
-#[allow(dead_code)]
 impl ShakeDetector {
     pub(crate) fn new() -> Self {
         Self::with_tuning(ShakeTuning::default())
@@ -445,10 +360,6 @@ impl ShakeDetector {
             return true;
         }
         false
-    }
-
-    pub(crate) fn has_fired(&self) -> bool {
-        self.fired
     }
 
     /// Current composite score in `[0, 1]`. Exposed for tuning/diagnostics.

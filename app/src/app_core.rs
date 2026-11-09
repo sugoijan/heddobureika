@@ -116,7 +116,9 @@ pub(crate) struct AppSnapshot {
     /// Full authoritative game state. Cloned from `AppState.game` into each
     /// snapshot so renderers and bridges can read from a `PlayableState` /
     /// `VisualState` directly.
-    pub(crate) game: Option<AppGameState>,
+    /// Shared with the authoritative state via `Rc`, so taking a snapshot is
+    /// a pointer bump rather than a deep copy of every piece table.
+    pub(crate) game: Option<Rc<AppGameState>>,
     /// Piece world poses in mm (center-of-piece coords), derived from
     /// `state.game.visual.piece_visual_pose`.
     pub(crate) piece_world_poses: Vec<Pose2>,
@@ -376,8 +378,7 @@ impl AppCore {
             if passes >= MAX_NOTIFY_PASSES {
                 // Subscribers keep mutating state on every pass; stop here
                 // rather than looping forever.
-                #[cfg(target_arch = "wasm32")]
-                gloo::console::warn!("notify did not settle; dropping a pending pass");
+                crate::web::warn("notify did not settle; dropping a pending pass");
                 break;
             }
         }
@@ -1960,7 +1961,7 @@ fn fill_game_state_view(state: &AppState, snapshot: &mut AppSnapshot) {
         snapshot.piece_group_anchor.clear();
         return;
     };
-    snapshot.game = Some(game.clone());
+    snapshot.game = Some(Rc::new(game.clone()));
     let total = game.playable.piece_count();
     snapshot.piece_world_poses.clear();
     snapshot.piece_world_poses.reserve(total);
@@ -2172,7 +2173,7 @@ fn time_nonce(previous: u32) -> u32 {
     #[cfg(target_arch = "wasm32")]
     {
         let now = Date::now() as u32;
-        return splitmix32(now ^ previous.wrapping_add(0x9E37_79B9));
+        splitmix32(now ^ previous.wrapping_add(0x9E37_79B9))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -2180,7 +2181,7 @@ fn time_nonce(previous: u32) -> u32 {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u32)
             .unwrap_or(0);
-        return splitmix32(now ^ previous.wrapping_add(0x9E37_79B9));
+        splitmix32(now ^ previous.wrapping_add(0x9E37_79B9))
     }
 }
 
@@ -2196,14 +2197,14 @@ pub(crate) fn now_ms_f32() -> f32 {
         {
             return ms as f32;
         }
-        return (Date::now() % 1_000_000.0) as f32;
+        (Date::now() % 1_000_000.0) as f32
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        return std::time::SystemTime::now()
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as f32)
-            .unwrap_or(0.0);
+            .unwrap_or(0.0)
     }
 }
 

@@ -64,8 +64,7 @@ fn install_test_hooks() {
     panic_now.forget();
     let panic_in_render = Closure::wrap(Box::new(|| {
         PANIC_IN_RENDER.with(|flag| flag.set(true));
-        crate::wgpu_app::request_render();
-        crate::svg_app::request_render();
+        crate::view_runtime::request_render();
     }) as Box<dyn Fn()>);
     let _ = js_sys::Reflect::set(
         &window,

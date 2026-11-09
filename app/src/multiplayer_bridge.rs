@@ -3,30 +3,27 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gloo::console;
-use js_sys::Date;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app_core::{AppCore, AppSubscription};
 use crate::game_state::AppGameState;
 use crate::local_snapshot::build_playable_snapshot_from_app;
+use crate::multiplayer_game_sync::LocalEvent;
 use crate::persisted::{PrivateImageEntry, PrivateImageRefs};
 use crate::persisted_store;
 use crate::runtime::{AssetEvent, SyncEvent, SyncHooks};
 use crate::sync_runtime;
+use crate::web::now_ms_u64;
 use heddobureika_core::{
-    AngleDeg, ClientId, ClientMsg, FlipState, GameRules, ImagePlacement, MergePolicy,
-    PRIVATE_ASSET_MAX_BYTES, PieceId, PlayableAction, PlayableGameSnapshot, PlayableRoomUpdate,
-    PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo, PuzzleTopology,
-    RestrictedPlayableAction, RoomControlUpdate, RoomPersistence, angle_matches,
+    AngleDeg, ChunkAssembler, ClientId, ClientMsg, FlipState, GameRules, ImagePlacement,
+    MergePolicy, PRIVATE_ASSET_MAX_BYTES, PieceId, PlayableAction, PlayableGameSnapshot,
+    PlayableRoomUpdate, PlayableState, Pose2, Position2, PuzzleImageRef, PuzzleInfo,
+    PuzzleTopology, RestrictedPlayableAction, RoomControlUpdate, RoomPersistence, angle_matches,
     safety_corrections_after_detach,
 };
 
 const PENDING_POS_EPS: f32 = 0.02;
 const PENDING_ROT_EPS: f32 = 0.05;
-
-fn now_ms_u64() -> u64 {
-    Date::now().max(0.0) as u64
-}
 
 #[derive(Clone, Debug)]
 struct PendingTransform {
@@ -50,9 +47,7 @@ struct AssetDownload {
     mime: String,
     width: u32,
     height: u32,
-    size: u32,
-    received: u32,
-    bytes: Vec<u8>,
+    assembler: ChunkAssembler,
 }
 
 struct MultiplayerBridgeState {
@@ -90,25 +85,25 @@ impl MultiplayerBridgeState {
         let hooks = self.build_hooks();
         sync_runtime::set_system_hooks(hooks);
         let state = Rc::clone(self);
-        sync_runtime::set_multiplayer_local_transform_observer(Some(Rc::new(
-            move |anchor_id, pos, rot_deg, client_seq, snap| {
-                state.record_pending_transform(anchor_id, pos, rot_deg, client_seq, snap);
+        sync_runtime::set_multiplayer_local_event_observer(Some(Rc::new(
+            move |event| match event {
+                LocalEvent::Transform {
+                    anchor_id,
+                    pos,
+                    rot_deg,
+                    client_seq,
+                    snap,
+                } => state.record_pending_transform(anchor_id, pos, rot_deg, client_seq, snap),
+                LocalEvent::Flip {
+                    piece_id,
+                    flipped,
+                    pos,
+                    rot_deg,
+                } => state.record_pending_flip(piece_id, flipped, pos, rot_deg),
+                LocalEvent::Detach { piece_id } => state.record_pending_detach(piece_id),
+                LocalEvent::SendToBack { piece_id } => state.apply_local_send_to_back(piece_id),
             },
         )));
-        let state = Rc::clone(self);
-        sync_runtime::set_multiplayer_local_flip_observer(Some(Rc::new(
-            move |piece_id, flipped, pos, rot_deg| {
-                state.record_pending_flip(piece_id, flipped, pos, rot_deg);
-            },
-        )));
-        let state = Rc::clone(self);
-        sync_runtime::set_multiplayer_local_detach_observer(Some(Rc::new(move |piece_id| {
-            state.record_pending_detach(piece_id);
-        })));
-        let state = Rc::clone(self);
-        sync_runtime::set_multiplayer_local_send_to_back_observer(Some(Rc::new(move |piece_id| {
-            state.apply_local_send_to_back(piece_id);
-        })));
         let state = Rc::clone(self);
         let subscription = self.core.subscribe(Rc::new(move || {
             state.try_send_init();
@@ -299,7 +294,6 @@ impl MultiplayerBridgeState {
                 self.core.install_game(updated_game, preserve_drag);
             }
         } else if newer_local_pending {
-            return;
         } else {
             self.core.install_game(updated_game, preserve_drag);
         }
@@ -331,18 +325,16 @@ impl MultiplayerBridgeState {
                 height,
                 size,
             } => {
-                if size == 0 || size > PRIVATE_ASSET_MAX_BYTES {
+                let Ok(assembler) = ChunkAssembler::begin(size, PRIVATE_ASSET_MAX_BYTES) else {
                     return;
-                }
+                };
                 self.asset_downloads.borrow_mut().insert(
                     hash,
                     AssetDownload {
                         mime,
                         width,
                         height,
-                        size,
-                        received: 0,
-                        bytes: Vec::with_capacity(size as usize),
+                        assembler,
                     },
                 );
             }
@@ -352,35 +344,27 @@ impl MultiplayerBridgeState {
                     return;
                 };
                 let _ = index;
-                let next = entry
-                    .received
-                    .saturating_add(bytes.len().min(u32::MAX as usize) as u32);
-                if next > entry.size || next > PRIVATE_ASSET_MAX_BYTES {
+                if entry.assembler.push(&bytes).is_err() {
                     downloads.remove(&hash);
-                    return;
                 }
-                entry.bytes.extend_from_slice(&bytes);
-                entry.received = next;
             }
             AssetEvent::End { hash } => {
                 let download = self.asset_downloads.borrow_mut().remove(&hash);
                 let Some(download) = download else {
                     return;
                 };
-                if download.received != download.size
-                    || download.bytes.len() != download.size as usize
-                {
+                let Ok(bytes) = download.assembler.finish() else {
                     return;
-                }
+                };
                 let scope_key = self.room_scope_key();
                 spawn_local(async move {
                     let now = now_ms_u64();
                     let entry = PrivateImageEntry {
-                        bytes: download.bytes,
+                        size: bytes.len() as u32,
+                        bytes,
                         mime: download.mime,
                         width: download.width,
                         height: download.height,
-                        size: download.size,
                         created_at: now,
                         last_used_at: now,
                     };
@@ -403,11 +387,7 @@ impl MultiplayerBridgeState {
                         };
                         let _ = persisted_store::save_private_image_refs(&scope_key, refs).await;
                     }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        crate::wgpu_app::private_image_stored(&hash);
-                        crate::svg_app::request_render();
-                    }
+                    crate::view_runtime::private_image_stored(&hash);
                 });
             }
             AssetEvent::UploadAck { hash } => {
@@ -916,7 +896,7 @@ impl MultiplayerBridgeState {
                 }
                 let mut pending = self.pending_by_anchor.borrow_mut();
                 for anchor_id in &invalid {
-                    pending.remove(&anchor_id);
+                    pending.remove(anchor_id);
                 }
                 self.pending_snaps
                     .borrow_mut()

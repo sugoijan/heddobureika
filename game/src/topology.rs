@@ -3,13 +3,13 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub use crate::triangular_lattice::{TriDirection, TriLattice};
 
 use crate::ids::{EdgeId, PieceId};
 use crate::playable::{PlayableState, Pose2};
-use crate::rotation_step::SymmetryStrength;
+use crate::rotation_step::{SymmetryStrength, symmetry_angles_60, symmetry_angles_90};
 pub use crate::traits::topology::{FrameBounds, ImagePlacement, PieceOuterFeature, PuzzleTopology};
 use crate::units::{AngleDeg, LengthMm};
 
@@ -362,7 +362,7 @@ impl PuzzleTopology for GridTopology {
     }
 
     fn symmetry_angles(&self, _piece: PieceId) -> &[AngleDeg] {
-        grid_symmetry_angles()
+        symmetry_angles_90()
     }
 
     fn frame_bounds(&self) -> Option<FrameBounds> {
@@ -782,10 +782,10 @@ impl PuzzleTopology for TriangularTessellationTopology {
 
     fn symmetry_angles(&self, piece: PieceId) -> &[AngleDeg] {
         match self.piece_kind(piece) {
-            Some(TrianglePieceKind::Regular) => triangular_regular_symmetry_angles(),
+            Some(TrianglePieceKind::Regular) => symmetry_angles_60(),
             // Border fillers aren't equilateral; treat their rotation hints
             // like the grid's 90° steps (weak).
-            _ => triangular_half_symmetry_angles(),
+            _ => symmetry_angles_90(),
         }
     }
 
@@ -1328,38 +1328,4 @@ impl<T: PuzzleTopology + ?Sized> PuzzleTopology for Arc<T> {
         self.as_ref()
             .build_render_geometry(image_width, image_height, shape_seed, settings)
     }
-}
-
-fn grid_symmetry_angles() -> &'static [AngleDeg] {
-    static ANGLES: OnceLock<Box<[AngleDeg]>> = OnceLock::new();
-    ANGLES
-        .get_or_init(|| {
-            vec![
-                AngleDeg::try_new(90.0).expect("finite"),
-                AngleDeg::try_new(180.0).expect("finite"),
-                AngleDeg::try_new(270.0).expect("finite"),
-            ]
-            .into_boxed_slice()
-        })
-        .as_ref()
-}
-
-fn triangular_regular_symmetry_angles() -> &'static [AngleDeg] {
-    static ANGLES: OnceLock<Box<[AngleDeg]>> = OnceLock::new();
-    ANGLES
-        .get_or_init(|| {
-            vec![
-                AngleDeg::try_new(60.0).expect("finite"),
-                AngleDeg::try_new(120.0).expect("finite"),
-                AngleDeg::try_new(180.0).expect("finite"),
-                AngleDeg::try_new(240.0).expect("finite"),
-                AngleDeg::try_new(300.0).expect("finite"),
-            ]
-            .into_boxed_slice()
-        })
-        .as_ref()
-}
-
-fn triangular_half_symmetry_angles() -> &'static [AngleDeg] {
-    grid_symmetry_angles()
 }

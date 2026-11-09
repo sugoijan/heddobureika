@@ -15,6 +15,8 @@ use crate::edge_profile::{
     ConnectorShape, EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments,
 };
 use crate::ids::{BorderEdgeId, EdgeId, FrameEdgeId, PieceId};
+use crate::math::{rand_range, rand_unit};
+use crate::shape::point_mm;
 use crate::shape::{
     BorderEdgeGeometryMm, EdgeSideGeometryMm, FrameGeometryMm, GeometryInvariantError,
     InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceGeometryMm, PieceGeometryProvider, PointMm,
@@ -481,11 +483,9 @@ fn build_shape_atlas(
         }
         builder
             .push_piece(piece_id, edges)
-            .map_err(|err| atlas_build_error_to_grid_error(err))?;
+            .map_err(atlas_build_error_to_grid_error)?;
     }
-    builder
-        .build()
-        .map_err(|err| atlas_build_error_to_grid_error(err))
+    builder.build().map_err(atlas_build_error_to_grid_error)
 }
 
 fn build_piece_sides(
@@ -868,24 +868,6 @@ struct Edge {
     params: EdgeParams,
 }
 
-fn splitmix32(mut value: u32) -> u32 {
-    value = value.wrapping_add(0x9E37_79B9);
-    let mut z = value;
-    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
-    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
-    z ^ (z >> 16)
-}
-
-fn rand_unit(seed: u32, salt: u32) -> f32 {
-    let mixed = splitmix32(seed ^ salt);
-    let top = mixed >> 8;
-    top as f32 / ((1u32 << 24) as f32)
-}
-
-fn rand_range(seed: u32, salt: u32, min: f32, max: f32) -> f32 {
-    min + (max - min) * rand_unit(seed, salt)
-}
-
 fn jitter_value(
     seed: u32,
     salt: u32,
@@ -1213,39 +1195,10 @@ fn path_from_points_closed(points: &[(f32, f32)]) -> PathMm {
 
 fn stitch_piece_ring(paths: &mut [PathMm; 4]) {
     for idx in 1..paths.len() {
-        let prev_end = path_end_point(&paths[idx - 1]);
+        let prev_end = paths[idx - 1].end_point();
         paths[idx].start = prev_end;
     }
     let first_start = paths[0].start;
     let last_idx = paths.len() - 1;
-    set_path_end_point(&mut paths[last_idx], first_start);
-}
-
-fn path_end_point(path: &PathMm) -> PointMm {
-    let mut current = path.start;
-    for seg in path.segs.iter() {
-        current = match seg {
-            PathSegMm::LineTo { to } => *to,
-            PathSegMm::CubicTo { to, .. } => *to,
-        };
-    }
-    current
-}
-
-fn set_path_end_point(path: &mut PathMm, target: PointMm) {
-    if let Some(last) = path.segs.last_mut() {
-        match last {
-            PathSegMm::LineTo { to } => *to = target,
-            PathSegMm::CubicTo { to, .. } => *to = target,
-        }
-    } else {
-        path.start = target;
-    }
-}
-
-fn point_mm(x: f32, y: f32) -> PointMm {
-    PointMm {
-        x: LengthMm::try_new(x).unwrap_or_default(),
-        y: LengthMm::try_new(y).unwrap_or_default(),
-    }
+    paths[last_idx].set_end_point(first_start);
 }

@@ -2,12 +2,12 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::catalog::PUZZLE_CATALOG;
 use heddobureika_core::codec::{decode, encode};
-use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN};
 use heddobureika_core::{
     ASSET_CHUNK_BYTES, AdminMsg, ClientMsg, GameRules, GridTopology, LogicalState, PieceId,
     PlayRules, PlayableGameSnapshot, PlayablePoseSnapshot, PlayablePositionSnapshot, PlayableState,
     Pose2, PuzzleImageRef, PuzzleInfo, PuzzleSpec, RoomPersistence, ServerMsg, TopologySpec,
 };
+use heddobureika_core::{AuthPayload, auth_message, encode_auth_protocol};
 
 /// Test fixture: each piece is its own singleton group with the given pose.
 /// No edges are active.
@@ -19,8 +19,6 @@ struct SingletonFixture {
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::elliptic_curve::Generate;
 use rand::RngExt;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -30,18 +28,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use url::Url;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-#[derive(Serialize)]
-struct AuthPayload {
-    v: u8,
-    client_id: String,
-    ts: i64,
-    nonce: String,
-    pubkey: String,
-    sig: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    admin_token: Option<String>,
-}
 
 fn env_or(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_string())
@@ -55,48 +41,34 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn derive_client_id(pubkey_sec1: &[u8]) -> u64 {
-    let digest = Sha256::digest(pubkey_sec1);
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(bytes)
-}
-
 fn random_nonce() -> String {
     let bytes = <[u8; 12]>::generate();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Signs the handshake with a fresh ephemeral key; the CLI has no persistent
+/// identity.
 fn build_auth_protocol(
     room_id: &str,
     admin_token: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
-    const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
-
     let signing_key = SigningKey::generate();
-    let verifying_key = signing_key.verifying_key();
-    let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
-    let client_id = derive_client_id(&public_key_sec1);
+    let public_key_sec1 = signing_key
+        .verifying_key()
+        .to_sec1_point(false)
+        .as_bytes()
+        .to_vec();
     let ts = now_ms();
     let nonce = random_nonce();
-    let message = format!("{room_id}\n{ts}\n{nonce}\n{AUTH_CONTEXT}");
-    let signature: Signature = signing_key.sign(message.as_bytes());
-
-    let payload = AuthPayload {
-        v: 1,
-        client_id: client_id.to_string(),
+    let signature: Signature = signing_key.sign(&auth_message(room_id, ts, &nonce));
+    let payload = AuthPayload::new(
         ts,
         nonce,
-        pubkey: URL_SAFE_NO_PAD.encode(&public_key_sec1),
-        sig: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-        admin_token: admin_token.map(|value| value.trim().to_string()),
-    };
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    Ok(format!(
-        "{AUTH_PROTOCOL_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(payload_bytes)
-    ))
+        &public_key_sec1,
+        &signature.to_bytes(),
+        admin_token.map(|token| token.trim().to_string()),
+    );
+    Ok(encode_auth_protocol(&payload)?)
 }
 
 async fn connect_room_with_auth(
@@ -125,13 +97,7 @@ fn admin_token_from_env() -> Option<String> {
 
 fn generate_room_id() -> String {
     let mut rng = rand::rng();
-    let alphabet = ROOM_ID_ALPHABET.as_bytes();
-    let mut id = String::with_capacity(ROOM_ID_LEN);
-    for _ in 0..ROOM_ID_LEN {
-        let idx = rng.random_range(0..alphabet.len());
-        id.push(alphabet[idx] as char);
-    }
-    id
+    heddobureika_core::generate_room_id(|len| rng.random_range(0..len)).to_string()
 }
 
 fn build_room_url(base_url: &str, room_id: &str) -> Result<Url, url::ParseError> {

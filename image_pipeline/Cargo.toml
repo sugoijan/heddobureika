@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 image = { workspace = true, features = ["png", "jpeg", "webp", "avif"] }
+imagesize.workspace = true
 img-parts.workspace = true
 moxcms.workspace = true
 png.workspace = true

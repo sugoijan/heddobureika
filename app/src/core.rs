@@ -122,6 +122,7 @@ pub(crate) enum ThemeMode {
 }
 
 #[derive(
+    Default,
     Clone,
     Copy,
     Debug,
@@ -134,17 +135,13 @@ pub(crate) enum ThemeMode {
 )]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InitMode {
+    #[default]
     Local,
     Online,
 }
 
-impl Default for InitMode {
-    fn default() -> Self {
-        InitMode::Local
-    }
-}
-
 #[derive(
+    Default,
     Clone,
     Copy,
     Debug,
@@ -158,12 +155,26 @@ impl Default for InitMode {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RendererKind {
     Svg,
+    #[default]
     Wgpu,
 }
 
-impl Default for RendererKind {
-    fn default() -> Self {
-        RendererKind::Wgpu
+impl RendererKind {
+    /// The lowercase name used by the dev panel, the boot loader and the
+    /// persisted preference (matches the serde representation).
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            RendererKind::Svg => "svg",
+            RendererKind::Wgpu => "wgpu",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "svg" => Some(RendererKind::Svg),
+            "wgpu" => Some(RendererKind::Wgpu),
+            _ => None,
+        }
     }
 }
 
@@ -517,16 +528,4 @@ pub(crate) fn click_rotation_delta(
         target = normalize_angle(target + ROTATION_STEP_DEG);
     }
     angle_delta(target, current_angle)
-}
-
-pub(crate) fn rotate_point(
-    x: f32,
-    y: f32,
-    origin_x: f32,
-    origin_y: f32,
-    angle_deg: f32,
-) -> (f32, f32) {
-    let (dx, dy) = (x - origin_x, y - origin_y);
-    let (rx, ry) = rotate_vec(dx, dy, angle_deg);
-    (origin_x + rx, origin_y + ry)
 }

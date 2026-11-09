@@ -1,7 +1,7 @@
 use heddobureika_game::{
     EdgeId, LengthMm, PathMm, PathSegMm, PieceGeometryProvider, PointMm, PuzzleTopology,
     TopologyShaper, TriangularTessellationShapeSettings, TriangularTessellationShaper,
-    TriangularTessellationTopology,
+    TriangularTessellationTopology, cubic_point,
 };
 
 const EPS: f32 = 0.75;
@@ -195,24 +195,6 @@ fn flatten_path(path: &PathMm, cubic_steps: usize) -> Vec<(f32, f32)> {
 
 fn point_tuple(point: PointMm) -> (f32, f32) {
     (point.x_mm(), point.y_mm())
-}
-
-fn cubic_point(
-    p0: (f32, f32),
-    p1: (f32, f32),
-    p2: (f32, f32),
-    p3: (f32, f32),
-    t: f32,
-) -> (f32, f32) {
-    let u = 1.0 - t;
-    let tt = t * t;
-    let uu = u * u;
-    let uuu = uu * u;
-    let ttt = tt * t;
-    (
-        uuu * p0.0 + 3.0 * uu * t * p1.0 + 3.0 * u * tt * p2.0 + ttt * p3.0,
-        uuu * p0.1 + 3.0 * uu * t * p1.1 + 3.0 * u * tt * p2.1 + ttt * p3.1,
-    )
 }
 
 fn point_in_polygon(point: (f32, f32), polygon: &[(f32, f32)]) -> bool {

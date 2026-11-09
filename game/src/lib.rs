@@ -18,6 +18,7 @@ pub mod hexagonal_shape;
 pub mod hexagonal_topology;
 pub mod ids;
 pub mod logical;
+pub mod math;
 pub mod playable;
 pub mod projection;
 pub mod render_geometry;
@@ -58,6 +59,10 @@ pub use ids::{BorderEdgeId, EdgeId, FrameEdgeId, GroupId, PieceId};
 pub use logical::{
     GroupSlot, LogicalInvariantError, LogicalMerge, LogicalState, LogicalStateSummary, PieceSlot,
 };
+pub use math::{
+    angle_matches, cubic_point, normalize_angle, rand_range, rand_unit, rotate_point, rotate_vec,
+    shortest_angle_delta, splitmix32,
+};
 pub use playable::{
     FlipState, PlayableAction, PlayableInvariantError, PlayableState, PlayableStateSummary, Pose2,
     Position2, RestrictedPlayableAction, SolveStage,
@@ -72,6 +77,7 @@ pub use render_geometry::{
 pub use rotation_step::{
     StepDirection, StepRotationTarget, SymmetryStrength, canonicalize_symmetry_angles,
     group_symmetry_angles, intersect_symmetry_angles, next_step_canonical, next_step_target,
+    symmetry_angles_60, symmetry_angles_90,
 };
 pub use rules::PlayRules;
 pub use shape::{

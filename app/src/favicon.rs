@@ -47,11 +47,11 @@ pub(crate) use dom::init;
 
 #[cfg(target_arch = "wasm32")]
 mod dom {
+    use crate::web::{color_scheme_query, prefers_dark_mode};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use js_sys::{Function, Reflect};
-    use wasm_bindgen::JsCast;
+    use js_sys::Reflect;
     use wasm_bindgen::closure::Closure;
 
     use super::*;
@@ -120,25 +120,6 @@ mod dom {
         if Reflect::set(&query, &"onchange".into(), listener.as_ref()).is_ok() {
             SCHEME_LISTENER.with(|slot| *slot.borrow_mut() = Some(listener));
         }
-    }
-
-    fn prefers_dark_mode() -> bool {
-        let Some(query) = color_scheme_query() else {
-            return false;
-        };
-        Reflect::get(&query, &"matches".into())
-            .ok()
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-    }
-
-    fn color_scheme_query() -> Option<wasm_bindgen::JsValue> {
-        let window = web_sys::window()?;
-        let match_media = Reflect::get(&window, &"matchMedia".into()).ok()?;
-        let match_media = match_media.dyn_into::<Function>().ok()?;
-        match_media
-            .call1(&window, &"(prefers-color-scheme: dark)".into())
-            .ok()
     }
 }
 

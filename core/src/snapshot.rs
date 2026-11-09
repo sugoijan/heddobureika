@@ -160,13 +160,6 @@ pub struct PlayablePositionSnapshot {
 }
 
 impl PlayablePositionSnapshot {
-    pub fn from_position(value: heddobureika_game::Position2) -> Self {
-        Self {
-            x_mm: value.x_mm(),
-            y_mm: value.y_mm(),
-        }
-    }
-
     pub fn to_position(self) -> Result<heddobureika_game::Position2, PlayableGameSnapshotError> {
         heddobureika_game::Position2::try_from_mm(self.x_mm, self.y_mm)
             .ok_or(PlayableGameSnapshotError::InvalidPose)

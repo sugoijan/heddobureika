@@ -3,6 +3,18 @@ use std::fmt;
 pub const ROOM_ID_LEN: usize = 10;
 pub const ROOM_ID_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+/// Builds a random room id from `ROOM_ID_ALPHABET`. `pick_index` is called
+/// once per character with the alphabet length and returns the index to use,
+/// so callers plug in whichever entropy source they have (`rand`,
+/// `Math.random`, ...).
+pub fn generate_room_id(mut pick_index: impl FnMut(usize) -> usize) -> RoomId {
+    let alphabet = ROOM_ID_ALPHABET.as_bytes();
+    let id = (0..ROOM_ID_LEN)
+        .map(|_| alphabet[pick_index(alphabet.len()).min(alphabet.len() - 1)] as char)
+        .collect();
+    RoomId(id)
+}
+
 pub fn is_valid_room_id(value: &str) -> bool {
     if value.len() != ROOM_ID_LEN {
         return false;

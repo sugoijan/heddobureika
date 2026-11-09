@@ -21,73 +21,46 @@ pub(crate) fn apply_playable_snapshot_to_core(
     current: &AppSnapshot,
 ) -> ApplySnapshotResult {
     let Some(info) = current.puzzle_info.as_ref() else {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore not ready (puzzle info)");
-        }
+        crate::web::log("local snapshot: restore not ready (puzzle info)");
         return ApplySnapshotResult::NotReady;
     };
     if info.image_ref != snapshot.puzzle.image_ref {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore mismatch image ref");
-        }
+        crate::web::log("local snapshot: restore mismatch image ref");
         return ApplySnapshotResult::Mismatch;
     }
     if info.image_width != snapshot.puzzle.image_width
         || info.image_height != snapshot.puzzle.image_height
     {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore mismatch image dims");
-        }
+        crate::web::log("local snapshot: restore mismatch image dims");
         return ApplySnapshotResult::Mismatch;
     }
     if info.topology != snapshot.puzzle.topology {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore mismatch topology descriptor");
-        }
+        crate::web::log("local snapshot: restore mismatch topology descriptor");
         return ApplySnapshotResult::Mismatch;
     }
     if let Some(game) = current.game.as_ref() {
         let snapshot_topology: heddobureika_core::TopologySpec =
             snapshot.state.topology.clone().into();
         if game.playable.logical.topology.to_spec() != snapshot_topology {
-            #[cfg(target_arch = "wasm32")]
-            {
-                gloo::console::log!("local snapshot: restore mismatch topology");
-            }
+            crate::web::log("local snapshot: restore mismatch topology");
             return ApplySnapshotResult::Mismatch;
         }
     }
     if info.shape_seed != snapshot.puzzle.shape_seed {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore mismatch shape seed");
-        }
+        crate::web::log("local snapshot: restore mismatch shape seed");
         return ApplySnapshotResult::Mismatch;
     }
     let total = snapshot.puzzle.piece_count() as usize;
     if total == 0 {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore not ready (empty topology)");
-        }
+        crate::web::log("local snapshot: restore not ready (empty topology)");
         return ApplySnapshotResult::NotReady;
     }
     let Ok(game) = AppGameState::from_snapshot(snapshot.clone()) else {
-        #[cfg(target_arch = "wasm32")]
-        {
-            gloo::console::log!("local snapshot: restore mismatch playable state");
-        }
+        crate::web::log("local snapshot: restore mismatch playable state");
         return ApplySnapshotResult::Mismatch;
     };
     core.install_game(game, false);
-    #[cfg(target_arch = "wasm32")]
-    {
-        gloo::console::log!("local snapshot: restore applied");
-    }
+    crate::web::log("local snapshot: restore applied");
     ApplySnapshotResult::Applied
 }
 

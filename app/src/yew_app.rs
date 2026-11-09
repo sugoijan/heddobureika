@@ -1,13 +1,13 @@
 use gloo::events::{EventListener, EventListenerOptions, EventListenerPhase};
 use gloo::timers::future::TimeoutFuture;
-use js_sys::{Date, Math};
+use js_sys::Math;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Element, Event, File, HtmlImageElement, HtmlInputElement, HtmlSelectElement, InputEvent,
-    KeyboardEvent, MouseEvent,
+    Element, Event, File, HtmlInputElement, HtmlSelectElement, InputEvent, KeyboardEvent,
+    MouseEvent,
 };
 use yew::prelude::*;
 
@@ -27,17 +27,16 @@ use crate::persisted_store;
 use crate::runtime::{FailReason, SyncEvent, SyncHooks};
 use crate::sync_runtime;
 use crate::view_runtime;
+use crate::web::now_ms_u64;
 use heddobureika_core::catalog::{
     BLANK_PUZZLES, PUZZLE_CATALOG, PuzzleCatalogEntry, blank_puzzle_by_slug,
 };
 use heddobureika_core::{
     ASSET_CHUNK_BYTES, AdminMsg, ClientId, PRIVATE_UPLOAD_MAX_BYTES, PieceCountChoice,
-    PlayableGameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleTopology, ROOM_ID_ALPHABET,
-    ROOM_ID_LEN, RoomControlUpdate, ServerMsg, TopologySpec, available_topologies,
-    is_valid_room_id, logical_image_size, topology_kind_for_tag,
+    PlayableGameSnapshot, PuzzleImageRef, PuzzleInfo, PuzzleSpec, PuzzleTopology, ROOM_ID_LEN,
+    RoomControlUpdate, ServerMsg, TopologySpec, available_topologies, is_valid_room_id,
+    logical_image_size, topology_kind_for_tag,
 };
-use image_pipeline::{AlphaMode, PipelineConfig};
-use sha2::{Digest, Sha256};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdminStatus {
     Idle,
@@ -419,13 +418,8 @@ fn encode_hash_value(value: &str) -> String {
 }
 
 fn generate_room_id() -> String {
-    let alphabet = ROOM_ID_ALPHABET.as_bytes();
-    let mut room_id = String::with_capacity(ROOM_ID_LEN);
-    for _ in 0..ROOM_ID_LEN {
-        let idx = (Math::random() * alphabet.len() as f64).floor() as usize;
-        room_id.push(alphabet[idx.min(alphabet.len().saturating_sub(1))] as char);
-    }
-    room_id
+    heddobureika_core::generate_room_id(|len| (Math::random() * len as f64).floor() as usize)
+        .to_string()
 }
 
 fn room_setup_status_label(status: RoomSetupStatus) -> &'static str {
@@ -541,78 +535,12 @@ fn clear_saved_game() {
     crate::sync_runtime::clear_local_snapshot();
 }
 
-fn now_ms_u64() -> u64 {
-    Date::now().max(0.0) as u64
-}
-
 async fn read_file_bytes(file: File) -> Result<Vec<u8>, String> {
     let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
         .await
         .map_err(|_| "failed to read file".to_string())?;
     let array = js_sys::Uint8Array::new(&buffer);
     Ok(array.to_vec())
-}
-
-fn is_avif_bytes(bytes: &[u8]) -> bool {
-    if bytes.len() < 12 {
-        return false;
-    }
-    if &bytes[4..8] != b"ftyp" {
-        return false;
-    }
-    matches!(&bytes[8..12], b"avif" | b"avis")
-}
-
-async fn load_image_dimensions(file: File) -> Result<(u32, u32), String> {
-    let url = web_sys::Url::create_object_url_with_blob(&file)
-        .map_err(|_| "failed to read image".to_string())?;
-    let img = HtmlImageElement::new().map_err(|_| "failed to read image".to_string())?;
-    let img = std::rc::Rc::new(img);
-    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-        let img_onload = img.clone();
-        let url_for_onload = url.clone();
-        let onload = wasm_bindgen::closure::Closure::once(move || {
-            let width = img_onload.natural_width();
-            let height = img_onload.natural_height();
-            let _ = web_sys::Url::revoke_object_url(&url_for_onload);
-            let result = js_sys::Array::new();
-            result.push(&wasm_bindgen::JsValue::from_f64(width as f64));
-            result.push(&wasm_bindgen::JsValue::from_f64(height as f64));
-            let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &result);
-        });
-        let url_for_onerror = url.clone();
-        let onerror = wasm_bindgen::closure::Closure::once(move || {
-            let _ = web_sys::Url::revoke_object_url(&url_for_onerror);
-            let _ = reject.call1(
-                &wasm_bindgen::JsValue::NULL,
-                &wasm_bindgen::JsValue::from_str("image_load_failed"),
-            );
-        });
-        img.set_onload(Some(onload.as_ref().unchecked_ref()));
-        img.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-        img.set_src(&url);
-        onload.forget();
-        onerror.forget();
-    });
-    let value = wasm_bindgen_futures::JsFuture::from(promise)
-        .await
-        .map_err(|_| "failed to read image".to_string())?;
-    let array = js_sys::Array::from(&value);
-    let width = array.get(0).as_f64().unwrap_or(0.0) as u32;
-    let height = array.get(1).as_f64().unwrap_or(0.0) as u32;
-    if width == 0 || height == 0 {
-        return Err("invalid image dimensions".to_string());
-    }
-    Ok((width, height))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{:02x}", byte));
-    }
-    hex
 }
 
 fn save_theme_mode(mode: ThemeMode) {
@@ -773,9 +701,9 @@ where
     Callback::from(move |event: InputEvent| {
         let input: HtmlInputElement = event.target_unchecked_into();
         if let Ok(value) = input.value().parse::<f32>() {
-            let mut next = (*settings).clone();
+            let mut next = *settings;
             updater(&mut next, value);
-            settings.set(next.clone());
+            settings.set(next);
             app_core.set_shape_settings(next);
         }
     })
@@ -867,7 +795,7 @@ fn app(props: &AppProps) -> Html {
         .as_ref()
         .map(|info| (info.image_width, info.image_height));
     let settings = use_state(ShapeSettings::default);
-    let settings_value = (*settings).clone();
+    let settings_value = *settings;
     let mut grid_choices = if let Some(info) = puzzle_info_value.as_ref() {
         build_grid_choices(info.image_width, info.image_height)
     } else {
@@ -1012,7 +940,7 @@ fn app(props: &AppProps) -> Html {
             </option>
         }))
         .collect();
-    let private_label = use_state(|| String::new());
+    let private_label = use_state(String::new);
     let private_label_value = (*private_label).clone();
     let private_error = use_state(|| None::<String>);
     let private_error_value = (*private_error).clone();
@@ -1048,7 +976,7 @@ fn app(props: &AppProps) -> Html {
     let admin_token_active_value = (*admin_token_active).clone();
     let admin_status = use_state(|| AdminStatus::Idle);
     let admin_status_value = *admin_status;
-    let admin_seed = use_state(|| String::new());
+    let admin_seed = use_state(String::new);
     let admin_seed_value = (*admin_seed).clone();
     let admin_socket = use_mut_ref(AdminSocket::new);
     let room_transition_seq = use_mut_ref(|| 0u64);
@@ -1090,14 +1018,8 @@ fn app(props: &AppProps) -> Html {
         .as_ref()
         .is_some_and(|config| config.is_p2p());
     let p2p_selected = *host_p2p && cfg!(feature = "experimental-p2p");
-    #[cfg(feature = "experimental-p2p")]
     let p2p_restore_available = crate::p2p_progress::has_saved_progress();
-    #[cfg(not(feature = "experimental-p2p"))]
-    let p2p_restore_available = false;
-    #[cfg(feature = "experimental-p2p")]
     let p2p_restore_error = crate::p2p_progress::load_error();
-    #[cfg(not(feature = "experimental-p2p"))]
-    let p2p_restore_error: Option<String> = None;
     let multiplayer_controls_online = multiplayer_active || online_setup_value;
     let show_online_setup = online_setup_value && !multiplayer_active;
     let mp_init_required_value = sync_view.init_required();
@@ -1597,7 +1519,6 @@ fn app(props: &AppProps) -> Html {
         let admin_room_id = admin_room_id.clone();
         let admin_token_value = admin_token_active_value.clone();
         let multiplayer_active = multiplayer_active && !p2p_active;
-        let online_setup_value = online_setup_value;
         use_effect_with(
             (
                 admin_token_value.clone(),
@@ -2206,10 +2127,7 @@ fn app(props: &AppProps) -> Html {
             || ()
         });
     }
-    let renderer_value = match renderer_kind {
-        RendererKind::Wgpu => "wgpu",
-        RendererKind::Svg => "svg",
-    };
+    let renderer_value = renderer_kind.as_str();
     let mode_value = if multiplayer_controls_online {
         "online"
     } else {
@@ -2294,10 +2212,6 @@ fn app(props: &AppProps) -> Html {
         let admin_room_id = admin_room_id.clone();
         let admin_token_active_value = admin_token_active_value.clone();
         let admin_seed_value = admin_seed_value.clone();
-        let multiplayer_active = multiplayer_active;
-        let admin_enabled = admin_enabled;
-        let mp_init_required_value = mp_init_required_value;
-        let image_max_dim = image_max_dim;
         Callback::from(move |req: PuzzleChangeRequest| {
             if multiplayer_active && !mp_init_required_value {
                 if !admin_enabled {
@@ -2355,11 +2269,7 @@ fn app(props: &AppProps) -> Html {
         let grid_custom_count = grid_custom_count.clone();
         let grid_choices = grid_choices.clone();
         let grid_choices_len = grid_choices.len();
-        let lock_puzzle_controls = lock_puzzle_controls;
         let apply_puzzle_change = apply_puzzle_change.clone();
-        let puzzle_art = puzzle_art;
-        let preset_grid = preset_grid;
-        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
@@ -2393,13 +2303,8 @@ fn app(props: &AppProps) -> Html {
     };
     let on_grid_custom_commit = {
         let grid_custom_count = grid_custom_count.clone();
-        let lock_puzzle_controls = lock_puzzle_controls;
         let apply_puzzle_change = apply_puzzle_change.clone();
-        let puzzle_art = puzzle_art;
-        let preset_grid = preset_grid;
-        let puzzle_dims_value = puzzle_dims_value;
         let current_custom = grid_custom_count_value;
-        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |input: HtmlInputElement| {
             if lock_puzzle_controls {
                 return;
@@ -2450,11 +2355,6 @@ fn app(props: &AppProps) -> Html {
         let non_grid_target_count = non_grid_target_count.clone();
         let non_grid_custom_count = non_grid_custom_count.clone();
         let apply_puzzle_change = apply_puzzle_change.clone();
-        let image_max_dim = image_max_dim;
-        let puzzle_art = puzzle_art;
-        let grid = grid;
-        let regenerate_seed_value = regenerate_seed_value;
-        let lock_puzzle_controls = lock_puzzle_controls;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
@@ -2514,11 +2414,7 @@ fn app(props: &AppProps) -> Html {
         let non_grid_target_count = non_grid_target_count.clone();
         let non_grid_custom_count = non_grid_custom_count.clone();
         let apply_puzzle_change = apply_puzzle_change.clone();
-        let image_max_dim = image_max_dim;
-        let puzzle_art = puzzle_art;
         let active_kind = active_topology_kind;
-        let regenerate_seed_value = regenerate_seed_value;
-        let lock_puzzle_controls = lock_puzzle_controls;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
@@ -2557,11 +2453,7 @@ fn app(props: &AppProps) -> Html {
         let non_grid_target_count = non_grid_target_count.clone();
         let non_grid_custom_count = non_grid_custom_count.clone();
         let apply_puzzle_change = apply_puzzle_change.clone();
-        let image_max_dim = image_max_dim;
-        let puzzle_art = puzzle_art;
         let active_kind = active_topology_kind;
-        let regenerate_seed_value = regenerate_seed_value;
-        let lock_puzzle_controls = lock_puzzle_controls;
         Callback::from(move |input: HtmlInputElement| {
             if lock_puzzle_controls {
                 return;
@@ -2610,11 +2502,7 @@ fn app(props: &AppProps) -> Html {
         let non_grid_target_count = non_grid_target_count.clone();
         let non_grid_custom_count = non_grid_custom_count.clone();
         let apply_puzzle_change = apply_puzzle_change.clone();
-        let image_max_dim = image_max_dim;
-        let puzzle_art = puzzle_art;
         let active_kind = active_topology_kind;
-        let grid = grid;
-        let lock_puzzle_controls = lock_puzzle_controls;
         Callback::from(move |_: MouseEvent| {
             if lock_puzzle_controls {
                 return;
@@ -2651,11 +2539,8 @@ fn app(props: &AppProps) -> Html {
         let puzzle_art_custom = puzzle_art_custom.clone();
         let puzzle_art_blank = puzzle_art_blank.clone();
         let puzzle_art_len = PUZZLE_ARTS.len();
-        let lock_puzzle_controls = lock_puzzle_controls;
         let apply_puzzle_change = apply_puzzle_change.clone();
         let descriptor = local_topology_descriptor.clone();
-        let grid = grid;
-        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |event: Event| {
             if lock_puzzle_controls {
                 return;
@@ -2724,7 +2609,6 @@ fn app(props: &AppProps) -> Html {
         let private_error = private_error.clone();
         let private_status = private_status.clone();
         let app_core = app_core.clone();
-        let image_max_dim = image_max_dim;
         let descriptor = local_topology_descriptor.clone();
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
@@ -2758,32 +2642,16 @@ fn app(props: &AppProps) -> Html {
                 };
                 private_status.set(Some("Processing image...".to_string()));
                 TimeoutFuture::new(0).await;
-                let is_avif = mime == "image/avif" || is_avif_bytes(&bytes);
-                let (stored_bytes, width, height) = if is_avif {
-                    let (width, height) = match load_image_dimensions(file).await {
-                        Ok(value) => value,
-                        Err(message) => {
-                            private_error.set(Some(message));
-                            private_status.set(None);
-                            return;
-                        }
-                    };
-                    (bytes, width, height)
-                } else {
-                    let mut config = PipelineConfig::default();
-                    config.alpha_mode = AlphaMode::Preserve;
-                    let result = match image_pipeline::transcode_to_avif(&bytes, config) {
-                        Ok(result) => result,
-                        Err(message) => {
-                            private_error.set(Some(format!("transcode failed: {message}")));
-                            private_status.set(None);
-                            return;
-                        }
-                    };
-                    (result.bytes, result.width, result.height)
+                let stored = match image_pipeline::prepare_stored_image(bytes) {
+                    Ok(stored) => stored,
+                    Err(message) => {
+                        private_error.set(Some(format!("image processing failed: {message}")));
+                        private_status.set(None);
+                        return;
+                    }
                 };
                 let (logical_width, logical_height) =
-                    logical_image_size(width, height, image_max_dim);
+                    logical_image_size(stored.width, stored.height, image_max_dim);
                 // The descriptor was built against the previously-active
                 // image's dimensions. Each topology decides whether its
                 // identity depends on image aspect (Voronoi, hexagonal and
@@ -2794,12 +2662,12 @@ fn app(props: &AppProps) -> Html {
                         (kind.rebuild_for_image)(&descriptor, logical_width, logical_height)
                     })
                     .unwrap_or(descriptor.clone());
-                let hash = sha256_hex(&stored_bytes);
+                let hash = heddobureika_core::sha256_hex(&stored.bytes);
                 let now = now_ms_u64();
-                let size = (stored_bytes.len() as u64).min(u32::MAX as u64) as u32;
+                let size = (stored.bytes.len() as u64).min(u32::MAX as u64) as u32;
                 let entry = PrivateImageEntry {
-                    bytes: stored_bytes,
-                    mime: "image/avif".to_string(),
+                    bytes: stored.bytes,
+                    mime: image_pipeline::STORED_IMAGE_MIME.to_string(),
                     width: logical_width,
                     height: logical_height,
                     size,
@@ -2941,7 +2809,7 @@ fn app(props: &AppProps) -> Html {
         let app_core = app_core.clone();
         let app_snapshot = app_snapshot.clone();
         Callback::from(move |_: MouseEvent| {
-            let view = (*app_snapshot).view;
+            let view = app_snapshot.view;
             let center_x = view.min_x + view.width * 0.5;
             let center_y = view.min_y + view.height * 0.5;
             app_core.zoom_view_at(1.1, center_x, center_y);
@@ -2951,7 +2819,7 @@ fn app(props: &AppProps) -> Html {
         let app_core = app_core.clone();
         let app_snapshot = app_snapshot.clone();
         Callback::from(move |_: MouseEvent| {
-            let view = (*app_snapshot).view;
+            let view = app_snapshot.view;
             let center_x = view.min_x + view.width * 0.5;
             let center_y = view.min_y + view.height * 0.5;
             app_core.zoom_view_at(1.0 / 1.1, center_x, center_y);
@@ -3104,11 +2972,8 @@ fn app(props: &AppProps) -> Html {
         let room_setup_error = room_setup_error.clone();
         let pending_created_room = pending_created_room.clone();
         let room_id_draft_trimmed = room_id_draft_trimmed.clone();
-        let room_id_draft_valid = room_id_draft_valid;
         let admin_seed_value = admin_seed_value.clone();
-        let puzzle_art = puzzle_art;
         let create_descriptor = local_topology_descriptor.clone();
-        let regenerate_seed_value = regenerate_seed_value;
         Callback::from(move |_: MouseEvent| {
             if *host_p2p && cfg!(feature = "experimental-p2p") {
                 let current =
@@ -3187,7 +3052,6 @@ fn app(props: &AppProps) -> Html {
         let room_setup_error = room_setup_error.clone();
         let connect_room_live = connect_room_live.clone();
         let room_id_draft_trimmed = room_id_draft_trimmed.clone();
-        let room_id_draft_valid = room_id_draft_valid;
         Callback::from(move |_: MouseEvent| {
             let room_id = room_id_draft_trimmed.trim().to_string();
             if !room_id_draft_valid {
@@ -3201,8 +3065,6 @@ fn app(props: &AppProps) -> Html {
         })
     };
     let on_mode_change = {
-        let multiplayer_active = multiplayer_active;
-        let show_online_setup = show_online_setup;
         let online_setup = online_setup.clone();
         let room_id_draft = room_id_draft.clone();
         let cancel_online_setup = cancel_online_setup.clone();
@@ -3261,12 +3123,8 @@ fn app(props: &AppProps) -> Html {
                 return;
             }
             let input: HtmlSelectElement = event.target_unchecked_into();
-            let next_renderer = match input.value().as_str() {
-                "svg" => RendererKind::Svg,
-                "wgpu" => RendererKind::Wgpu,
-                _ => RendererKind::Wgpu,
-            };
-            let current = (*render_settings).renderer;
+            let next_renderer = RendererKind::parse(&input.value()).unwrap_or_default();
+            let current = render_settings.renderer;
             if current == next_renderer {
                 return;
             }
@@ -3472,7 +3330,7 @@ fn app(props: &AppProps) -> Html {
             // The render_settings effect re-persists, re-applies, and syncs
             // image_max_dim to the core automatically.
             let mut next = RenderSettings::default();
-            next.renderer = (*render_settings).renderer;
+            next.renderer = render_settings.renderer;
             render_settings.set(next);
         })
     };
@@ -5123,17 +4981,6 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    fn assert_close(actual: f32, expected: f32) {
-        let delta = (actual - expected).abs();
-        assert!(
-            delta <= 1e-6,
-            "expected {:.6} got {:.6} (delta {:.6})",
-            expected,
-            actual,
-            delta
-        );
-    }
-
     #[wasm_bindgen_test]
     fn generated_room_ids_are_valid() {
         set_panic_hook();
@@ -5449,6 +5296,6 @@ mod tests {
     #[wasm_bindgen_test]
     fn wasm_smoke() {
         set_panic_hook();
-        assert_eq!(1 + 1, 2);
+        assert!(web_sys::window().is_some());
     }
 }

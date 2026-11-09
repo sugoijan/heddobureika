@@ -8,19 +8,18 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use heddobureika_core::codec::{decode_result, encode};
-use heddobureika_core::room_id::{ROOM_ID_ALPHABET, ROOM_ID_LEN, RoomId};
+use heddobureika_core::room_id::RoomId;
 use heddobureika_core::{
     ASSET_CHUNK_BYTES, AdminMsg, PRIVATE_UPLOAD_MAX_BYTES, PUZZLE_CATALOG, PuzzleImageRef,
     PuzzleSpec, RecordedCommand, RecordedCommandKind, RecordedCommandOutcome, ServerMsg,
     puzzle_by_slug,
 };
+use heddobureika_core::{AuthPayload, auth_message, encode_auth_protocol};
 use mime_guess::MimeGuess;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::elliptic_curve::Generate;
 use rand::RngExt;
 use serde::Deserialize;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -1461,7 +1460,7 @@ fn infer_grid_dims(total: usize) -> (usize, usize) {
     let mut best_diff = best_cols.saturating_sub(best_rows);
     let limit = (total as f64).sqrt().floor() as usize;
     for rows in 1..=limit.max(1) {
-        if total % rows != 0 {
+        if !total.is_multiple_of(rows) {
             continue;
         }
         let cols = total / rows;
@@ -2001,13 +2000,7 @@ async fn recv_server_msg(
 
 fn generate_room_id() -> String {
     let mut rng = rand::rng();
-    let alphabet = ROOM_ID_ALPHABET.as_bytes();
-    let mut id = String::with_capacity(ROOM_ID_LEN);
-    for _ in 0..ROOM_ID_LEN {
-        let idx = rng.random_range(0..alphabet.len());
-        id.push(alphabet[idx] as char);
-    }
-    id
+    heddobureika_core::generate_room_id(|len| rng.random_range(0..len)).to_string()
 }
 
 fn build_admin_url(base_url: &str, room_id: &str, token: &str) -> Result<Url, url::ParseError> {
@@ -2038,7 +2031,7 @@ fn parse_seed_arg(raw: &str) -> Result<u32, Box<dyn std::error::Error>> {
 }
 
 fn err_msg(msg: impl Into<String>) -> Box<dyn std::error::Error> {
-    std::io::Error::new(std::io::ErrorKind::Other, msg.into()).into()
+    std::io::Error::other(msg.into()).into()
 }
 
 fn install_crypto_provider() -> Result<(), Box<dyn std::error::Error>> {
@@ -2054,54 +2047,29 @@ fn install_crypto_provider() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Serialize)]
-struct AuthPayload {
-    v: u8,
-    client_id: String,
-    ts: i64,
-    nonce: String,
-    pubkey: String,
-    sig: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    admin_token: Option<String>,
-}
-
+/// Signs the handshake with a fresh ephemeral key; the CLI has no persistent
+/// identity.
 fn build_auth_protocol(
     room_id: &str,
     admin_token: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    const AUTH_PROTOCOL_PREFIX: &str = "heddo-auth-v1.";
-    const AUTH_CONTEXT: &str = "heddobureika-auth-v1";
-
     let signing_key = SigningKey::generate();
-    let verifying_key = signing_key.verifying_key();
-    let public_key_sec1 = verifying_key.to_sec1_point(false).as_bytes().to_vec();
-    let client_id = derive_client_id(&public_key_sec1);
+    let public_key_sec1 = signing_key
+        .verifying_key()
+        .to_sec1_point(false)
+        .as_bytes()
+        .to_vec();
     let ts = now_ms();
     let nonce = random_nonce();
-    let message = format!("{room_id}\n{ts}\n{nonce}\n{AUTH_CONTEXT}");
-    let signature: Signature = signing_key.sign(message.as_bytes());
-    let payload = AuthPayload {
-        v: 1,
-        client_id: client_id.to_string(),
+    let signature: Signature = signing_key.sign(&auth_message(room_id, ts, &nonce));
+    let payload = AuthPayload::new(
         ts,
         nonce,
-        pubkey: URL_SAFE_NO_PAD.encode(&public_key_sec1),
-        sig: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-        admin_token: admin_token.map(|token| token.trim().to_string()),
-    };
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    Ok(format!(
-        "{AUTH_PROTOCOL_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(payload_bytes)
-    ))
-}
-
-fn derive_client_id(pubkey_sec1: &[u8]) -> u64 {
-    let digest = Sha256::digest(pubkey_sec1);
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(bytes)
+        &public_key_sec1,
+        &signature.to_bytes(),
+        admin_token.map(|token| token.trim().to_string()),
+    );
+    Ok(encode_auth_protocol(&payload)?)
 }
 
 fn random_nonce() -> String {

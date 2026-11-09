@@ -63,11 +63,21 @@ pub struct ExportPiecesArgs {
 pub fn export_pieces(args: &ExportPiecesArgs) -> Result<()> {
     let aspect = match args.aspect {
         Some(aspect) => aspect,
-        None => HexagonalTopology::uniform_aspect_for(args.cols, args.rows)
-            .ok_or_else(|| anyhow!("no uniform aspect for {}x{} (need odd cols >= 3, rows >= 2)", args.cols, args.rows))?,
+        None => HexagonalTopology::uniform_aspect_for(args.cols, args.rows).ok_or_else(|| {
+            anyhow!(
+                "no uniform aspect for {}x{} (need odd cols >= 3, rows >= 2)",
+                args.cols,
+                args.rows
+            )
+        })?,
     };
-    let topology = HexagonalTopology::try_new(args.cols, args.rows, aspect)
-        .ok_or_else(|| anyhow!("invalid hex topology {}x{} (cols must be odd)", args.cols, args.rows))?;
+    let topology = HexagonalTopology::try_new(args.cols, args.rows, aspect).ok_or_else(|| {
+        anyhow!(
+            "invalid hex topology {}x{} (cols must be odd)",
+            args.cols,
+            args.rows
+        )
+    })?;
 
     let frame_h = LengthMm::try_new(args.height_mm)
         .ok_or_else(|| anyhow!("invalid --height-mm {}", args.height_mm))?;
@@ -75,12 +85,15 @@ pub fn export_pieces(args: &ExportPiecesArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("invalid derived width for aspect {aspect}"))?;
 
     let (col, row) = parse_piece(&args.piece)?;
-    let focus = topology
-        .piece_id_at(col, row)
-        .ok_or_else(|| anyhow!("no piece at col {col}, row {row} in a {}x{} grid", args.cols, args.rows))?;
+    let focus = topology.piece_id_at(col, row).ok_or_else(|| {
+        anyhow!(
+            "no piece at col {col}, row {row} in a {}x{} grid",
+            args.cols,
+            args.rows
+        )
+    })?;
 
-    fs::create_dir_all(&args.out)
-        .with_context(|| format!("creating {}", args.out.display()))?;
+    fs::create_dir_all(&args.out).with_context(|| format!("creating {}", args.out.display()))?;
 
     for &seed in &args.seeds {
         let svg = export_one(&topology, frame_w, frame_h, seed, focus, args.rings)?;

@@ -24,7 +24,8 @@
 //! fall back to uniform layout.
 
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
+
+use crate::rotation_step::{symmetry_angles_60, symmetry_angles_90};
 
 use crate::ids::{EdgeId, PieceId};
 use crate::playable::Pose2;
@@ -82,7 +83,7 @@ impl HexagonalTopology {
     /// inner hex shape stays regular when the aspect leaves
     /// horizontal extra, otherwise we fall back to uniform layout).
     pub fn new(cols: NonZeroU32, rows: NonZeroU32, aspect_ratio: f32) -> Option<Self> {
-        if cols.get() % 2 == 0 {
+        if cols.get().is_multiple_of(2) {
             return None;
         }
         if !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
@@ -280,7 +281,7 @@ pub(crate) fn col_pose_x(col: u32, cols: u32, outer_gap_pose: f32) -> f32 {
 /// Number of pieces in a `C × R` hex puzzle. `(2*R*C - C + 1) / 2` —
 /// equivalent to `(C+1)/2 * R + (C-1)/2 * (R-1)`.
 fn piece_count_for(cols: u32, rows: u32) -> u32 {
-    (cols * (2 * rows - 1) + 1) / 2
+    (cols * (2 * rows - 1)).div_ceil(2)
 }
 
 /// Even columns count from the front: col `2k` corresponds to pair `k`.
@@ -290,7 +291,7 @@ fn piece_count_for(cols: u32, rows: u32) -> u32 {
 fn piece_id_unchecked(_cols: u32, rows: u32, col: u32, row_in_col: u32) -> PieceId {
     let r = rows;
     let pair = col / 2;
-    if col % 2 == 0 {
+    if col.is_multiple_of(2) {
         PieceId(pair * (2 * r - 1) + row_in_col)
     } else {
         PieceId(pair * (2 * r - 1) + r + row_in_col)
@@ -301,7 +302,7 @@ fn is_valid_coord(cols: u32, rows: u32, col: i32, row_in_col: i32) -> bool {
     if col < 0 || (col as u32) >= cols || row_in_col < 0 {
         return false;
     }
-    let limit = if (col as u32) % 2 == 0 {
+    let limit = if (col as u32).is_multiple_of(2) {
         rows
     } else {
         rows.saturating_sub(1)
@@ -315,7 +316,7 @@ fn is_valid_coord(cols: u32, rows: u32, col: i32, row_in_col: i32) -> bool {
 fn neighbour_coords(col: u32, row_in_col: u32) -> [(i32, i32); 6] {
     let c = col as i32;
     let r = row_in_col as i32;
-    if col % 2 == 0 {
+    if col.is_multiple_of(2) {
         [
             (c, r - 1),     // N
             (c, r + 1),     // S
@@ -424,8 +425,8 @@ impl PuzzleTopology for HexagonalTopology {
         // multiples, matching the rectangular frame's symmetry, so
         // they use 90° step quanta.
         match self.piece_kind(piece) {
-            Some(HexPieceKind::Regular) => hex_regular_symmetry_angles(),
-            _ => hex_boundary_symmetry_angles(),
+            Some(HexPieceKind::Regular) => symmetry_angles_60(),
+            _ => symmetry_angles_90(),
         }
     }
 
@@ -469,10 +470,6 @@ impl PuzzleTopology for HexagonalTopology {
         (total_x, (r as f32 - 1.0) * SQRT_3)
     }
 
-    fn snap_frame_extent_in_pose_units(&self) -> (f32, f32) {
-        self.image_extent_in_pose_units()
-    }
-
     fn canonical_position_in_pose_units(&self, piece: PieceId) -> Option<(f32, f32)> {
         let (x, y) = self.canonical_position_mm(piece)?;
         Some((x.as_mm_f32(), y.as_mm_f32()))
@@ -497,7 +494,7 @@ impl PuzzleTopology for HexagonalTopology {
         let on_bottom_tangent = col % 2 == 1 && row_in_col + 1 == r - 1;
 
         match kind {
-            HexPieceKind::Regular => return,
+            HexPieceKind::Regular => (),
             HexPieceKind::Corner => {
                 // The corner hex's anchor sits AT the rectangle corner
                 // (in pose units the anchor IS `(0|extent_x, 0|extent_y)`).
@@ -602,36 +599,6 @@ impl PuzzleTopology for HexagonalTopology {
             |_piece| (0.0, 0.0),
         )
     }
-}
-
-fn hex_regular_symmetry_angles() -> &'static [AngleDeg] {
-    static ANGLES: OnceLock<Box<[AngleDeg]>> = OnceLock::new();
-    ANGLES
-        .get_or_init(|| {
-            vec![
-                AngleDeg::try_new(60.0).expect("finite"),
-                AngleDeg::try_new(120.0).expect("finite"),
-                AngleDeg::try_new(180.0).expect("finite"),
-                AngleDeg::try_new(240.0).expect("finite"),
-                AngleDeg::try_new(300.0).expect("finite"),
-            ]
-            .into_boxed_slice()
-        })
-        .as_ref()
-}
-
-fn hex_boundary_symmetry_angles() -> &'static [AngleDeg] {
-    static ANGLES: OnceLock<Box<[AngleDeg]>> = OnceLock::new();
-    ANGLES
-        .get_or_init(|| {
-            vec![
-                AngleDeg::try_new(90.0).expect("finite"),
-                AngleDeg::try_new(180.0).expect("finite"),
-                AngleDeg::try_new(270.0).expect("finite"),
-            ]
-            .into_boxed_slice()
-        })
-        .as_ref()
 }
 
 #[cfg(test)]

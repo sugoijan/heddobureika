@@ -8,7 +8,11 @@ build = "build.rs"
 
 [dependencies]
 heddobureika-game = { path = "../game" }
+base64.workspace = true
 rkyv.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
 
 [build-dependencies]
 dotenvy.workspace = true

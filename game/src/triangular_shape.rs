@@ -3,23 +3,20 @@
 use std::collections::HashMap;
 
 use crate::edge_compose::ConnectorSeg;
-use crate::edge_profile::{
-    ConnectorShape, EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments,
-};
+use crate::edge_profile::{EdgeProfileInput, EdgeShapeStyle, build_edge_profile_segments};
 use crate::ids::{BorderEdgeId, EdgeId, FrameEdgeId, PieceId};
+use crate::math::{self, splitmix32};
 use crate::shape::{
     BorderEdgeGeometryMm, EdgeSide, EdgeSideGeometryMm, FrameGeometryMm, GeometryInvariantError,
     InteriorEdgeGeometryMm, PathMm, PathSegMm, PieceEdgeRef, PieceGeometryMm,
     PieceGeometryProvider, PointMm, ShapeAtlasMm, TopologyShaper,
 };
+use crate::shape_profiles::{
+    self, Point2, TAB_DEPTH_LIMIT, connector_for_edge, connector_segments_fit_frame, distance,
+    reverse_path,
+};
 use crate::topology::{PuzzleTopology, TriangularTessellationTopology};
 use crate::units::LengthMm;
-
-const TAB_DEPTH_LIMIT: f32 = 0.24;
-const TAB_WIDTH_AVG_MIN: f32 = 0.075;
-const TAB_WIDTH_AVG_MAX: f32 = 0.115;
-const TAB_DEPTH_AVG_MIN: f32 = 0.055;
-const TAB_DEPTH_AVG_MAX: f32 = 0.075;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TriangularTessellationShapeSettings {
@@ -118,12 +115,6 @@ impl TopologyShaper<TriangularTessellationTopology> for TriangularTessellationSh
             atlas,
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Point2 {
-    x: f32,
-    y: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -415,17 +406,6 @@ fn average_interior_edge_len(
     } else {
         total / count as f32
     }
-}
-
-fn straight_path(
-    start: Point2,
-    end: Point2,
-) -> Result<PathMm, TriangularTessellationShapeBuildError> {
-    Ok(PathMm::new(
-        point(start)?,
-        vec![PathSegMm::LineTo { to: point(end)? }].into_boxed_slice(),
-        false,
-    ))
 }
 
 /// Knows where the four corner arcs of the rounded-rect frame sit and
@@ -734,74 +714,6 @@ fn nearest_transition(arc: &ArcInfo, reference: Point2) -> Point2 {
     }
 }
 
-/// Builds a `PathMm` that traces the short arc from `start` to `end`
-/// on the circle centred at `center`. The path is a single cubic
-/// Bézier (or a straight chord if the sweep is degenerate).
-fn arc_cubic_path(
-    start: Point2,
-    end: Point2,
-    center: Point2,
-) -> Result<PathMm, TriangularTessellationShapeBuildError> {
-    let mut segs = Vec::with_capacity(1);
-    if !push_arc_cubic_seg(&mut segs, start, end, center)? {
-        return straight_path(start, end);
-    }
-    Ok(PathMm::new(point(start)?, segs.into_boxed_slice(), false))
-}
-
-/// Appends a single cubic-Bézier `PathSegMm::CubicTo` approximating
-/// the short arc from `start` to `end` around `center`. Returns
-/// `Ok(true)` if a segment was appended, `Ok(false)` if the sweep is
-/// effectively zero (caller should emit a straight line instead).
-///
-/// Uses the standard `α = (4/3) · tan(sweep/4)` arc-to-Bézier
-/// formula. Maximum radial error is ≈ `0.0002 · radius` for sweeps up
-/// to 45°, well under a pixel even at large image sizes.
-fn push_arc_cubic_seg(
-    out: &mut Vec<PathSegMm>,
-    start: Point2,
-    end: Point2,
-    center: Point2,
-) -> Result<bool, TriangularTessellationShapeBuildError> {
-    let theta1 = (start.y - center.y).atan2(start.x - center.x);
-    let theta2 = (end.y - center.y).atan2(end.x - center.x);
-    let mut sweep = theta2 - theta1;
-    if sweep > std::f32::consts::PI {
-        sweep -= 2.0 * std::f32::consts::PI;
-    } else if sweep <= -std::f32::consts::PI {
-        sweep += 2.0 * std::f32::consts::PI;
-    }
-    if sweep.abs() <= 1.0e-6 {
-        return Ok(false);
-    }
-    let alpha = (4.0 / 3.0) * (sweep / 4.0).tan();
-    // Unit tangent at θ is `(-sin θ, cos θ)` (CCW). When `sweep < 0`,
-    // `alpha` flips sign, which flips the control points to the CW
-    // side — so the same formula handles both directions.
-    let tan_start = Point2 {
-        x: -(start.y - center.y),
-        y: start.x - center.x,
-    };
-    let tan_end = Point2 {
-        x: -(end.y - center.y),
-        y: end.x - center.x,
-    };
-    let c1 = Point2 {
-        x: start.x + alpha * tan_start.x,
-        y: start.y + alpha * tan_start.y,
-    };
-    let c2 = Point2 {
-        x: end.x - alpha * tan_end.x,
-        y: end.y - alpha * tan_end.y,
-    };
-    out.push(PathSegMm::CubicTo {
-        c1: point(c1)?,
-        c2: point(c2)?,
-        to: point(end)?,
-    });
-    Ok(true)
-}
-
 fn profiled_path(
     start: Point2,
     end: Point2,
@@ -839,6 +751,10 @@ fn profiled_path(
     straight_path(start, end)
 }
 
+/// The triangular shaper keeps the strict pre-tolerance frame check (see
+/// `shape_profiles::FRAME_FIT_TOLERANCE_PX` for the relaxed one).
+const FRAME_FIT_TOLERANCE_PX: f32 = 0.01;
+
 fn path_from_connector_segments_in_frame(
     start: Point2,
     end: Point2,
@@ -846,148 +762,60 @@ fn path_from_connector_segments_in_frame(
     frame_width: f32,
     frame_height: f32,
 ) -> Result<Option<PathMm>, TriangularTessellationShapeBuildError> {
-    if !connector_segments_fit_frame(start, end, segments, frame_width, frame_height) {
+    if !connector_segments_fit_frame(
+        start,
+        end,
+        segments,
+        frame_width,
+        frame_height,
+        FRAME_FIT_TOLERANCE_PX,
+    ) {
         return Ok(None);
     }
     path_from_connector_segments(start, end, segments).map(Some)
 }
 
-fn connector_segments_fit_frame(
-    start: Point2,
-    end: Point2,
-    segments: &[ConnectorSeg],
-    frame_width: f32,
-    frame_height: f32,
-) -> bool {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len <= 1.0e-5 {
-        return true;
-    }
-    let tx = dx / len;
-    let ty = dy / len;
-    let nx = -ty;
-    let ny = tx;
-    for segment in segments {
-        let points: &[(f32, f32)] = match segment {
-            ConnectorSeg::LineTo { to } => std::slice::from_ref(to),
-            ConnectorSeg::CubicTo { c1, c2, to } => {
-                let candidates = [*c1, *c2, *to];
-                for local in candidates {
-                    let point = map_local(start, tx, ty, nx, ny, local);
-                    if !point_in_frame(point, frame_width, frame_height) {
-                        return false;
-                    }
-                }
-                continue;
-            }
-        };
-        for local in points {
-            let point = map_local(start, tx, ty, nx, ny, *local);
-            if !point_in_frame(point, frame_width, frame_height) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn point_in_frame(point: Point2, frame_width: f32, frame_height: f32) -> bool {
-    let epsilon = 0.01;
-    point.x >= -epsilon
-        && point.y >= -epsilon
-        && point.x <= frame_width + epsilon
-        && point.y <= frame_height + epsilon
-}
-
-fn connector_for_edge(seed: u32, edge: EdgeId, len: f32, average_edge_len: f32) -> ConnectorShape {
-    let base = seed ^ edge.as_u32().wrapping_mul(0x9E37_79B9);
-    let average = average_edge_len.max(1.0e-5);
-    let tab_width = average * rand_range(base, 0, TAB_WIDTH_AVG_MIN, TAB_WIDTH_AVG_MAX);
-    let tab_depth = average * rand_range(base, 1, TAB_DEPTH_AVG_MIN, TAB_DEPTH_AVG_MAX);
-    let tab_size = (tab_width / len.max(1.0e-5)).clamp(0.04, 0.24);
-    let tab_depth = (tab_depth / (average * tab_size).max(1.0e-5)).clamp(0.2, 1.4);
-    let jitter_depth = 0.015;
-    let jitter_len = (average * 0.025 / len.max(1.0e-5)).clamp(0.0, 0.05);
-    ConnectorShape {
-        tab_size,
-        tab_depth,
-        a: rand_range(base, 2, -jitter_depth, jitter_depth),
-        b: rand_range(base, 3, -jitter_len, jitter_len),
-        c: rand_range(base, 4, -jitter_depth, jitter_depth),
-        d: rand_range(base, 5, -jitter_len, jitter_len),
-        e: rand_range(base, 6, -jitter_depth, jitter_depth),
-    }
-}
+// `shape_profiles` reports construction failures as `None`; the triangular
+// shaper surfaces them as its own error.
 
 fn path_from_connector_segments(
     start: Point2,
     end: Point2,
     segments: &[ConnectorSeg],
 ) -> Result<PathMm, TriangularTessellationShapeBuildError> {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len <= 1.0e-5 {
-        return straight_path(start, end);
-    }
-    let tx = dx / len;
-    let ty = dy / len;
-    let nx = -ty;
-    let ny = tx;
-    let mut path_segments = Vec::<PathSegMm>::with_capacity(segments.len());
-    for segment in segments {
-        match *segment {
-            ConnectorSeg::LineTo { to } => {
-                path_segments.push(PathSegMm::LineTo {
-                    to: point(map_local(start, tx, ty, nx, ny, to))?,
-                });
-            }
-            ConnectorSeg::CubicTo { c1, c2, to } => {
-                path_segments.push(PathSegMm::CubicTo {
-                    c1: point(map_local(start, tx, ty, nx, ny, c1))?,
-                    c2: point(map_local(start, tx, ty, nx, ny, c2))?,
-                    to: point(map_local(start, tx, ty, nx, ny, to))?,
-                });
-            }
-        }
-    }
-    let mut path = PathMm::new(point(start)?, path_segments.into_boxed_slice(), false);
-    set_path_end_point(&mut path, point(end)?);
-    Ok(path)
+    shape_profiles::path_from_connector_segments(start, end, segments)
+        .ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
 }
 
-fn reverse_path(path: &PathMm) -> PathMm {
-    let mut states = Vec::<(PointMm, PathSegMm, PointMm)>::with_capacity(path.segs.len());
-    let mut current = path.start;
-    for segment in path.segs.iter() {
-        let segment_start = current;
-        let segment = segment.clone();
-        match segment {
-            PathSegMm::LineTo { to } => {
-                current = to;
-            }
-            PathSegMm::CubicTo { c1, c2, to } => {
-                let _ = (c1, c2);
-                current = to;
-            }
-        }
-        states.push((segment_start, segment, current));
-    }
+fn straight_path(
+    start: Point2,
+    end: Point2,
+) -> Result<PathMm, TriangularTessellationShapeBuildError> {
+    shape_profiles::straight_path(start, end)
+        .ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
+}
 
-    let mut segs = Vec::<PathSegMm>::with_capacity(states.len());
-    for (start, segment, _) in states.into_iter().rev() {
-        match segment {
-            PathSegMm::LineTo { .. } => segs.push(PathSegMm::LineTo { to: start }),
-            PathSegMm::CubicTo { c1, c2, .. } => segs.push(PathSegMm::CubicTo {
-                c1: c2,
-                c2: c1,
-                to: start,
-            }),
-        }
-    }
-    PathMm::new(current, segs.into_boxed_slice(), false)
+fn arc_cubic_path(
+    start: Point2,
+    end: Point2,
+    center: Point2,
+) -> Result<PathMm, TriangularTessellationShapeBuildError> {
+    shape_profiles::arc_cubic_path(start, end, center)
+        .ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
+}
+
+fn push_arc_cubic_seg(
+    segs: &mut Vec<PathSegMm>,
+    start: Point2,
+    end: Point2,
+    center: Point2,
+) -> Result<bool, TriangularTessellationShapeBuildError> {
+    shape_profiles::push_arc_cubic_seg(segs, start, end, center)
+        .ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
+}
+
+fn point(value: Point2) -> Result<PointMm, TriangularTessellationShapeBuildError> {
+    shape_profiles::point(value).ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
 }
 
 fn side_geometry_from_path(
@@ -1008,17 +836,6 @@ fn side_geometry_from_path(
             y: sy / denom,
         })?,
     })
-}
-
-fn set_path_end_point(path: &mut PathMm, target: PointMm) {
-    if let Some(last) = path.segs.last_mut() {
-        match last {
-            PathSegMm::LineTo { to } => *to = target,
-            PathSegMm::CubicTo { to, .. } => *to = target,
-        }
-    } else {
-        path.start = target;
-    }
 }
 
 fn sample_path(path: &PathMm, cubic_steps: usize) -> Vec<Point2> {
@@ -1061,62 +878,10 @@ fn sample_path(path: &PathMm, cubic_steps: usize) -> Vec<Point2> {
 }
 
 fn cubic_point(p0: Point2, p1: Point2, p2: Point2, p3: Point2, t: f32) -> Point2 {
-    let u = 1.0 - t;
-    let tt = t * t;
-    let uu = u * u;
-    let uuu = uu * u;
-    let ttt = tt * t;
-    Point2 {
-        x: uuu * p0.x + 3.0 * uu * t * p1.x + 3.0 * u * tt * p2.x + ttt * p3.x,
-        y: uuu * p0.y + 3.0 * uu * t * p1.y + 3.0 * u * tt * p2.y + ttt * p3.y,
-    }
-}
-
-fn map_local(start: Point2, tx: f32, ty: f32, nx: f32, ny: f32, local: (f32, f32)) -> Point2 {
-    Point2 {
-        x: start.x + tx * local.0 + nx * local.1,
-        y: start.y + ty * local.0 + ny * local.1,
-    }
-}
-
-fn point(value: Point2) -> Result<PointMm, TriangularTessellationShapeBuildError> {
-    let x = if value.x > -0.01 && value.x < 0.0 {
-        0.0
-    } else {
-        value.x
-    };
-    let y = if value.y > -0.01 && value.y < 0.0 {
-        0.0
-    } else {
-        value.y
-    };
-    PointMm::try_from_mm(x, y).ok_or(TriangularTessellationShapeBuildError::InternalConstruction)
+    let (x, y) = math::cubic_point((p0.x, p0.y), (p1.x, p1.y), (p2.x, p2.y), (p3.x, p3.y), t);
+    Point2 { x, y }
 }
 
 fn ordered_edge_key(a: usize, b: usize) -> (usize, usize) {
     if a <= b { (a, b) } else { (b, a) }
-}
-
-fn distance(a: Point2, b: Point2) -> f32 {
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    (dx * dx + dy * dy).sqrt()
-}
-
-fn splitmix32(mut value: u32) -> u32 {
-    value = value.wrapping_add(0x9E37_79B9);
-    let mut z = value;
-    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
-    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
-    z ^ (z >> 16)
-}
-
-fn rand_unit(seed: u32, salt: u32) -> f32 {
-    let mixed = splitmix32(seed ^ salt);
-    let top = mixed >> 8;
-    top as f32 / ((1u32 << 24) as f32)
-}
-
-fn rand_range(seed: u32, salt: u32, min: f32, max: f32) -> f32 {
-    min + (max - min) * rand_unit(seed, salt)
 }

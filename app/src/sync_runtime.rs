@@ -11,7 +11,7 @@ use crate::app_router::{self, MultiplayerConfig};
 use crate::boot_runtime::{self, BootState};
 use crate::core::InitMode;
 use crate::local_snapshot::{ApplySnapshotResult, apply_playable_snapshot_to_core};
-use crate::multiplayer_game_sync::MultiplayerGameSync;
+use crate::multiplayer_game_sync::{LocalEventObserver, MultiplayerGameSync};
 use crate::runtime::{
     CoreAction, FailReason, GameSync, LocalSyncAdapter, SyncAction, SyncHooks, SyncView,
 };
@@ -40,10 +40,7 @@ struct SyncRuntimeState {
     retry_timer: Option<Timeout>,
     sync_view_hooks: Vec<(u64, Rc<dyn Fn()>)>,
     next_sync_view_hook_id: u64,
-    mp_local_transform_observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
-    mp_local_flip_observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
-    mp_local_detach_observer: Option<Rc<dyn Fn(u32)>>,
-    mp_local_send_to_back_observer: Option<Rc<dyn Fn(u32)>>,
+    mp_local_event_observer: Option<LocalEventObserver>,
 }
 
 impl SyncRuntimeState {
@@ -66,10 +63,7 @@ impl SyncRuntimeState {
             retry_timer: None,
             sync_view_hooks: Vec::new(),
             next_sync_view_hook_id: 0,
-            mp_local_transform_observer: None,
-            mp_local_flip_observer: None,
-            mp_local_detach_observer: None,
-            mp_local_send_to_back_observer: None,
+            mp_local_event_observer: None,
         }
     }
 
@@ -85,31 +79,10 @@ impl SyncRuntimeState {
             }
             if let (Some(sync), Some(observer)) = (
                 self.multiplayer.as_ref(),
-                self.mp_local_transform_observer.as_ref(),
+                self.mp_local_event_observer.as_ref(),
             ) {
                 sync.borrow()
-                    .set_local_transform_observer(Some(observer.clone()));
-            }
-            if let (Some(sync), Some(observer)) = (
-                self.multiplayer.as_ref(),
-                self.mp_local_flip_observer.as_ref(),
-            ) {
-                sync.borrow()
-                    .set_local_flip_observer(Some(observer.clone()));
-            }
-            if let (Some(sync), Some(observer)) = (
-                self.multiplayer.as_ref(),
-                self.mp_local_detach_observer.as_ref(),
-            ) {
-                sync.borrow()
-                    .set_local_detach_observer(Some(observer.clone()));
-            }
-            if let (Some(sync), Some(observer)) = (
-                self.multiplayer.as_ref(),
-                self.mp_local_send_to_back_observer.as_ref(),
-            ) {
-                sync.borrow()
-                    .set_local_send_to_back_observer(Some(observer.clone()));
+                    .set_local_event_observer(Some(observer.clone()));
             }
             if let Some(mut local_sync) = self.local_sync.take() {
                 local_sync.shutdown();
@@ -615,46 +588,15 @@ pub(crate) fn set_local_observer(observer: Option<Rc<dyn Fn(&CoreAction)>>) {
     });
 }
 
-pub(crate) fn set_multiplayer_local_transform_observer(
-    observer: Option<Rc<dyn Fn(u32, (f32, f32), Option<f32>, u64, bool)>>,
-) {
+/// Registers the observer that sees every locally applied multiplayer action
+/// (see [`crate::multiplayer_game_sync::LocalEvent`]); it is re-attached
+/// whenever the backend is rebuilt.
+pub(crate) fn set_multiplayer_local_event_observer(observer: Option<LocalEventObserver>) {
     STATE.with(|slot| {
         let mut state = slot.borrow_mut();
-        state.mp_local_transform_observer = observer.clone();
+        state.mp_local_event_observer = observer.clone();
         if let Some(sync) = state.multiplayer.as_ref() {
-            sync.borrow().set_local_transform_observer(observer);
-        }
-    });
-}
-
-pub(crate) fn set_multiplayer_local_flip_observer(
-    observer: Option<Rc<dyn Fn(u32, bool, (f32, f32), f32)>>,
-) {
-    STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.mp_local_flip_observer = observer.clone();
-        if let Some(sync) = state.multiplayer.as_ref() {
-            sync.borrow().set_local_flip_observer(observer);
-        }
-    });
-}
-
-pub(crate) fn set_multiplayer_local_detach_observer(observer: Option<Rc<dyn Fn(u32)>>) {
-    STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.mp_local_detach_observer = observer.clone();
-        if let Some(sync) = state.multiplayer.as_ref() {
-            sync.borrow().set_local_detach_observer(observer);
-        }
-    });
-}
-
-pub(crate) fn set_multiplayer_local_send_to_back_observer(observer: Option<Rc<dyn Fn(u32)>>) {
-    STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.mp_local_send_to_back_observer = observer.clone();
-        if let Some(sync) = state.multiplayer.as_ref() {
-            sync.borrow().set_local_send_to_back_observer(observer);
+            sync.borrow().set_local_event_observer(observer);
         }
     });
 }

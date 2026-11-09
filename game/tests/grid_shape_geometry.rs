@@ -336,7 +336,7 @@ fn piece_ring_is_closed_and_contiguous_for_all_pieces() {
         for idx in 0..geom.edges.len() {
             let edge = cache.piece_edge_geometry(piece_id, idx);
             assert_eq!(edge.path.start, prev_end);
-            prev_end = path_end_point(&edge.path);
+            prev_end = edge.path.end_point();
         }
 
         assert_eq!(prev_end, first_start);
@@ -761,17 +761,6 @@ fn expected_grid_edge_id(rows: u32, cols: u32, row: u32, col: u32, side: usize) 
 
 fn point(x_mm: f32, y_mm: f32) -> PointMm {
     PointMm::try_from_mm(x_mm, y_mm).expect("point should be finite")
-}
-
-fn path_end_point(path: &PathMm) -> PointMm {
-    let mut current = path.start;
-    for seg in path.segs.iter() {
-        current = match seg {
-            PathSegMm::LineTo { to } => *to,
-            PathSegMm::CubicTo { to, .. } => *to,
-        };
-    }
-    current
 }
 
 fn assert_approx(actual: f32, expected: f32) {
