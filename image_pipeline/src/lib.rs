@@ -473,6 +473,55 @@ fn linear_to_u8_srgb_dithered(linear: f32, offset: f32) -> u8 {
     quant as u8
 }
 
+/// Converted RGB samples, kept at the precision needed by each source profile.
+enum SrgbSamples {
+    Linear(Vec<f32>),
+    Encoded(Vec<u16>),
+}
+
+fn convert_to_srgb(
+    rgba: &ImageBuffer<Rgba<u16>, Vec<u16>>,
+    metadata: &ImageMetadata,
+) -> Result<SrgbSamples, PipelineError> {
+    let mut src_info = build_src_profile(metadata)?;
+    loop {
+        let result = if src_info.transfer.is_hdr() {
+            map_rgba16_to_linear_srgb_f32(rgba, &src_info.profile).map(|mut rgb| {
+                tone_map_hdr_rgb(&mut rgb, src_info.transfer);
+                SrgbSamples::Linear(rgb)
+            })
+        } else {
+            transform_rgb16_with_profile(rgba, &src_info.profile).map(SrgbSamples::Encoded)
+        };
+        match result {
+            Ok(samples) => return Ok(samples),
+            Err(err) => match build_fallback_profile(metadata, &src_info) {
+                Some(fallback) => src_info = fallback,
+                None => return Err(err),
+            },
+        }
+    }
+}
+
+fn encode_linear_rgb8(rgb: &[f32], index: usize, width: u32, dither: bool) -> [u8; 3] {
+    if dither {
+        let x = (index as u32) % width;
+        let y = (index as u32) / width;
+        let offset = dither_offset_4x4(x, y);
+        [
+            linear_to_u8_srgb_dithered(rgb[0], offset),
+            linear_to_u8_srgb_dithered(rgb[1], offset),
+            linear_to_u8_srgb_dithered(rgb[2], offset),
+        ]
+    } else {
+        [
+            linear_to_u8_srgb(rgb[0]),
+            linear_to_u8_srgb(rgb[1]),
+            linear_to_u8_srgb(rgb[2]),
+        ]
+    }
+}
+
 pub fn map_rgba16_to_srgb_rgb16(
     rgba: &ImageBuffer<Rgba<u16>, Vec<u16>>,
     metadata: &ImageMetadata,
@@ -481,46 +530,11 @@ pub fn map_rgba16_to_srgb_rgb16(
     if width == 0 || height == 0 {
         return Err(PipelineError::Dimensions);
     }
-
-    let mut src_info = build_src_profile(metadata)?;
-    loop {
-        if src_info.transfer.is_hdr() {
-            match map_rgba16_to_linear_srgb_f32(rgba, &src_info.profile) {
-                Ok(mut linear_rgb) => {
-                    if src_info.transfer.is_hdr() {
-                        tone_map_hdr_rgb(&mut linear_rgb, src_info.transfer);
-                    }
-                    let mut out = Vec::with_capacity(linear_rgb.len());
-                    for value in linear_rgb {
-                        out.push(linear_to_u16_srgb(value));
-                    }
-                    return ImageBuffer::from_raw(width, height, out)
-                        .ok_or(PipelineError::Dimensions);
-                }
-                Err(err) => {
-                    if let Some(fallback) = build_fallback_profile(metadata, &src_info) {
-                        src_info = fallback;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        } else {
-            match transform_rgb16_with_profile(rgba, &src_info.profile) {
-                Ok(dst_rgb) => {
-                    return ImageBuffer::from_raw(width, height, dst_rgb)
-                        .ok_or(PipelineError::Dimensions);
-                }
-                Err(err) => {
-                    if let Some(fallback) = build_fallback_profile(metadata, &src_info) {
-                        src_info = fallback;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-    }
+    let rgb = match convert_to_srgb(rgba, metadata)? {
+        SrgbSamples::Linear(rgb) => rgb.into_iter().map(linear_to_u16_srgb).collect(),
+        SrgbSamples::Encoded(rgb) => rgb,
+    };
+    ImageBuffer::from_raw(width, height, rgb).ok_or(PipelineError::Dimensions)
 }
 
 pub fn map_rgba16_to_srgb_rgb8(
@@ -529,60 +543,17 @@ pub fn map_rgba16_to_srgb_rgb8(
     dither: bool,
 ) -> Result<image::RgbImage, PipelineError> {
     let (width, height) = rgba.dimensions();
-    let mut src_info = build_src_profile(metadata)?;
-    loop {
-        if src_info.transfer.is_hdr() {
-            match map_rgba16_to_linear_srgb_f32(rgba, &src_info.profile) {
-                Ok(mut linear_rgb) => {
-                    if src_info.transfer.is_hdr() {
-                        tone_map_hdr_rgb(&mut linear_rgb, src_info.transfer);
-                    }
-                    let mut out = Vec::with_capacity(linear_rgb.len());
-                    for (idx, chunk) in linear_rgb.chunks_exact(3).enumerate() {
-                        if dither {
-                            let x = (idx as u32) % width;
-                            let y = (idx as u32) / width;
-                            let offset = dither_offset_4x4(x, y);
-                            out.push(linear_to_u8_srgb_dithered(chunk[0], offset));
-                            out.push(linear_to_u8_srgb_dithered(chunk[1], offset));
-                            out.push(linear_to_u8_srgb_dithered(chunk[2], offset));
-                        } else {
-                            out.push(linear_to_u8_srgb(chunk[0]));
-                            out.push(linear_to_u8_srgb(chunk[1]));
-                            out.push(linear_to_u8_srgb(chunk[2]));
-                        }
-                    }
-                    return image::RgbImage::from_raw(width, height, out)
-                        .ok_or(PipelineError::Dimensions);
-                }
-                Err(err) => {
-                    if let Some(fallback) = build_fallback_profile(metadata, &src_info) {
-                        src_info = fallback;
-                        continue;
-                    }
-                    return Err(err);
-                }
+    let rgb = match convert_to_srgb(rgba, metadata)? {
+        SrgbSamples::Linear(rgb) => {
+            let mut out = Vec::with_capacity(rgb.len());
+            for (idx, chunk) in rgb.chunks_exact(3).enumerate() {
+                out.extend_from_slice(&encode_linear_rgb8(chunk, idx, width, dither));
             }
-        } else {
-            match transform_rgb16_with_profile(rgba, &src_info.profile) {
-                Ok(dst_rgb) => {
-                    let mut out = Vec::with_capacity(dst_rgb.len());
-                    for value in dst_rgb {
-                        out.push(u16_to_u8(value));
-                    }
-                    return image::RgbImage::from_raw(width, height, out)
-                        .ok_or(PipelineError::Dimensions);
-                }
-                Err(err) => {
-                    if let Some(fallback) = build_fallback_profile(metadata, &src_info) {
-                        src_info = fallback;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
+            out
         }
-    }
+        SrgbSamples::Encoded(rgb) => rgb.into_iter().map(u16_to_u8).collect(),
+    };
+    image::RgbImage::from_raw(width, height, rgb).ok_or(PipelineError::Dimensions)
 }
 
 pub fn map_rgba16_to_srgb_rgba8(
@@ -591,64 +562,27 @@ pub fn map_rgba16_to_srgb_rgba8(
     dither: bool,
 ) -> Result<image::RgbaImage, PipelineError> {
     let (width, height) = rgba.dimensions();
-    let mut src_info = build_src_profile(metadata)?;
-    loop {
-        if src_info.transfer.is_hdr() {
-            match map_rgba16_to_linear_srgb_f32(rgba, &src_info.profile) {
-                Ok(mut linear_rgb) => {
-                    tone_map_hdr_rgb(&mut linear_rgb, src_info.transfer);
-                    let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
-                    for (idx, chunk) in linear_rgb.chunks_exact(3).enumerate() {
-                        if dither {
-                            let x = (idx as u32) % width;
-                            let y = (idx as u32) / width;
-                            let offset = dither_offset_4x4(x, y);
-                            out.push(linear_to_u8_srgb_dithered(chunk[0], offset));
-                            out.push(linear_to_u8_srgb_dithered(chunk[1], offset));
-                            out.push(linear_to_u8_srgb_dithered(chunk[2], offset));
-                        } else {
-                            out.push(linear_to_u8_srgb(chunk[0]));
-                            out.push(linear_to_u8_srgb(chunk[1]));
-                            out.push(linear_to_u8_srgb(chunk[2]));
-                        }
-                        out.push(u16_to_u8(rgba.as_raw()[idx * 4 + 3]));
-                    }
-                    return image::RgbaImage::from_raw(width, height, out)
-                        .ok_or(PipelineError::Dimensions);
-                }
-                Err(err) => {
-                    if let Some(fallback) = build_fallback_profile(metadata, &src_info) {
-                        src_info = fallback;
-                        continue;
-                    }
-                    return Err(err);
-                }
+    let samples = convert_to_srgb(rgba, metadata)?;
+    let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    match samples {
+        SrgbSamples::Linear(rgb) => {
+            for (idx, chunk) in rgb.chunks_exact(3).enumerate() {
+                out.extend_from_slice(&encode_linear_rgb8(chunk, idx, width, dither));
+                out.push(u16_to_u8(rgba.as_raw()[idx * 4 + 3]));
             }
-        } else {
-            match transform_rgb16_with_profile(rgba, &src_info.profile) {
-                Ok(dst_rgb) => {
-                    let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
-                    let mut rgb_iter = dst_rgb.chunks_exact(3);
-                    let mut alpha_iter = rgba.as_raw().chunks_exact(4);
-                    while let (Some(rgb), Some(src)) = (rgb_iter.next(), alpha_iter.next()) {
-                        out.push(u16_to_u8(rgb[0]));
-                        out.push(u16_to_u8(rgb[1]));
-                        out.push(u16_to_u8(rgb[2]));
-                        out.push(u16_to_u8(src[3]));
-                    }
-                    return image::RgbaImage::from_raw(width, height, out)
-                        .ok_or(PipelineError::Dimensions);
-                }
-                Err(err) => {
-                    if let Some(fallback) = build_fallback_profile(metadata, &src_info) {
-                        src_info = fallback;
-                        continue;
-                    }
-                    return Err(err);
-                }
+        }
+        SrgbSamples::Encoded(rgb) => {
+            for (rgb, src) in rgb.chunks_exact(3).zip(rgba.as_raw().chunks_exact(4)) {
+                out.extend_from_slice(&[
+                    u16_to_u8(rgb[0]),
+                    u16_to_u8(rgb[1]),
+                    u16_to_u8(rgb[2]),
+                    u16_to_u8(src[3]),
+                ]);
             }
         }
     }
+    image::RgbaImage::from_raw(width, height, out).ok_or(PipelineError::Dimensions)
 }
 
 pub fn extract_icc_profile(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -1075,6 +1009,29 @@ mod tests {
             let (rgba, metadata) = decode_rgba16(bytes).expect("decode");
             let rgb = map_rgba16_to_srgb_rgb8(&rgba, &metadata, false).expect("map");
             assert_eq!(rgb.dimensions(), rgba.dimensions());
+        }
+    }
+
+    #[test]
+    fn output_formats_share_colors_and_preserve_alpha() {
+        for bytes in [SRGB_PNG, GAMA_PNG, PQ_PNG, HLG_PNG, ICC_JPEG, EXIF_JPEG] {
+            let (mut rgba, metadata) = decode_rgba16(bytes).expect("decode");
+            let alpha_values = [0, 16384, 32768, u16::MAX];
+            for (idx, pixel) in rgba.pixels_mut().enumerate() {
+                pixel[3] = alpha_values[idx % alpha_values.len()];
+            }
+            let rgb16 = map_rgba16_to_srgb_rgb16(&rgba, &metadata).expect("RGB16");
+            assert_eq!(rgb16.dimensions(), rgba.dimensions());
+            for dither in [false, true] {
+                let rgb8 = map_rgba16_to_srgb_rgb8(&rgba, &metadata, dither).expect("RGB8");
+                let rgba8 = map_rgba16_to_srgb_rgba8(&rgba, &metadata, dither).expect("RGBA8");
+                assert_eq!(rgb8.dimensions(), rgba.dimensions());
+                assert_eq!(rgba8.dimensions(), rgba.dimensions());
+                for (idx, (rgb, rgba)) in rgb8.pixels().zip(rgba8.pixels()).enumerate() {
+                    assert_eq!(rgb.0, [rgba[0], rgba[1], rgba[2]]);
+                    assert_eq!(rgba[3], [0, 64, 128, 255][idx % alpha_values.len()]);
+                }
+            }
         }
     }
 

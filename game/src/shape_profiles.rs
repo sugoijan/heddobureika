@@ -147,32 +147,25 @@ pub fn straight_path(start: Point2, end: Point2) -> Option<PathMm> {
 /// Returns the input path walked from end to start (used by interior
 /// edges to give one piece the mirror of the other piece's path).
 pub fn reverse_path(path: &PathMm) -> PathMm {
-    let mut states = Vec::<(PointMm, PathSegMm, PointMm)>::with_capacity(path.segs.len());
+    let mut segs = Vec::with_capacity(path.segs.len());
     let mut current = path.start;
     for segment in path.segs.iter() {
-        let segment_start = current;
-        let segment = segment.clone();
-        match segment {
+        match *segment {
             PathSegMm::LineTo { to } => {
+                segs.push(PathSegMm::LineTo { to: current });
                 current = to;
             }
-            PathSegMm::CubicTo { to, .. } => {
+            PathSegMm::CubicTo { c1, c2, to } => {
+                segs.push(PathSegMm::CubicTo {
+                    c1: c2,
+                    c2: c1,
+                    to: current,
+                });
                 current = to;
             }
         }
-        states.push((segment_start, segment, current));
     }
-    let mut segs = Vec::<PathSegMm>::with_capacity(states.len());
-    for (start, segment, _) in states.into_iter().rev() {
-        match segment {
-            PathSegMm::LineTo { .. } => segs.push(PathSegMm::LineTo { to: start }),
-            PathSegMm::CubicTo { c1, c2, .. } => segs.push(PathSegMm::CubicTo {
-                c1: c2,
-                c2: c1,
-                to: start,
-            }),
-        }
-    }
+    segs.reverse();
     PathMm::new(current, segs.into_boxed_slice(), false)
 }
 

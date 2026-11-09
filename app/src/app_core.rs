@@ -2433,45 +2433,58 @@ mod tests {
 
     #[test]
     fn ctrl_drag_rotates_piece_visual_pose() {
-        let core = AppCore::new();
-        core.set_puzzle_with_topology(
-            "rot".to_string(),
-            PuzzleImageRef::BuiltIn {
-                slug: "rot".to_string(),
-            },
-            (300, 200),
-            TopologySpec::grid(3, 2),
-            None,
-        );
-        // Unflip every piece so the rotation direction in the test is
-        // independent of the random scramble.
-        core.clear_all_group_flips();
-        let snapshot = core.snapshot();
-        let start_top_left = snapshot.piece_top_left_px[0];
-        let start_rot = snapshot.piece_world_poses[0].rotation_degrees();
-        let piece_w = snapshot.pose_unit_px[0];
-        let piece_h = snapshot.pose_unit_px[1];
-        let pivot_x = start_top_left.0 + piece_w * 0.5;
-        let pivot_y = start_top_left.1 + piece_h * 0.5;
-        core.begin_drag(0, pivot_x + 20.0, pivot_y, false, true, false, 4.0, Some(1));
-        // Drag perpendicular — should rotate by 90 deg.
-        core.drag_move(pivot_x, pivot_y + 20.0);
-        let snapshot = core.snapshot();
-        let new_rot = snapshot.piece_world_poses[0].rotation_degrees();
-        assert!(
-            (new_rot - (start_rot + 90.0)).abs() < 0.5
-                || (new_rot - (start_rot - 270.0)).abs() < 0.5,
-            "rotation should change from {start_rot} to ~{}, got {new_rot}",
-            start_rot + 90.0
-        );
-        // After drag end, the rotation should persist (be committed to playable).
-        core.drag_end(Some(1));
-        let snapshot = core.snapshot();
-        let end_rot = snapshot.piece_world_poses[0].rotation_degrees();
-        assert!(
-            (end_rot - new_rot).abs() < 0.5,
-            "rotation should persist after drag end: drag rotation {new_rot}, post-end {end_rot}"
-        );
+        // Free rotations persist; rotations within the snap tolerance settle
+        // onto the topology's cardinal angle when the drag is released.
+        for (start_rotation, expected_end_rotation) in [(25.0, 115.0), (2.9, 90.0)] {
+            let core = AppCore::new();
+            core.set_puzzle_with_topology(
+                "rot".to_string(),
+                PuzzleImageRef::BuiltIn {
+                    slug: "rot".to_string(),
+                },
+                (300, 200),
+                TopologySpec::grid(3, 2),
+                Some(1),
+            );
+            // Unflip every piece so the rotation direction in the test is
+            // independent of the random scramble.
+            core.clear_all_group_flips();
+            {
+                let mut state = core.state.borrow_mut();
+                let game = state.game.as_mut().expect("game");
+                let group = game.playable.logical.group_of(PieceId(0)).expect("group");
+                let pose = &mut game.playable.group_pose[group.as_usize()];
+                pose.rotation = AngleDeg::try_new(start_rotation).expect("finite");
+                game.rebuild_visual();
+            }
+            core.notify();
+            let snapshot = core.snapshot();
+            let start_top_left = snapshot.piece_top_left_px[0];
+            let start_rot = snapshot.piece_world_poses[0].rotation_degrees();
+            let piece_w = snapshot.pose_unit_px[0];
+            let piece_h = snapshot.pose_unit_px[1];
+            let pivot_x = start_top_left.0 + piece_w * 0.5;
+            let pivot_y = start_top_left.1 + piece_h * 0.5;
+            core.begin_drag(0, pivot_x + 20.0, pivot_y, false, true, false, 4.0, Some(1));
+            // Drag perpendicular — should rotate by 90 deg.
+            core.drag_move(pivot_x, pivot_y + 20.0);
+            let snapshot = core.snapshot();
+            let new_rot = snapshot.piece_world_poses[0].rotation_degrees();
+            assert!(
+                (new_rot - (start_rot + 90.0)).abs() < 0.5
+                    || (new_rot - (start_rot - 270.0)).abs() < 0.5,
+                "rotation should change from {start_rot} to ~{}, got {new_rot}",
+                start_rot + 90.0
+            );
+            // Release commits the rotation and applies the normal snapping rules.
+            core.drag_end(Some(1));
+            let snapshot = core.snapshot();
+            let end_rot = snapshot.piece_world_poses[0].rotation_degrees();
+            assert!(
+                angle_delta(end_rot, expected_end_rotation).abs() < 0.5,
+                "drag rotation {new_rot} should settle at {expected_end_rotation}, got {end_rot}"
+            );
+        }
     }
 
     #[test]

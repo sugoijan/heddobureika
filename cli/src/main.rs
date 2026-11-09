@@ -409,15 +409,16 @@ async fn create_room(
         None => None,
     };
 
-    let (create_spec, upload_plan) = if let Some(path) = puzzle_file {
-        if puzzle_by_slug(&puzzle).is_none() {
-            eprintln!("unknown puzzle: {puzzle}");
-            eprintln!("available puzzles:");
-            for entry in PUZZLE_CATALOG {
-                eprintln!("  {} ({})", entry.slug, entry.label);
-            }
-            return Err(err_msg(format!("unknown puzzle: {puzzle}")));
+    if puzzle_by_slug(&puzzle).is_none() {
+        eprintln!("unknown puzzle: {puzzle}");
+        eprintln!("available puzzles:");
+        for entry in PUZZLE_CATALOG {
+            eprintln!("  {} ({})", entry.slug, entry.label);
         }
+        return Err(err_msg(format!("unknown puzzle: {puzzle}")));
+    }
+
+    let (create_spec, upload_plan) = if let Some(path) = puzzle_file {
         (
             PuzzleSpec {
                 image_ref: PuzzleImageRef::BuiltIn {
@@ -431,14 +432,6 @@ async fn create_room(
             Some(UploadPlan { path, pieces, seed }),
         )
     } else {
-        if puzzle_by_slug(&puzzle).is_none() {
-            eprintln!("unknown puzzle: {puzzle}");
-            eprintln!("available puzzles:");
-            for entry in PUZZLE_CATALOG {
-                eprintln!("  {} ({})", entry.slug, entry.label);
-            }
-            return Err(err_msg(format!("unknown puzzle: {puzzle}")));
-        }
         (
             PuzzleSpec {
                 image_ref: PuzzleImageRef::BuiltIn {

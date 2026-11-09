@@ -174,22 +174,7 @@ impl AdminSocket {
 
     fn send(&mut self, ws_base: String, room_id: String, admin_token: String, msg: AdminMsg) {
         self.pending.borrow_mut().push(msg);
-        let url = app_router::build_room_ws_url(&ws_base, &room_id);
-        let connect_key = format!("{url}|{admin_token}");
-        let url_changed = self.connect_key.as_deref() != Some(connect_key.as_str());
-        if url_changed {
-            self.connect_key = Some(connect_key);
-            self.connected.set(false);
-            self.update_status(AdminStatus::Connecting);
-            self.connect(url, room_id, admin_token);
-            return;
-        }
-        if self.connected.get() {
-            self.flush();
-        } else {
-            self.update_status(AdminStatus::Connecting);
-            self.connect(url, room_id, admin_token);
-        }
+        self.flush_or_connect(ws_base, room_id, admin_token);
     }
 
     fn send_upload(
@@ -204,6 +189,10 @@ impl AdminSocket {
         }
         self.upload_pending.set(true);
         self.pending.borrow_mut().extend(msgs);
+        self.flush_or_connect(ws_base, room_id, admin_token);
+    }
+
+    fn flush_or_connect(&mut self, ws_base: String, room_id: String, admin_token: String) {
         let url = app_router::build_room_ws_url(&ws_base, &room_id);
         let connect_key = format!("{url}|{admin_token}");
         let url_changed = self.connect_key.as_deref() != Some(connect_key.as_str());

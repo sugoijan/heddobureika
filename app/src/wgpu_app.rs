@@ -24,8 +24,7 @@ use crate::input::{
 use crate::puzzle_image::{resolve_puzzle_credit, resolve_puzzle_image_src};
 use crate::renderer::{
     EdgeVertex, FlipEdgeSpan, FlipEdges, Instance, InstanceBatch, InstanceSet, MaskAtlasData,
-    UiRotationOrigin, UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer,
-    build_mask_atlas,
+    UiSpriteSpec, UiSpriteTexture, UiTextId, UiTextSpec, WgpuRenderer, build_mask_atlas,
 };
 use crate::rotation_anim::{
     GroupAnim, SpringParams, apply_group_transform, rotate_group_succession,
@@ -48,7 +47,6 @@ const POSE_UNIT_MM: f32 = 25.0;
 /// A piece counts as "mid-flip" (needs the extrusion pass) when its flip
 /// progress is this far from both 0 and 1.
 const FLIP_ACTIVE_EPS: f32 = 0.001;
-const UI_DEBUG_FONT_RATIO: f32 = 0.02;
 const OUTLINE_KIND_HOVER: f32 = 1.0;
 const OUTLINE_KIND_OWNED: f32 = 2.0;
 const OUTLINE_KIND_DEBUG: f32 = 3.0;
@@ -2697,161 +2695,6 @@ fn push_flip_edge_verts(outline: &[[f32; 2]], out: &mut Vec<EdgeVertex>) {
         out.push(a_front);
         out.push(b_front);
     }
-}
-
-fn build_ui_specs(
-    measure: &mut GlyphonMeasureState,
-    layout: WorkspaceLayout,
-    width: f32,
-    height: f32,
-    title_text: &str,
-    art_credit_text: Option<&str>,
-    frame_rect: [f32; 4],
-    solved: bool,
-    connections_label: &str,
-    border_connections_label: &str,
-    show_debug: bool,
-    backend_label: Option<&str>,
-    menu_visible: bool,
-    is_dark: bool,
-) -> Vec<UiTextSpec> {
-    let min_dim = width.min(height).max(1.0);
-    let base_color = ui_text_color(is_dark);
-    let muted_color = ui_with_alpha(base_color, ui_scaled_alpha(170));
-    let accent_color = ui_accent_color(is_dark);
-    let mut specs = Vec::new();
-    if menu_visible {
-        let title_size = min_dim * UI_MENU_TITLE_FONT_RATIO;
-        let sub_size = min_dim * UI_MENU_SUB_FONT_RATIO;
-        specs.push(UiTextSpec {
-            id: UiTextId::MenuTitle,
-            text: "Pick a puzzle".to_string(),
-            pos: [0.0, 0.0],
-            rotation_deg: UI_MENU_TITLE_ROTATION_DEG,
-            rotation_origin: UiRotationOrigin::Center,
-            rotation_offset: [0.0, 0.0],
-            font_size: title_size,
-            line_height: title_size * 1.08,
-            color: base_color,
-        });
-        specs.push(UiTextSpec {
-            id: UiTextId::MenuSubtitle,
-            text: "Scramble / Puzzle / Pieces".to_string(),
-            pos: [0.0, 0.0],
-            rotation_deg: UI_MENU_SUB_ROTATION_DEG,
-            rotation_origin: UiRotationOrigin::Center,
-            rotation_offset: [0.0, 0.0],
-            font_size: sub_size,
-            line_height: sub_size * 1.08,
-            color: muted_color,
-        });
-    } else {
-        if !title_text.is_empty() {
-            let title_size = min_dim * UI_TITLE_FONT_RATIO;
-            specs.push(UiTextSpec {
-                id: UiTextId::Title,
-                text: title_text.to_string(),
-                pos: [0.0, 0.0],
-                rotation_deg: UI_TITLE_ROTATION_DEG,
-                rotation_origin: UiRotationOrigin::BottomLeft,
-                rotation_offset: [0.0, 0.0],
-                font_size: title_size,
-                line_height: title_size * 1.08,
-                color: base_color,
-            });
-        }
-        let progress_text = format!(
-            "{} of borders and {} in total complete",
-            border_connections_label, connections_label
-        );
-        let progress_size = min_dim * UI_PROGRESS_FONT_RATIO;
-        specs.push(UiTextSpec {
-            id: UiTextId::Progress,
-            text: progress_text,
-            pos: [0.0, 0.0],
-            rotation_deg: UI_PROGRESS_ROTATION_DEG,
-            rotation_origin: UiRotationOrigin::TopLeft,
-            rotation_offset: [0.0, 0.0],
-            font_size: progress_size,
-            line_height: progress_size * 1.08,
-            color: base_color,
-        });
-
-        let credit_text = CREDIT_TEXT.to_string();
-        let credit_size = min_dim * UI_CREDIT_FONT_RATIO;
-        specs.push(UiTextSpec {
-            id: UiTextId::Credit,
-            text: credit_text,
-            pos: [0.0, 0.0],
-            rotation_deg: UI_CREDIT_ROTATION_DEG,
-            rotation_origin: UiRotationOrigin::BottomLeft,
-            rotation_offset: [0.0, 0.0],
-            font_size: credit_size,
-            line_height: credit_size * 1.08,
-            color: base_color,
-        });
-
-        if let Some(text) = art_credit_text {
-            // Anchored just below the puzzle frame's bottom-right corner
-            // rather than the workspace gutter grid, so it stays visible
-            // once the puzzle is complete; apply_taffy_layout skips it.
-            let art_size = min_dim * UI_ART_CREDIT_FONT_RATIO;
-            let mut spec = UiTextSpec {
-                id: UiTextId::ArtCredit,
-                text: text.to_string(),
-                pos: [0.0, 0.0],
-                rotation_deg: UI_ART_CREDIT_ROTATION_DEG,
-                rotation_origin: UiRotationOrigin::BottomRight,
-                rotation_offset: [0.0, 0.0],
-                font_size: art_size,
-                line_height: art_size * 1.08,
-                color: base_color,
-            };
-            let (text_width, text_height) = layout_text_bounds(measure, &spec);
-            spec.rotation_offset =
-                rotation_offset_for(spec.rotation_origin, text_width, text_height);
-            let pad = art_size * UI_ART_CREDIT_PAD_RATIO;
-            spec.pos = [
-                frame_rect[0] + frame_rect[2] - pad - text_width * 0.5,
-                frame_rect[1] + frame_rect[3] + pad + text_height * 0.5,
-            ];
-            specs.push(spec);
-        }
-
-        if solved {
-            let success_size = min_dim * UI_SUCCESS_FONT_RATIO;
-            specs.push(UiTextSpec {
-                id: UiTextId::Success,
-                text: "Well done!".to_string(),
-                pos: [0.0, 0.0],
-                rotation_deg: UI_SUCCESS_ROTATION_DEG,
-                rotation_origin: UiRotationOrigin::Center,
-                rotation_offset: [0.0, 0.0],
-                font_size: success_size,
-                line_height: success_size * 1.1,
-                color: accent_color,
-            });
-        }
-    }
-    if show_debug && !menu_visible {
-        if let Some(label) = backend_label {
-            let debug_size = min_dim * UI_DEBUG_FONT_RATIO;
-            specs.push(UiTextSpec {
-                id: UiTextId::Debug,
-                text: format!("WGPU backend: {label}"),
-                pos: [0.0, 0.0],
-                rotation_deg: 0.0,
-                rotation_origin: UiRotationOrigin::Center,
-                rotation_offset: [0.0, 0.0],
-                font_size: debug_size,
-                line_height: debug_size * 1.08,
-                color: muted_color,
-            });
-        }
-    }
-
-    apply_taffy_layout(measure, layout, width, height, menu_visible, &mut specs);
-    specs
 }
 
 fn rect_to_view(rect: Rect, view: ViewRect, canvas_rect: &web_sys::DomRect) -> Rect {

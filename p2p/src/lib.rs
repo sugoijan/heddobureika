@@ -242,11 +242,8 @@ pub fn validate_snapshot(snapshot: &PlayableGameSnapshot) -> Result<()> {
     if snapshot.version != heddobureika_core::PLAYABLE_GAME_SNAPSHOT_VERSION {
         return Err("This P2P puzzle uses an incompatible save version".into());
     }
-    if !matches!(snapshot.puzzle.image_ref, PuzzleImageRef::BuiltIn { .. }) {
-        return Err("P2P currently supports catalog puzzles only".into());
-    }
     let PuzzleImageRef::BuiltIn { slug } = &snapshot.puzzle.image_ref else {
-        unreachable!()
+        return Err("P2P currently supports catalog puzzles only".into());
     };
     let entry = heddobureika_core::puzzle_by_slug(slug)
         .ok_or("This puzzle is missing from your catalog")?;

@@ -388,7 +388,6 @@ impl PlayableRoomUpdate {
         batch: &PlayableUpdateBatch,
         state: &PlayableGameStateSnapshot,
     ) -> Self {
-        let applied = &batch.proposal;
         let group_changes = batch
             .delta
             .dirty_groups
@@ -421,39 +420,7 @@ impl PlayableRoomUpdate {
                 })
             })
             .collect::<Vec<_>>();
-        Self {
-            kind,
-            action_id: applied.action_id.map(|id| id.0),
-            status: applied.status.into(),
-            rejection: applied.rejection.map(ProposalApplyRejectionSnapshot::from),
-            rebased: applied.rebased,
-            base_revision: applied.base_revision,
-            revision_before: batch.revision_before,
-            revision_after: batch.revision_after,
-            mover_group: applied.mover_group.as_u32(),
-            fixed_group: applied.fixed_group.map(|group| group.as_u32()),
-            activated_edges: applied
-                .activated_edges
-                .iter()
-                .map(|edge| edge.as_u32())
-                .collect(),
-            deactivated_edges: applied
-                .deactivated_edges
-                .iter()
-                .map(|edge| edge.as_u32())
-                .collect(),
-            merged_groups: applied
-                .merged_groups
-                .iter()
-                .copied()
-                .map(GroupMergeSnapshot::from)
-                .collect(),
-            group_changes,
-            piece_changes,
-            z_order_changed: batch.delta.z_order_changed,
-            membership_changed: batch.delta.membership_changed,
-            solved_changed: batch.delta.solved_changed,
-        }
+        Self::from_batch(kind, batch, group_changes, piece_changes)
     }
 
     /// Builds a wire update from a freshly applied `PlayableUpdateBatch` and
@@ -464,7 +431,6 @@ impl PlayableRoomUpdate {
         batch: &PlayableUpdateBatch,
         playable: &PlayableState<T>,
     ) -> Self {
-        let applied = &batch.proposal;
         let group_changes = batch
             .delta
             .dirty_groups
@@ -495,6 +461,16 @@ impl PlayableRoomUpdate {
                 })
             })
             .collect::<Vec<_>>();
+        Self::from_batch(kind, batch, group_changes, piece_changes)
+    }
+
+    fn from_batch(
+        kind: PlayableRoomUpdateKind,
+        batch: &PlayableUpdateBatch,
+        group_changes: Vec<GroupChangeSnapshot>,
+        piece_changes: Vec<PieceChangeSnapshot>,
+    ) -> Self {
+        let applied = &batch.proposal;
         Self {
             kind,
             action_id: applied.action_id.map(|id| id.0),

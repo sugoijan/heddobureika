@@ -13,7 +13,7 @@ use crate::edge_compose::ConnectorSeg;
 use crate::edge_profile::{ConnectorShape, EdgeProfileInput, build_edge_profile_segments};
 use crate::grid_shape::GridShapeSettings;
 use crate::ids::{EdgeId, PieceId};
-use crate::math::{normalize_angle, rand_range, rand_unit, shortest_angle_delta};
+use crate::math::{normalize_angle, rand_range, rand_unit, shortest_angle_delta, upper_median};
 use crate::playable::Pose2;
 use crate::render_geometry::{PuzzleRenderGeometry, build_render_geometry_from_atlas};
 use crate::rotation_step::SymmetryStrength;
@@ -475,7 +475,7 @@ fn build_layout(piece_count: u32, seed: u32, aspect_ratio: f32) -> VoronoiLayout
 /// physical interlock. Collapsing the segment to its midpoint across every
 /// cell that touched it restores the natural higher-order junction and
 /// removes the spurious connection.
-fn collapse_tiny_edges(polygons: &mut Vec<Vec<Point>>, extent_x: f32, extent_y: f32) {
+fn collapse_tiny_edges(polygons: &mut [Vec<Point>], extent_x: f32, extent_y: f32) {
     for _ in 0..COLLAPSE_MAX_PASSES {
         let median = median_polygon_edge_len(polygons, extent_x, extent_y);
         if median <= EPS {
@@ -507,15 +507,11 @@ fn median_polygon_edge_len(polygons: &[Vec<Point>], extent_x: f32, extent_y: f32
             }
         }
     }
-    if lengths.is_empty() {
-        return 0.0;
-    }
-    lengths.sort_by(|a, b| a.total_cmp(b));
-    lengths[lengths.len() / 2]
+    upper_median(&mut lengths).unwrap_or(0.0)
 }
 
 fn collapse_one_pass(
-    polygons: &mut Vec<Vec<Point>>,
+    polygons: &mut [Vec<Point>],
     extent_x: f32,
     extent_y: f32,
     threshold: f32,
@@ -1267,11 +1263,7 @@ fn median_edge_len(cell: &VoronoiCell) -> f32 {
         .map(|edge| distance_sq(edge.start, edge.end).sqrt())
         .filter(|len| *len > EPS)
         .collect::<Vec<_>>();
-    if lengths.is_empty() {
-        return 1.0;
-    }
-    lengths.sort_by(|a, b| a.total_cmp(b));
-    lengths[lengths.len() / 2]
+    upper_median(&mut lengths).unwrap_or(1.0)
 }
 
 fn line_angle_degrees(start: Point, end: Point) -> f32 {
@@ -1613,13 +1605,11 @@ fn typical_interior_edge_len_px(topology: &VoronoiTopology, pose_unit_px: [f32; 
             }
         }
     }
-    if lengths.is_empty() {
+    upper_median(&mut lengths).unwrap_or_else(|| {
         let area = (topology.layout.extent_x * pose_unit_px[0])
             * (topology.layout.extent_y * pose_unit_px[1]);
-        return (area / topology.piece_count().max(1) as f32).sqrt();
-    }
-    lengths.sort_by(|a, b| a.total_cmp(b));
-    lengths[lengths.len() / 2]
+        (area / topology.piece_count().max(1) as f32).sqrt()
+    })
 }
 
 fn shaped_edge_path(

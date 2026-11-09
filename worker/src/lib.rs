@@ -2056,7 +2056,6 @@ impl Room {
                 .borrow_mut()
                 .assets
                 .insert(hash.to_string(), asset.clone());
-            return Ok(Some(asset.clone()));
         }
         Ok(asset)
     }

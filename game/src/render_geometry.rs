@@ -132,10 +132,9 @@ impl PuzzleRenderGeometry {
             widths.push(piece.bounds_px.width);
             heights.push(piece.bounds_px.height);
         }
-        widths.sort_by(|a, b| a.total_cmp(b));
-        heights.sort_by(|a, b| a.total_cmp(b));
-        let mid = widths.len() / 2;
-        ([min_w, min_h], [widths[mid], heights[mid]])
+        let median_w = math::upper_median(&mut widths).unwrap_or(0.0);
+        let median_h = math::upper_median(&mut heights).unwrap_or(0.0);
+        ([min_w, min_h], [median_w, median_h])
     }
 
     pub fn piece(&self, id: PieceId) -> Option<&PieceRenderGeometry> {

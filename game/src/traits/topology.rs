@@ -3,6 +3,7 @@
 use std::any::Any;
 
 use crate::ids::{EdgeId, PieceId};
+use crate::math::upper_median;
 use crate::playable::Pose2;
 use crate::render_geometry::PuzzleRenderGeometry;
 use crate::rotation_step::{StepDirection, SymmetryStrength, next_step_canonical};
@@ -300,11 +301,8 @@ pub trait PuzzleTopology {
             xs.push(px.as_mm_f32());
             ys.push(py.as_mm_f32());
         }
-        xs.sort_by(|a, b| a.total_cmp(b));
-        ys.sort_by(|a, b| a.total_cmp(b));
-        let mid = xs.len() / 2;
-        let median_x = xs[mid];
-        let median_y = ys[mid];
+        let median_x = upper_median(&mut xs).unwrap_or(0.0);
+        let median_y = upper_median(&mut ys).unwrap_or(0.0);
         (
             LengthMm::try_new(median_x).unwrap_or_default(),
             LengthMm::try_new(median_y).unwrap_or_default(),

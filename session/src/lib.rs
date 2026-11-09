@@ -242,14 +242,7 @@ impl SessionAuthority {
             if piece_id as usize >= total {
                 return None;
             }
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, piece_id as usize)?;
             let anchor_id = members[0] as u32;
 
             if let Some(existing) = inner.owners_by_anchor.get(&anchor_id) {
@@ -328,14 +321,7 @@ impl SessionAuthority {
             if piece_id as usize >= total {
                 return None;
             }
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, piece_id as usize)?;
             let anchor_id = members[0] as u32;
 
             let owns_anchor = inner
@@ -394,14 +380,7 @@ impl SessionAuthority {
                 return None;
             }
 
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize)?;
             let anchor_id_usize = members[0];
             if anchor_id_usize as u32 != anchor_id {
                 return None;
@@ -487,14 +466,7 @@ impl SessionAuthority {
                 return None;
             }
 
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize)?;
             let anchor_id_usize = members[0];
             if anchor_id_usize as u32 != anchor_id {
                 return None;
@@ -558,14 +530,7 @@ impl SessionAuthority {
                 return None;
             }
 
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, piece_id as usize)?;
             let anchor_id = members[0] as u32;
             if members.len() != 1 || anchor_id != piece_id {
                 return None;
@@ -630,14 +595,7 @@ impl SessionAuthority {
                 return None;
             }
 
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, piece_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, piece_id as usize)?;
             let anchor_id = members[0] as u32;
             if members.len() == 1 && anchor_id == piece_id {
                 return None;
@@ -736,14 +694,7 @@ impl SessionAuthority {
             if anchor_id as usize >= total {
                 return None;
             }
-            let mut members =
-                match playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize) {
-                    Some(members) => members,
-                    None => {
-                        return None;
-                    }
-                };
-            members.sort_unstable();
+            let members = playable_group_members(&runtime_snapshot.snapshot, anchor_id as usize)?;
             let anchor_id_usize = members[0];
             if anchor_id_usize as u32 != anchor_id {
                 return None;
@@ -1214,13 +1165,14 @@ impl RoomGeometry {
     }
 }
 
+/// Members are returned in ascending piece-ID order, with the anchor first.
 fn playable_group_members(snapshot: &PlayableGameSnapshot, piece_id: usize) -> Option<Vec<usize>> {
     let total = snapshot.state.topology_piece_count as usize;
     if piece_id >= total || snapshot.state.piece_group.len() != total {
         return None;
     }
     let group = *snapshot.state.piece_group.get(piece_id)?;
-    let mut members = snapshot
+    let members = snapshot
         .state
         .piece_group
         .iter()
@@ -1228,7 +1180,6 @@ fn playable_group_members(snapshot: &PlayableGameSnapshot, piece_id: usize) -> O
         .enumerate()
         .filter_map(|(idx, candidate)| (candidate == group).then_some(idx))
         .collect::<Vec<_>>();
-    members.sort_unstable();
     (!members.is_empty()).then_some(members)
 }
 

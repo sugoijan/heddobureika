@@ -81,9 +81,39 @@ pub fn cubic_point(
     )
 }
 
+/// Selects the middle value under total float ordering without sorting the
+/// whole slice. For an even-length slice this is the upper of the two middles.
+pub(crate) fn upper_median(values: &mut [f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mid = values.len() / 2;
+    Some(*values.select_nth_unstable_by(mid, f32::total_cmp).1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upper_median_preserves_total_float_order() {
+        assert_eq!(upper_median(&mut []), None);
+        for mut values in [
+            vec![3.0],
+            vec![4.0, 1.0, 3.0, 2.0],
+            vec![3.0, 1.0, 2.0, 2.0, 5.0],
+            vec![0.0, -0.0],
+            vec![f32::NAN, f32::INFINITY, -1.0, f32::NEG_INFINITY],
+            vec![f32::from_bits(0x7fc0_0001), f32::from_bits(0x7fc0_0002)],
+        ] {
+            let mut sorted = values.clone();
+            sorted.sort_by(f32::total_cmp);
+            assert_eq!(
+                upper_median(&mut values).unwrap().to_bits(),
+                sorted[sorted.len() / 2].to_bits()
+            );
+        }
+    }
 
     #[test]
     fn shortest_delta_wraps_both_ways() {

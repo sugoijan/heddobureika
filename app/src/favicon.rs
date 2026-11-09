@@ -17,8 +17,12 @@ const DARK_PALETTE: FaviconPalette = FaviconPalette {
 };
 
 fn favicon_svg(dark: bool) -> String {
+    apply_favicon_palette(FAVICON_TEMPLATE, dark)
+}
+
+fn apply_favicon_palette(template: &str, dark: bool) -> String {
     let palette = if dark { DARK_PALETTE } else { LIGHT_PALETTE };
-    let svg = replace_css_var(FAVICON_TEMPLATE, "--hb-favicon-bg", palette.bg);
+    let svg = replace_css_var(template, "--hb-favicon-bg", palette.bg);
     replace_css_var(&svg, "--hb-favicon-glyph", palette.glyph)
 }
 
@@ -127,32 +131,47 @@ mod dom {
 mod tests {
     use super::*;
 
+    const THEMED_TEMPLATE: &str = r#"<svg viewBox="0 0 100 100">
+<style>
+.hb-favicon-bg { fill: var(--hb-favicon-bg, pink); }
+.hb-favicon-glyph { fill: var(--hb-favicon-glyph, blue); }
+</style>
+<path d="M0 0L100 100"/>
+</svg>"#;
+
     #[test]
     fn light_favicon_uses_light_palette() {
-        let svg = favicon_svg(false);
-        assert!(svg.contains("fill: #141312"));
-        assert!(svg.contains("fill: #fff"));
+        let svg = apply_favicon_palette(THEMED_TEMPLATE, false);
+        assert!(svg.contains(".hb-favicon-bg { fill: #141312; }"));
+        assert!(svg.contains(".hb-favicon-glyph { fill: #fff; }"));
     }
 
     #[test]
     fn dark_favicon_swaps_palette() {
-        let svg = favicon_svg(true);
+        let svg = apply_favicon_palette(THEMED_TEMPLATE, true);
         assert!(svg.contains(".hb-favicon-bg { fill: #fff; }"));
         assert!(svg.contains(".hb-favicon-glyph { fill: #141312; }"));
     }
 
     #[test]
     fn favicon_has_no_remaining_css_vars() {
-        for dark in [false, true] {
-            let svg = favicon_svg(dark);
-            assert!(!svg.contains("var(--hb-"));
+        for template in [THEMED_TEMPLATE, FAVICON_TEMPLATE] {
+            for dark in [false, true] {
+                let svg = apply_favicon_palette(template, dark);
+                assert!(!svg.contains("var(--hb-"));
+            }
         }
     }
 
     #[test]
     fn favicon_preserves_geometry() {
-        let svg = favicon_svg(false);
-        assert!(svg.contains(r#"viewBox="0 0 100 100""#));
-        assert!(svg.contains("<path"));
+        for dark in [false, true] {
+            let themed = apply_favicon_palette(THEMED_TEMPLATE, dark);
+            assert!(themed.contains(r#"viewBox="0 0 100 100""#));
+            assert!(themed.contains(r#"<path d="M0 0L100 100"/>"#));
+            // The Sketch export uses fixed brand colors, so palette application
+            // must preserve the entire exported icon, including its geometry.
+            assert_eq!(favicon_svg(dark), FAVICON_TEMPLATE);
+        }
     }
 }

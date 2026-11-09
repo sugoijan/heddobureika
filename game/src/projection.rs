@@ -115,11 +115,7 @@ impl IdentityPhysicalState {
 
 impl PhysicalProjection for IdentityPhysicalState {
     fn refresh_from_authoritative(&mut self, authoritative: &InteractableState) {
-        if self.poses.len() != authoritative.piece_world_pose.len() {
-            self.poses = authoritative.piece_world_pose.clone();
-        } else {
-            self.poses.clone_from_slice(&authoritative.piece_world_pose);
-        }
+        self.poses.clone_from(&authoritative.piece_world_pose);
     }
 
     fn refresh_dirty(&mut self, authoritative: &InteractableState, dirty: &[PieceId]) {
@@ -151,7 +147,7 @@ impl PhysicalProjection for IdentityPhysicalState {
 impl VisualState {
     pub fn rebuild_from<T: PuzzleTopology>(playable: &PlayableState<T>) -> Self {
         let authoritative = InteractableState::rebuild_from(playable);
-        let poses = authoritative.piece_world_pose.to_vec().into_boxed_slice();
+        let poses = authoritative.piece_world_pose.clone();
         Self {
             authoritative,
             piece_visual_pose: poses.clone(),
@@ -215,13 +211,10 @@ impl VisualState {
     }
 
     pub fn reset_visual_to_authoritative(&mut self) {
-        let poses = self
-            .authoritative
-            .piece_world_pose
-            .to_vec()
-            .into_boxed_slice();
-        self.piece_visual_pose = poses.clone();
-        self.piece_target_pose = poses;
+        self.piece_visual_pose
+            .clone_from(&self.authoritative.piece_world_pose);
+        self.piece_target_pose
+            .clone_from(&self.authoritative.piece_world_pose);
     }
 
     pub fn snap_piece_to_authoritative(&mut self, piece: PieceId) -> bool {
